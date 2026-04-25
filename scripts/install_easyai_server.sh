@@ -94,7 +94,11 @@ system_file="$config_dir/system.txt"
 api_key_file="$config_dir/api_key"
 
 ctx_size=128000
-ngl=99                                        # --ngl <n>  (-1=auto, 0=CPU only, 99=all layers)
+# --ngl: -1 = auto-fit (llama.cpp picks how many layers fit), 0 = CPU only,
+# 99 = force all layers on GPU (will OOM if it doesn't fit; auto-fit refuses
+# to reduce a user-pinned value).  Default is -1 so a fresh install never
+# hits the "n_gpu_layers already set by user, abort" failure mode.
+ngl=-1
 webui_title="easyai"                          # --webui-title <text>
 webui_icon=""                                 # --webui-icon <path/to/.ico|.png|.svg|.gif|.jpg|.webp>
 webui_icon_dest="$config_dir/favicon"         # final installed path under /etc/easyai
