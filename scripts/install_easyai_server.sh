@@ -37,6 +37,8 @@
 #   ./install_easyai_server.sh --service-host 0.0.0.0
 #   ./install_easyai_server.sh --ctx-size 32768
 #   ./install_easyai_server.sh --no-mlock --use-mmap
+#   ./install_easyai_server.sh --webui-title "AI Box"
+#   ./install_easyai_server.sh --webui-icon /path/to/logo.svg   # ico|png|svg|gif|jpg|webp
 #   ./install_easyai_server.sh --upgrade             # git pull + rebuild
 #   ./install_easyai_server.sh --enable-now          # systemctl start now
 #   ./install_easyai_server.sh --no-service          # build/install only
@@ -91,6 +93,9 @@ system_file="$config_dir/system.txt"
 api_key_file="$config_dir/api_key"
 
 ctx_size=128000
+webui_title="easyai"                          # --webui-title <text>
+webui_icon=""                                 # --webui-icon <path/to/.ico|.png|.svg|.gif|.jpg|.webp>
+webui_icon_dest="$config_dir/favicon"         # final installed path under /etc/easyai
 n_threads_default="$jobs"
 n_threads_batch_default="$jobs"
 preset="balanced"
@@ -162,9 +167,8 @@ while [[ $# -gt 0 ]]; do
         --with-mcp|--no-mcp)
             warn "$1: ignored — easyai bundles web_search/web_fetch as built-in tools"
             shift ;;
-        --webui-title)
-            warn "--webui-title: ignored — easyai's webui is embedded; rebrand by editing examples/server.cpp"
-            shift 2 ;;
+        --webui-title)      webui_title="$2"; shift 2 ;;
+        --webui-icon)       webui_icon="$2";  shift 2 ;;
         --thinking-budget)
             warn "--thinking-budget: not yet supported in easyai (use --thinking on/off + --max-tokens at runtime)"
             shift 2 ;;
@@ -186,7 +190,7 @@ while [[ $# -gt 0 ]]; do
             exit 0 ;;
         # -----------------------------------------------------------------
 
-        -h|--help)          sed -n '2,44p' "$0"; exit 0 ;;
+        -h|--help)          sed -n '2,46p' "$0"; exit 0 ;;
         *)
             echo "unknown arg: $1" >&2
             echo "run with --help for usage" >&2
@@ -260,6 +264,8 @@ printf '    preset           = %s  thinking=%s\n' "$preset" "$thinking"
 printf '    KV cache         = K=%s  V=%s  flash_attn=%s\n' "$cache_type_k" "$cache_type_v" "$enable_flash_attn"
 printf '    memory           = mlock=%s  no_mmap=%s\n' "$mlock" "$no_mmap"
 printf '    metrics          = %s\n' "$enable_metrics"
+printf '    webui_title      = %s\n' "$webui_title"
+printf '    webui_icon       = %s\n' "${webui_icon:-<default — no icon>}"
 printf '    api_key          = %s\n' "$([[ -n "$api_key" ]] && echo "<set>" || echo "<none — server is open>")"
 printf '    model_src        = %s\n' "${model_src:-<none — pass --model PATH>}"
 printf '    flags            = install:%s build:%s groups:%s limits:%s kernel:%s\n' \
@@ -434,6 +440,21 @@ SYS
     elif [[ -f "$api_key_file" ]]; then
         warn "leaving existing $api_key_file in place (use --api-key '' to clear)"
     fi
+
+    # ---- favicon: copy operator-supplied icon to /etc/easyai/favicon
+    #              and let the unit point easyai-server at it -----------
+    if [[ -n "$webui_icon" ]]; then
+        [[ -f "$webui_icon" ]] || die "favicon not found: $webui_icon"
+        # preserve the original extension so easyai-server can pick the
+        # right Content-Type at runtime.
+        ext="${webui_icon##*.}"
+        webui_icon_dest="$config_dir/favicon.$ext"
+        log "installing favicon → $webui_icon_dest"
+        sudo install -Dm644 -o root -g "$service_group" \
+            "$webui_icon" "$webui_icon_dest"
+    else
+        webui_icon_dest=""
+    fi
 fi
 
 # ---------- groups (render/video for GPU access) ---------------------------
@@ -535,6 +556,8 @@ if [[ $do_service -eq 1 ]]; then
     args+=( --preset "$preset" )
     args+=( --sandbox "$service_workspace" )
     args+=( --system-file "$system_file" )
+    [[ -n "$webui_title"     ]] && args+=( --webui-title "$webui_title" )
+    [[ -n "$webui_icon_dest" ]] && args+=( --webui-icon  "$webui_icon_dest" )
     [[ "$enable_flash_attn" -eq 1 ]] && args+=( -fa )
     [[ -n "$cache_type_k" ]]         && args+=( -ctk "$cache_type_k" )
     [[ -n "$cache_type_v" ]]         && args+=( -ctv "$cache_type_v" )
@@ -654,6 +677,9 @@ printf '  health    : http://localhost:%s/health\n' "$service_port"
 [[ $enable_metrics -eq 1 ]] && \
     printf '  metrics   : http://localhost:%s/metrics\n' "$service_port"
 printf '  system.txt: %s   (sudo nano %s)\n' "$system_file" "$system_file"
+printf '  webui     : title="%s"\n' "$webui_title"
+[[ -n "$webui_icon_dest" ]] && \
+    printf '              icon="%s" (served at /favicon and /favicon.ico)\n' "$webui_icon_dest"
 [[ -f "$api_key_file" ]] && \
     printf '  api key   : %s   (Bearer auth required on /v1)\n' "$api_key_file"
 echo

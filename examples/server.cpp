@@ -63,7 +63,8 @@ using nlohmann::ordered_json;
 constexpr char kWebUI[] = R"HTML(<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>easyai</title>
+<title>__EASYAI_TITLE__</title>
+<link rel="icon" href="/favicon">
 <style>
 * { box-sizing: border-box; }
 body { font: 14px/1.45 -apple-system, system-ui, sans-serif; margin:0; background:#0e1117; color:#e6edf3; height:100vh; display:flex; flex-direction:column; }
@@ -87,7 +88,7 @@ small.hint { color:#6e7681; padding:0 1rem .5rem; }
 </style></head>
 <body>
 <header>
-  <h1>easyai</h1>
+  <h1>__EASYAI_TITLE__</h1>
   <span class="pill" id="model">…</span>
   <span class="pill" id="backend">…</span>
   <span class="pill" id="ntools">…</span>
@@ -204,6 +205,73 @@ static std::string read_text_file(const std::string & path,
 }
 
 // ---------------------------------------------------------------------------
+// HTML escape — used to keep an operator-supplied --webui-title string from
+// breaking out of the <title> / <h1> elements (defense in depth: only the
+// admin can set this flag, but better safe than embarrassed).
+// ---------------------------------------------------------------------------
+static std::string html_escape(const std::string & s) {
+    std::string out;
+    out.reserve(s.size() + 8);
+    for (char c : s) {
+        switch (c) {
+            case '<':  out += "&lt;";   break;
+            case '>':  out += "&gt;";   break;
+            case '&':  out += "&amp;";  break;
+            case '"':  out += "&quot;"; break;
+            case '\'': out += "&#39;";  break;
+            default:   out += c;
+        }
+    }
+    return out;
+}
+
+// Substitute every occurrence of `from` with `to`. Returns a copy.
+static std::string str_replace_all(std::string s,
+                                   const std::string & from,
+                                   const std::string & to) {
+    if (from.empty()) return s;
+    size_t pos = 0;
+    while ((pos = s.find(from, pos)) != std::string::npos) {
+        s.replace(pos, from.size(), to);
+        pos += to.size();
+    }
+    return s;
+}
+
+// Read a small binary file fully (icon).  Capped at 256 KiB — anything
+// larger is almost certainly a mistake (a webfont or a hi-res splash).
+static std::string read_binary_file(const std::string & path,
+                                    size_t max_bytes = 256u * 1024u) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return {};
+    f.seekg(0, std::ios::end);
+    auto sz = f.tellg();
+    if (sz <= 0) return {};
+    if ((size_t) sz > max_bytes) sz = (std::streamoff) max_bytes;
+    f.seekg(0, std::ios::beg);
+    std::string out((size_t) sz, '\0');
+    f.read(out.data(), sz);
+    out.resize((size_t) f.gcount());
+    return out;
+}
+
+// Lower-case the file extension to pick a Content-Type for the favicon.
+static std::string mime_for_icon(const std::string & path) {
+    auto dot = path.find_last_of('.');
+    if (dot == std::string::npos) return "application/octet-stream";
+    std::string ext = path.substr(dot + 1);
+    for (auto & c : ext) c = (char) std::tolower((unsigned char) c);
+    if (ext == "ico")           return "image/x-icon";
+    if (ext == "png")           return "image/png";
+    if (ext == "svg")           return "image/svg+xml";
+    if (ext == "gif")           return "image/gif";
+    if (ext == "jpg" ||
+        ext == "jpeg")          return "image/jpeg";
+    if (ext == "webp")          return "image/webp";
+    return "application/octet-stream";
+}
+
+// ---------------------------------------------------------------------------
 // Build an OpenAI-compatible error envelope.
 // ---------------------------------------------------------------------------
 static std::string error_json(const std::string & msg, const char * type = "invalid_request_error") {
@@ -282,6 +350,12 @@ struct ServerCtx {
     std::string                model_id;        // basename of model file
     std::string                api_key;         // empty = auth disabled
     bool                       no_think = false;// strip <think> from responses
+
+    // Webui customisation (built once at start-up so the / handler can just
+    // hand back the prebuilt buffer).
+    std::string                webui_html;      // HTML with title substituted
+    std::string                webui_icon;      // raw icon bytes (empty = none)
+    std::string                webui_icon_mime; // "image/x-icon" etc.
 
     // /metrics counters (atomics so /metrics can read without holding engine_mu)
     std::atomic<uint64_t>      n_requests{0};
@@ -662,6 +736,11 @@ static bool require_auth(const ServerCtx & ctx, const httplib::Request & req,
         "       --metrics               Expose Prometheus /metrics endpoint\n"
         "       --reasoning <on|off>    Enable model thinking (default on)\n"
         "       --no-think              Strip <think>...</think> from replies\n"
+        "\nWebui rebrand:\n"
+        "       --webui-title <text>    Title shown in the browser tab and the\n"
+        "                                <h1> at the top of the page (default 'easyai')\n"
+        "       --webui-icon <path>     Favicon file (.ico|.png|.svg|.gif|.jpg|.webp)\n"
+        "                                served at /favicon and /favicon.ico\n"
         "\n  -h, --help                   Show this help and exit\n",
         argv0);
     std::exit(1);
@@ -710,6 +789,10 @@ struct ServerArgs {
     bool        metrics        = false;
     bool        reasoning      = true;   // enable_thinking flag default ON
     bool        no_think       = false;  // strip <think>…</think> from /v1 responses
+
+    // webui rebrand
+    std::string webui_title    = "easyai";
+    std::string webui_icon;              // optional path to .ico/.png/.svg
 };
 
 static ServerArgs parse_args(int argc, char ** argv) {
@@ -762,6 +845,8 @@ static ServerArgs parse_args(int argc, char ** argv) {
             a.reasoning = (v == "on" || v == "1" || v == "true" || v == "yes");
         }
         else if (s == "--no-think")                  a.no_think       = true;
+        else if (s == "--webui-title")               a.webui_title    = need(i, "--webui-title");
+        else if (s == "--webui-icon")                a.webui_icon     = need(i, "--webui-icon");
         else if (s == "-h" || s == "--help")         die_usage(argv[0]);
         else { std::fprintf(stderr, "unknown arg: %s\n", s.c_str()); die_usage(argv[0]); }
     }
@@ -830,6 +915,29 @@ int main(int argc, char ** argv) {
     ctx->no_think = args.no_think;
     if (!args.alias.empty()) ctx->model_id = args.alias;
 
+    // ----- webui rebrand: substitute the title placeholder once and load
+    //       the optional favicon into memory.
+    {
+        std::string title = args.webui_title.empty() ? std::string("easyai")
+                                                     : args.webui_title;
+        ctx->webui_html = str_replace_all(kWebUI, "__EASYAI_TITLE__",
+                                          html_escape(title));
+        if (!args.webui_icon.empty()) {
+            ctx->webui_icon = read_binary_file(args.webui_icon);
+            if (ctx->webui_icon.empty()) {
+                std::fprintf(stderr,
+                    "[easyai-server] WARN: failed to read --webui-icon '%s'\n",
+                    args.webui_icon.c_str());
+            } else {
+                ctx->webui_icon_mime = mime_for_icon(args.webui_icon);
+                std::fprintf(stderr,
+                    "[easyai-server] webui icon loaded: %s (%zu bytes, %s)\n",
+                    args.webui_icon.c_str(), ctx->webui_icon.size(),
+                    ctx->webui_icon_mime.c_str());
+            }
+        }
+    }
+
     if (args.parallel > 1) {
         std::fprintf(stderr,
             "[easyai-server] note: --parallel %d requested but the engine is "
@@ -897,8 +1005,18 @@ int main(int argc, char ** argv) {
     // Routes — every handler captures `ctx_ref` by reference.  Lifetime is
     // safe because main() does not return until svr.listen() exits.
     auto & ctx_ref = *ctx;
-    svr.Get ("/",                     [](const httplib::Request &, httplib::Response & res){
-        res.set_content(kWebUI, "text/html; charset=utf-8");
+    svr.Get ("/",                     [&](const httplib::Request &, httplib::Response & res){
+        res.set_content(ctx_ref.webui_html, "text/html; charset=utf-8");
+    });
+    // Favicon: serve the operator-supplied icon if --webui-icon was given;
+    // otherwise return 204 No Content so the browser stops asking.
+    svr.Get ("/favicon",              [&](const httplib::Request &, httplib::Response & res){
+        if (ctx_ref.webui_icon.empty()) { res.status = 204; return; }
+        res.set_content(ctx_ref.webui_icon, ctx_ref.webui_icon_mime.c_str());
+    });
+    svr.Get ("/favicon.ico",          [&](const httplib::Request &, httplib::Response & res){
+        if (ctx_ref.webui_icon.empty()) { res.status = 204; return; }
+        res.set_content(ctx_ref.webui_icon, ctx_ref.webui_icon_mime.c_str());
     });
     svr.Get ("/health",               [&](const auto & q, auto & r){ route_health  (ctx_ref, q, r); });
     if (args.metrics) {
