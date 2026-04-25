@@ -2557,19 +2557,13 @@ int main(int argc, char ** argv) {
                   "return root;"
                 "};"
 
-                // Re-anchor the bar to sit just above the chat textarea, no
-                // matter how tall it grows.  Falls back to a sane fixed
-                // offset if no textarea is found.
+                // Anchor the bar at the very bottom of the viewport, lifted
+                // a few pixels off the edge so it has breathing room.  The
+                // bundle's input form sits in the layout flow above this
+                // position, so the bar visually appears BELOW the textarea.
                 "const reposition=()=>{"
                   "if(!barHost)return;"
-                  "const ta=document.querySelector('textarea');"
-                  "if(ta){"
-                    "const r=ta.getBoundingClientRect();"
-                    "const above=Math.max(8,window.innerHeight-r.top+8);"
-                    "barHost.style.bottom=above+'px';"
-                  "}else{"
-                    "barHost.style.bottom='7rem';"
-                  "}"
+                  "barHost.style.bottom='0.55rem';"
                 "};"
 
                 "if(document.documentElement){ensureBar();reposition();}"
@@ -2596,33 +2590,40 @@ int main(int argc, char ** argv) {
                   "complete:'#3fb950',idle:'#5b626a'"
                 "};"
                 "const findActionRow=(msg)=>{"
-                  // Heuristic: the action row is the parent that contains
-                  // the most siblings of role='button' / <button>. Walk all
-                  // descendant buttons and return the parent with the
-                  // highest button count (>=2).
-                  "const buttons=msg.querySelectorAll('button,[role=\"button\"]');"
-                  "let best=null,bestCount=1;"
-                  "buttons.forEach(b=>{"
-                    "const p=b.parentElement;"
-                    "if(!p)return;"
-                    "const c=p.querySelectorAll('button,[role=\"button\"]').length;"
-                    "if(c>bestCount){bestCount=c;best=p;}"
-                  "});"
+                  // The action toolbar is the parent whose DIRECT children
+                  // are buttons (>=2). Walk depth-first and pick the
+                  // deepest match so we don't accidentally land on the
+                  // whole message wrapper (which has lots of descendant
+                  // buttons via code-block 'copy code' etc.).
+                  "let best=null,bestDepth=-1;"
+                  "const walk=(el,d)=>{"
+                    "let direct=0;"
+                    "for(const c of el.children){"
+                      "if(c.tagName==='BUTTON'||c.getAttribute&&c.getAttribute('role')==='button')direct++;"
+                    "}"
+                    "if(direct>=2&&d>bestDepth){best=el;bestDepth=d;}"
+                    "for(const c of el.children)walk(c,d+1);"
+                  "};"
+                  "walk(msg,0);"
                   "return best;"
                 "};"
                 "const attachChip=(msg)=>{"
                   "if(msg[CHIP_MARK]&&document.contains(msg[CHIP_MARK]))return;"
                   "const row=findActionRow(msg);if(!row)return;"
                   "const chip=document.createElement('span');"
+                  // align-self:center keeps the chip baseline-locked with
+                  // the icon buttons in the row regardless of font size.
                   "chip.style.cssText="
                     "'display:none;align-items:center;gap:.3rem;'+"
-                    "'margin-left:.5rem;padding:.1rem .55rem;"
-                    " border:1px solid #2a313b;border-radius:999px;"
-                    " color:#8b949e;background:rgba(15,19,24,.6);"
-                    " font:.7rem -apple-system,system-ui,sans-serif;';"
+                    "'align-self:center;vertical-align:middle;line-height:1;'+"
+                    "'margin:0 0 0 .5rem;padding:.18rem .6rem;'+"
+                    "'border:1px solid #2a313b;border-radius:999px;'+"
+                    "'color:#8b949e;background:rgba(15,19,24,.6);'+"
+                    "'font:.72rem -apple-system,system-ui,sans-serif;'+"
+                    "'flex-shrink:0;white-space:nowrap;';"
                   "chip.innerHTML="
                     "'<span class=\"d\" style=\"width:.45rem;height:.45rem;"
-                      "border-radius:50%;background:#5b626a\"></span>"
+                      "border-radius:50%;background:#5b626a;flex-shrink:0\"></span>"
                     "<span class=\"l\"></span>';"
                   "row.appendChild(chip);"
                   "msg[CHIP_MARK]=chip;"
