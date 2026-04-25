@@ -1717,9 +1717,16 @@ static void handle_chat_stream(ServerCtx & ctx,
                 emit_data(delta.dump());
             });
 
-            // ---- on_tool callback: custom events for the webui ----------
+            // ---- on_tool callback: emit BOTH custom events and an inline
+            // markdown <details> block so any OpenAI-compatible client
+            // (incl. the embedded llama-server-derived webui) can see the
+            // tool activity inline as it happens.  The custom events drive
+            // our minimal webui's tool cards; the markdown block drives the
+            // modern webui (and survives saved conversation history /
+            // copy-paste).
             ctx.engine.on_tool([&](const easyai::ToolCall & c, const easyai::ToolResult & r) {
                 ctx.n_tool_calls.fetch_add(1, std::memory_order_relaxed);
+
                 ordered_json call_evt;
                 call_evt["name"]      = c.name;
                 call_evt["arguments"] = c.arguments_json;
@@ -1731,6 +1738,49 @@ static void handle_chat_stream(ServerCtx & ctx,
                 res_evt["content"]  = r.content;
                 res_evt["is_error"] = r.is_error;
                 emit_event("easyai.tool_result", res_evt.dump());
+
+                // Compose an inline markdown summary that any markdown
+                // renderer will display nicely.  We use a <details> HTML
+                // block (allowed by marked.js with its default settings)
+                // so the tool result is collapsible.
+                auto html_escape_inline = [](const std::string & s){
+                    std::string o; o.reserve(s.size());
+                    for (char ch : s) {
+                        switch (ch) {
+                            case '<': o += "&lt;"; break;
+                            case '>': o += "&gt;"; break;
+                            case '&': o += "&amp;"; break;
+                            default:  o += ch;
+                        }
+                    }
+                    return o;
+                };
+                std::string clipped = r.content;
+                if (clipped.size() > 4096) {
+                    clipped.resize(4096);
+                    clipped += "\n…[truncated]";
+                }
+                std::string args = c.arguments_json;
+                if (args.size() > 600) { args.resize(600); args += "…"; }
+
+                std::ostringstream md;
+                md << "\n\n<details class=\"easyai-tool\""
+                   << (r.is_error ? " data-error=\"1\"" : "") << ">"
+                   << "<summary>"
+                   << (r.is_error ? "❌ " : "🔧 ")
+                   << "<code>" << html_escape_inline(c.name)
+                   << "(" << html_escape_inline(args) << ")</code>"
+                   << "</summary>\n\n```\n"
+                   << clipped
+                   << "\n```\n\n</details>\n\n";
+
+                ordered_json delta;
+                delta["choices"] = json::array({{
+                    {"index", 0},
+                    {"delta", {{"content", md.str()}}},
+                    {"finish_reason", nullptr},
+                }});
+                emit_data(delta.dump());
             });
 
             // ---- run the engine ----------------------------------------
@@ -2195,6 +2245,8 @@ int main(int argc, char ** argv) {
                               index_html_len);
 
             std::ostringstream inj;
+
+            // ----- title pin --------------------------------------------------
             inj << "<script>(()=>{"
                 << "const t=" << json(title).dump() << ";"
                 << "const apply=()=>{if(document.title!==t)document.title=t;};"
@@ -2204,15 +2256,81 @@ int main(int argc, char ** argv) {
                 << "    document.querySelector('title')||document.head,"
                 << "    {subtree:true,characterData:true,childList:true});"
                 << "});"
-                << "})();</script>"
-                // Hide MCP UI everywhere.  Catches Svelte-compiled class names
-                // ("mcp-*", "Mcp*") and any data-testid that mentions mcp.
-                << "<style>"
-                << "[class*=\"mcp\" i],[class*=\"Mcp\"],"
-                << "[data-testid*=\"mcp\" i],"
-                << "a[href*=\"mcp\" i],button[aria-label*=\"mcp\" i]"
-                << "{display:none !important;visibility:hidden !important;}"
-                << "</style>";
+                << "})();</script>";
+
+            // ----- fetch interceptor: stub or 404 endpoints we don't expose ---
+            // Without this, the Svelte app gets red error toasts for /authorize,
+            // /token, /register, /models/load, /cors-proxy, /properties, etc.
+            inj <<
+              "<script>(()=>{"
+                "const orig=window.fetch.bind(window);"
+                "const stub=(b,s=200)=>new Response(JSON.stringify(b),{"
+                  "status:s,headers:{'Content-Type':'application/json'}"
+                "});"
+                "const empty=stub({},200);"
+                "const reject=stub({error:{message:'not supported on easyai-server'}},501);"
+                "window.fetch=(input,init)=>{"
+                  "let url=typeof input==='string'?input:(input&&input.url)||'';"
+                  "try{const u=new URL(url,location.origin);url=u.pathname;}catch(e){}"
+                  // OAuth paths — we use bearer keys, not OAuth.
+                  "if(url==='/authorize'||url==='/token'||url==='/register'"
+                    "||url.startsWith('/.well-known/')) return reject;"
+                  // Model swapping — we have one model loaded at startup.
+                  "if(url==='/models/load'||url==='/models/unload') return reject;"
+                  // CORS proxy / pyodide bootstrap files — not on easyai.
+                  "if(url==='/cors-proxy'||url.startsWith('/home/web_user/')"
+                    "||url==='/dev/poll') return reject;"
+                  // /properties is the model-properties endpoint they expose.
+                  // We don't, so return an empty object so the UI doesn't error.
+                  "if(url==='/properties') return stub({});"
+                  "return orig(input,init);"
+                "};"
+              "})();</script>";
+
+            // ----- CSS hiding for features we don't support ------------------
+            // The Svelte build minifies class names but keeps human-readable
+            // ARIA labels, data-testids, and a few stable kebab-case classnames
+            // (e.g. "mcp-*", "model-card-*").  We hide aggressively by name
+            // patterns; if upstream renames things we'll need to revisit.
+            inj <<
+              "<style>"
+                // MCP — explicit user request.
+                "[class*=\"mcp\" i],[class*=\"Mcp\"],"
+                "[data-testid*=\"mcp\" i],"
+                "a[href*=\"mcp\" i],button[aria-label*=\"mcp\" i],"
+                // Model load/unload (we serve a single fixed model).
+                "[data-testid*=\"model-load\" i],[data-testid*=\"model-unload\" i],"
+                "[aria-label*=\"load model\" i],[aria-label*=\"unload model\" i],"
+                "[aria-label*=\"manage models\" i],"
+                // OAuth / login (we use --api-key Bearer auth).
+                "[data-testid*=\"oauth\" i],[data-testid*=\"login\" i],"
+                "[data-testid*=\"authorize\" i],[aria-label*=\"sign in\" i],"
+                // Pyodide / Python interpreter.
+                "[class*=\"pyodide\" i],[data-testid*=\"pyodide\" i],"
+                "[class*=\"python\" i][role],[aria-label*=\"python\" i],"
+                // Slot usage display (we have one slot).
+                "[data-testid*=\"slot\" i]:not([data-testid*=\"slot-machine\"]),"
+                "[aria-label*=\"slot usage\" i],"
+                // Audio recording / microphone / camera.
+                "[aria-label*=\"microphone\" i],[aria-label*=\"record audio\" i],"
+                "[aria-label*=\"camera\" i],[data-testid*=\"audio-record\" i]"
+                "{display:none !important;visibility:hidden !important;"
+                " width:0 !important;height:0 !important;overflow:hidden !important;}"
+
+                // Style tweaks for our inline tool blocks.
+                ".easyai-tool{margin:.5rem 0;border-left:3px solid #4fb0ff;"
+                  "background:rgba(79,176,255,.08);border-radius:6px;"
+                  "padding:.4rem .7rem;font-size:.9em;}"
+                ".easyai-tool[data-error=\"1\"]{border-left-color:#f85149;"
+                  "background:rgba(248,81,73,.08);}"
+                ".easyai-tool>summary{cursor:pointer;color:#4fb0ff;"
+                  "font-weight:600;list-style:none;}"
+                ".easyai-tool[data-error=\"1\"]>summary{color:#f85149;}"
+                ".easyai-tool>summary::-webkit-details-marker{display:none;}"
+                ".easyai-tool pre{margin:.4rem 0 0;font-size:.85em;"
+                  "max-height:18em;overflow-y:auto;}"
+              "</style>";
+
             if (!args.webui_icon.empty()) {
                 inj << "<link rel=\"icon\" href=\"/favicon\">";
             }
@@ -2345,6 +2463,9 @@ int main(int argc, char ** argv) {
                             "text/html; charset=utf-8");
         });
         // Minimal /props stub — tells the webui what the server can do.
+        // We advertise thinking + tool calls so the webui's <think>...</think>
+        // and tool-call renderers light up.  No image / audio modalities, no
+        // model swapping, no slots.
         svr.Get("/props", [&](const httplib::Request &, httplib::Response & res) {
             ordered_json p;
             p["model_alias"]   = ctx_ref.model_id;
@@ -2352,7 +2473,13 @@ int main(int argc, char ** argv) {
             p["total_slots"]   = 1;
             p["modalities"]    = { {"vision", false}, {"audio", false} };
             p["chat_template"] = "";
-            p["chat_template_caps"] = json::object();
+            p["chat_template_caps"] = {
+                {"supports_tools",                true},
+                {"supports_tool_calls",           true},
+                {"supports_system_role",          true},
+                {"supports_parallel_tool_calls",  false},
+                {"supports_preserve_reasoning",   true},   // pass <think>...</think> through
+            };
             p["bos_token"]     = "";
             p["eos_token"]     = "";
             p["build_info"]    = "easyai-server";
