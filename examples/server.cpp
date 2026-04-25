@@ -37,6 +37,15 @@
 #include "httplib.h"          // vendored by llama.cpp
 #include "nlohmann/json.hpp"  // vendored by llama.cpp
 
+#if defined(EASYAI_BUILD_WEBUI)
+// Each *.hpp declares  unsigned char NAME[]  +  unsigned int NAME_len
+// where NAME is the filename with '.' / '-' replaced by '_' (xxd convention).
+#include "webui_index.html.hpp"
+#include "webui_bundle.js.hpp"
+#include "webui_bundle.css.hpp"
+#include "webui_loading.html.hpp"
+#endif
+
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -1963,9 +1972,10 @@ static bool require_auth(const ServerCtx & ctx, const httplib::Request & req,
         "       --metrics               Expose Prometheus /metrics endpoint\n"
         "       --reasoning <on|off>    Enable model thinking (default on)\n"
         "       --no-think              Strip <think>...</think> from replies\n"
-        "\nWebui rebrand:\n"
-        "       --webui-title <text>    Title shown in the browser tab and the\n"
-        "                                <h1> at the top of the page (default 'easyai')\n"
+        "\nWebui:\n"
+        "       --webui <mode>          'modern' (default — embedded llama-server-\n"
+        "                                derived bundle) or 'minimal' (small inline UI)\n"
+        "       --webui-title <text>    Title shown in the browser tab (default 'easyai')\n"
         "       --webui-icon <path>     Favicon file (.ico|.png|.svg|.gif|.jpg|.webp)\n"
         "                                served at /favicon and /favicon.ico\n"
         "\n  -h, --help                   Show this help and exit\n",
@@ -2020,6 +2030,7 @@ struct ServerArgs {
     // webui rebrand
     std::string webui_title    = "easyai";
     std::string webui_icon;              // optional path to .ico/.png/.svg
+    std::string webui_mode     = "modern"; // "modern" (embedded llama-server fork) | "minimal" (inline)
 };
 
 static ServerArgs parse_args(int argc, char ** argv) {
@@ -2074,6 +2085,7 @@ static ServerArgs parse_args(int argc, char ** argv) {
         else if (s == "--no-think")                  a.no_think       = true;
         else if (s == "--webui-title")               a.webui_title    = need(i, "--webui-title");
         else if (s == "--webui-icon")                a.webui_icon     = need(i, "--webui-icon");
+        else if (s == "--webui")                     a.webui_mode     = need(i, "--webui");
         else if (s == "-h" || s == "--help")         die_usage(argv[0]);
         else { std::fprintf(stderr, "unknown arg: %s\n", s.c_str()); die_usage(argv[0]); }
     }
@@ -2165,13 +2177,62 @@ int main(int argc, char ** argv) {
     ctx->no_think = args.no_think;
     if (!args.alias.empty()) ctx->model_id = args.alias;
 
-    // ----- webui rebrand: substitute the title placeholder once and load
-    //       the optional favicon into memory.
+    // ----- webui rebrand: build the served HTML once and load any custom
+    //       favicon into memory.
     {
         std::string title = args.webui_title.empty() ? std::string("easyai")
                                                      : args.webui_title;
-        ctx->webui_html = str_replace_all(kWebUI, "__EASYAI_TITLE__",
-                                          html_escape(title));
+
+#if defined(EASYAI_BUILD_WEBUI)
+        if (args.webui_mode != "minimal") {
+            // Start from the llama-server-derived index.html and inject:
+            //   - a <script> that pins document.title to our --webui-title
+            //     even if the Svelte app tries to set it later (MutationObserver)
+            //   - a <link rel="icon"> that points to our /favicon route when a
+            //     --webui-icon was given
+            //   - a <style> that hides MCP-related UI sections
+            std::string html(reinterpret_cast<const char *>(index_html),
+                              index_html_len);
+
+            std::ostringstream inj;
+            inj << "<script>(()=>{"
+                << "const t=" << json(title).dump() << ";"
+                << "const apply=()=>{if(document.title!==t)document.title=t;};"
+                << "apply();"
+                << "document.addEventListener('DOMContentLoaded',()=>{apply();"
+                << "  new MutationObserver(apply).observe("
+                << "    document.querySelector('title')||document.head,"
+                << "    {subtree:true,characterData:true,childList:true});"
+                << "});"
+                << "})();</script>"
+                // Hide MCP UI everywhere.  Catches Svelte-compiled class names
+                // ("mcp-*", "Mcp*") and any data-testid that mentions mcp.
+                << "<style>"
+                << "[class*=\"mcp\" i],[class*=\"Mcp\"],"
+                << "[data-testid*=\"mcp\" i],"
+                << "a[href*=\"mcp\" i],button[aria-label*=\"mcp\" i]"
+                << "{display:none !important;visibility:hidden !important;}"
+                << "</style>";
+            if (!args.webui_icon.empty()) {
+                inj << "<link rel=\"icon\" href=\"/favicon\">";
+            }
+
+            // Splice immediately after <head>.
+            const std::string head_open = "<head>";
+            size_t pos = html.find(head_open);
+            if (pos != std::string::npos) {
+                html.insert(pos + head_open.size(), inj.str());
+            }
+            ctx->webui_html = std::move(html);
+        } else
+#endif
+        {
+            // Minimal inline webui — substitute the title placeholder we
+            // baked into the kWebUI string.
+            ctx->webui_html = str_replace_all(kWebUI, "__EASYAI_TITLE__",
+                                              html_escape(title));
+        }
+
         if (!args.webui_icon.empty()) {
             ctx->webui_icon = read_binary_file(args.webui_icon);
             if (ctx->webui_icon.empty()) {
@@ -2255,9 +2316,72 @@ int main(int argc, char ** argv) {
     // Routes — every handler captures `ctx_ref` by reference.  Lifetime is
     // safe because main() does not return until svr.listen() exits.
     auto & ctx_ref = *ctx;
-    svr.Get ("/",                     [&](const httplib::Request &, httplib::Response & res){
-        res.set_content(ctx_ref.webui_html, "text/html; charset=utf-8");
-    });
+
+    // ---- webui routes ---------------------------------------------------
+    // We serve the embedded llama-server-derived bundle by default. The
+    // operator can fall back to the small inline kWebUI by passing
+    // --webui minimal at startup.  When EASYAI_BUILD_WEBUI was OFF at
+    // configure time, the modern path simply isn't available and we
+    // always serve the minimal one.
+    const bool serve_modern = (args.webui_mode != "minimal");
+#if defined(EASYAI_BUILD_WEBUI)
+    if (serve_modern) {
+        svr.Get("/", [&](const httplib::Request &, httplib::Response & res) {
+            // Required by some embedded resources (matches llama-server defaults).
+            res.set_header("Cross-Origin-Embedder-Policy", "require-corp");
+            res.set_header("Cross-Origin-Opener-Policy",   "same-origin");
+            res.set_content(ctx_ref.webui_html, "text/html; charset=utf-8");
+        });
+        svr.Get("/bundle.js", [](const httplib::Request &, httplib::Response & res) {
+            res.set_content(reinterpret_cast<const char*>(bundle_js), bundle_js_len,
+                            "application/javascript; charset=utf-8");
+        });
+        svr.Get("/bundle.css", [](const httplib::Request &, httplib::Response & res) {
+            res.set_content(reinterpret_cast<const char*>(bundle_css), bundle_css_len,
+                            "text/css; charset=utf-8");
+        });
+        svr.Get("/loading.html", [](const httplib::Request &, httplib::Response & res) {
+            res.set_content(reinterpret_cast<const char*>(loading_html), loading_html_len,
+                            "text/html; charset=utf-8");
+        });
+        // Minimal /props stub — tells the webui what the server can do.
+        svr.Get("/props", [&](const httplib::Request &, httplib::Response & res) {
+            ordered_json p;
+            p["model_alias"]   = ctx_ref.model_id;
+            p["model_path"]    = ctx_ref.engine.model_path();
+            p["total_slots"]   = 1;
+            p["modalities"]    = { {"vision", false}, {"audio", false} };
+            p["chat_template"] = "";
+            p["chat_template_caps"] = json::object();
+            p["bos_token"]     = "";
+            p["eos_token"]     = "";
+            p["build_info"]    = "easyai-server";
+            p["webui"]         = "easyai";
+            p["webui_settings"] = json::object();
+            p["default_generation_settings"] = {
+                {"params", {
+                    {"temperature", ctx_ref.def_temperature},
+                    {"top_p",       ctx_ref.def_top_p},
+                    {"top_k",       ctx_ref.def_top_k},
+                    {"min_p",       ctx_ref.def_min_p},
+                }},
+                {"n_ctx", ctx_ref.engine.n_ctx()},
+            };
+            p["endpoint_props"]   = false;
+            p["endpoint_slots"]   = false;
+            p["endpoint_metrics"] = ctx_ref.api_key.empty();   // hint
+            p["is_sleeping"]      = false;
+            res.set_content(p.dump(), "application/json");
+        });
+    } else
+#endif
+    {
+        // Minimal inline webui (legacy / fallback / when EASYAI_BUILD_WEBUI=OFF)
+        svr.Get("/", [&](const httplib::Request &, httplib::Response & res) {
+            res.set_content(ctx_ref.webui_html, "text/html; charset=utf-8");
+        });
+    }
+
     // Favicon: serve the operator-supplied icon if --webui-icon was given;
     // otherwise return 204 No Content so the browser stops asking.
     svr.Get ("/favicon",              [&](const httplib::Request &, httplib::Response & res){

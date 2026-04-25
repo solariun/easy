@@ -6,8 +6,9 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-option(EASYAI_BUILD_EXAMPLES "Build easyai example agents"   ON)
-option(EASYAI_WITH_CURL      "Build web_fetch / web_search"  ON)
+option(EASYAI_BUILD_EXAMPLES "Build easyai example agents"             ON)
+option(EASYAI_WITH_CURL      "Build web_fetch / web_search"            ON)
+option(EASYAI_BUILD_WEBUI    "Embed the llama-server-style webui"      ON)
 
 # ------------------------------------------------------------------ llama.cpp
 # Pulled in as a sibling directory; we disable its own apps so the build
@@ -80,10 +81,33 @@ if (EASYAI_BUILD_EXAMPLES)
         target_compile_definitions(easyai-cli PRIVATE EASYAI_HAVE_CURL=1)
     endif()
 
-    add_executable(easyai-server examples/server.cpp)
+    # ----- embed the llama-server-derived webui (xxd-style binary embed) ---
+    set(EASYAI_WEBUI_HEADERS "")
+    if (EASYAI_BUILD_WEBUI)
+        set(WEBUI_ASSETS index.html bundle.js bundle.css loading.html)
+        foreach(asset ${WEBUI_ASSETS})
+            set(_in  "${CMAKE_CURRENT_SOURCE_DIR}/webui/${asset}")
+            set(_out "${CMAKE_CURRENT_BINARY_DIR}/webui_${asset}.hpp")
+            list(APPEND EASYAI_WEBUI_HEADERS ${_out})
+            add_custom_command(
+                DEPENDS "${_in}"
+                OUTPUT  "${_out}"
+                COMMAND ${CMAKE_COMMAND} -DINPUT=${_in} -DOUTPUT=${_out}
+                        -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/xxd.cmake
+                COMMENT "[easyai] embed webui asset: ${asset}"
+            )
+            set_source_files_properties(${_out} PROPERTIES GENERATED TRUE)
+        endforeach()
+    endif()
+
+    add_executable(easyai-server examples/server.cpp ${EASYAI_WEBUI_HEADERS})
     target_link_libraries(easyai-server PRIVATE easyai cpp-httplib)
     # cpp-httplib's include dir isn't PUBLIC-exported; reach in directly.
     target_include_directories(easyai-server PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/../llama.cpp/vendor/cpp-httplib
-        ${CMAKE_CURRENT_SOURCE_DIR}/../llama.cpp/vendor)
+        ${CMAKE_CURRENT_SOURCE_DIR}/../llama.cpp/vendor
+        ${CMAKE_CURRENT_BINARY_DIR})           # for webui_*.hpp
+    if (EASYAI_BUILD_WEBUI)
+        target_compile_definitions(easyai-server PRIVATE EASYAI_BUILD_WEBUI=1)
+    endif()
 endif()
