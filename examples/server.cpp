@@ -1721,9 +1721,59 @@ static void handle_chat_stream(ServerCtx & ctx,
             } strip;
             strip.strip_think = ctx.no_think;
 
+            // ---- thinking-prefix guard ---------------------------------
+            // Some templates (Qwen3 / DeepSeek-R1 in thinking mode) inject
+            // <think> into the rendered prompt itself, so the model's first
+            // streamed bytes are ALREADY thinking content; the closing
+            // </think> arrives but no opening <think> ever does.  The
+            // webui's parser then can't fold the thinking block.
+            //
+            // We buffer up to 80 chars of the first content and:
+            //   - if we see </think> before <think>  → prepend <think>
+            //   - if we see <think>                  → emit as-is
+            //   - if neither in 80 chars             → emit as-is (no thinking)
+            struct ThinkPrefixGuard {
+                std::string buf;
+                bool        decided = false;
+                std::string feed(std::string piece) {
+                    if (decided) return piece;
+                    buf += piece;
+                    size_t open  = buf.find("<think>");
+                    size_t close = buf.find("</think>");
+                    if (open != std::string::npos &&
+                        (close == std::string::npos || open < close)) {
+                        decided = true;
+                        std::string out = std::move(buf);
+                        buf.clear();
+                        return out;
+                    }
+                    if (close != std::string::npos) {
+                        decided = true;
+                        std::string out = "<think>" + std::move(buf);
+                        buf.clear();
+                        return out;
+                    }
+                    if (buf.size() > 80) {
+                        decided = true;
+                        std::string out = std::move(buf);
+                        buf.clear();
+                        return out;
+                    }
+                    return std::string();
+                }
+                std::string flush() {
+                    decided = true;
+                    std::string out = std::move(buf);
+                    buf.clear();
+                    return out;
+                }
+            } thinkGuard;
+
             // ---- on_token callback: stream OpenAI-shape deltas ----------
             ctx.engine.on_token([&](const std::string & piece) {
-                std::string visible = strip.filter(piece);
+                std::string after_guard = thinkGuard.feed(piece);
+                if (after_guard.empty()) return;
+                std::string visible = strip.filter(after_guard);
                 if (visible.empty()) return;
                 ordered_json delta;
                 delta["choices"] = json::array({{
@@ -1800,7 +1850,22 @@ static void handle_chat_stream(ServerCtx & ctx,
                 emit_data(safe_dump(err));
             }
 
-            // Drain whatever the strip state machine was holding.
+            // Drain whatever the guard / strip state machines were holding.
+            // Order matters: thinkGuard's leftover bytes still need to go
+            // through the tag-stripper.
+            std::string guarded_tail = thinkGuard.flush();
+            if (!guarded_tail.empty()) {
+                std::string after = strip.filter(guarded_tail);
+                if (!after.empty()) {
+                    ordered_json delta;
+                    delta["choices"] = json::array({{
+                        {"index", 0},
+                        {"delta", {{"content", after}}},
+                        {"finish_reason", nullptr},
+                    }});
+                    emit_data(safe_dump(delta));
+                }
+            }
             std::string tail = strip.flush();
             if (!tail.empty()) {
                 ordered_json delta;
@@ -2046,6 +2111,9 @@ static bool require_auth(const ServerCtx & ctx, const httplib::Request & req,
         "       --metrics               Expose Prometheus /metrics endpoint\n"
         "       --reasoning <on|off>    Enable model thinking (default on)\n"
         "       --no-think              Strip <think>...</think> from replies\n"
+        "  -v,  --verbose               Engine logs raw model output + parser\n"
+        "                                 actions to stderr — useful for debugging\n"
+        "                                 'why did it stop?' moments\n"
         "\nWebui:\n"
         "       --webui <mode>          'modern' (default — embedded llama-server-\n"
         "                                derived bundle) or 'minimal' (small inline UI)\n"
@@ -2103,6 +2171,7 @@ struct ServerArgs {
     bool        metrics        = false;
     bool        reasoning      = true;   // enable_thinking flag default ON
     bool        no_think       = false;  // strip <think>…</think> from /v1 responses
+    bool        verbose        = false;  // engine.verbose(true) — log model raw output
 
     // webui rebrand
     std::string webui_title    = "Box EasyAI";
@@ -2161,6 +2230,7 @@ static ServerArgs parse_args(int argc, char ** argv) {
             a.reasoning = (v == "on" || v == "1" || v == "true" || v == "yes");
         }
         else if (s == "--no-think")                  a.no_think       = true;
+        else if (s == "-v" || s == "--verbose")      a.verbose        = true;
         else if (s == "--webui-title")               a.webui_title    = need(i, "--webui-title");
         else if (s == "--webui-icon")                a.webui_icon     = need(i, "--webui-icon");
         else if (s == "--webui-placeholder")         a.webui_placeholder = need(i, "--webui-placeholder");
@@ -2764,6 +2834,20 @@ int main(int argc, char ** argv) {
                 "[aria-label*=\"camera\" i],[data-testid*=\"audio-record\" i]"
                 "{display:none !important;visibility:hidden !important;"
                 " width:0 !important;height:0 !important;overflow:hidden !important;}"
+
+                // Style thinking blocks: smaller, dimmer, monospace.  Catch
+                // both the bundle's own thinking renderer (whichever class
+                // it ends up minified to) and a literal &lt;think&gt; tag if
+                // it ever survives sanitisation.
+                " details[data-thinking],details.thinking,"
+                " [data-testid*=\"thinking\" i],[class*=\"reasoning\" i],"
+                " [class*=\"think-block\" i]{"
+                "  font-size:.78rem !important;color:#8b949e !important;"
+                "  font-family:ui-monospace,SFMono-Regular,Menlo,monospace !important;"
+                "  border-left:2px solid #b97df3 !important;"
+                "  padding-left:.6rem !important;margin:.4rem 0 !important;"
+                "  opacity:.85;"
+                " }"
               "</style>";
 
             if (!args.webui_icon.empty()) {
@@ -2843,7 +2927,7 @@ int main(int argc, char ** argv) {
                .context    (args.n_ctx)
                .gpu_layers (args.ngl)
                .system     (default_system)
-               .verbose    (false);
+               .verbose    (args.verbose);
     if (args.n_threads > 0)     ctx->engine.threads(args.n_threads);
     if (args.threads_batch > 0) ctx->engine.threads_batch(args.threads_batch);
     if (args.n_batch   > 0)  ctx->engine.batch  (args.n_batch);
