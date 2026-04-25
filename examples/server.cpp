@@ -2557,13 +2557,27 @@ int main(int argc, char ** argv) {
                   "return root;"
                 "};"
 
-                // Anchor the bar at the very bottom of the viewport, lifted
-                // a few pixels off the edge so it has breathing room.  The
-                // bundle's input form sits in the layout flow above this
-                // position, so the bar visually appears BELOW the textarea.
+                // To make a clean gap *below* the input form, we inject a
+                // margin-bottom into whatever ancestor of the textarea is
+                // pinned to the viewport bottom (usually the form), then
+                // park the bar inside that gap.  The lift runs on every
+                // body mutation so a Svelte re-render can't undo it.
+                "const LIFT=44;"
+                "const liftInput=()=>{"
+                  "const ta=document.querySelector('textarea');"
+                  "if(!ta)return;"
+                  "const target=ta.closest('form')||ta.parentElement;"
+                  // Idempotent — re-applying the same value is harmless,
+                  // and it survives Svelte re-renders that reset inline
+                  // styles without our knowing.
+                  "if(target)target.style.setProperty('margin-bottom',LIFT+'px','important');"
+                "};"
+                // Bar sits in the lifted gap, just below the input form
+                // and a few px off the viewport edge.
                 "const reposition=()=>{"
                   "if(!barHost)return;"
-                  "barHost.style.bottom='0.55rem';"
+                  "liftInput();"
+                  "barHost.style.bottom='0.5rem';"
                 "};"
 
                 "if(document.documentElement){ensureBar();reposition();}"
