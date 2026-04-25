@@ -2246,17 +2246,91 @@ int main(int argc, char ** argv) {
 
             std::ostringstream inj;
 
-            // ----- title pin --------------------------------------------------
+            // ----- title pin (HARD) -----------------------------------------
+            // The bundle has `document.title="llama.cpp - AI Chat Interface"`
+            // hard-coded in several places.  A MutationObserver isn't enough
+            // because the property is also re-assigned imperatively.  We
+            // intercept *every* write to document.title via Object.defineProperty
+            // and force our own value back.  Also pre-populates the localStorage
+            // flag the bundle uses for "is MCP enabled".
             inj << "<script>(()=>{"
-                << "const t=" << json(title).dump() << ";"
-                << "const apply=()=>{if(document.title!==t)document.title=t;};"
+                << "const T=" << json(title).dump() << ";"
+                << "try{Object.defineProperty(document,'title',{"
+                <<   "configurable:true,"
+                <<   "get(){return T;},"
+                <<   "set(_){const e=document.querySelector('title');"
+                <<        "if(e)e.textContent=T;}});}catch(e){}"
+                << "try{localStorage.setItem('LlamaCppWebui.mcpDefaultEnabled','false');}"
+                <<   "catch(e){}"
+                << "const apply=()=>{const e=document.querySelector('title');"
+                <<   "if(e&&e.textContent!==T)e.textContent=T;};"
                 << "apply();"
                 << "document.addEventListener('DOMContentLoaded',()=>{apply();"
-                << "  new MutationObserver(apply).observe("
-                << "    document.querySelector('title')||document.head,"
-                << "    {subtree:true,characterData:true,childList:true});"
+                <<   "new MutationObserver(apply).observe(document.head,"
+                <<     "{subtree:true,characterData:true,childList:true});"
                 << "});"
                 << "})();</script>";
+
+            // ----- runtime DOM scrubber for MCP and other unsupported UI ----
+            // The Svelte build produces hashed class names, so [class*=mcp]
+            // selectors don't match anything.  Instead, identify offending
+            // elements by their visible text (the UI strings are stable) and
+            // hide their containing card / list-item / dialog / menu-item.
+            inj <<
+              "<script>(()=>{"
+                "const NEEDLES=["
+                  "/^MCP\\b/i,"
+                  "/^MCP Server/i,"
+                  "/MCP Servers?$/i,"
+                  "/^MCP Prompt/i,"
+                  "/^MCP Resource/i,"
+                  "/Add (files, )?(system prompt or )?(configure )?MCP/i,"
+                  "/No MCP /i,"
+                  "/All MCP server connections/i,"
+                  "/^Sign in/i,/^Log in$/i,/^Login$/i,"
+                  "/^Authorize/i,"
+                  "/^Load model/i,/^Unload model/i,/^Manage models/i,"
+                  "/^Use Pyodide/i,/^Python interpreter/i"
+                "];"
+                "const isMatch=(el)=>{"
+                  "const t=(el.innerText||el.textContent||'').trim();"
+                  "if(!t||t.length>200)return false;"
+                  "for(const re of NEEDLES)if(re.test(t))return true;"
+                  "return false;"
+                "};"
+                "const ANCESTORS=["
+                  "'[role=\"dialog\"]',"
+                  "'[role=\"menuitem\"]',"
+                  "'[role=\"tab\"]',"
+                  "'[role=\"tabpanel\"]',"
+                  "'fieldset',"
+                  "'.menu li','.menu-item',"
+                  "'li','.collapse','.card','.tab','.tab-content'"
+                "];"
+                "const hide=(el)=>{"
+                  "for(const sel of ANCESTORS){"
+                    "const a=el.closest(sel);"
+                    "if(a){a.style.setProperty('display','none','important');return;}"
+                  "}"
+                  "el.style.setProperty('display','none','important');"
+                "};"
+                "const scrub=()=>{"
+                  "document.querySelectorAll("
+                    "'h1,h2,h3,h4,label,a,button,summary,[role=\"menuitem\"],[role=\"tab\"]'"
+                  ").forEach(e=>{if(isMatch(e))hide(e);});"
+                "};"
+                "let tries=0;"
+                "const tick=()=>{"
+                  "scrub();"
+                  "if(++tries<60)setTimeout(tick,300);"
+                "};"
+                "document.addEventListener('DOMContentLoaded',()=>{"
+                  "tick();"
+                  // keep an observer running for late-mounted dialogs
+                  "new MutationObserver(scrub).observe(document.body,"
+                    "{childList:true,subtree:true});"
+                "});"
+              "})();</script>";
 
             // ----- fetch interceptor: stub or 404 endpoints we don't expose ---
             // Without this, the Svelte app gets red error toasts for /authorize,
