@@ -62,239 +62,727 @@ using nlohmann::ordered_json;
 // ============================================================================
 constexpr char kWebUI[] = R"HTML(<!doctype html>
 <html lang="en"><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <title>__EASYAI_TITLE__</title>
 <link rel="icon" href="/favicon">
+<!-- Optional rich-rendering libs (used when reachable; fallback otherwise) -->
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
 <style>
 :root {
   --bg: #0b0d10;
-  --bg-elev: #15191f;
+  --bg-elev: #14181e;
+  --bg-elev2: #1a1f27;
   --bg-input: #0f1318;
+  --bg-hover: #1c2129;
   --border: #2a313b;
+  --border-hi: #3a414b;
   --text: #e6edf3;
   --text-dim: #8b949e;
+  --text-faint: #5b626a;
   --accent: #1f6feb;
+  --accent-hi: #2f7ffb;
   --accent-dim: #1f6feb33;
   --tool: #4fb0ff;
-  --tool-bg: #11212e;
+  --tool-bg: #102230;
   --think: #b97df3;
-  --think-bg: #1c142a;
+  --think-bg: #1a1330;
   --good: #3fb950;
   --bad: #f85149;
+  --warn: #d29922;
+  --shadow: 0 4px 20px rgba(0,0,0,.4);
 }
-* { box-sizing: border-box; }
-html, body { margin:0; height:100vh; }
-body { font: 14px/1.5 -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif; background:var(--bg); color:var(--text); display:flex; flex-direction:column; }
-header { padding:.6rem 1rem; background:var(--bg-elev); border-bottom:1px solid var(--border); display:flex; align-items:center; gap:.5rem; flex-wrap:wrap; }
-header h1 { font-size:1rem; margin:0; font-weight:600; letter-spacing:.01em; }
-.pill { font-size:.72rem; color:var(--text-dim); padding:.15rem .55rem; border:1px solid var(--border); border-radius:999px; }
-.btn { background:transparent; color:var(--text); border:1px solid var(--border); border-radius:6px; padding:.3rem .65rem; cursor:pointer; font-size:.8rem; transition: background .12s; }
-.btn:hover { background:var(--bg-input); }
-.btn.active { background:var(--accent); border-color:var(--accent); color:#fff; }
-.spacer { flex:1; }
-.label { font-size:.75rem; color:var(--text-dim); margin: 0 .3rem 0 .6rem; }
+*, *::before, *::after { box-sizing: border-box; }
+html, body { margin: 0; height: 100vh; overflow: hidden; }
+body {
+  font: 14px/1.5 -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui,
+        "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  -webkit-font-smoothing: antialiased;
+}
 
-#chat { flex:1; overflow-y:auto; padding:1rem 0; }
-.msg { max-width: 78ch; margin: 0 auto 1.4rem; padding: 0 1rem; }
-.msg .role { font-size:.7rem; color:var(--text-dim); text-transform:uppercase; letter-spacing:.06em; margin-bottom:.25rem; }
-.msg.user .body { background:#0d2543; border:1px solid #1f4a77; padding:.55rem .8rem; border-radius:8px; white-space: pre-wrap; word-wrap: break-word; }
-.msg.assistant .content { padding:.2rem 0; word-wrap:break-word; overflow-wrap:anywhere; }
-.msg.assistant .content p { margin: .3rem 0; }
-.msg.assistant .content pre { background:var(--bg-input); border:1px solid var(--border); padding:.6rem .8rem; border-radius:6px; overflow-x:auto; font-size:.85em; line-height:1.45; }
-.msg.assistant .content code { background:var(--bg-input); padding:.08rem .35rem; border-radius:3px; font-size:.88em; font-family: ui-monospace, "SF Mono", Menlo, monospace; }
-.msg.assistant .content pre code { background:transparent; padding:0; font-size:1em; }
-.msg.assistant .content a { color:var(--accent); text-decoration:none; }
-.msg.assistant .content a:hover { text-decoration:underline; }
+/* ---------- layout shell ------------------------------------------------ */
+#app { display: grid; grid-template-columns: 260px 1fr; height: 100vh; }
+#app.no-sidebar { grid-template-columns: 0 1fr; }
+@media (max-width: 760px) {
+  #app { grid-template-columns: 0 1fr; }
+  #app.show-sidebar { grid-template-columns: 240px 1fr; }
+}
 
-.thinking { border:1px solid var(--think-bg); background:var(--think-bg); border-left:3px solid var(--think); border-radius:6px; margin:.45rem 0; padding:.3rem .6rem; font-size:.85em; color:var(--text-dim); }
-.thinking summary { cursor:pointer; color:var(--think); font-weight:600; outline:none; user-select:none; }
-.thinking summary::marker { color:var(--think); }
-.thinking[open] summary { margin-bottom:.4rem; }
-.thinking .think-body { white-space:pre-wrap; font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size:.82rem; line-height:1.5; max-height:30em; overflow-y:auto; }
+/* ---------- sidebar ----------------------------------------------------- */
+aside#sidebar {
+  background: var(--bg-elev);
+  border-right: 1px solid var(--border);
+  display: flex; flex-direction: column;
+  overflow: hidden;
+  transition: width .15s ease;
+}
+.no-sidebar #sidebar { display: none; }
+@media (max-width: 760px) { #sidebar { display: none; } .show-sidebar #sidebar { display: flex; } }
 
-.tool-card { border:1px solid var(--tool-bg); background:var(--tool-bg); border-left:3px solid var(--tool); border-radius:6px; margin:.45rem 0; padding:.4rem .6rem; font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size:.8rem; }
-.tool-card.error { border-left-color: var(--bad); background:#22151a; }
-.tool-card .head { display:flex; align-items:baseline; gap:.4rem; flex-wrap:wrap; }
-.tool-card .name { color:var(--tool); font-weight:600; }
-.tool-card.error .name { color:var(--bad); }
-.tool-card .args { color:var(--text-dim); word-break:break-all; }
-.tool-card .result { color:var(--text); margin-top:.3rem; white-space:pre-wrap; max-height:14em; overflow-y:auto; padding-top:.3rem; border-top:1px dashed var(--border); }
-.tool-card .result.pending { color:var(--text-dim); font-style:italic; }
+#sidebar .head {
+  padding: .55rem .55rem; border-bottom: 1px solid var(--border);
+  display: flex; gap: .4rem; align-items: center;
+}
+#newChatBtn {
+  flex: 1; background: transparent; color: var(--text);
+  border: 1px dashed var(--border-hi); border-radius: 6px;
+  padding: .45rem .6rem; font: inherit; cursor: pointer;
+  display: flex; align-items: center; gap: .4rem;
+  transition: background .12s, border-color .12s;
+}
+#newChatBtn:hover { background: var(--bg-hover); border-color: var(--accent); }
+#newChatBtn .plus { font-weight: 700; color: var(--accent); }
 
-.cursor { display:inline-block; width:.5em; height:1em; background:var(--text); animation: blink 1s steps(1, end) infinite; vertical-align:text-bottom; margin-left:1px; }
+#convList { list-style: none; margin: 0; padding: .35rem; overflow-y: auto; flex: 1; }
+.conv-item {
+  display: flex; align-items: center; gap: .4rem;
+  padding: .45rem .55rem; border-radius: 6px;
+  cursor: pointer; color: var(--text-dim); font-size: .85rem;
+  position: relative;
+}
+.conv-item:hover { background: var(--bg-hover); color: var(--text); }
+.conv-item.active { background: var(--accent-dim); color: var(--text); }
+.conv-item .title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.conv-item .stamp { font-size: .68rem; color: var(--text-faint); flex-shrink: 0; }
+.conv-item .del {
+  display: none; background: none; border: 0; color: var(--text-dim);
+  font-size: .9rem; cursor: pointer; padding: 0 .2rem; line-height: 1;
+}
+.conv-item:hover .del { display: inline-block; }
+.conv-item .del:hover { color: var(--bad); }
+
+#sidebar .foot {
+  border-top: 1px solid var(--border); padding: .45rem .55rem;
+  font-size: .7rem; color: var(--text-faint);
+  display: flex; align-items: center; gap: .4rem;
+}
+
+/* ---------- main / header ----------------------------------------------- */
+main { display: flex; flex-direction: column; min-width: 0; }
+header.topbar {
+  padding: .55rem .85rem;
+  background: var(--bg-elev);
+  border-bottom: 1px solid var(--border);
+  display: flex; align-items: center; gap: .55rem; flex-wrap: wrap;
+}
+header.topbar h1 { font-size: 1rem; margin: 0; font-weight: 600; letter-spacing: .01em; }
+.pill {
+  font-size: .7rem; color: var(--text-dim);
+  padding: .15rem .55rem; border: 1px solid var(--border); border-radius: 999px;
+  white-space: nowrap;
+}
+.icon-btn {
+  background: transparent; color: var(--text-dim); border: 1px solid transparent;
+  border-radius: 6px; padding: .25rem .45rem; cursor: pointer; font-size: 1rem;
+  transition: background .12s, color .12s, border-color .12s;
+}
+.icon-btn:hover { background: var(--bg-hover); color: var(--text); border-color: var(--border); }
+.spacer { flex: 1; }
+
+/* ---------- chat area --------------------------------------------------- */
+#chat { flex: 1; overflow-y: auto; padding: 1.2rem 0 .8rem; }
+.empty {
+  height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center;
+  color: var(--text-faint); padding: 2rem; text-align: center; gap: .6rem;
+}
+.empty h2 { color: var(--text-dim); font-weight: 500; margin: 0; }
+.empty .ex { display: flex; flex-wrap: wrap; gap: .4rem; justify-content: center; max-width: 540px; }
+.empty .ex button {
+  background: var(--bg-elev); color: var(--text-dim);
+  border: 1px solid var(--border); border-radius: 999px;
+  padding: .35rem .8rem; font-size: .8rem; cursor: pointer;
+}
+.empty .ex button:hover { color: var(--text); border-color: var(--accent); }
+
+.msg { max-width: 78ch; margin: 0 auto 1.4rem; padding: 0 1.2rem; }
+.msg .role {
+  font-size: .68rem; color: var(--text-faint); text-transform: uppercase;
+  letter-spacing: .08em; margin-bottom: .25rem;
+  display: flex; align-items: center; gap: .5rem;
+}
+.msg .role .actions { margin-left: auto; opacity: 0; transition: opacity .12s; }
+.msg:hover .role .actions { opacity: 1; }
+.msg .role .actions button {
+  background: none; border: 0; color: var(--text-dim); padding: 0 .3rem;
+  cursor: pointer; font-size: .75rem; border-radius: 3px;
+}
+.msg .role .actions button:hover { color: var(--text); background: var(--bg-hover); }
+
+.msg.user .body {
+  background: #0d2543; border: 1px solid #1f4a77;
+  padding: .6rem .85rem; border-radius: 8px;
+  white-space: pre-wrap; word-wrap: break-word;
+}
+
+.msg.assistant .content { padding: .15rem 0; word-wrap: break-word; overflow-wrap: anywhere; }
+.msg.assistant .content p { margin: .35rem 0; }
+.msg.assistant .content p:first-child { margin-top: 0; }
+.msg.assistant .content p:last-child  { margin-bottom: 0; }
+.msg.assistant .content h1, .msg.assistant .content h2, .msg.assistant .content h3 {
+  font-size: 1rem; margin: 1rem 0 .35rem; font-weight: 600;
+}
+.msg.assistant .content h1 { font-size: 1.15rem; }
+.msg.assistant .content h2 { font-size: 1.05rem; }
+.msg.assistant .content ul, .msg.assistant .content ol { padding-left: 1.4rem; margin: .35rem 0; }
+.msg.assistant .content li { margin: .15rem 0; }
+.msg.assistant .content blockquote {
+  border-left: 3px solid var(--border); margin: .4rem 0; padding: .1rem .8rem; color: var(--text-dim);
+}
+.msg.assistant .content pre {
+  background: #0a0d11; border: 1px solid var(--border);
+  padding: .65rem .8rem; border-radius: 6px;
+  overflow-x: auto; font-size: .85em; line-height: 1.45; margin: .5rem 0;
+}
+.msg.assistant .content code {
+  background: var(--bg-input); padding: .1rem .35rem;
+  border-radius: 3px; font-size: .88em;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+}
+.msg.assistant .content pre code { background: transparent; padding: 0; font-size: 1em; }
+.msg.assistant .content a { color: var(--accent); text-decoration: none; }
+.msg.assistant .content a:hover { text-decoration: underline; }
+.msg.assistant .content table { border-collapse: collapse; margin: .5rem 0; }
+.msg.assistant .content th, .msg.assistant .content td {
+  border: 1px solid var(--border); padding: .25rem .5rem; font-size: .9em;
+}
+.msg.assistant .content th { background: var(--bg-elev); font-weight: 600; }
+
+/* thinking + tool cards keep their own visual identity */
+.thinking {
+  border: 1px solid var(--think-bg); background: var(--think-bg);
+  border-left: 3px solid var(--think); border-radius: 6px;
+  margin: .5rem 0; padding: .35rem .6rem; font-size: .85em; color: var(--text-dim);
+}
+.thinking summary {
+  cursor: pointer; color: var(--think); font-weight: 600;
+  outline: none; user-select: none; list-style: none;
+}
+.thinking summary::-webkit-details-marker { display: none; }
+.thinking summary::before { content: "▸ "; color: var(--think); font-weight: 700; }
+.thinking[open] summary::before { content: "▾ "; }
+.thinking[open] summary { margin-bottom: .4rem; }
+.thinking .think-body {
+  white-space: pre-wrap; font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: .82rem; line-height: 1.5; max-height: 24em; overflow-y: auto;
+}
+
+.tool-card {
+  border: 1px solid var(--tool-bg); background: var(--tool-bg);
+  border-left: 3px solid var(--tool); border-radius: 6px;
+  margin: .5rem 0; padding: .45rem .65rem;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: .8rem;
+}
+.tool-card.error { border-left-color: var(--bad); background: #22151a; }
+.tool-card .head { display: flex; align-items: baseline; gap: .4rem; flex-wrap: wrap; }
+.tool-card .name { color: var(--tool); font-weight: 600; }
+.tool-card.error .name { color: var(--bad); }
+.tool-card .args { color: var(--text-dim); word-break: break-all; }
+.tool-card .result {
+  color: var(--text); margin-top: .35rem; white-space: pre-wrap;
+  max-height: 16em; overflow-y: auto; padding-top: .35rem;
+  border-top: 1px dashed var(--border);
+}
+.tool-card .result.pending { color: var(--text-dim); font-style: italic; }
+
+.cursor {
+  display: inline-block; width: .5em; height: 1em;
+  background: var(--text); animation: blink 1s steps(1, end) infinite;
+  vertical-align: text-bottom; margin-left: 1px;
+}
 @keyframes blink { 50% { opacity: 0; } }
 
-.stats { font-size:.7rem; color:var(--text-dim); margin-top:.3rem; font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+.stats {
+  font-size: .68rem; color: var(--text-faint); margin-top: .35rem;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+}
+.error-msg {
+  color: var(--bad); background: #22151a;
+  border: 1px solid #6a2a31; border-radius: 6px;
+  padding: .5rem .7rem; font-size: .9em;
+}
 
-form { display:flex; gap:.5rem; padding:.7rem 1rem; background:var(--bg-elev); border-top:1px solid var(--border); }
-textarea { flex:1; resize:vertical; min-height:2.4rem; max-height:30vh; padding:.5rem .65rem; background:var(--bg-input); color:var(--text); border:1px solid var(--border); border-radius:6px; font:inherit; }
-textarea:focus { outline: 2px solid var(--accent-dim); border-color:var(--accent); }
-.send { background:var(--accent); color:#fff; border:0; border-radius:6px; padding: 0 1.1rem; cursor:pointer; font-weight:600; }
-.send:disabled { opacity:.6; cursor:wait; }
-small.hint { color:#5b626a; padding: 0 1rem .4rem; font-size:.72rem; }
-.error-msg { color: var(--bad); background:#22151a; border:1px solid #6a2a31; border-radius:6px; padding:.4rem .6rem; }
+/* ---------- input bar --------------------------------------------------- */
+#inputWrap {
+  border-top: 1px solid var(--border); background: var(--bg-elev);
+  padding: .55rem .85rem .7rem; position: relative;
+}
+#inputBar { display: flex; gap: .45rem; align-items: flex-end; }
+#textArea {
+  flex: 1; resize: none; min-height: 2.4rem; max-height: 30vh;
+  padding: .55rem .7rem;
+  background: var(--bg-input); color: var(--text);
+  border: 1px solid var(--border); border-radius: 8px;
+  font: inherit; line-height: 1.5;
+}
+#textArea:focus { outline: 2px solid var(--accent-dim); border-color: var(--accent); }
+#sendBtn, #stopBtn {
+  background: var(--accent); color: #fff; border: 0;
+  border-radius: 8px; padding: 0 1.05rem; cursor: pointer; font-weight: 600;
+  height: 2.4rem; align-self: flex-end;
+}
+#sendBtn:hover { background: var(--accent-hi); }
+#sendBtn:disabled { opacity: .55; cursor: wait; }
+#stopBtn { background: var(--bad); }
+#stopBtn:hover { filter: brightness(1.1); }
+#settingsToggle, #sidebarToggle {
+  background: var(--bg-input); color: var(--text-dim);
+  border: 1px solid var(--border); border-radius: 8px;
+  padding: 0 .65rem; cursor: pointer; font-size: 1rem;
+  height: 2.4rem; align-self: flex-end;
+}
+#settingsToggle:hover, #sidebarToggle:hover { background: var(--bg-hover); color: var(--text); }
+#settingsToggle.active { color: var(--accent); border-color: var(--accent); }
+
+#settingsHint {
+  color: var(--text-faint); font-size: .68rem; padding-top: .3rem;
+  display: flex; gap: 1rem; flex-wrap: wrap;
+}
+#settingsHint .pill { font-size: .65rem; padding: .05rem .45rem; cursor: pointer; }
+#settingsHint .pill:hover { color: var(--text); border-color: var(--border-hi); }
+
+/* settings popover */
+#settingsPanel {
+  position: absolute; bottom: calc(100% + 2px); right: .85rem;
+  width: min(380px, calc(100vw - 1.7rem));
+  background: var(--bg-elev2); color: var(--text);
+  border: 1px solid var(--border-hi); border-radius: 10px;
+  box-shadow: var(--shadow); padding: .7rem .85rem;
+  display: none; z-index: 50;
+}
+#settingsPanel.open { display: block; }
+#settingsPanel h3 {
+  font-size: .82rem; margin: 0 0 .55rem; font-weight: 600;
+  color: var(--text-dim); text-transform: uppercase; letter-spacing: .06em;
+}
+.preset-row {
+  display: flex; flex-wrap: wrap; gap: .25rem;
+  margin-bottom: .65rem;
+}
+.preset-row button {
+  background: transparent; color: var(--text-dim);
+  border: 1px solid var(--border); border-radius: 999px;
+  padding: .25rem .65rem; cursor: pointer; font-size: .75rem;
+}
+.preset-row button:hover { background: var(--bg-hover); color: var(--text); }
+.preset-row button.active { background: var(--accent); border-color: var(--accent); color: white; }
+.slider-row {
+  display: grid; grid-template-columns: 80px 1fr 56px;
+  gap: .55rem; align-items: center; margin: .35rem 0;
+  font-size: .82rem;
+}
+.slider-row label { color: var(--text-dim); }
+.slider-row input[type=range] { width: 100%; accent-color: var(--accent); }
+.slider-row input[type=number] {
+  width: 100%; background: var(--bg-input); color: var(--text);
+  border: 1px solid var(--border); border-radius: 4px; padding: .15rem .3rem;
+  font: inherit; font-size: .82rem; text-align: right;
+}
+#settingsPanel .reset-link {
+  font-size: .72rem; color: var(--text-dim); text-decoration: underline;
+  background: none; border: 0; cursor: pointer; padding: 0; margin-top: .3rem;
+}
+
+/* small helper: invisible on narrow screens */
+.hide-narrow { display: inline-flex; }
+@media (max-width: 760px) { .hide-narrow { display: none; } }
 </style></head>
 <body>
-<header>
-  <h1>__EASYAI_TITLE__</h1>
-  <span class="pill" id="model">loading…</span>
-  <span class="pill" id="backend"></span>
-  <span class="pill" id="ntools"></span>
-  <span class="spacer"></span>
-  <span class="label">preset</span>
-  <button class="btn" data-p="deterministic">deterministic</button>
-  <button class="btn" data-p="precise">precise</button>
-  <button class="btn active" data-p="balanced">balanced</button>
-  <button class="btn" data-p="creative">creative</button>
-  <button class="btn" data-p="wild">wild</button>
-  <button class="btn" id="thinkToggle" title="Toggle visibility of <think> blocks">thinking ◐</button>
-  <button class="btn" id="reset">reset</button>
-</header>
-<div id="chat"></div>
-<small class="hint">Ctrl/⌘+Enter sends • inline preset works too: <code>creative 0.9 write me a poem about the moon</code></small>
-<form id="f">
-  <textarea id="t" placeholder="Type a message…" rows="1"></textarea>
-  <button class="send" id="send" type="submit">Send</button>
-</form>
+<div id="app" class="show-sidebar">
+  <aside id="sidebar">
+    <div class="head">
+      <button id="newChatBtn"><span class="plus">+</span> New chat</button>
+    </div>
+    <ul id="convList"></ul>
+    <div class="foot">
+      <span id="model" class="pill">…</span>
+      <span id="backend" class="pill"></span>
+      <span id="ntools" class="pill"></span>
+    </div>
+  </aside>
+
+  <main>
+    <header class="topbar">
+      <button class="icon-btn" id="sidebarToggle" title="Toggle sidebar">☰</button>
+      <h1>__EASYAI_TITLE__</h1>
+      <span class="spacer"></span>
+      <button class="icon-btn hide-narrow" id="thinkToggleHdr" title="Show / hide reasoning blocks">◐ thinking</button>
+    </header>
+
+    <div id="chat"></div>
+
+    <div id="inputWrap">
+      <div id="settingsPanel">
+        <h3>preset</h3>
+        <div class="preset-row" id="presetRow">
+          <button data-p="deterministic">deterministic</button>
+          <button data-p="precise">precise</button>
+          <button data-p="balanced" class="active">balanced</button>
+          <button data-p="creative">creative</button>
+          <button data-p="wild">wild</button>
+        </div>
+        <h3>sampling</h3>
+        <div class="slider-row">
+          <label for="sTemp">temperature</label>
+          <input type="range" id="sTemp" min="0" max="2" step="0.05" value="0.7">
+          <input type="number" id="sTempN" min="0" max="2" step="0.05" value="0.7">
+        </div>
+        <div class="slider-row">
+          <label for="sTopP">top_p</label>
+          <input type="range" id="sTopP" min="0" max="1" step="0.01" value="0.95">
+          <input type="number" id="sTopPN" min="0" max="1" step="0.01" value="0.95">
+        </div>
+        <div class="slider-row">
+          <label for="sTopK">top_k</label>
+          <input type="range" id="sTopK" min="1" max="100" step="1" value="40">
+          <input type="number" id="sTopKN" min="1" max="100" step="1" value="40">
+        </div>
+        <div class="slider-row">
+          <label for="sMinP">min_p</label>
+          <input type="range" id="sMinP" min="0" max="0.5" step="0.01" value="0.05">
+          <input type="number" id="sMinPN" min="0" max="0.5" step="0.01" value="0.05">
+        </div>
+        <div class="slider-row">
+          <label for="sMaxTok">max_tokens</label>
+          <input type="range" id="sMaxTok" min="0" max="4096" step="64" value="0">
+          <input type="number" id="sMaxTokN" min="0" max="32768" step="1" value="0">
+        </div>
+        <button class="reset-link" id="settingsReset">reset to balanced</button>
+      </div>
+
+      <div id="inputBar">
+        <button id="settingsToggle" title="Sampling settings">⚙</button>
+        <textarea id="textArea" rows="1" placeholder="Type a message…"></textarea>
+        <button id="stopBtn" hidden>stop</button>
+        <button id="sendBtn">send</button>
+      </div>
+
+      <div id="settingsHint">
+        <span>Ctrl/⌘+Enter to send</span>
+        <span class="pill" data-quick="0">temp 0.0 (deterministic)</span>
+        <span class="pill" data-quick="0.7">temp 0.7 (balanced)</span>
+        <span class="pill" data-quick="1.0">temp 1.0 (creative)</span>
+        <span style="color:var(--text-faint)">or inline: <code>creative 0.9 …</code></span>
+      </div>
+    </div>
+  </main>
+</div>
+
+<!-- markdown lib (loaded async, with graceful fallback) -->
+<script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js" defer></script>
+
 <script>
 "use strict";
 
 // ============================================================================
-// helpers
+//  helpers
 // ============================================================================
-const $ = (sel, root=document) => root.querySelector(sel);
-const $$ = (sel, root=document) => Array.from(root.querySelectorAll(sel));
-const chatEl = $('#chat');
-const ta = $('#t');
-const sendBtn = $('#send');
+const $  = (s, r=document) => r.querySelector(s);
+const $$ = (s, r=document) => Array.from(r.querySelectorAll(s));
+const escHTML = s => String(s).replace(/[&<>"']/g, c => ({
+  '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+}[c]));
 
-function escHTML(s){
-  return String(s).replace(/[&<>"']/g, c => ({
-    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
-  }[c]));
+function relTime(ts){
+  const s = (Date.now() - ts) / 1000;
+  if (s < 60)        return Math.floor(s) + 's';
+  if (s < 3600)      return Math.floor(s/60) + 'm';
+  if (s < 86400)     return Math.floor(s/3600) + 'h';
+  if (s < 86400*7)   return Math.floor(s/86400) + 'd';
+  return new Date(ts).toLocaleDateString();
 }
 
-// Tiny markdown subset: code blocks, inline code, bold, italics, links,
-// auto-link, line breaks. Run on already-escaped HTML, then mark code-block
-// content as "do not touch" before applying inline rules.
-function renderMarkdown(s){
+// Tiny markdown fallback used when marked.js failed to load (offline boxes).
+function tinyMD(s){
   if (!s) return '';
   let html = escHTML(s);
-  // We park "atomic" HTML fragments (code blocks, anchors) behind a sentinel
-  // so subsequent passes don't re-match the URL/text we already rewrote.
-  // Restore happens at the very end.
   const parked = [];
-  const park = (frag) => { parked.push(frag); return `\u0001${parked.length-1}\u0001`; };
-
-  // 1. fenced code blocks ```lang\n...\n```
-  html = html.replace(/```([a-zA-Z0-9_-]*)\n([\s\S]*?)```/g, (_, lang, code) =>
-    park(`<pre><code class="lang-${escHTML(lang)}">${code}</code></pre>`));
-
-  // 2. inline code (single backticks, no newlines)
+  const park = f => (parked.push(f), `\u0001${parked.length-1}\u0001`);
+  html = html.replace(/```([a-zA-Z0-9_-]*)\n([\s\S]*?)```/g, (_, l, c) =>
+    park(`<pre><code class="lang-${escHTML(l)}">${c}</code></pre>`));
   html = html.replace(/`([^`\n]+)`/g, (_, c) => park(`<code>${c}</code>`));
-
-  // 3. explicit markdown links: [text](url) — park the resulting <a> so
-  //    the auto-link pass below cannot re-match the URL inside its href.
-  html = html.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g,
-    (_, t, u) => park(`<a href="${u}" target="_blank" rel="noopener">${t}</a>`));
-
-  // 4. bold + italics
+  html = html.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (_, t, u) =>
+    park(`<a href="${u}" target="_blank" rel="noopener">${t}</a>`));
   html = html.replace(/\*\*([^\*\n]+?)\*\*/g, '<strong>$1</strong>');
   html = html.replace(/(^|[^\*])\*([^\*\n]+?)\*(?!\*)/g, '$1<em>$2</em>');
-
-  // 5. auto-link bare http(s)://… URLs.  Trailing punctuation .,;:!?) is
-  //    excluded so it isn't swallowed into the link.
   html = html.replace(/(\bhttps?:\/\/[^\s<]+?)([.,;:!?)\]]*)(?=\s|$)/g,
-    (_, u, tail) => park(`<a href="${u}" target="_blank" rel="noopener">${u}</a>`) + tail);
-
-  // 6. newlines → <br>.  Skip ones inside parked fragments since those are
-  //    sentinels (single-line by construction).
+    (_, u, t) => park(`<a href="${u}" target="_blank" rel="noopener">${u}</a>`) + t);
   html = html.replace(/\n/g, '<br>');
-
-  // 7. restore everything we parked.
   html = html.replace(/\u0001(\d+)\u0001/g, (_, i) => parked[+i]);
   return html;
 }
 
-// ============================================================================
-// streaming SSE consumer
-// ============================================================================
-async function streamChat(messages, handlers){
-  const res = await fetch('/v1/chat/completions', {
-    method: 'POST',
-    headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({ model:'easyai', messages, stream:true })
-  });
-  if (!res.ok){
-    const txt = await res.text();
-    throw new Error(`HTTP ${res.status}: ${txt.slice(0,400)}`);
-  }
-  const reader = res.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
-  while (true){
-    const {value, done} = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, {stream:true});
-    while (true){
-      const idx = buffer.indexOf('\n\n');
-      if (idx === -1) break;
-      const event = buffer.slice(0, idx);
-      buffer = buffer.slice(idx + 2);
-
-      // Parse one SSE event: optional `event:` line + one or more `data:`
-      // lines (concatenated by newline).
-      let evtType = 'message';
-      const dataLines = [];
-      for (let line of event.split('\n')){
-        if (line.startsWith('\r')) line = line.slice(1);
-        if (line.endsWith('\r')) line = line.slice(0, -1);
-        if (line.startsWith('event:')) evtType = line.slice(6).trim();
-        else if (line.startsWith('data:')) dataLines.push(line.slice(5).replace(/^ /,''));
+function renderMD(s){
+  if (window.marked) {
+    try {
+      // Configure once.
+      if (!window._mdReady) {
+        window.marked.setOptions({ breaks: true, gfm: true });
+        window._mdReady = true;
       }
-      const data = dataLines.join('\n');
-      if (!data) continue;
-      if (data === '[DONE]') return;
-      try {
-        const j = JSON.parse(data);
-        if (evtType === 'easyai.tool_call')   { handlers.onToolCall && handlers.onToolCall(j); continue; }
-        if (evtType === 'easyai.tool_result') { handlers.onToolResult && handlers.onToolResult(j); continue; }
-        // standard OpenAI delta envelope
-        const ch = j?.choices?.[0];
-        if (!ch) continue;
-        if (ch.delta?.content) handlers.onContent && handlers.onContent(ch.delta.content);
-        if (ch.delta?.tool_calls) handlers.onClientToolCalls && handlers.onClientToolCalls(ch.delta.tool_calls);
-        if (ch.finish_reason) handlers.onFinish && handlers.onFinish(ch.finish_reason);
-        if (j.error) throw new Error(j.error.message || 'server error');
-      } catch (e) {
-        console.warn('SSE parse', data, e);
+      let html = window.marked.parse(s || '');
+      // Run highlight.js on freshly built code blocks.
+      if (window.hljs) {
+        const tmp = document.createElement('div');
+        tmp.innerHTML = html;
+        $$('pre code', tmp).forEach(b => {
+          try { window.hljs.highlightElement(b); } catch {}
+        });
+        html = tmp.innerHTML;
       }
+      return html;
+    } catch (e) {
+      console.warn('markdown fallback', e);
     }
+  }
+  return tinyMD(s);
+}
+
+// ============================================================================
+//  IndexedDB-backed conversation storage
+// ============================================================================
+const DB_NAME = 'easyai';
+const STORE   = 'conversations';
+
+function openDB(){
+  return new Promise((res, rej) => {
+    const req = indexedDB.open(DB_NAME, 1);
+    req.onupgradeneeded = () => req.result.createObjectStore(STORE, { keyPath: 'id' });
+    req.onsuccess = () => res(req.result);
+    req.onerror   = () => rej(req.error);
+  });
+}
+async function dbAll(){
+  const db = await openDB();
+  return new Promise((res, rej) => {
+    const tx = db.transaction(STORE, 'readonly');
+    const req = tx.objectStore(STORE).getAll();
+    req.onsuccess = () => res(req.result || []);
+    req.onerror   = () => rej(req.error);
+  });
+}
+async function dbPut(conv){
+  const db = await openDB();
+  return new Promise((res, rej) => {
+    const tx = db.transaction(STORE, 'readwrite');
+    tx.objectStore(STORE).put(conv);
+    tx.oncomplete = () => res();
+    tx.onerror    = () => rej(tx.error);
+  });
+}
+async function dbDel(id){
+  const db = await openDB();
+  return new Promise((res, rej) => {
+    const tx = db.transaction(STORE, 'readwrite');
+    tx.objectStore(STORE).delete(id);
+    tx.oncomplete = () => res();
+    tx.onerror    = () => rej(tx.error);
+  });
+}
+
+// ============================================================================
+//  app state
+// ============================================================================
+const state = {
+  convs:        [],           // [{id, title, created, updated, messages, settings}]
+  currentId:    null,
+  showThinking: true,
+  abort:        null,         // current AbortController
+  settings: loadSettings(),   // sampling defaults persisted in localStorage
+};
+
+const PRESETS = {
+  deterministic: { temperature: 0.0, top_p: 1.0, top_k: 1,  min_p: 0.0  },
+  precise:       { temperature: 0.2, top_p: 0.95, top_k: 40, min_p: 0.10 },
+  balanced:      { temperature: 0.7, top_p: 0.95, top_k: 40, min_p: 0.05 },
+  creative:      { temperature: 1.0, top_p: 0.95, top_k: 40, min_p: 0.05 },
+  wild:          { temperature: 1.4, top_p: 0.98, top_k: 60, min_p: 0.0  },
+};
+
+function loadSettings(){
+  try {
+    const j = JSON.parse(localStorage.getItem('easyai-settings') || '{}');
+    return Object.assign({
+      preset:       'balanced',
+      temperature:  PRESETS.balanced.temperature,
+      top_p:        PRESETS.balanced.top_p,
+      top_k:        PRESETS.balanced.top_k,
+      min_p:        PRESETS.balanced.min_p,
+      max_tokens:   0,            // 0 = no client cap
+    }, j);
+  } catch { return loadDefaultSettings(); }
+}
+function loadDefaultSettings(){
+  return Object.assign({ preset:'balanced', max_tokens: 0 }, PRESETS.balanced);
+}
+function saveSettings(){ localStorage.setItem('easyai-settings', JSON.stringify(state.settings)); }
+
+function newConv(){
+  return {
+    id: (crypto && crypto.randomUUID) ? crypto.randomUUID() : (Date.now() + '-' + Math.random()),
+    title: 'New chat',
+    created: Date.now(),
+    updated: Date.now(),
+    messages: [],
+  };
+}
+
+async function loadAllConvs(){
+  state.convs = (await dbAll().catch(() => [])).sort((a,b) => b.updated - a.updated);
+  if (state.convs.length === 0) {
+    const c = newConv();
+    state.convs.push(c);
+    state.currentId = c.id;
+    await dbPut(c).catch(()=>{});
+  } else {
+    state.currentId = state.convs[0].id;
+  }
+}
+
+const currentConv = () => state.convs.find(c => c.id === state.currentId);
+
+// ============================================================================
+//  rendering — sidebar
+// ============================================================================
+function renderSidebar(){
+  const list = $('#convList');
+  list.innerHTML = '';
+  for (const c of state.convs) {
+    const li = document.createElement('li');
+    li.className = 'conv-item' + (c.id === state.currentId ? ' active' : '');
+    li.innerHTML = `
+      <span class="title"></span>
+      <span class="stamp"></span>
+      <button class="del" title="Delete">×</button>`;
+    $('.title', li).textContent = c.title || 'untitled';
+    $('.stamp', li).textContent = relTime(c.updated);
+    li.onclick = e => {
+      if (e.target.classList.contains('del')) return;
+      switchConv(c.id);
+    };
+    $('.del', li).onclick = async () => {
+      if (!confirm('Delete this conversation?')) return;
+      await dbDel(c.id).catch(()=>{});
+      state.convs = state.convs.filter(x => x.id !== c.id);
+      if (state.currentId === c.id) {
+        if (state.convs.length === 0) {
+          const nc = newConv(); state.convs.push(nc); state.currentId = nc.id;
+          await dbPut(nc).catch(()=>{});
+        } else state.currentId = state.convs[0].id;
+      }
+      renderSidebar(); renderChat();
+    };
+    list.appendChild(li);
+  }
+}
+
+function switchConv(id){
+  if (state.abort) state.abort.abort();
+  state.currentId = id;
+  renderSidebar();
+  renderChat();
+}
+
+async function startNewConv(){
+  if (state.abort) state.abort.abort();
+  const c = newConv();
+  state.convs.unshift(c);
+  state.currentId = c.id;
+  await dbPut(c).catch(()=>{});
+  renderSidebar();
+  renderChat();
+  $('#textArea').focus();
+}
+
+// ============================================================================
+//  rendering — chat
+// ============================================================================
+const chatEl = $('#chat');
+
+function renderChat(){
+  const c = currentConv();
+  chatEl.innerHTML = '';
+  if (!c || c.messages.length === 0) {
+    chatEl.innerHTML = `
+      <div class="empty">
+        <h2>How can I help?</h2>
+        <div class="ex">
+          <button data-pp="What time is it now?">What time is it now?</button>
+          <button data-pp="Search the web for the latest llama.cpp release and summarise.">Latest llama.cpp release</button>
+          <button data-pp="creative 0.9 write me a haiku about silicon">creative 0.9 haiku</button>
+          <button data-pp="List the files in the current directory.">List files</button>
+        </div>
+      </div>`;
+    $$('.empty .ex button').forEach(b => b.onclick = () => {
+      $('#textArea').value = b.dataset.pp;
+      $('#textArea').focus();
+    });
+    return;
+  }
+  for (const m of c.messages) renderMessage(m);
+  chatEl.scrollTop = chatEl.scrollHeight;
+}
+
+function appendUserMsg(text){
+  const el = document.createElement('div');
+  el.className = 'msg user';
+  el.innerHTML = `<div class="role">you</div><div class="body"></div>`;
+  $('.body', el).textContent = text;
+  chatEl.appendChild(el);
+  chatEl.scrollTop = chatEl.scrollHeight;
+  return el;
+}
+
+function renderMessage(m){
+  if (m.role === 'user') {
+    appendUserMsg(m.content);
+    return;
+  }
+  if (m.role === 'assistant') {
+    const turn = new AssistantTurn(state.showThinking, /*live=*/false);
+    turn.raw = m.content || '';
+    if (m.toolCards) {
+      for (const t of m.toolCards) turn.replayToolCard(t);
+    }
+    turn.finish('stop');
   }
 }
 
 // ============================================================================
-// turn renderer — one assistant message
+//  AssistantTurn — one streaming reply
 // ============================================================================
 class AssistantTurn {
-  constructor(showThinking){
+  constructor(showThinking, live=true){
     this.raw = '';
     this.tokens = 0;
     this.startMs = performance.now();
     this.showThinking = showThinking;
-    this.toolCards = [];
-    this.pendingToolByName = new Map();
+    this.toolCards = [];          // {name, args, result, error}
+    this.pendingByName = new Map();
+    this._done = !live;
 
     this.el = document.createElement('div');
     this.el.className = 'msg assistant';
     this.el.innerHTML = `
-      <div class="role">assistant</div>
+      <div class="role">
+        <span>assistant</span>
+        <span class="actions">
+          <button class="copy" title="Copy">copy</button>
+        </span>
+      </div>
       <div class="content"></div>
       <div class="stats"></div>`;
     this.contentEl = $('.content', this.el);
-    this.statsEl   = $('.stats', this.el);
+    this.statsEl   = $('.stats',   this.el);
     chatEl.appendChild(this.el);
     chatEl.scrollTop = chatEl.scrollHeight;
+
+    $('.copy', this.el).onclick = () => {
+      const t = this.finalText();
+      navigator.clipboard?.writeText(t).catch(()=>{});
+    };
   }
 
   addContent(piece){
@@ -304,44 +792,37 @@ class AssistantTurn {
   }
 
   render(){
-    // Split raw into [thinking blocks..., content with tags removed].
-    let content = this.raw;
-    let thinking = [];
-    let openTag = null;
-    const re = /<think(?:ing)?>([\s\S]*?)(?:<\/think(?:ing)?>|$)/g;
-    let m;
+    // Split out <think>...</think> blocks; render content with markdown.
     let cleaned = '';
-    let last = 0;
-    while ((m = re.exec(this.raw)) !== null){
+    const thinks = [];
+    const re = /<think(?:ing)?>([\s\S]*?)(?:<\/think(?:ing)?>|$)/g;
+    let m, last = 0;
+    while ((m = re.exec(this.raw)) !== null) {
       cleaned += this.raw.slice(last, m.index);
-      thinking.push(m[1]);
+      thinks.push(m[1]);
       last = m.index + m[0].length;
     }
     cleaned += this.raw.slice(last);
-    content = cleaned;
 
-    // (Re)build the thinking block if present.
     let thinkEl = $(':scope > .thinking', this.el);
-    if (thinking.length){
-      const txt = thinking.join('\n\n— —\n\n');
-      if (!thinkEl){
+    if (thinks.length) {
+      const txt = thinks.join('\n\n— —\n\n');
+      if (!thinkEl) {
         thinkEl = document.createElement('details');
         thinkEl.className = 'thinking';
         if (this.showThinking) thinkEl.open = true;
         thinkEl.innerHTML = '<summary>Thinking</summary><div class="think-body"></div>';
-        // Insert above the content (and above tool cards if any).
         this.el.insertBefore(thinkEl, this.contentEl);
       }
       $('.think-body', thinkEl).textContent = txt;
     }
 
-    // Render markdown content + a blinking cursor while streaming.
-    this.contentEl.innerHTML = renderMarkdown(content) +
+    this.contentEl.innerHTML = renderMD(cleaned) +
         (this._done ? '' : '<span class="cursor"></span>');
     chatEl.scrollTop = chatEl.scrollHeight;
   }
 
-  // A tool was just dispatched server-side.
+  // server-side tool dispatch — card with running placeholder
   addToolCall(evt){
     const card = document.createElement('div');
     card.className = 'tool-card';
@@ -356,144 +837,328 @@ class AssistantTurn {
       <div class="result pending">…running…</div>`;
     $('.name', card).textContent = evt.name;
     $('.args', card).textContent = '(' + argStr + ')';
-    // Insert cards above the live content area, in chronological order.
     this.el.insertBefore(card, this.contentEl);
-    this.toolCards.push(card);
-    if (!this.pendingToolByName.has(evt.name)) this.pendingToolByName.set(evt.name, []);
-    this.pendingToolByName.get(evt.name).push(card);
+    this.toolCards.push({ el: card, name: evt.name, args: argStr });
+    if (!this.pendingByName.has(evt.name)) this.pendingByName.set(evt.name, []);
+    this.pendingByName.get(evt.name).push(card);
     chatEl.scrollTop = chatEl.scrollHeight;
   }
 
-  // Pair a tool result with the most-recent unfilled card for that name.
   addToolResult(evt){
-    const stack = this.pendingToolByName.get(evt.name);
+    const stack = this.pendingByName.get(evt.name);
     if (!stack || !stack.length) return;
     const card = stack.shift();
     const resEl = $('.result', card);
     resEl.classList.remove('pending');
     resEl.textContent = evt.content || '';
     if (evt.is_error) card.classList.add('error');
+    // Keep a record for replay/persistence.
+    const rec = this.toolCards.find(t => t.el === card);
+    if (rec) { rec.result = evt.content || ''; rec.error = !!evt.is_error; }
   }
 
-  // For client-tools mode: a tool_calls array arrived in the OpenAI delta —
-  // render them as informational cards with no result (the upstream client,
-  // e.g. opencode, would dispatch these).
+  // For client-tools mode (rare from the webui).
   addClientToolCalls(tcs){
-    for (const tc of tcs){
+    for (const tc of tcs) {
       if (!tc.function) continue;
       this.addToolCall({
         name: tc.function.name || '?',
         arguments: tc.function.arguments || '{}',
         id: tc.id || ''
       });
-      const stack = this.pendingToolByName.get(tc.function.name);
-      if (stack && stack.length){
+      const stack = this.pendingByName.get(tc.function.name);
+      if (stack && stack.length) {
         const card = stack.shift();
-        const resEl = $('.result', card);
-        resEl.classList.remove('pending');
-        resEl.textContent = '(forwarded to client for execution)';
-        resEl.style.fontStyle = 'italic';
+        $('.result', card).classList.remove('pending');
+        $('.result', card).textContent = '(forwarded to client for execution)';
+        $('.result', card).style.fontStyle = 'italic';
       }
     }
+  }
+
+  // Used during conversation replay (loading from IDB).
+  replayToolCard(t){
+    const card = document.createElement('div');
+    card.className = 'tool-card' + (t.error ? ' error' : '');
+    card.innerHTML = `
+      <div class="head">
+        <span class="name"></span>
+        <span class="args"></span>
+      </div>
+      <div class="result"></div>`;
+    $('.name', card).textContent = t.name;
+    $('.args', card).textContent = '(' + (t.args || '') + ')';
+    $('.result', card).textContent = t.result || '';
+    this.el.insertBefore(card, this.contentEl);
+    this.toolCards.push(t);
   }
 
   finish(reason){
     this._done = true;
     const elapsed = (performance.now() - this.startMs) / 1000;
-    const tps = this.tokens / Math.max(elapsed, 0.001);
-    this.statsEl.textContent = `${this.tokens} chunks · ${elapsed.toFixed(2)}s · ${tps.toFixed(1)} chunks/s · ${reason}`;
+    if (this.tokens > 0) {
+      const tps = this.tokens / Math.max(elapsed, 0.001);
+      this.statsEl.textContent = `${this.tokens} chunks · ${elapsed.toFixed(2)}s · ${tps.toFixed(1)} chunks/s · ${reason}`;
+    }
     this.render();
   }
-
   fail(msg){
     this._done = true;
     this.contentEl.innerHTML = `<div class="error-msg">⚠︎ ${escHTML(msg)}</div>`;
   }
 
+  // Strip <think> blocks — what we save into history for the next request.
   finalText(){
-    // Strip <think>...</think> for sending back to the server in the next turn.
     return this.raw.replace(/<think(?:ing)?>[\s\S]*?<\/think(?:ing)?>/g, '').trim();
   }
 }
 
 // ============================================================================
-// app state
+//  SSE consumer
 // ============================================================================
-let history = [];
-let showThinking = true;  // expand <think> blocks by default
+async function streamChat(messages, settings, handlers, signal){
+  const body = {
+    model: 'easyai',
+    messages,
+    stream: true,
+    temperature: settings.temperature,
+    top_p:       settings.top_p,
+    top_k:       settings.top_k,
+    min_p:       settings.min_p,
+  };
+  if (settings.max_tokens > 0) body.max_tokens = settings.max_tokens;
 
-function addUserMsg(text){
-  const m = document.createElement('div');
-  m.className = 'msg user';
-  m.innerHTML = '<div class="role">you</div><div class="body"></div>';
-  $('.body', m).textContent = text;
-  chatEl.appendChild(m);
-  chatEl.scrollTop = chatEl.scrollHeight;
+  const res = await fetch('/v1/chat/completions', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+    signal,
+  });
+  if (!res.ok) {
+    const txt = await res.text();
+    throw new Error(`HTTP ${res.status}: ${txt.slice(0, 400)}`);
+  }
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = '';
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    while (true) {
+      const idx = buf.indexOf('\n\n');
+      if (idx === -1) break;
+      const event = buf.slice(0, idx);
+      buf = buf.slice(idx + 2);
+      let evtType = 'message';
+      const dataLines = [];
+      for (let line of event.split('\n')) {
+        if (line.endsWith('\r')) line = line.slice(0, -1);
+        if (line.startsWith('event:')) evtType = line.slice(6).trim();
+        else if (line.startsWith('data:')) dataLines.push(line.slice(5).replace(/^ /, ''));
+      }
+      const data = dataLines.join('\n');
+      if (!data) continue;
+      if (data === '[DONE]') return;
+      try {
+        const j = JSON.parse(data);
+        if (evtType === 'easyai.tool_call')   { handlers.onToolCall && handlers.onToolCall(j); continue; }
+        if (evtType === 'easyai.tool_result') { handlers.onToolResult && handlers.onToolResult(j); continue; }
+        const ch = j?.choices?.[0];
+        if (!ch) continue;
+        if (ch.delta?.content)    handlers.onContent && handlers.onContent(ch.delta.content);
+        if (ch.delta?.tool_calls) handlers.onClientToolCalls && handlers.onClientToolCalls(ch.delta.tool_calls);
+        if (ch.finish_reason)     handlers.onFinish && handlers.onFinish(ch.finish_reason);
+        if (j.error) throw new Error(j.error.message || 'server error');
+      } catch (e) {
+        if (e.name === 'AbortError') throw e;
+        console.warn('SSE parse', data, e);
+      }
+    }
+  }
 }
 
+// ============================================================================
+//  send pipeline
+// ============================================================================
 async function send(text){
-  addUserMsg(text);
-  history.push({role:'user', content:text});
-  sendBtn.disabled = true;
-  const turn = new AssistantTurn(showThinking);
+  const c = currentConv();
+  if (!c) return;
+  c.messages.push({ role: 'user', content: text });
+  if (c.messages.length === 1) c.title = (text.slice(0, 40) || 'New chat');
+  c.updated = Date.now();
+  appendUserMsg(text);
+  // remove the empty placeholder if present
+  $$('.empty', chatEl).forEach(e => e.remove());
+  await dbPut(c).catch(()=>{});
+  renderSidebar();
+
+  const turn = new AssistantTurn(state.showThinking);
+  $('#sendBtn').hidden = true;
+  $('#stopBtn').hidden = false;
+  state.abort = new AbortController();
+
+  // Build the API messages: include past assistant content sans tool cards.
+  const apiMsgs = c.messages.map(m =>
+    m.role === 'assistant' ? { role: 'assistant', content: m.content || '' }
+                           : { role: m.role, content: m.content });
+
   try {
-    await streamChat(history, {
+    await streamChat(apiMsgs, state.settings, {
       onContent:         p => turn.addContent(p),
       onToolCall:        e => turn.addToolCall(e),
       onToolResult:      e => turn.addToolResult(e),
       onClientToolCalls: t => turn.addClientToolCalls(t),
       onFinish:          r => turn.finish(r),
+    }, state.abort.signal);
+    c.messages.push({
+      role: 'assistant',
+      content: turn.finalText(),
+      toolCards: turn.toolCards.map(t => ({ name: t.name, args: t.args, result: t.result, error: t.error })),
     });
-    history.push({role:'assistant', content: turn.finalText()});
+    c.updated = Date.now();
+    await dbPut(c).catch(()=>{});
+    renderSidebar();
   } catch (e) {
-    turn.fail(e.message || String(e));
+    if (e.name === 'AbortError') {
+      turn.fail('stopped');
+    } else {
+      turn.fail(e.message || String(e));
+    }
   } finally {
-    sendBtn.disabled = false; ta.focus();
+    $('#sendBtn').hidden = false;
+    $('#stopBtn').hidden = true;
+    state.abort = null;
+    $('#textArea').focus();
   }
 }
 
+function stopGeneration(){
+  if (state.abort) state.abort.abort();
+}
+
 // ============================================================================
-// wiring
+//  settings UI wiring
 // ============================================================================
-$('#f').addEventListener('submit', e => {
-  e.preventDefault();
-  const text = ta.value.trim();
-  if (!text || sendBtn.disabled) return;
-  ta.value = '';
-  send(text);
+function syncSettingsUI(){
+  $('#sTemp').value  = $('#sTempN').value  = state.settings.temperature;
+  $('#sTopP').value  = $('#sTopPN').value  = state.settings.top_p;
+  $('#sTopK').value  = $('#sTopKN').value  = state.settings.top_k;
+  $('#sMinP').value  = $('#sMinPN').value  = state.settings.min_p;
+  $('#sMaxTok').value = $('#sMaxTokN').value = state.settings.max_tokens;
+  $$('#presetRow button').forEach(b => b.classList.toggle('active', b.dataset.p === state.settings.preset));
+}
+
+function applyPreset(name){
+  const p = PRESETS[name];
+  if (!p) return;
+  state.settings.preset = name;
+  Object.assign(state.settings, p);
+  saveSettings();
+  syncSettingsUI();
+}
+
+function bindSlider(rangeId, numId, key, min, max){
+  const r = $('#' + rangeId), n = $('#' + numId);
+  const update = v => {
+    let f = parseFloat(v);
+    if (isNaN(f)) return;
+    if (f < min) f = min; if (f > max) f = max;
+    state.settings[key] = f;
+    state.settings.preset = 'custom';
+    $$('#presetRow button').forEach(b => b.classList.remove('active'));
+    saveSettings();
+    r.value = f; n.value = f;
+  };
+  r.addEventListener('input', () => update(r.value));
+  n.addEventListener('change', () => update(n.value));
+}
+bindSlider('sTemp',  'sTempN',  'temperature', 0,    2);
+bindSlider('sTopP',  'sTopPN',  'top_p',       0,    1);
+bindSlider('sTopK',  'sTopKN',  'top_k',       1,    1024);
+bindSlider('sMinP',  'sMinPN',  'min_p',       0,    0.5);
+bindSlider('sMaxTok','sMaxTokN','max_tokens',  0,    65536);
+
+$$('#presetRow button').forEach(b => {
+  b.onclick = () => applyPreset(b.dataset.p);
 });
-ta.addEventListener('keydown', e => {
-  if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)){
-    e.preventDefault();
-    $('#f').requestSubmit();
+
+$('#settingsReset').onclick = () => applyPreset('balanced');
+
+$('#settingsToggle').onclick = e => {
+  $('#settingsPanel').classList.toggle('open');
+  e.currentTarget.classList.toggle('active');
+};
+document.addEventListener('click', e => {
+  if (!e.target.closest('#settingsPanel') && !e.target.closest('#settingsToggle')) {
+    $('#settingsPanel').classList.remove('open');
+    $('#settingsToggle').classList.remove('active');
   }
 });
-$('#reset').onclick = () => { history = []; chatEl.innerHTML = ''; };
-$('#thinkToggle').onclick = e => {
-  showThinking = !showThinking;
-  e.target.textContent = showThinking ? 'thinking ◐' : 'thinking ○';
-  // Toggle existing blocks too.
-  $$('details.thinking').forEach(d => d.open = showThinking);
-};
-$$('header [data-p]').forEach(b => {
-  b.onclick = async () => {
-    $$('header [data-p]').forEach(x => x.classList.remove('active'));
-    b.classList.add('active');
-    try {
-      await fetch('/v1/preset', {
-        method:'POST', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({preset: b.dataset.p})
-      });
-    } catch (e) { console.warn(e); }
+
+// quick-temp pills under the textarea
+$$('#settingsHint .pill[data-quick]').forEach(p => {
+  p.onclick = () => {
+    const v = parseFloat(p.dataset.quick);
+    state.settings.temperature = v;
+    state.settings.preset = 'custom';
+    saveSettings(); syncSettingsUI();
   };
 });
 
-// status pills
+// ============================================================================
+//  app wiring
+// ============================================================================
+const ta = $('#textArea');
+
+ta.addEventListener('input', () => {
+  ta.style.height = 'auto';
+  ta.style.height = Math.min(ta.scrollHeight, window.innerHeight * 0.3) + 'px';
+});
+ta.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+    e.preventDefault();
+    submitMsg();
+  }
+});
+
+function submitMsg(){
+  const text = ta.value.trim();
+  if (!text || state.abort) return;
+  ta.value = ''; ta.style.height = 'auto';
+  send(text);
+}
+
+$('#sendBtn').onclick = submitMsg;
+$('#stopBtn').onclick = stopGeneration;
+$('#newChatBtn').onclick = startNewConv;
+$('#sidebarToggle').onclick = () => {
+  $('#app').classList.toggle('show-sidebar');
+  $('#app').classList.toggle('no-sidebar');
+};
+$('#thinkToggleHdr').onclick = () => {
+  state.showThinking = !state.showThinking;
+  $$('details.thinking').forEach(d => d.open = state.showThinking);
+  $('#thinkToggleHdr').textContent = (state.showThinking ? '◐' : '○') + ' thinking';
+};
+
+// /health pills
 fetch('/health').then(r => r.json()).then(j => {
   $('#model').textContent   = j.model || '?';
   $('#backend').textContent = j.backend ? 'backend: ' + j.backend : '';
   $('#ntools').textContent  = (j.tools ?? 0) + ' tools';
 }).catch(()=>{});
+
+// ============================================================================
+//  bootstrap
+// ============================================================================
+(async () => {
+  syncSettingsUI();
+  await loadAllConvs();
+  renderSidebar();
+  renderChat();
+  ta.focus();
+})();
 </script>
 </body></html>
 )HTML";
