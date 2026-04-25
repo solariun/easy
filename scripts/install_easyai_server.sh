@@ -595,6 +595,11 @@ Type=simple
 User=$service_user
 Group=$service_group
 WorkingDirectory=$service_home
+# Mesa RADV graphics-pipeline-library: ~10-15% faster inference on RDNA2 iGPUs
+# (Radeon 680M etc.). Harmless on other backends.
+Environment=RADV_PERFTEST=gpl
+Environment=HOME=$service_home
+Environment=XDG_CACHE_HOME=$service_home/cache
 $( [[ -f "$api_key_file" ]] && echo "Environment=\"EASYAI_API_KEY_FILE=$api_key_file\"" )
 $( [[ -f "$api_key_file" ]] && echo "ExecStartPre=/bin/sh -c 'test -r \"$api_key_file\"'" )
 ExecStart=/bin/sh -c '$( [[ -f "$api_key_file" ]] && echo "EASYAI_API_KEY=\$(cat $api_key_file) " )exec $install_prefix/bin/easyai-server$arg_string'
