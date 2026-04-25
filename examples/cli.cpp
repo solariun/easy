@@ -791,7 +791,19 @@ int main(int argc, char ** argv) {
     CliArgs args = parse(argc, argv);
     install_sigint();
 
-    // Resolve system prompt: --system inline beats -s file.
+    // Resolve system prompt: --system inline > -s file > built-in default.
+    // The default discourages a small model from calling tools on simple
+    // greetings (a noticeable problem with 0.5B-3B GGUFs).
+    static constexpr char kBuiltinSystem[] =
+        "You are a helpful, concise assistant.\n"
+        "Answer directly when you can — for greetings, chitchat, basic facts, "
+        "math, and anything in your training data, just respond.\n"
+        "Use a tool ONLY when the request truly needs one:\n"
+        "  - up-to-date / time-sensitive info → web_search, then web_fetch\n"
+        "  - the current date/time            → datetime\n"
+        "  - reading or listing files         → fs_read_file / fs_list_dir / fs_glob / fs_grep\n"
+        "Never call a tool just to look busy.  When you do call one, cite the result.";
+
     std::string system_prompt = args.system_inline;
     if (system_prompt.empty() && !args.system_path.empty()) {
         system_prompt = read_text_file(args.system_path);
@@ -800,6 +812,7 @@ int main(int argc, char ** argv) {
                          args.system_path.c_str());
         }
     }
+    if (system_prompt.empty() && args.load_tools) system_prompt = kBuiltinSystem;
 
     const easyai::Preset * p0 = easyai::find_preset(args.preset);
     easyai::Preset preset = p0 ? *p0 : *easyai::find_preset("balanced");

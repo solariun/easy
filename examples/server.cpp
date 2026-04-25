@@ -180,26 +180,39 @@ function escHTML(s){
 function renderMarkdown(s){
   if (!s) return '';
   let html = escHTML(s);
-  const blocks = [];
-  // fenced code blocks: ```lang\n...\n```
-  html = html.replace(/```([a-zA-Z0-9_-]*)\n([\s\S]*?)```/g, (_, lang, code) => {
-    blocks.push(`<pre><code class="lang-${escHTML(lang)}">${code}</code></pre>`);
-    return `\u0001${blocks.length-1}\u0001`;
-  });
-  // inline code (single backticks, no newlines)
-  html = html.replace(/`([^`\n]+)`/g, (_, c) => `<code>${c}</code>`);
-  // bold (**...**) and italics (*...*) — bold first to win the regex race
+  // We park "atomic" HTML fragments (code blocks, anchors) behind a sentinel
+  // so subsequent passes don't re-match the URL/text we already rewrote.
+  // Restore happens at the very end.
+  const parked = [];
+  const park = (frag) => { parked.push(frag); return `\u0001${parked.length-1}\u0001`; };
+
+  // 1. fenced code blocks ```lang\n...\n```
+  html = html.replace(/```([a-zA-Z0-9_-]*)\n([\s\S]*?)```/g, (_, lang, code) =>
+    park(`<pre><code class="lang-${escHTML(lang)}">${code}</code></pre>`));
+
+  // 2. inline code (single backticks, no newlines)
+  html = html.replace(/`([^`\n]+)`/g, (_, c) => park(`<code>${c}</code>`));
+
+  // 3. explicit markdown links: [text](url) — park the resulting <a> so
+  //    the auto-link pass below cannot re-match the URL inside its href.
+  html = html.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g,
+    (_, t, u) => park(`<a href="${u}" target="_blank" rel="noopener">${t}</a>`));
+
+  // 4. bold + italics
   html = html.replace(/\*\*([^\*\n]+?)\*\*/g, '<strong>$1</strong>');
   html = html.replace(/(^|[^\*])\*([^\*\n]+?)\*(?!\*)/g, '$1<em>$2</em>');
-  // explicit markdown links: [text](url)
-  html = html.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g,
-    (_, t, u) => `<a href="${u}" target="_blank" rel="noopener">${t}</a>`);
-  // auto-link plain http(s)://
-  html = html.replace(/(\bhttps?:\/\/[^\s<]+[^\s<.,;:!?\)])/g,
-    u => `<a href="${u}" target="_blank" rel="noopener">${u}</a>`);
-  // newlines → <br>, then restore code blocks
+
+  // 5. auto-link bare http(s)://… URLs.  Trailing punctuation .,;:!?) is
+  //    excluded so it isn't swallowed into the link.
+  html = html.replace(/(\bhttps?:\/\/[^\s<]+?)([.,;:!?)\]]*)(?=\s|$)/g,
+    (_, u, tail) => park(`<a href="${u}" target="_blank" rel="noopener">${u}</a>`) + tail);
+
+  // 6. newlines → <br>.  Skip ones inside parked fragments since those are
+  //    sentinels (single-line by construction).
   html = html.replace(/\n/g, '<br>');
-  html = html.replace(/\u0001(\d+)\u0001/g, (_, i) => blocks[+i]);
+
+  // 7. restore everything we parked.
+  html = html.replace(/\u0001(\d+)\u0001/g, (_, i) => parked[+i]);
   return html;
 }
 
@@ -931,63 +944,91 @@ static void handle_chat_stream(ServerCtx & ctx,
                 sink.write(s.data(), s.size());
             };
 
-            // ---- streaming <think> stripper (only when ctx.no_think) ----
-            // Mirrors the JS-side state machine: buffer at most one tag's
-            // worth and gate output bytes accordingly.  When stripping is
-            // off we just pass pieces through.
+            // ---- streaming tag stripper --------------------------------
+            // Always suppresses <tool_call>…</tool_call> blocks — those are
+            // protocol artefacts, and the webui already renders the call as
+            // a card via easyai.tool_call/result events.
+            //
+            // Optionally also suppresses <think>…</think> when the operator
+            // passed --no-think.
+            //
+            // The state machine keeps a small buffer (longest tag length)
+            // so a tag split across token chunks still matches.
             struct StripState {
-                bool   enabled  = false;
-                bool   in_think = false;
+                bool        strip_think = false;   // gated by --no-think
+                bool        in_drop = false;       // currently inside a stripped span
+                const char *close_needle  = nullptr; // which close tag to look for
                 std::string buf;
+
+                // Detect any open tag we care about at index i in buf.
+                // Returns {pos_of_open, pos_after_open, close_needle} or pos==npos.
+                struct Open { size_t pos = std::string::npos; size_t after = 0; const char *close = nullptr; };
+                Open find_open() const {
+                    Open best{};
+                    auto consider = [&](const char * open, const char * close) {
+                        size_t p = buf.find(open);
+                        if (p == std::string::npos) return;
+                        if (best.pos == std::string::npos || p < best.pos) {
+                            best.pos   = p;
+                            best.after = p + std::strlen(open);
+                            best.close = close;
+                        }
+                    };
+                    consider("<tool_call>", "</tool_call>");
+                    if (strip_think) {
+                        consider("<think>",    "</think>");
+                        consider("<thinking>", "</thinking>");
+                    }
+                    return best;
+                }
+
                 std::string filter(std::string piece) {
-                    if (!enabled) return piece;
-                    // longest tag = "</thinking>" → keep at most 12 trailing chars
-                    constexpr size_t margin = 12;
                     buf += piece;
                     std::string out;
+                    // Longest open we care about is "<thinking>" (10).
+                    // Longest close is "</thinking>" (11).  Keep that many
+                    // trailing chars unflushed so a partial tag can complete.
+                    constexpr size_t open_margin  = 10;
+                    constexpr size_t close_margin = 12;
                     for (;;) {
-                        if (in_think) {
-                            size_t p1 = buf.find("</think>");
-                            size_t p2 = buf.find("</thinking>");
-                            size_t end = std::min(p1 == std::string::npos ? std::string::npos : p1,
-                                                  p2 == std::string::npos ? std::string::npos : p2);
-                            if (end == std::string::npos) {
-                                if (buf.size() > margin) buf.erase(0, buf.size() - margin);
+                        if (in_drop) {
+                            size_t p = buf.find(close_needle);
+                            if (p == std::string::npos) {
+                                if (buf.size() > close_margin)
+                                    buf.erase(0, buf.size() - close_margin);
                                 return out;
                             }
-                            size_t close = buf.find('>', end);
-                            if (close == std::string::npos) return out;
-                            buf.erase(0, close + 1);
-                            in_think = false;
+                            buf.erase(0, p + std::strlen(close_needle));
+                            in_drop = false;
+                            close_needle = nullptr;
                         } else {
-                            size_t p1 = buf.find("<think>");
-                            size_t p2 = buf.find("<thinking>");
-                            size_t start = std::min(p1 == std::string::npos ? std::string::npos : p1,
-                                                    p2 == std::string::npos ? std::string::npos : p2);
-                            if (start == std::string::npos) {
-                                size_t safe = buf.size() > 10 ? buf.size() - 10 : 0;
-                                if (safe > 0) { out.append(buf, 0, safe); buf.erase(0, safe); }
+                            Open o = find_open();
+                            if (o.pos == std::string::npos) {
+                                size_t safe = buf.size() > open_margin
+                                                 ? buf.size() - open_margin : 0;
+                                if (safe > 0) {
+                                    out.append(buf, 0, safe);
+                                    buf.erase(0, safe);
+                                }
                                 return out;
                             }
-                            out.append(buf, 0, start);
-                            size_t close = buf.find('>', start);
-                            if (close == std::string::npos) {
-                                buf.erase(0, start);
-                                return out;
-                            }
-                            buf.erase(0, close + 1);
-                            in_think = true;
+                            out.append(buf, 0, o.pos);
+                            buf.erase(0, o.after);
+                            in_drop = true;
+                            close_needle = o.close;
                         }
                     }
                 }
                 std::string flush() {
                     std::string out;
-                    if (!enabled || !in_think) out = std::move(buf);
-                    buf.clear(); in_think = false;
+                    if (!in_drop) out = std::move(buf);
+                    buf.clear();
+                    in_drop = false;
+                    close_needle = nullptr;
                     return out;
                 }
             } strip;
-            strip.enabled = ctx.no_think;
+            strip.strip_think = ctx.no_think;
 
             // ---- on_token callback: stream OpenAI-shape deltas ----------
             ctx.engine.on_token([&](const std::string & piece) {
@@ -1386,6 +1427,20 @@ int main(int argc, char ** argv) {
     ServerArgs args = parse_args(argc, argv);
 
     // -------- resolve system prompt --------------------------------------
+    // Precedence: --system inline > -s file > built-in default. The default
+    // exists because a *small* model with NO system prompt and a tool list
+    // is very likely to over-eagerly call tools on simple greetings ("hi"
+    // → web_search).  Operators can fully replace it via -s.
+    static constexpr char kBuiltinSystem[] =
+        "You are a helpful, concise assistant.\n"
+        "Answer directly when you can — for greetings, chitchat, basic facts, "
+        "math, and anything in your training data, just respond.\n"
+        "Use a tool ONLY when the request truly needs one:\n"
+        "  - up-to-date / time-sensitive info → web_search, then web_fetch\n"
+        "  - the current date/time            → datetime\n"
+        "  - reading or listing files         → fs_read_file / fs_list_dir / fs_glob / fs_grep\n"
+        "Never call a tool just to look busy.  When you do call one, cite the result.";
+
     std::string default_system = args.system_inline;
     if (default_system.empty() && !args.system_path.empty()) {
         default_system = read_text_file(args.system_path);
@@ -1394,6 +1449,7 @@ int main(int argc, char ** argv) {
                          args.system_path.c_str());
         }
     }
+    if (default_system.empty()) default_system = kBuiltinSystem;
 
     // -------- build the context (heap-allocated so HTTP lambdas can capture
     // a stable reference; lifetime tied to main()'s scope via unique_ptr).
