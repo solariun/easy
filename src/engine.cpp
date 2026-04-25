@@ -1,4 +1,5 @@
 #include "easyai/engine.hpp"
+#include "easyai/tool.hpp"        // easyai::args::get_string for tool_call recovery
 
 #include "common.h"
 #include "sampling.h"
@@ -19,6 +20,122 @@
 #include <vector>
 
 namespace easyai {
+
+// ===========================================================================
+// Tool-call recovery helpers
+// ---------------------------------------------------------------------------
+// Some models (notably Qwen2.5-Instruct in its current GGUF chat-template
+// builds) emit tool calls with DOUBLED braces:
+//
+//     <tool_call>
+//     {{"name":"web_search","arguments":{"query":"hello"}}}
+//     </tool_call>
+//
+// The Jinja chat-template's example uses `{{ ... }}` for variable
+// interpolation, and the template itself isn't escaping them when rendering
+// the tool-call demo, so the model imitates the literal form.  The PEG
+// parser in llama.cpp (correctly) refuses that JSON, falls through, and we
+// end up with no tool_calls at all even though the user clearly asked for
+// one.
+//
+// These helpers recover those calls by hand: we scan the raw output for
+// <tool_call>...</tool_call> blocks and pull `name` + `arguments` out of
+// each, tolerant of extra wrapping braces.
+// ===========================================================================
+namespace {
+
+// Walk a JSON object starting at `s[i]` (which must be '{'), respecting
+// strings.  Returns the index ONE PAST the matching '}', or npos on failure.
+size_t walk_balanced_braces(const std::string & s, size_t i) {
+    if (i >= s.size() || s[i] != '{') return std::string::npos;
+    int  depth = 0;
+    bool in_str = false, esc = false;
+    for (; i < s.size(); ++i) {
+        char c = s[i];
+        if (in_str) {
+            if (esc)             esc = false;
+            else if (c == '\\')  esc = true;
+            else if (c == '"')   in_str = false;
+            continue;
+        }
+        if      (c == '"') in_str = true;
+        else if (c == '{') ++depth;
+        else if (c == '}') {
+            --depth;
+            if (depth == 0) return i + 1;
+        }
+    }
+    return std::string::npos;
+}
+
+// Scan `raw` for <tool_call>...</tool_call> blocks (terminated or
+// unterminated) and return whatever {name, arguments} pairs we can recover.
+std::vector<common_chat_tool_call> recover_qwen_tool_calls(const std::string & raw) {
+    std::vector<common_chat_tool_call> out;
+    static const std::string open_tag  = "<tool_call>";
+    static const std::string close_tag = "</tool_call>";
+
+    size_t pos = 0;
+    while (true) {
+        size_t a = raw.find(open_tag, pos);
+        if (a == std::string::npos) break;
+        size_t body_begin = a + open_tag.size();
+        size_t b = raw.find(close_tag, body_begin);
+        std::string body = (b == std::string::npos)
+                               ? raw.substr(body_begin)
+                               : raw.substr(body_begin, b - body_begin);
+
+        // Pull out "name" — `args::get_string` does a forgiving top-level
+        // key scan that already tolerates the doubled-brace wrapper.
+        std::string name;
+        if (!args::get_string(body, "name", name) || name.empty()) {
+            pos = (b == std::string::npos) ? raw.size() : b + close_tag.size();
+            continue;
+        }
+
+        // Pull out "arguments" — find the colon, then walk the JSON object.
+        std::string arguments_json = "{}";
+        size_t k = body.find("\"arguments\"");
+        if (k != std::string::npos) {
+            k = body.find(':', k);
+            if (k != std::string::npos) {
+                ++k;
+                while (k < body.size() &&
+                       std::isspace((unsigned char) body[k])) ++k;
+                if (k < body.size() && body[k] == '{') {
+                    size_t end = walk_balanced_braces(body, k);
+                    if (end != std::string::npos) {
+                        arguments_json = body.substr(k, end - k);
+                    }
+                }
+            }
+        }
+
+        common_chat_tool_call tc;
+        tc.name      = std::move(name);
+        tc.arguments = std::move(arguments_json);
+        out.push_back(std::move(tc));
+
+        pos = (b == std::string::npos) ? raw.size() : b + close_tag.size();
+    }
+    return out;
+}
+
+// Drop any text inside <tool_call>...</tool_call> blocks (so the user
+// doesn't see the raw JSON in the visible content after recovery).
+std::string strip_tool_call_blocks(std::string s) {
+    static const std::string open_tag  = "<tool_call>";
+    static const std::string close_tag = "</tool_call>";
+    size_t pos = 0;
+    while ((pos = s.find(open_tag, pos)) != std::string::npos) {
+        size_t end = s.find(close_tag, pos + open_tag.size());
+        if (end == std::string::npos) { s.erase(pos); break; }
+        s.erase(pos, end + close_tag.size() - pos);
+    }
+    return s;
+}
+
+}  // namespace
 
 // ===========================================================================
 // Engine::Impl
@@ -183,16 +300,32 @@ struct Engine::Impl {
                     "[easyai] failed to load chat parser arena: %s\n", e.what());
             }
         }
+        // 1) Try the official parser first.
+        common_chat_msg msg;
         try {
-            return common_chat_parse(raw, /*is_partial=*/false, pp);
+            msg = common_chat_parse(raw, /*is_partial=*/false, pp);
         } catch (const std::exception & e) {
             if (verbose) std::fprintf(stderr,
-                "[easyai] chat parser failed (%s) - returning raw content\n", e.what());
-            common_chat_msg fallback;
-            fallback.role    = "assistant";
-            fallback.content = raw;
-            return fallback;
+                "[easyai] chat parser failed (%s) — attempting recovery\n", e.what());
+            msg.role    = "assistant";
+            msg.content = raw;
         }
+
+        // 2) Recovery pass — if the official parser produced no tool_calls
+        //    but the raw output contains <tool_call> markers, the model
+        //    most likely emitted Qwen-style doubled-brace JSON that the PEG
+        //    grammar refused. Pull what we can out of it by hand.
+        if (msg.tool_calls.empty() && raw.find("<tool_call>") != std::string::npos) {
+            auto recovered = recover_qwen_tool_calls(raw);
+            if (!recovered.empty()) {
+                msg.tool_calls = std::move(recovered);
+                msg.content    = strip_tool_call_blocks(msg.content);
+                if (verbose) std::fprintf(stderr,
+                    "[easyai] recovered %zu tool call(s) from malformed output\n",
+                    msg.tool_calls.size());
+            }
+        }
+        return msg;
     }
 
     // Find the registered tool by name.
