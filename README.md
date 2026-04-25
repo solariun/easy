@@ -206,6 +206,16 @@ HTTPS to duckduckgo.com.
 * [`manual.md`](manual.md) — hands-on developer manual. Beginner walkthrough
   ("hello, agent") all the way to advanced topics (writing your own tools,
   customising the chat-template parser, hosting behind a reverse proxy).
+* [`scripts/install_easyai_server.sh`](scripts/install_easyai_server.sh) —
+  one-shot Debian/Ubuntu installer; **drop-in replacement** for the
+  `install_llama_server.sh` workflow. Clones llama.cpp + easyai, builds
+  with the right backend (auto-detects Vulkan / CUDA / ROCm / CPU),
+  creates a system user + `/var/lib/easyai`, drops a hardened systemd
+  unit with mlock + flash-attn + q8_0 KV cache + Bearer auth +
+  Prometheus `/metrics`. Accepts every flag the original took
+  (`--with-mcp`, `--draft-model`, `--webui-title`, etc.) — built-in
+  features become no-ops with a friendly warning so existing automation
+  keeps working.
 
 ---
 
