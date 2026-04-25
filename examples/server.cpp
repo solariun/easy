@@ -66,116 +66,420 @@ constexpr char kWebUI[] = R"HTML(<!doctype html>
 <title>__EASYAI_TITLE__</title>
 <link rel="icon" href="/favicon">
 <style>
+:root {
+  --bg: #0b0d10;
+  --bg-elev: #15191f;
+  --bg-input: #0f1318;
+  --border: #2a313b;
+  --text: #e6edf3;
+  --text-dim: #8b949e;
+  --accent: #1f6feb;
+  --accent-dim: #1f6feb33;
+  --tool: #4fb0ff;
+  --tool-bg: #11212e;
+  --think: #b97df3;
+  --think-bg: #1c142a;
+  --good: #3fb950;
+  --bad: #f85149;
+}
 * { box-sizing: border-box; }
-body { font: 14px/1.45 -apple-system, system-ui, sans-serif; margin:0; background:#0e1117; color:#e6edf3; height:100vh; display:flex; flex-direction:column; }
-header { padding:.6rem 1rem; background:#161b22; border-bottom:1px solid #30363d; display:flex; align-items:center; gap:.6rem; flex-wrap:wrap; }
-header h1 { font-size:1rem; margin:0; font-weight:600; }
-header .pill { font-size:.75rem; color:#8b949e; padding:.15rem .5rem; border:1px solid #30363d; border-radius:99px; }
-header button { background:#21262d; color:#e6edf3; border:1px solid #30363d; border-radius:6px; padding:.3rem .7rem; cursor:pointer; font-size:.85rem; }
-header button:hover { background:#30363d; }
-header button.active { background:#1f6feb; border-color:#1f6feb; color:white; }
-#chat { flex:1; overflow-y:auto; padding:1rem 1.2rem; }
-.msg { margin:0 0 1rem; max-width: 80ch; }
-.msg .who { font-size:.75rem; color:#8b949e; text-transform:uppercase; letter-spacing:.05em; }
-.msg .body { white-space:pre-wrap; word-wrap:break-word; padding:.4rem .6rem; border-radius:8px; background:#161b22; border:1px solid #30363d; margin-top:.2rem; }
-.msg.user .body { background:#0d2a4a; border-color:#1f4a77; }
-.msg.tool .body { background:#1d2818; border-color:#3a532a; font-family: ui-monospace, monospace; font-size:.85rem; }
-form { display:flex; gap:.5rem; padding:.7rem 1rem; background:#161b22; border-top:1px solid #30363d; }
-textarea { flex:1; resize:vertical; min-height:2.4rem; max-height:30vh; padding:.5rem; background:#0e1117; color:#e6edf3; border:1px solid #30363d; border-radius:6px; font:inherit; }
-button.send { background:#1f6feb; color:white; border:0; border-radius:6px; padding:0 1rem; cursor:pointer; font-weight:600; }
-button.send:disabled { opacity:.6; cursor:wait; }
-small.hint { color:#6e7681; padding:0 1rem .5rem; }
+html, body { margin:0; height:100vh; }
+body { font: 14px/1.5 -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif; background:var(--bg); color:var(--text); display:flex; flex-direction:column; }
+header { padding:.6rem 1rem; background:var(--bg-elev); border-bottom:1px solid var(--border); display:flex; align-items:center; gap:.5rem; flex-wrap:wrap; }
+header h1 { font-size:1rem; margin:0; font-weight:600; letter-spacing:.01em; }
+.pill { font-size:.72rem; color:var(--text-dim); padding:.15rem .55rem; border:1px solid var(--border); border-radius:999px; }
+.btn { background:transparent; color:var(--text); border:1px solid var(--border); border-radius:6px; padding:.3rem .65rem; cursor:pointer; font-size:.8rem; transition: background .12s; }
+.btn:hover { background:var(--bg-input); }
+.btn.active { background:var(--accent); border-color:var(--accent); color:#fff; }
+.spacer { flex:1; }
+.label { font-size:.75rem; color:var(--text-dim); margin: 0 .3rem 0 .6rem; }
+
+#chat { flex:1; overflow-y:auto; padding:1rem 0; }
+.msg { max-width: 78ch; margin: 0 auto 1.4rem; padding: 0 1rem; }
+.msg .role { font-size:.7rem; color:var(--text-dim); text-transform:uppercase; letter-spacing:.06em; margin-bottom:.25rem; }
+.msg.user .body { background:#0d2543; border:1px solid #1f4a77; padding:.55rem .8rem; border-radius:8px; white-space: pre-wrap; word-wrap: break-word; }
+.msg.assistant .content { padding:.2rem 0; word-wrap:break-word; overflow-wrap:anywhere; }
+.msg.assistant .content p { margin: .3rem 0; }
+.msg.assistant .content pre { background:var(--bg-input); border:1px solid var(--border); padding:.6rem .8rem; border-radius:6px; overflow-x:auto; font-size:.85em; line-height:1.45; }
+.msg.assistant .content code { background:var(--bg-input); padding:.08rem .35rem; border-radius:3px; font-size:.88em; font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+.msg.assistant .content pre code { background:transparent; padding:0; font-size:1em; }
+.msg.assistant .content a { color:var(--accent); text-decoration:none; }
+.msg.assistant .content a:hover { text-decoration:underline; }
+
+.thinking { border:1px solid var(--think-bg); background:var(--think-bg); border-left:3px solid var(--think); border-radius:6px; margin:.45rem 0; padding:.3rem .6rem; font-size:.85em; color:var(--text-dim); }
+.thinking summary { cursor:pointer; color:var(--think); font-weight:600; outline:none; user-select:none; }
+.thinking summary::marker { color:var(--think); }
+.thinking[open] summary { margin-bottom:.4rem; }
+.thinking .think-body { white-space:pre-wrap; font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size:.82rem; line-height:1.5; max-height:30em; overflow-y:auto; }
+
+.tool-card { border:1px solid var(--tool-bg); background:var(--tool-bg); border-left:3px solid var(--tool); border-radius:6px; margin:.45rem 0; padding:.4rem .6rem; font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size:.8rem; }
+.tool-card.error { border-left-color: var(--bad); background:#22151a; }
+.tool-card .head { display:flex; align-items:baseline; gap:.4rem; flex-wrap:wrap; }
+.tool-card .name { color:var(--tool); font-weight:600; }
+.tool-card.error .name { color:var(--bad); }
+.tool-card .args { color:var(--text-dim); word-break:break-all; }
+.tool-card .result { color:var(--text); margin-top:.3rem; white-space:pre-wrap; max-height:14em; overflow-y:auto; padding-top:.3rem; border-top:1px dashed var(--border); }
+.tool-card .result.pending { color:var(--text-dim); font-style:italic; }
+
+.cursor { display:inline-block; width:.5em; height:1em; background:var(--text); animation: blink 1s steps(1, end) infinite; vertical-align:text-bottom; margin-left:1px; }
+@keyframes blink { 50% { opacity: 0; } }
+
+.stats { font-size:.7rem; color:var(--text-dim); margin-top:.3rem; font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+
+form { display:flex; gap:.5rem; padding:.7rem 1rem; background:var(--bg-elev); border-top:1px solid var(--border); }
+textarea { flex:1; resize:vertical; min-height:2.4rem; max-height:30vh; padding:.5rem .65rem; background:var(--bg-input); color:var(--text); border:1px solid var(--border); border-radius:6px; font:inherit; }
+textarea:focus { outline: 2px solid var(--accent-dim); border-color:var(--accent); }
+.send { background:var(--accent); color:#fff; border:0; border-radius:6px; padding: 0 1.1rem; cursor:pointer; font-weight:600; }
+.send:disabled { opacity:.6; cursor:wait; }
+small.hint { color:#5b626a; padding: 0 1rem .4rem; font-size:.72rem; }
+.error-msg { color: var(--bad); background:#22151a; border:1px solid #6a2a31; border-radius:6px; padding:.4rem .6rem; }
 </style></head>
 <body>
 <header>
   <h1>__EASYAI_TITLE__</h1>
-  <span class="pill" id="model">…</span>
-  <span class="pill" id="backend">…</span>
-  <span class="pill" id="ntools">…</span>
-  <span style="flex:1"></span>
-  <span style="font-size:.8rem;color:#8b949e">preset:</span>
-  <button data-p="deterministic">deterministic</button>
-  <button data-p="precise">precise</button>
-  <button data-p="balanced" class="active">balanced</button>
-  <button data-p="creative">creative</button>
-  <button data-p="wild">wild</button>
-  <button id="reset">reset chat</button>
+  <span class="pill" id="model">loading…</span>
+  <span class="pill" id="backend"></span>
+  <span class="pill" id="ntools"></span>
+  <span class="spacer"></span>
+  <span class="label">preset</span>
+  <button class="btn" data-p="deterministic">deterministic</button>
+  <button class="btn" data-p="precise">precise</button>
+  <button class="btn active" data-p="balanced">balanced</button>
+  <button class="btn" data-p="creative">creative</button>
+  <button class="btn" data-p="wild">wild</button>
+  <button class="btn" id="thinkToggle" title="Toggle visibility of <think> blocks">thinking ◐</button>
+  <button class="btn" id="reset">reset</button>
 </header>
 <div id="chat"></div>
-<small class="hint">Tip — you can also type commands inline: <code>creative 0.9 write me a poem about the moon</code></small>
+<small class="hint">Ctrl/⌘+Enter sends • inline preset works too: <code>creative 0.9 write me a poem about the moon</code></small>
 <form id="f">
-  <textarea id="t" placeholder="Type a message… (Ctrl+Enter to send)"></textarea>
+  <textarea id="t" placeholder="Type a message…" rows="1"></textarea>
   <button class="send" id="send" type="submit">Send</button>
 </form>
 <script>
-const chat = document.getElementById('chat');
-const t = document.getElementById('t');
-const sendBtn = document.getElementById('send');
-let history = [];
+"use strict";
 
-function add(role, body){
+// ============================================================================
+// helpers
+// ============================================================================
+const $ = (sel, root=document) => root.querySelector(sel);
+const $$ = (sel, root=document) => Array.from(root.querySelectorAll(sel));
+const chatEl = $('#chat');
+const ta = $('#t');
+const sendBtn = $('#send');
+
+function escHTML(s){
+  return String(s).replace(/[&<>"']/g, c => ({
+    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+  }[c]));
+}
+
+// Tiny markdown subset: code blocks, inline code, bold, italics, links,
+// auto-link, line breaks. Run on already-escaped HTML, then mark code-block
+// content as "do not touch" before applying inline rules.
+function renderMarkdown(s){
+  if (!s) return '';
+  let html = escHTML(s);
+  const blocks = [];
+  // fenced code blocks: ```lang\n...\n```
+  html = html.replace(/```([a-zA-Z0-9_-]*)\n([\s\S]*?)```/g, (_, lang, code) => {
+    blocks.push(`<pre><code class="lang-${escHTML(lang)}">${code}</code></pre>`);
+    return `\u0001${blocks.length-1}\u0001`;
+  });
+  // inline code (single backticks, no newlines)
+  html = html.replace(/`([^`\n]+)`/g, (_, c) => `<code>${c}</code>`);
+  // bold (**...**) and italics (*...*) — bold first to win the regex race
+  html = html.replace(/\*\*([^\*\n]+?)\*\*/g, '<strong>$1</strong>');
+  html = html.replace(/(^|[^\*])\*([^\*\n]+?)\*(?!\*)/g, '$1<em>$2</em>');
+  // explicit markdown links: [text](url)
+  html = html.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g,
+    (_, t, u) => `<a href="${u}" target="_blank" rel="noopener">${t}</a>`);
+  // auto-link plain http(s)://
+  html = html.replace(/(\bhttps?:\/\/[^\s<]+[^\s<.,;:!?\)])/g,
+    u => `<a href="${u}" target="_blank" rel="noopener">${u}</a>`);
+  // newlines → <br>, then restore code blocks
+  html = html.replace(/\n/g, '<br>');
+  html = html.replace(/\u0001(\d+)\u0001/g, (_, i) => blocks[+i]);
+  return html;
+}
+
+// ============================================================================
+// streaming SSE consumer
+// ============================================================================
+async function streamChat(messages, handlers){
+  const res = await fetch('/v1/chat/completions', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ model:'easyai', messages, stream:true })
+  });
+  if (!res.ok){
+    const txt = await res.text();
+    throw new Error(`HTTP ${res.status}: ${txt.slice(0,400)}`);
+  }
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  while (true){
+    const {value, done} = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, {stream:true});
+    while (true){
+      const idx = buffer.indexOf('\n\n');
+      if (idx === -1) break;
+      const event = buffer.slice(0, idx);
+      buffer = buffer.slice(idx + 2);
+
+      // Parse one SSE event: optional `event:` line + one or more `data:`
+      // lines (concatenated by newline).
+      let evtType = 'message';
+      const dataLines = [];
+      for (let line of event.split('\n')){
+        if (line.startsWith('\r')) line = line.slice(1);
+        if (line.endsWith('\r')) line = line.slice(0, -1);
+        if (line.startsWith('event:')) evtType = line.slice(6).trim();
+        else if (line.startsWith('data:')) dataLines.push(line.slice(5).replace(/^ /,''));
+      }
+      const data = dataLines.join('\n');
+      if (!data) continue;
+      if (data === '[DONE]') return;
+      try {
+        const j = JSON.parse(data);
+        if (evtType === 'easyai.tool_call')   { handlers.onToolCall && handlers.onToolCall(j); continue; }
+        if (evtType === 'easyai.tool_result') { handlers.onToolResult && handlers.onToolResult(j); continue; }
+        // standard OpenAI delta envelope
+        const ch = j?.choices?.[0];
+        if (!ch) continue;
+        if (ch.delta?.content) handlers.onContent && handlers.onContent(ch.delta.content);
+        if (ch.delta?.tool_calls) handlers.onClientToolCalls && handlers.onClientToolCalls(ch.delta.tool_calls);
+        if (ch.finish_reason) handlers.onFinish && handlers.onFinish(ch.finish_reason);
+        if (j.error) throw new Error(j.error.message || 'server error');
+      } catch (e) {
+        console.warn('SSE parse', data, e);
+      }
+    }
+  }
+}
+
+// ============================================================================
+// turn renderer — one assistant message
+// ============================================================================
+class AssistantTurn {
+  constructor(showThinking){
+    this.raw = '';
+    this.tokens = 0;
+    this.startMs = performance.now();
+    this.showThinking = showThinking;
+    this.toolCards = [];
+    this.pendingToolByName = new Map();
+
+    this.el = document.createElement('div');
+    this.el.className = 'msg assistant';
+    this.el.innerHTML = `
+      <div class="role">assistant</div>
+      <div class="content"></div>
+      <div class="stats"></div>`;
+    this.contentEl = $('.content', this.el);
+    this.statsEl   = $('.stats', this.el);
+    chatEl.appendChild(this.el);
+    chatEl.scrollTop = chatEl.scrollHeight;
+  }
+
+  addContent(piece){
+    this.tokens += 1;
+    this.raw += piece;
+    this.render();
+  }
+
+  render(){
+    // Split raw into [thinking blocks..., content with tags removed].
+    let content = this.raw;
+    let thinking = [];
+    let openTag = null;
+    const re = /<think(?:ing)?>([\s\S]*?)(?:<\/think(?:ing)?>|$)/g;
+    let m;
+    let cleaned = '';
+    let last = 0;
+    while ((m = re.exec(this.raw)) !== null){
+      cleaned += this.raw.slice(last, m.index);
+      thinking.push(m[1]);
+      last = m.index + m[0].length;
+    }
+    cleaned += this.raw.slice(last);
+    content = cleaned;
+
+    // (Re)build the thinking block if present.
+    let thinkEl = $(':scope > .thinking', this.el);
+    if (thinking.length){
+      const txt = thinking.join('\n\n— —\n\n');
+      if (!thinkEl){
+        thinkEl = document.createElement('details');
+        thinkEl.className = 'thinking';
+        if (this.showThinking) thinkEl.open = true;
+        thinkEl.innerHTML = '<summary>Thinking</summary><div class="think-body"></div>';
+        // Insert above the content (and above tool cards if any).
+        this.el.insertBefore(thinkEl, this.contentEl);
+      }
+      $('.think-body', thinkEl).textContent = txt;
+    }
+
+    // Render markdown content + a blinking cursor while streaming.
+    this.contentEl.innerHTML = renderMarkdown(content) +
+        (this._done ? '' : '<span class="cursor"></span>');
+    chatEl.scrollTop = chatEl.scrollHeight;
+  }
+
+  // A tool was just dispatched server-side.
+  addToolCall(evt){
+    const card = document.createElement('div');
+    card.className = 'tool-card';
+    let argStr = '';
+    try { argStr = JSON.stringify(JSON.parse(evt.arguments)); }
+    catch { argStr = evt.arguments || ''; }
+    card.innerHTML = `
+      <div class="head">
+        <span class="name"></span>
+        <span class="args"></span>
+      </div>
+      <div class="result pending">…running…</div>`;
+    $('.name', card).textContent = evt.name;
+    $('.args', card).textContent = '(' + argStr + ')';
+    // Insert cards above the live content area, in chronological order.
+    this.el.insertBefore(card, this.contentEl);
+    this.toolCards.push(card);
+    if (!this.pendingToolByName.has(evt.name)) this.pendingToolByName.set(evt.name, []);
+    this.pendingToolByName.get(evt.name).push(card);
+    chatEl.scrollTop = chatEl.scrollHeight;
+  }
+
+  // Pair a tool result with the most-recent unfilled card for that name.
+  addToolResult(evt){
+    const stack = this.pendingToolByName.get(evt.name);
+    if (!stack || !stack.length) return;
+    const card = stack.shift();
+    const resEl = $('.result', card);
+    resEl.classList.remove('pending');
+    resEl.textContent = evt.content || '';
+    if (evt.is_error) card.classList.add('error');
+  }
+
+  // For client-tools mode: a tool_calls array arrived in the OpenAI delta —
+  // render them as informational cards with no result (the upstream client,
+  // e.g. opencode, would dispatch these).
+  addClientToolCalls(tcs){
+    for (const tc of tcs){
+      if (!tc.function) continue;
+      this.addToolCall({
+        name: tc.function.name || '?',
+        arguments: tc.function.arguments || '{}',
+        id: tc.id || ''
+      });
+      const stack = this.pendingToolByName.get(tc.function.name);
+      if (stack && stack.length){
+        const card = stack.shift();
+        const resEl = $('.result', card);
+        resEl.classList.remove('pending');
+        resEl.textContent = '(forwarded to client for execution)';
+        resEl.style.fontStyle = 'italic';
+      }
+    }
+  }
+
+  finish(reason){
+    this._done = true;
+    const elapsed = (performance.now() - this.startMs) / 1000;
+    const tps = this.tokens / Math.max(elapsed, 0.001);
+    this.statsEl.textContent = `${this.tokens} chunks · ${elapsed.toFixed(2)}s · ${tps.toFixed(1)} chunks/s · ${reason}`;
+    this.render();
+  }
+
+  fail(msg){
+    this._done = true;
+    this.contentEl.innerHTML = `<div class="error-msg">⚠︎ ${escHTML(msg)}</div>`;
+  }
+
+  finalText(){
+    // Strip <think>...</think> for sending back to the server in the next turn.
+    return this.raw.replace(/<think(?:ing)?>[\s\S]*?<\/think(?:ing)?>/g, '').trim();
+  }
+}
+
+// ============================================================================
+// app state
+// ============================================================================
+let history = [];
+let showThinking = true;  // expand <think> blocks by default
+
+function addUserMsg(text){
   const m = document.createElement('div');
-  m.className = 'msg ' + role;
-  m.innerHTML = '<div class="who">'+role+'</div><div class="body"></div>';
-  m.querySelector('.body').textContent = body;
-  chat.appendChild(m);
-  chat.scrollTop = chat.scrollHeight;
-  return m;
+  m.className = 'msg user';
+  m.innerHTML = '<div class="role">you</div><div class="body"></div>';
+  $('.body', m).textContent = text;
+  chatEl.appendChild(m);
+  chatEl.scrollTop = chatEl.scrollHeight;
 }
 
 async function send(text){
+  addUserMsg(text);
   history.push({role:'user', content:text});
-  add('user', text);
   sendBtn.disabled = true;
-  const placeholder = add('assistant','…');
+  const turn = new AssistantTurn(showThinking);
   try {
-    const r = await fetch('/v1/chat/completions', {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ model:'easyai', messages:history })
+    await streamChat(history, {
+      onContent:         p => turn.addContent(p),
+      onToolCall:        e => turn.addToolCall(e),
+      onToolResult:      e => turn.addToolResult(e),
+      onClientToolCalls: t => turn.addClientToolCalls(t),
+      onFinish:          r => turn.finish(r),
     });
-    const j = await r.json();
-    if (j.error) throw new Error(j.error.message || JSON.stringify(j.error));
-    const reply = j.choices?.[0]?.message?.content || '';
-    placeholder.querySelector('.body').textContent = reply || '[empty]';
-    history.push({role:'assistant', content:reply});
-    if (j.choices?.[0]?.message?.tool_calls?.length){
-      add('tool', JSON.stringify(j.choices[0].message.tool_calls, null, 2));
-    }
-  } catch(e){
-    placeholder.querySelector('.body').textContent = '⚠︎ ' + e.message;
-    placeholder.classList.add('user');
+    history.push({role:'assistant', content: turn.finalText()});
+  } catch (e) {
+    turn.fail(e.message || String(e));
   } finally {
-    sendBtn.disabled = false; t.focus();
+    sendBtn.disabled = false; ta.focus();
   }
 }
 
-document.getElementById('f').addEventListener('submit', e => {
+// ============================================================================
+// wiring
+// ============================================================================
+$('#f').addEventListener('submit', e => {
   e.preventDefault();
-  const text = t.value.trim();
-  if (!text) return;
-  t.value = '';
+  const text = ta.value.trim();
+  if (!text || sendBtn.disabled) return;
+  ta.value = '';
   send(text);
 });
-t.addEventListener('keydown', e => {
-  if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
-    e.preventDefault(); document.getElementById('f').requestSubmit();
+ta.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)){
+    e.preventDefault();
+    $('#f').requestSubmit();
   }
 });
-document.getElementById('reset').onclick = () => { history = []; chat.innerHTML = ''; };
-document.querySelectorAll('header [data-p]').forEach(b => {
+$('#reset').onclick = () => { history = []; chatEl.innerHTML = ''; };
+$('#thinkToggle').onclick = e => {
+  showThinking = !showThinking;
+  e.target.textContent = showThinking ? 'thinking ◐' : 'thinking ○';
+  // Toggle existing blocks too.
+  $$('details.thinking').forEach(d => d.open = showThinking);
+};
+$$('header [data-p]').forEach(b => {
   b.onclick = async () => {
-    document.querySelectorAll('header [data-p]').forEach(x => x.classList.remove('active'));
+    $$('header [data-p]').forEach(x => x.classList.remove('active'));
     b.classList.add('active');
-    await fetch('/v1/preset', {method:'POST', headers:{'Content-Type':'application/json'},
-                               body: JSON.stringify({preset: b.dataset.p})});
+    try {
+      await fetch('/v1/preset', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({preset: b.dataset.p})
+      });
+    } catch (e) { console.warn(e); }
   };
 });
 
-// pull live status
+// status pills
 fetch('/health').then(r => r.json()).then(j => {
-  document.getElementById('model').textContent   = j.model;
-  document.getElementById('backend').textContent = 'backend: ' + j.backend;
-  document.getElementById('ntools').textContent  = j.tools + ' tools';
+  $('#model').textContent   = j.model || '?';
+  $('#backend').textContent = j.backend ? 'backend: ' + j.backend : '';
+  $('#ntools').textContent  = (j.tools ?? 0) + ' tools';
 }).catch(()=>{});
 </script>
 </body></html>
@@ -398,24 +702,24 @@ struct ServerCtx {
 // ============================================================================
 
 // ---------------------------------------------------------------------------
-// POST /v1/chat/completions
-//
-// Flow:
-//
-//   1. Parse JSON body → extract `messages`, `tools`, sampling overrides.
-//   2. Lock engine.
-//   3. Reset engine to ambient defaults.
-//   4. If body.tools present → swap engine tools for stub-handlers (no
-//      server-side dispatch); otherwise keep default toolbelt.
-//   5. Apply per-request sampling overrides.
-//   6. Replace history with the request's messages.
-//   7. If we own the tools → call engine.chat(<last user content>).  This
-//      runs the multi-hop loop server-side and returns final text.
-//      Else → call engine.generate_one() and forward any tool_calls back.
-//   8. Build OpenAI response and send.
+// Chat-completions request — parsed once, used by both sync and stream paths.
 // ---------------------------------------------------------------------------
-static void route_chat_completions(ServerCtx & ctx, const httplib::Request & req,
-                                   httplib::Response & res) {
+struct ChatRequest {
+    std::vector<std::pair<std::string, std::string>> hist;          // full history
+    std::string                                       last_user;    // peeled-off
+    bool                                              client_tools = false;
+    json                                              tools_blob;   // raw OpenAI tools[]
+    double                                            temp_override  = -1.0;
+    double                                            top_p_override = -1.0;
+    double                                            top_k_override = -1.0;
+    bool                                              stream = false;
+    easyai::PresetResult                              preset_inline; // applied=true if peeled
+};
+
+// Returns false on bad request (and writes the error to `res`).
+static bool parse_chat_request(const httplib::Request & req,
+                               httplib::Response & res,
+                               ChatRequest & out) {
     json body;
     try {
         body = json::parse(req.body);
@@ -423,7 +727,7 @@ static void route_chat_completions(ServerCtx & ctx, const httplib::Request & req
         res.status = 400;
         res.set_content(error_json(std::string("invalid JSON: ") + e.what()),
                         "application/json");
-        return;
+        return false;
     }
 
     if (!body.contains("messages") || !body["messages"].is_array() ||
@@ -431,14 +735,10 @@ static void route_chat_completions(ServerCtx & ctx, const httplib::Request & req
         res.status = 400;
         res.set_content(error_json("'messages' is required and must be a non-empty array"),
                         "application/json");
-        return;
+        return false;
     }
 
-    // Pull out the last user message early — we'll need its content for chat()
-    // once we know whether to run agentically or single-pass.
-    std::vector<std::pair<std::string, std::string>> hist;
-    hist.reserve(body["messages"].size());
-    std::string last_user_content;
+    out.hist.reserve(body["messages"].size());
     bool last_is_user = false;
     for (const auto & m : body["messages"]) {
         std::string role = m.value("role", "user");
@@ -446,51 +746,51 @@ static void route_chat_completions(ServerCtx & ctx, const httplib::Request & req
         if (m.contains("content") && m["content"].is_string()) {
             content = m["content"].get<std::string>();
         } else if (m.contains("content") && m["content"].is_array()) {
-            // OpenAI vision-style content parts → flatten to text.
             for (const auto & part : m["content"]) {
                 if (part.value("type", "") == "text") content += part.value("text", "");
             }
         }
-        hist.emplace_back(role, content);
+        out.hist.emplace_back(role, content);
         last_is_user = (role == "user");
-        if (last_is_user) last_user_content = content;
+        if (last_is_user) out.last_user = content;
     }
-
     if (!last_is_user) {
         res.status = 400;
         res.set_content(error_json("the final message must have role='user'"),
                         "application/json");
-        return;
+        return false;
     }
 
-    const bool client_supplied_tools = body.contains("tools") &&
-                                       body["tools"].is_array() &&
-                                       !body["tools"].empty();
+    out.client_tools = body.contains("tools") && body["tools"].is_array() &&
+                        !body["tools"].empty();
+    if (out.client_tools) out.tools_blob = body["tools"];
 
-    // Optional sampling overrides.  We treat absent / null / wrong-type as
-    // "use server default".
     auto get_num = [&](const char * k, double dflt) -> double {
         if (body.contains(k) && body[k].is_number()) return body[k].get<double>();
         return dflt;
     };
-    const double temp_override  = get_num("temperature", -1.0);
-    const double top_p_override = get_num("top_p",       -1.0);
-    const double top_k_override = get_num("top_k",       -1.0);
+    out.temp_override  = get_num("temperature", -1.0);
+    out.top_p_override = get_num("top_p",       -1.0);
+    out.top_k_override = get_num("top_k",       -1.0);
+    out.stream         = body.value("stream", false);
 
-    ctx.n_requests.fetch_add(1, std::memory_order_relaxed);
+    // Inline preset prefix in the last user message ("creative 0.9 …").
+    out.preset_inline = easyai::parse_preset(out.last_user);
+    if (!out.preset_inline.applied.empty()) {
+        out.last_user = out.last_user.substr(out.preset_inline.consumed);
+        out.hist.back().second = out.last_user;
+    }
+    return true;
+}
 
-    // ===== ENGINE-LOCKED SECTION =========================================
-    std::lock_guard<std::mutex> lock(ctx.engine_mu);
-
-    ctx.reset_engine_defaults();
-
-    // Per-request tools — replace, don't append, so a single rogue request
-    // can't permanently mutate the engine.
-    if (client_supplied_tools) {
+// ---------------------------------------------------------------------------
+// Apply request-level overrides + replace history. Caller already holds
+// engine_mu and has called reset_engine_defaults().
+// ---------------------------------------------------------------------------
+static void prepare_engine_for_request(ServerCtx & ctx, const ChatRequest & req) {
+    if (req.client_tools) {
         ctx.engine.clear_tools();
-        for (const auto & t : body["tools"]) {
-            // Accept the OpenAI shape {"type":"function","function":{name,description,parameters}}
-            // and the raw shape {name,description,parameters}.
+        for (const auto & t : req.tools_blob) {
             const json & f = t.contains("function") ? t["function"] : t;
             std::string name        = f.value("name", "");
             std::string description = f.value("description", "");
@@ -501,53 +801,71 @@ static void route_chat_completions(ServerCtx & ctx, const httplib::Request & req
             ctx.engine.add_tool(make_stub_tool(name, description, params_json));
         }
     }
-
-    // Sampling overrides (only set fields that were provided).
     ctx.engine.set_sampling(
-        temp_override  >= 0 ? (float) temp_override  : -1.0f,
-        top_p_override >= 0 ? (float) top_p_override : -1.0f,
-        top_k_override >= 0 ? (int)   top_k_override : -1,
+        req.temp_override  >= 0 ? (float) req.temp_override  : -1.0f,
+        req.top_p_override >= 0 ? (float) req.top_p_override : -1.0f,
+        req.top_k_override >= 0 ? (int)   req.top_k_override : -1,
         -1.0f);
-
-    // Apply preset commands embedded in the user message ("creative 0.9 …").
-    // Only the LAST user message is inspected — earlier ones are history.
-    {
-        easyai::PresetResult pr = easyai::parse_preset(last_user_content);
-        if (!pr.applied.empty()) {
-            ctx.engine.set_sampling(pr.temperature, pr.top_p, pr.top_k, pr.min_p);
-            // Strip the preset prefix from the last user message — both in
-            // hist (which we'll feed to the engine) and in our local copy.
-            last_user_content = last_user_content.substr(pr.consumed);
-            hist.back().second = last_user_content;
-        }
+    if (!req.preset_inline.applied.empty()) {
+        ctx.engine.set_sampling(req.preset_inline.temperature,
+                                 req.preset_inline.top_p,
+                                 req.preset_inline.top_k,
+                                 req.preset_inline.min_p);
     }
-
-    // Replay history WITHOUT the final user message; we'll feed it via
-    // chat() / generate_one() so the chat() loop can drive tool calls.
     std::vector<std::pair<std::string, std::string>> hist_minus_last(
-        hist.begin(), hist.end() - 1);
+        req.hist.begin(), req.hist.end() - 1);
     ctx.engine.replace_history(hist_minus_last);
+}
 
-    // ===== generation =====================================================
+// ---------------------------------------------------------------------------
+// Strip <think>…</think> blocks (server-side).  Used for the non-streaming
+// reply when --no-think was passed.  The streaming path uses a state-machine
+// version inline so it can act per-token.
+// ---------------------------------------------------------------------------
+static std::string strip_think_blocks(const std::string & content) {
+    if (content.empty()) return content;
+    std::string out;
+    out.reserve(content.size());
+    size_t i = 0;
+    while (i < content.size()) {
+        size_t a = content.find("<think>",    i);
+        size_t b = content.find("<thinking>", i);
+        size_t open = std::min(a == std::string::npos ? std::string::npos : a,
+                               b == std::string::npos ? std::string::npos : b);
+        if (open == std::string::npos) { out.append(content, i, std::string::npos); break; }
+        out.append(content, i, open - i);
+        size_t ca = content.find("</think>",    open);
+        size_t cb = content.find("</thinking>", open);
+        size_t close = std::min(ca == std::string::npos ? std::string::npos : ca,
+                                cb == std::string::npos ? std::string::npos : cb);
+        if (close == std::string::npos) break;
+        size_t close_end = content.find('>', close) + 1;
+        i = close_end;
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// Non-streaming path — kept exactly as before. Caller guarantees ctx.engine_mu
+// is held.
+// ---------------------------------------------------------------------------
+static void handle_chat_sync(ServerCtx & ctx, ChatRequest & req,
+                             httplib::Response & res) {
     std::string content;
     std::vector<std::pair<std::string, std::string>> tool_calls;
     std::vector<std::string> tool_call_ids;
     std::string finish_reason = "stop";
 
     try {
-        if (client_supplied_tools) {
-            // Single-pass: push the user msg, generate one assistant turn,
-            // hand any tool_calls back to the client.
-            ctx.engine.push_message("user", last_user_content);
+        if (req.client_tools) {
+            ctx.engine.push_message("user", req.last_user);
             auto turn = ctx.engine.generate_one();
             content       = std::move(turn.content);
             tool_calls    = std::move(turn.tool_calls);
             tool_call_ids = std::move(turn.tool_call_ids);
             finish_reason = std::move(turn.finish_reason);
         } else {
-            // Agentic: chat() loops until no tool_calls or max hops.
-            content = ctx.engine.chat(last_user_content);
-            finish_reason = "stop";
+            content = ctx.engine.chat(req.last_user);
         }
     } catch (const std::exception & e) {
         ctx.n_errors.fetch_add(1, std::memory_order_relaxed);
@@ -557,38 +875,241 @@ static void route_chat_completions(ServerCtx & ctx, const httplib::Request & req
                         "application/json");
         return;
     }
-
     if (!tool_calls.empty()) ctx.n_tool_calls.fetch_add(tool_calls.size(),
                                                         std::memory_order_relaxed);
-
-    // Optional server-side <think>…</think> stripping (default: keep visible).
-    if (ctx.no_think && !content.empty()) {
-        std::string out;
-        out.reserve(content.size());
-        size_t i = 0;
-        while (i < content.size()) {
-            size_t a = content.find("<think>",     i);
-            size_t b = content.find("<thinking>",  i);
-            size_t open = std::min(a == std::string::npos ? std::string::npos : a,
-                                   b == std::string::npos ? std::string::npos : b);
-            if (open == std::string::npos) { out.append(content, i, std::string::npos); break; }
-            out.append(content, i, open - i);
-            size_t ca = content.find("</think>",    open);
-            size_t cb = content.find("</thinking>", open);
-            size_t close = std::min(ca == std::string::npos ? std::string::npos : ca,
-                                    cb == std::string::npos ? std::string::npos : cb);
-            if (close == std::string::npos) break;  // unterminated → drop tail
-            size_t close_end = content.find('>', close) + 1;
-            i = close_end;
-        }
-        content = std::move(out);
-    }
+    if (ctx.no_think) content = strip_think_blocks(content);
 
     res.status = 200;
     res.set_content(build_chat_response(ctx.model_id, content,
                                          tool_calls, tool_call_ids,
                                          finish_reason),
                      "application/json");
+}
+
+// ---------------------------------------------------------------------------
+// Streaming path (Server-Sent Events).
+//
+// Standard OpenAI delta envelope is emitted for each generated piece:
+//
+//   data: {"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}
+//
+// Plus two custom event types so the embedded webui can render tool activity
+// inline:
+//
+//   event: easyai.tool_call
+//   data: {"name":"web_search","arguments":"{...}","id":"call_1"}
+//
+//   event: easyai.tool_result
+//   data: {"name":"web_search","content":"...","is_error":false}
+//
+// Generic OpenAI clients ignore unknown event types, so this is additive.
+//
+// All engine work happens INSIDE the chunked-content lambda so we can hold
+// the engine mutex from there.  shared_ptr<ChatRequest> keeps the parsed
+// state alive past `route_chat_completions`'s return.
+// ---------------------------------------------------------------------------
+static void handle_chat_stream(ServerCtx & ctx,
+                               std::shared_ptr<ChatRequest> req_state,
+                               httplib::Response & res) {
+    res.set_header("Cache-Control",     "no-cache");
+    res.set_header("X-Accel-Buffering", "no");
+
+    res.set_chunked_content_provider("text/event-stream",
+        [&ctx, req_state](size_t /*offset*/, httplib::DataSink & sink) -> bool {
+            std::lock_guard<std::mutex> lock(ctx.engine_mu);
+
+            ctx.reset_engine_defaults();
+            prepare_engine_for_request(ctx, *req_state);
+
+            // ---- emit helpers --------------------------------------------
+            auto emit_data = [&sink](const std::string & ev) {
+                std::string s = "data: " + ev + "\n\n";
+                sink.write(s.data(), s.size());
+            };
+            auto emit_event = [&sink](const std::string & evt_type, const std::string & ev) {
+                std::string s = "event: " + evt_type + "\ndata: " + ev + "\n\n";
+                sink.write(s.data(), s.size());
+            };
+
+            // ---- streaming <think> stripper (only when ctx.no_think) ----
+            // Mirrors the JS-side state machine: buffer at most one tag's
+            // worth and gate output bytes accordingly.  When stripping is
+            // off we just pass pieces through.
+            struct StripState {
+                bool   enabled  = false;
+                bool   in_think = false;
+                std::string buf;
+                std::string filter(std::string piece) {
+                    if (!enabled) return piece;
+                    // longest tag = "</thinking>" → keep at most 12 trailing chars
+                    constexpr size_t margin = 12;
+                    buf += piece;
+                    std::string out;
+                    for (;;) {
+                        if (in_think) {
+                            size_t p1 = buf.find("</think>");
+                            size_t p2 = buf.find("</thinking>");
+                            size_t end = std::min(p1 == std::string::npos ? std::string::npos : p1,
+                                                  p2 == std::string::npos ? std::string::npos : p2);
+                            if (end == std::string::npos) {
+                                if (buf.size() > margin) buf.erase(0, buf.size() - margin);
+                                return out;
+                            }
+                            size_t close = buf.find('>', end);
+                            if (close == std::string::npos) return out;
+                            buf.erase(0, close + 1);
+                            in_think = false;
+                        } else {
+                            size_t p1 = buf.find("<think>");
+                            size_t p2 = buf.find("<thinking>");
+                            size_t start = std::min(p1 == std::string::npos ? std::string::npos : p1,
+                                                    p2 == std::string::npos ? std::string::npos : p2);
+                            if (start == std::string::npos) {
+                                size_t safe = buf.size() > 10 ? buf.size() - 10 : 0;
+                                if (safe > 0) { out.append(buf, 0, safe); buf.erase(0, safe); }
+                                return out;
+                            }
+                            out.append(buf, 0, start);
+                            size_t close = buf.find('>', start);
+                            if (close == std::string::npos) {
+                                buf.erase(0, start);
+                                return out;
+                            }
+                            buf.erase(0, close + 1);
+                            in_think = true;
+                        }
+                    }
+                }
+                std::string flush() {
+                    std::string out;
+                    if (!enabled || !in_think) out = std::move(buf);
+                    buf.clear(); in_think = false;
+                    return out;
+                }
+            } strip;
+            strip.enabled = ctx.no_think;
+
+            // ---- on_token callback: stream OpenAI-shape deltas ----------
+            ctx.engine.on_token([&](const std::string & piece) {
+                std::string visible = strip.filter(piece);
+                if (visible.empty()) return;
+                ordered_json delta;
+                delta["choices"] = json::array({{
+                    {"index", 0},
+                    {"delta", {{"content", visible}}},
+                    {"finish_reason", nullptr},
+                }});
+                emit_data(delta.dump());
+            });
+
+            // ---- on_tool callback: custom events for the webui ----------
+            ctx.engine.on_tool([&](const easyai::ToolCall & c, const easyai::ToolResult & r) {
+                ctx.n_tool_calls.fetch_add(1, std::memory_order_relaxed);
+                ordered_json call_evt;
+                call_evt["name"]      = c.name;
+                call_evt["arguments"] = c.arguments_json;
+                call_evt["id"]        = c.id;
+                emit_event("easyai.tool_call", call_evt.dump());
+
+                ordered_json res_evt;
+                res_evt["name"]     = c.name;
+                res_evt["content"]  = r.content;
+                res_evt["is_error"] = r.is_error;
+                emit_event("easyai.tool_result", res_evt.dump());
+            });
+
+            // ---- run the engine ----------------------------------------
+            std::string finish_reason = "stop";
+            std::vector<std::pair<std::string, std::string>> tool_calls;
+            std::vector<std::string> tool_call_ids;
+            try {
+                if (req_state->client_tools) {
+                    ctx.engine.push_message("user", req_state->last_user);
+                    auto turn = ctx.engine.generate_one();
+                    tool_calls    = std::move(turn.tool_calls);
+                    tool_call_ids = std::move(turn.tool_call_ids);
+                    finish_reason = turn.tool_calls.empty() ? "stop" : "tool_calls";
+                } else {
+                    ctx.engine.chat(req_state->last_user);
+                }
+            } catch (const std::exception & e) {
+                ctx.n_errors.fetch_add(1, std::memory_order_relaxed);
+                ordered_json err;
+                err["error"] = { {"message", e.what()}, {"type", "internal_error"} };
+                emit_data(err.dump());
+            }
+
+            // Drain whatever the strip state machine was holding.
+            std::string tail = strip.flush();
+            if (!tail.empty()) {
+                ordered_json delta;
+                delta["choices"] = json::array({{
+                    {"index", 0},
+                    {"delta", {{"content", tail}}},
+                    {"finish_reason", nullptr},
+                }});
+                emit_data(delta.dump());
+            }
+
+            // For client-tools mode, emit the assembled tool_calls array as
+            // a single delta so OpenAI clients (and our webui) see them.
+            if (!tool_calls.empty()) {
+                ordered_json tc_arr = json::array();
+                for (size_t i = 0; i < tool_calls.size(); ++i) {
+                    ordered_json tc;
+                    tc["index"]    = (int) i;
+                    tc["id"]       = i < tool_call_ids.size() && !tool_call_ids[i].empty()
+                                         ? tool_call_ids[i]
+                                         : ("call_" + std::to_string(i));
+                    tc["type"]     = "function";
+                    tc["function"] = { {"name", tool_calls[i].first},
+                                       {"arguments", tool_calls[i].second} };
+                    tc_arr.push_back(tc);
+                }
+                ordered_json delta;
+                delta["choices"] = json::array({{
+                    {"index", 0},
+                    {"delta", {{"tool_calls", tc_arr}}},
+                    {"finish_reason", nullptr},
+                }});
+                emit_data(delta.dump());
+            }
+
+            // Final close-out chunk — empty delta + finish_reason.
+            ordered_json done_delta;
+            done_delta["choices"] = json::array({{
+                {"index", 0},
+                {"delta", json::object()},
+                {"finish_reason", finish_reason},
+            }});
+            emit_data(done_delta.dump());
+            emit_data("[DONE]");
+
+            sink.done();
+            return true;
+        });
+}
+
+// ---------------------------------------------------------------------------
+// POST /v1/chat/completions — dispatch to sync or stream path.
+// ---------------------------------------------------------------------------
+static void route_chat_completions(ServerCtx & ctx, const httplib::Request & req,
+                                   httplib::Response & res) {
+    auto state = std::make_shared<ChatRequest>();
+    if (!parse_chat_request(req, res, *state)) return;
+
+    ctx.n_requests.fetch_add(1, std::memory_order_relaxed);
+
+    if (state->stream) {
+        // Streaming path: lock + engine work happen inside the chunked
+        // content provider lambda (which runs after this function returns).
+        handle_chat_stream(ctx, state, res);
+    } else {
+        std::lock_guard<std::mutex> lock(ctx.engine_mu);
+        ctx.reset_engine_defaults();
+        prepare_engine_for_request(ctx, *state);
+        handle_chat_sync(ctx, *state, res);
+    }
 }
 
 // ---------------------------------------------------------------------------
