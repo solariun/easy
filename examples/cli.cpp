@@ -796,13 +796,21 @@ int main(int argc, char ** argv) {
     // greetings (a noticeable problem with 0.5B-3B GGUFs).
     static constexpr char kBuiltinSystem[] =
         "You are a helpful, concise assistant.\n"
-        "Answer directly when you can — for greetings, chitchat, basic facts, "
-        "math, and anything in your training data, just respond.\n"
-        "Use a tool ONLY when the request truly needs one:\n"
-        "  - up-to-date / time-sensitive info → web_search, then web_fetch\n"
-        "  - the current date/time            → datetime\n"
-        "  - reading or listing files         → fs_read_file / fs_list_dir / fs_glob / fs_grep\n"
-        "Never call a tool just to look busy.  When you do call one, cite the result.";
+        "Answer directly for greetings, chitchat, math, and anything you "
+        "already know — do NOT call a tool for those.\n"
+        "Use a tool only when the request truly needs one:\n"
+        "  - up-to-date / 'today' / 'latest' info → web_search, THEN web_fetch\n"
+        "  - the current date/time                → datetime\n"
+        "  - reading / listing files              → fs_read_file / fs_list_dir / fs_glob / fs_grep\n"
+        "\n"
+        "CRITICAL rules for web work:\n"
+        " 1. web_search returns titles + short snippets only. The snippets are "
+        "    NOT enough to summarize from. After every web_search you MUST call "
+        "    web_fetch on the top 1-3 most relevant URLs to read actual content.\n"
+        " 2. Two web_search calls in a row is wrong. Search ONCE, then fetch.\n"
+        " 3. When you summarize an article, base it on fetched body text, "
+        "    not the search snippet, and cite the URL.\n"
+        " 4. If a fetch fails, try the next URL — don't fall back to snippets.";
 
     std::string system_prompt = args.system_inline;
     if (system_prompt.empty() && !args.system_path.empty()) {

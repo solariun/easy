@@ -251,8 +251,12 @@ Tool datetime() {
 // ============================================================================
 Tool web_fetch() {
     return Tool::builder("web_fetch")
-        .describe("Fetch a URL and return its text content (HTML stripped). "
-                  "Use for reading web pages.")
+        .describe("Fetch a URL and return its text content (HTML stripped, "
+                  "trimmed to ~16 KB). This is the ONLY way to read a web "
+                  "page's actual content — web_search returns titles and "
+                  "short snippets, not the page body. Always call this after "
+                  "web_search when the user wants the contents of an article, "
+                  "documentation page, or news story.")
         .param("url",     "string", "Fully-qualified http(s) URL to fetch", true)
         .param("as_html", "boolean","If true, return raw HTML instead of stripped text", false)
         .handle([](const ToolCall & c) {
@@ -296,8 +300,11 @@ Tool web_fetch() {
 Tool web_search() {
     return Tool::builder("web_search")
         .describe("Search the web (DuckDuckGo). Returns a numbered list of "
-                  "title / url / snippet results. Pair with web_fetch to read "
-                  "any of the returned URLs.")
+                  "title / url / snippet results. The snippets are 1-2 short "
+                  "sentences only — NEVER summarize a topic from them alone. "
+                  "After this call, you MUST call web_fetch on the top 1-3 "
+                  "most relevant URLs from the result list to read the actual "
+                  "page content, then base your answer on the fetched text.")
         .param("query",       "string",  "Search query", true)
         .param("max_results", "integer", "Maximum results to return "
                                          "(default 5, max 20)", false)
