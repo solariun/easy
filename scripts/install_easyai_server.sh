@@ -493,9 +493,16 @@ case "$do_swap" in
         fi
         ;;
     tune)
-        log "keeping swap, setting swappiness=1"
-        echo 1 | sudo tee /proc/sys/vm/swappiness >/dev/null || true
-        sudo install -Dm644 /dev/stdin /etc/sysctl.d/60-easyai-swap.conf <<<"vm.swappiness=1"
+        log "keeping swap, setting swappiness=1, vfs_cache_pressure=50"
+        echo 1  | sudo tee /proc/sys/vm/swappiness        >/dev/null || true
+        echo 50 | sudo tee /proc/sys/vm/vfs_cache_pressure >/dev/null || true
+        sudo tee /etc/sysctl.d/60-easyai-swap.conf >/dev/null <<'EOF'
+# easyai: keep swap as a safety net but make the kernel almost never use it,
+# and don't aggressively reclaim VFS caches (large GGUFs benefit from it).
+vm.swappiness = 1
+vm.vfs_cache_pressure = 50
+EOF
+        sudo sysctl --system 2>&1 | grep -E 'swappiness|cache_pressure' | sed 's/^/    /'
         ;;
     "")
         log "leaving swap untouched"
@@ -587,6 +594,7 @@ if [[ $do_service -eq 1 ]]; then
     sudo tee "/etc/systemd/system/$service_name" >/dev/null <<UNIT
 [Unit]
 Description=easyai OpenAI-compatible LLM server
+Documentation=https://github.com/solariun/easy
 After=network-online.target
 Wants=network-online.target
 
@@ -595,8 +603,25 @@ Type=simple
 User=$service_user
 Group=$service_group
 WorkingDirectory=$service_home
-# Mesa RADV graphics-pipeline-library: ~10-15% faster inference on RDNA2 iGPUs
-# (Radeon 680M etc.). Harmless on other backends.
+
+# Render / video groups give the service access to /dev/dri/* (GPU). The
+# usermod step above adds them to the user, but baking them into the unit
+# means they apply even if the user gets recreated.
+SupplementaryGroups=render video
+
+# Make the service much less likely to be picked by the OOM killer when
+# RAM gets tight (model + KV + activations dominate the box's footprint).
+OOMScoreAdjust=-700
+
+# Run the inference loop at SCHED_FIFO priority — the original
+# install_llama_server.sh used this for steady token throughput on the
+# 680M iGPU.  Requires "RestrictRealtime=no" (default) and an unbounded
+# rt budget on modern systemd, which is the kernel default.
+CPUSchedulingPolicy=fifo
+CPUSchedulingPriority=50
+
+# Mesa RADV graphics-pipeline-library: ~10-15% faster inference on RDNA2
+# iGPUs (Radeon 680M, 780M, …). Harmless on other backends.
 Environment=RADV_PERFTEST=gpl
 Environment=HOME=$service_home
 Environment=XDG_CACHE_HOME=$service_home/cache
@@ -604,8 +629,10 @@ $( [[ -f "$api_key_file" ]] && echo "Environment=\"EASYAI_API_KEY_FILE=$api_key_
 $( [[ -f "$api_key_file" ]] && echo "ExecStartPre=/bin/sh -c 'test -r \"$api_key_file\"'" )
 ExecStart=/bin/sh -c '$( [[ -f "$api_key_file" ]] && echo "EASYAI_API_KEY=\$(cat $api_key_file) " )exec $install_prefix/bin/easyai-server$arg_string'
 Restart=on-failure
-RestartSec=3
+RestartSec=10
 KillSignal=SIGINT
+# Loading a 30B+ GGUF over a slow disk can take a minute; don't time out.
+TimeoutStartSec=0
 TimeoutStopSec=20
 
 # hardening
@@ -618,7 +645,6 @@ ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
 LockPersonality=yes
-RestrictRealtime=yes
 RestrictSUIDSGID=yes
 LimitMEMLOCK=infinity
 LimitNOFILE=1048576
