@@ -430,22 +430,57 @@ if [[ $do_build -eq 1 ]]; then
     sudo install -Dm755 "$easyai_dir/build/easyai-chat"   "$install_prefix/bin/easyai-chat"  || true
     # libeasyai.so + dynamically-loaded llama / ggml libs.
     #
+    # We install everything into an ISOLATED directory ($prefix/lib/easyai)
+    # rather than dumping into $prefix/lib.  Two wins:
+    #   1. No risk of clobbering / being clobbered by another package's
+    #      libllama / libggml install on the same box.
+    #   2. The runtime loader doesn't need ldconfig to find them — the
+    #      systemd unit sets LD_LIBRARY_PATH explicitly, so a fresh install
+    #      works even before any cache refresh.
+    #
     # llama.cpp's targets land under several subdirs of build/_deps/llama.cpp/
-    # (src/, common/, ggml/src/, ggml/src/ggml-*/) and use versioned SONAMEs
+    # (src/, common/, ggml/src/, ggml/src/ggml-*/) with versioned SONAMEs
     # like libllama.so.0.  We need ALL of them — both the bare *.so symlinks
-    # and the actual *.so.N files they point at — so the runtime loader can
-    # resolve everything libeasyai.so depends on.
-    sudo install -Dm644 "$easyai_dir/build/libeasyai.so" "$install_prefix/lib/libeasyai.so" || true
+    # and the actual *.so.N files they point at.  cp -P preserves the
+    # symlink chain so libllama.so → libllama.so.0 → libllama.so.0.10.0
+    # all land alongside each other.
+    LIB_DEST="$install_prefix/lib/easyai"
+    log "installing shared libs to $LIB_DEST"
+    sudo install -d -m755 "$LIB_DEST"
+    sudo install -Dm644 "$easyai_dir/build/libeasyai.so" "$LIB_DEST/libeasyai.so" || true
+
+    copied=0
     while IFS= read -r so; do
         [[ -f "$so" || -L "$so" ]] || continue
-        # `cp -P` preserves the symlink chain so libllama.so → libllama.so.0
-        # → libllama.so.0.10.0 all land alongside each other.
-        sudo cp -Pf "$so" "$install_prefix/lib/$(basename "$so")"
+        sudo cp -Pf "$so" "$LIB_DEST/$(basename "$so")"
+        copied=$((copied+1))
     done < <(find "$easyai_dir/build" \
                   \( -name 'libllama*.so*' -o -name 'libggml*.so*' \
                   -o -name 'libllama-common*.so*' -o -name 'libllava*.so*' \
                   -o -name 'libcpp-httplib*.so*' \) -print 2>/dev/null)
-    sudo ldconfig || true
+    log "copied $copied shared library entries"
+
+    # Sanity: every SONAME the binary needs must resolve under $LIB_DEST.
+    # Print any missing ones now, before the systemd unit tries (and fails)
+    # to start the service.
+    if command -v ldd >/dev/null 2>&1; then
+        missing=$(LD_LIBRARY_PATH="$LIB_DEST" ldd "$install_prefix/bin/easyai-server" 2>/dev/null \
+                  | awk '/=> not found/ {print $1}')
+        if [[ -n "$missing" ]]; then
+            warn "the following SONAMEs the binary needs are MISSING from $LIB_DEST:"
+            echo "$missing" | sed 's/^/    /' >&2
+            warn "the service will refuse to start until these are present"
+        fi
+    fi
+
+    # ldconfig is no longer load-bearing (we use LD_LIBRARY_PATH on the
+    # unit), but refresh it anyway so easyai-server invoked outside the
+    # service still finds the libs if /etc/ld.so.conf.d ever picks up
+    # $LIB_DEST.
+    if [[ -d /etc/ld.so.conf.d ]]; then
+        echo "$LIB_DEST" | sudo tee /etc/ld.so.conf.d/easyai.conf >/dev/null
+        sudo ldconfig || true
+    fi
 
     if [[ $do_presets -eq 1 ]]; then
         log "installing easyai-cli as 'ai' shortcut → $install_prefix/bin/ai"
@@ -672,6 +707,10 @@ CPUSchedulingPriority=50
 Environment=RADV_PERFTEST=gpl
 Environment=HOME=$service_home
 Environment=XDG_CACHE_HOME=$service_home/cache
+# Where libllama / libggml / libeasyai live — kept out of /usr/lib so we
+# never collide with another package's install.
+Environment=LD_LIBRARY_PATH=$install_prefix/lib/easyai
+ExecStartPre=/bin/sh -c 'test -f $install_prefix/lib/easyai/libllama-common.so.0 || (echo "missing $install_prefix/lib/easyai/libllama-common.so.0 — re-run install_easyai_server.sh --upgrade" >&2; exit 1)'
 $( [[ -f "$api_key_file" ]] && echo "Environment=\"EASYAI_API_KEY_FILE=$api_key_file\"" )
 $( [[ -f "$api_key_file" ]] && echo "ExecStartPre=/bin/sh -c 'test -r \"$api_key_file\"'" )
 ExecStart=/bin/sh -c '$( [[ -f "$api_key_file" ]] && echo "EASYAI_API_KEY=\$(cat $api_key_file) " )exec $install_prefix/bin/easyai-server$arg_string'
