@@ -2465,24 +2465,33 @@ int main(int argc, char ** argv) {
                 "}"
               "})();</script>";
 
-            // ----- floating status panel (tone dropdown + live activity) ---
-            // Mounted inside a Shadow DOM attached to <html> so Svelte's
-            // body re-renders cannot wipe it and page CSS can't override
-            // it.  Single element shows generation phase + tone selector +
-            // post-completion stats (tokens, seconds, t/s).
+            // ----- two floating panels in Shadow DOM ------------------------
+            //   Status pill   — centred just above the input bar (so it
+            //                   visually sits right below the last assistant
+            //                   response). Shows the live generation phase
+            //                   and post-completion stats.
+            //   Tone chip     — bottom-left, near the model name on the
+            //                   input row. Picks the named sampling profile
+            //                   the fetch interceptor injects on every
+            //                   /v1/chat/completions request.
+            // Both are mounted inside Shadow DOM attached to <html> so the
+            // Svelte body subtree can't wipe them.
             inj <<
               "<script>(()=>{"
-                "const HOST_ID='__easyaiPillHost';"
-                "let pillRoot=null;"
-                "const ensureHost=()=>{"
-                  "let h=document.getElementById(HOST_ID);"
-                  "if(h&&pillRoot)return pillRoot;"
+
+                // --- status pill ---------------------------------------
+                "const STATUS_ID='__easyaiStatusHost';"
+                "let statusRoot=null;"
+                "const ensureStatus=()=>{"
+                  "let h=document.getElementById(STATUS_ID);"
+                  "if(h&&statusRoot)return statusRoot;"
                   "if(!document.documentElement)return null;"
                   "h=document.createElement('div');"
-                  "h.id=HOST_ID;"
+                  "h.id=STATUS_ID;"
                   "h.setAttribute('aria-hidden','false');"
                   "h.style.cssText="
-                    "'all:initial;position:fixed;bottom:0;right:0;'+"
+                    "'all:initial;position:fixed;bottom:5.2rem;'+"
+                    "'left:50%;transform:translateX(-50%);'+"
                     "'z-index:2147483647;pointer-events:none;'+"
                     "'font:14px/1 -apple-system,system-ui,sans-serif;';"
                   "document.documentElement.appendChild(h);"
@@ -2491,7 +2500,7 @@ int main(int argc, char ** argv) {
                     "'<style>"
                       ":host,*{box-sizing:border-box}"
                       ".pill{pointer-events:auto;display:inline-flex;"
-                        "align-items:center;gap:.5rem;margin:.65rem .9rem;"
+                        "align-items:center;gap:.5rem;"
                         "background:rgba(15,19,24,.94);"
                         "border:1px solid #2a313b;border-radius:999px;"
                         "padding:.3rem .8rem;color:#8b949e;"
@@ -2506,17 +2515,54 @@ int main(int argc, char ** argv) {
                       ".dot.error{background:#f85149}"
                       ".label{color:#e6edf3}"
                       ".stats{color:#8b949e;font-family:ui-monospace,monospace;font-size:.7rem}"
-                      ".sep{color:#3a414b}"
-                      "select{background:transparent;color:#e6edf3;border:0;"
-                        "font:inherit;cursor:pointer;outline:none;padding:0 .15rem}"
-                      "select option{background:#15191f;color:#e6edf3}"
+                      ".sep{color:#3a414b;display:none}"
+                      ".stats:not(:empty)+.sep{display:inline}"
                       "@keyframes p{0%,100%{opacity:1}50%{opacity:.35}}"
                     "</style>'+"
                     "'<div class=\"pill\">"
                       "<span class=\"dot\"></span>"
                       "<span class=\"label\">idle</span>"
-                      "<span class=\"stats\"></span>"
                       "<span class=\"sep\">·</span>"
+                      "<span class=\"stats\"></span>"
+                    "</div>';"
+                  "statusRoot=root;"
+                  "return root;"
+                "};"
+
+                // --- tone chip -----------------------------------------
+                "const TONE_ID='__easyaiToneHost';"
+                "let toneRoot=null;"
+                "const ensureTone=()=>{"
+                  "let h=document.getElementById(TONE_ID);"
+                  "if(h&&toneRoot)return toneRoot;"
+                  "if(!document.documentElement)return null;"
+                  "h=document.createElement('div');"
+                  "h.id=TONE_ID;"
+                  "h.setAttribute('aria-hidden','false');"
+                  // Bottom-left, on the input row, just left of where the
+                  // bundle paints the model-name badge.
+                  "h.style.cssText="
+                    "'all:initial;position:fixed;bottom:1rem;left:1rem;'+"
+                    "'z-index:2147483647;pointer-events:none;'+"
+                    "'font:14px/1 -apple-system,system-ui,sans-serif;';"
+                  "document.documentElement.appendChild(h);"
+                  "const root=h.attachShadow({mode:'open'});"
+                  "root.innerHTML="
+                    "'<style>"
+                      ":host,*{box-sizing:border-box}"
+                      ".chip{pointer-events:auto;display:inline-flex;"
+                        "align-items:center;gap:.4rem;"
+                        "background:rgba(15,19,24,.94);"
+                        "border:1px solid #2a313b;border-radius:999px;"
+                        "padding:.25rem .65rem;color:#8b949e;"
+                        "font:.78rem -apple-system,system-ui,sans-serif;"
+                        "backdrop-filter:blur(6px);"
+                        "box-shadow:0 2px 12px rgba(0,0,0,.35);}"
+                      "select{background:transparent;color:#e6edf3;border:0;"
+                        "font:inherit;cursor:pointer;outline:none;padding:0 .15rem}"
+                      "select option{background:#15191f;color:#e6edf3}"
+                    "</style>'+"
+                    "'<div class=\"chip\">"
                       "<span>tone</span>"
                       "<select>"
                         "<option value=\"deterministic\">deterministic</option>"
@@ -2531,18 +2577,21 @@ int main(int argc, char ** argv) {
                     "window.__easyaiTone=sel.value;"
                     "try{localStorage.setItem('easyai-tone',sel.value);}catch(e){}"
                   "};"
-                  "pillRoot=root;"
+                  "toneRoot=root;"
                   "return root;"
                 "};"
-                "if(document.documentElement)ensureHost();"
-                "document.addEventListener('DOMContentLoaded',ensureHost);"
+
+                "const ensureBoth=()=>{ensureStatus();ensureTone();};"
+                "if(document.documentElement)ensureBoth();"
+                "document.addEventListener('DOMContentLoaded',ensureBoth);"
                 "setInterval(()=>{"
-                  "if(!document.getElementById(HOST_ID)){pillRoot=null;ensureHost();}"
+                  "if(!document.getElementById(STATUS_ID)){statusRoot=null;ensureStatus();}"
+                  "if(!document.getElementById(TONE_ID)){toneRoot=null;ensureTone();}"
                 "},1000);"
 
-                // Public helper: set the pill's activity state.
+                // Public helper: set the status pill's activity state.
                 "window.__easyaiSetStatus=(state,extra)=>{"
-                  "const r=ensureHost();if(!r)return;"
+                  "const r=ensureStatus();if(!r)return;"
                   "const dot=r.querySelector('.dot');"
                   "const lab=r.querySelector('.label');"
                   "const sta=r.querySelector('.stats');"
