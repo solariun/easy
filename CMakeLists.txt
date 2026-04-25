@@ -1,0 +1,82 @@
+cmake_minimum_required(VERSION 3.18)
+project(easyai CXX C)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+option(EASYAI_BUILD_EXAMPLES "Build easyai example agents"   ON)
+option(EASYAI_WITH_CURL      "Build web_fetch / web_search"  ON)
+
+# ------------------------------------------------------------------ llama.cpp
+# Pulled in as a sibling directory; we disable its own apps so the build
+# is fast and we only get the libraries we need.
+set(LLAMA_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
+set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(LLAMA_BUILD_TOOLS    OFF CACHE BOOL "" FORCE)
+set(LLAMA_BUILD_SERVER   OFF CACHE BOOL "" FORCE)
+set(LLAMA_CURL           OFF CACHE BOOL "" FORCE)
+# We DO need the `common` static library — it provides chat templates,
+# tool-call parsing and the high-level sampler used by easyai.
+set(LLAMA_BUILD_COMMON   ON  CACHE BOOL "" FORCE)
+
+# GPU backends — auto-enable per platform, user can override via -D...=OFF.
+if (APPLE)
+    set(GGML_METAL              ON  CACHE BOOL "" FORCE)
+    set(GGML_METAL_EMBED_LIBRARY ON CACHE BOOL "" FORCE)
+endif()
+option(GGML_VULKAN "ggml: enable Vulkan backend" OFF)
+
+if (NOT TARGET llama)
+    add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../llama.cpp
+                     ${CMAKE_BINARY_DIR}/_deps/llama.cpp
+                     EXCLUDE_FROM_ALL)
+endif()
+
+# ------------------------------------------------------------------ easyai lib
+set(EASYAI_SOURCES
+    src/engine.cpp
+    src/tool.cpp
+    src/builtin_tools.cpp
+    src/presets.cpp
+)
+
+add_library(easyai ${EASYAI_SOURCES})
+target_include_directories(easyai
+    PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/include
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(easyai PUBLIC  llama
+                              PRIVATE llama-common)
+target_compile_features(easyai PUBLIC cxx_std_17)
+
+if (EASYAI_WITH_CURL)
+    find_package(CURL QUIET)
+    if (CURL_FOUND)
+        target_link_libraries(easyai PRIVATE CURL::libcurl)
+        target_compile_definitions(easyai PRIVATE EASYAI_HAVE_CURL=1)
+        message(STATUS "easyai: libcurl found — web_fetch / web_search enabled")
+    else()
+        message(WARNING "easyai: libcurl not found — web tools will return errors at runtime")
+    endif()
+endif()
+
+# ------------------------------------------------------------------ examples
+if (EASYAI_BUILD_EXAMPLES)
+    add_executable(easyai-chat examples/chat.cpp)
+    target_link_libraries(easyai-chat PRIVATE easyai)
+
+    add_executable(easyai-agent examples/agent.cpp)
+    target_link_libraries(easyai-agent PRIVATE easyai)
+
+    add_executable(easyai-cli examples/cli.cpp)
+    target_link_libraries(easyai-cli PRIVATE easyai)
+
+    add_executable(easyai-server examples/server.cpp)
+    target_link_libraries(easyai-server PRIVATE easyai cpp-httplib)
+    # cpp-httplib's include dir isn't PUBLIC-exported; reach in directly.
+    target_include_directories(easyai-server PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../llama.cpp/vendor/cpp-httplib
+        ${CMAKE_CURRENT_SOURCE_DIR}/../llama.cpp/vendor)
+endif()

@@ -1,0 +1,10 @@
+build/
+build-*/
+models/*.gguf
+*.o
+*.dylib
+*.so
+*.a
+.cache/
+.DS_Store
+compile_commands.json
