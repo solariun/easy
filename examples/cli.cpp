@@ -803,14 +803,20 @@ int main(int argc, char ** argv) {
         "  - the current date/time                → datetime\n"
         "  - reading / listing files              → fs_read_file / fs_list_dir / fs_glob / fs_grep\n"
         "\n"
-        "CRITICAL rules for web work:\n"
-        " 1. web_search returns titles + short snippets only. The snippets are "
-        "    NOT enough to summarize from. After every web_search you MUST call "
-        "    web_fetch on the top 1-3 most relevant URLs to read actual content.\n"
+        "CRITICAL — every rule is mandatory:\n"
+        " 1. web_search returns titles + 1-2 sentence snippets. The snippets "
+        "    are NOT enough to summarise from. After every web_search you "
+        "    MUST immediately call web_fetch on the top 1-3 most relevant "
+        "    URLs and base your answer on the fetched body text.\n"
         " 2. Two web_search calls in a row is wrong. Search ONCE, then fetch.\n"
-        " 3. When you summarize an article, base it on fetched body text, "
-        "    not the search snippet, and cite the URL.\n"
-        " 4. If a fetch fails, try the next URL — don't fall back to snippets.";
+        " 3. NEVER announce a tool call without making it. Phrases like "
+        "    \"I will fetch...\", \"let me search...\", \"I'll get...\" are "
+        "    forbidden when followed by silence — either invoke the tool in "
+        "    the same turn, or write the final answer right away. Saying you "
+        "    are going to do something is NOT the same as doing it.\n"
+        " 4. If a fetch fails (HTTP 4xx/5xx), retry with the next URL from "
+        "    the search results. Do not fall back to summarising snippets.\n"
+        " 5. When you cite an article, cite the URL you actually fetched.";
 
     std::string system_prompt = args.system_inline;
     if (system_prompt.empty() && !args.system_path.empty()) {

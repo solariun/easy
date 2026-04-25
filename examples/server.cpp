@@ -2176,14 +2176,20 @@ int main(int argc, char ** argv) {
         "  - the current date/time                → datetime\n"
         "  - reading / listing files              → fs_read_file / fs_list_dir / fs_glob / fs_grep\n"
         "\n"
-        "CRITICAL rules for web work:\n"
-        " 1. web_search returns titles + short snippets only. The snippets are "
-        "    NOT enough to summarize from. After every web_search you MUST call "
-        "    web_fetch on the top 1-3 most relevant URLs to read actual content.\n"
+        "CRITICAL — every rule is mandatory:\n"
+        " 1. web_search returns titles + 1-2 sentence snippets. The snippets "
+        "    are NOT enough to summarise from. After every web_search you "
+        "    MUST immediately call web_fetch on the top 1-3 most relevant "
+        "    URLs and base your answer on the fetched body text.\n"
         " 2. Two web_search calls in a row is wrong. Search ONCE, then fetch.\n"
-        " 3. When you summarize an article, base it on fetched body text, "
-        "    not the search snippet, and cite the URL.\n"
-        " 4. If a fetch fails, try the next URL — don't fall back to snippets.";
+        " 3. NEVER announce a tool call without making it. Phrases like "
+        "    \"I will fetch...\", \"let me search...\", \"I'll get...\" are "
+        "    forbidden when followed by silence — either invoke the tool in "
+        "    the same turn, or write the final answer right away. Saying you "
+        "    are going to do something is NOT the same as doing it.\n"
+        " 4. If a fetch fails (HTTP 4xx/5xx), retry with the next URL from "
+        "    the search results. Do not fall back to summarising snippets.\n"
+        " 5. When you cite an article, cite the URL you actually fetched.";
 
     std::string default_system = args.system_inline;
     if (default_system.empty() && !args.system_path.empty()) {
@@ -2429,21 +2435,11 @@ int main(int argc, char ** argv) {
                 "Initializing connection to " + title + " server…");
             js = str_replace_all(js, "} - llama.cpp", "} - " + title);
 
-            // Sidebar / topbar brand markup.  When the operator gave us a
-            // --webui-icon we splice an <img> in front of the title text.
-            // The bundle uses single-quoted JS strings for these fragments,
-            // so embedded double-quotes in the HTML attribute don't need
-            // to be escaped.
-            std::string brand_h1;
-            if (!args.webui_icon.empty()) {
-                brand_h1 = "><img src=\"/favicon\" alt=\"\" "
-                           "style=\"display:inline-block;width:1.05em;height:1.05em;"
-                           "vertical-align:-2px;margin-right:.4em;border-radius:4px\">"
-                         + title + "</h1>";
-            } else {
-                brand_h1 = ">" + title + "</h1>";
-            }
-            js = str_replace_all(js, ">llama.cpp</h1>", brand_h1);
+            // Sidebar / topbar brand markup.  Just the text — the favicon
+            // stays on the browser tab via the <link rel="icon"> in the
+            // index.html injection, but inline next to the title was
+            // rendering as a broken-image glyph in some browsers.
+            js = str_replace_all(js, ">llama.cpp</h1>", ">" + title + "</h1>");
 
             // Input placeholder.
             if (!args.webui_placeholder.empty()) {
