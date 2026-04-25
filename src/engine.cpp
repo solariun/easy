@@ -548,7 +548,11 @@ bool Engine::load() {
         bool any = false;
         for (int i = 0; i < n_dev; ++i) {
             ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-            if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            // Anything that's not the bare CPU device counts as an offload
+            // backend (GPU, ACCEL, IPU, etc.). RADV+Vulkan in particular
+            // sometimes reports GPU as ACCEL, which the strict GPU filter
+            // missed and made the banner say "CPU" even when offloading.
+            if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
                 if (any) s << ", ";
                 s << ggml_backend_dev_name(dev);
                 any = true;

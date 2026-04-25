@@ -1623,6 +1623,17 @@ static void handle_chat_stream(ServerCtx & ctx,
                 std::string s = "event: " + evt_type + "\ndata: " + ev + "\n\n";
                 sink.write(s.data(), s.size());
             };
+            // Dump JSON tolerantly: a multi-byte UTF-8 character can split
+            // across two model tokens (one piece ends with the lead byte,
+            // the next starts with the continuation byte 0x80-0xBF), and
+            // strict-mode dump throws on an isolated continuation byte
+            // ("invalid UTF-8 byte at index 0: 0x8B"), aborting the
+            // service.  ::replace substitutes a U+FFFD glyph for invalid
+            // bytes and keeps the stream alive.
+            auto safe_dump = [](const ordered_json & j) {
+                return j.dump(-1, ' ', false,
+                              ordered_json::error_handler_t::replace);
+            };
 
             // ---- streaming tag stripper --------------------------------
             // Always suppresses <tool_call>…</tool_call> blocks — those are
@@ -1720,7 +1731,7 @@ static void handle_chat_stream(ServerCtx & ctx,
                     {"delta", {{"content", visible}}},
                     {"finish_reason", nullptr},
                 }});
-                emit_data(delta.dump());
+                emit_data(safe_dump(delta));
             });
 
             // ---- on_tool callback: emit BOTH custom events and an inline
@@ -1737,13 +1748,13 @@ static void handle_chat_stream(ServerCtx & ctx,
                 call_evt["name"]      = c.name;
                 call_evt["arguments"] = c.arguments_json;
                 call_evt["id"]        = c.id;
-                emit_event("easyai.tool_call", call_evt.dump());
+                emit_event("easyai.tool_call", safe_dump(call_evt));
 
                 ordered_json res_evt;
                 res_evt["name"]     = c.name;
                 res_evt["content"]  = r.content;
                 res_evt["is_error"] = r.is_error;
-                emit_event("easyai.tool_result", res_evt.dump());
+                emit_event("easyai.tool_result", safe_dump(res_evt));
 
                 // Minimal inline indicator: a single italicised line so
                 // the user sees something happened, without the full body
@@ -1765,7 +1776,7 @@ static void handle_chat_stream(ServerCtx & ctx,
                     {"delta", {{"content", md.str()}}},
                     {"finish_reason", nullptr},
                 }});
-                emit_data(delta.dump());
+                emit_data(safe_dump(delta));
             });
 
             // ---- run the engine ----------------------------------------
@@ -1786,7 +1797,7 @@ static void handle_chat_stream(ServerCtx & ctx,
                 ctx.n_errors.fetch_add(1, std::memory_order_relaxed);
                 ordered_json err;
                 err["error"] = { {"message", e.what()}, {"type", "internal_error"} };
-                emit_data(err.dump());
+                emit_data(safe_dump(err));
             }
 
             // Drain whatever the strip state machine was holding.
@@ -1798,7 +1809,7 @@ static void handle_chat_stream(ServerCtx & ctx,
                     {"delta", {{"content", tail}}},
                     {"finish_reason", nullptr},
                 }});
-                emit_data(delta.dump());
+                emit_data(safe_dump(delta));
             }
 
             // For client-tools mode, emit the assembled tool_calls array as
@@ -1822,7 +1833,7 @@ static void handle_chat_stream(ServerCtx & ctx,
                     {"delta", {{"tool_calls", tc_arr}}},
                     {"finish_reason", nullptr},
                 }});
-                emit_data(delta.dump());
+                emit_data(safe_dump(delta));
             }
 
             // Final close-out chunk — empty delta + finish_reason + the
@@ -1860,7 +1871,7 @@ static void handle_chat_stream(ServerCtx & ctx,
                 {"completion_tokens", predicted_n},
                 {"total_tokens",      prompt_n + predicted_n},
             };
-            emit_data(done_delta.dump());
+            emit_data(safe_dump(done_delta));
             emit_data("[DONE]");
 
             sink.done();
