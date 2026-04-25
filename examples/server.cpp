@@ -1635,91 +1635,113 @@ static void handle_chat_stream(ServerCtx & ctx,
                               ordered_json::error_handler_t::replace);
             };
 
-            // ---- streaming tag stripper --------------------------------
-            // Always suppresses <tool_call>…</tool_call> blocks — those are
-            // protocol artefacts, and the webui already renders the call as
-            // a card via easyai.tool_call/result events.
+            // ---- streaming content router ------------------------------
+            // Routes the model's raw token stream into THREE buckets:
             //
-            // Optionally also suppresses <think>…</think> when the operator
-            // passed --no-think.
+            //   visible content    → delta.content            (rendered as message body)
+            //   thinking content   → delta.reasoning_content  (rendered as a
+            //                                                  collapsible panel
+            //                                                  by the bundle's
+            //                                                  native renderer)
+            //   <tool_call> bytes  → discarded                (we surface them
+            //                                                  via easyai.tool_call/
+            //                                                  easyai.tool_result
+            //                                                  custom SSE events)
             //
-            // The state machine keeps a small buffer (longest tag length)
-            // so a tag split across token chunks still matches.
-            struct StripState {
-                bool        strip_think = false;   // gated by --no-think
-                bool        in_drop = false;       // currently inside a stripped span
-                const char *close_needle  = nullptr; // which close tag to look for
+            // --no-think causes thinking bytes to be silently dropped too.
+            //
+            // The state machine keeps a small trailing buffer (longest
+            // closing-tag length) so a tag split across token chunks still
+            // matches correctly.
+            struct ContentRouter {
+                enum Phase { OUTSIDE, IN_THINK, IN_TOOL };
+                Phase       phase        = OUTSIDE;
+                bool        drop_think   = false;   // gated by --no-think
                 std::string buf;
 
-                // Detect any open tag we care about at index i in buf.
-                // Returns {pos_of_open, pos_after_open, close_needle} or pos==npos.
-                struct Open { size_t pos = std::string::npos; size_t after = 0; const char *close = nullptr; };
-                Open find_open() const {
-                    Open best{};
-                    auto consider = [&](const char * open, const char * close) {
-                        size_t p = buf.find(open);
-                        if (p == std::string::npos) return;
-                        if (best.pos == std::string::npos || p < best.pos) {
-                            best.pos   = p;
-                            best.after = p + std::strlen(open);
-                            best.close = close;
-                        }
-                    };
-                    consider("<tool_call>", "</tool_call>");
-                    if (strip_think) {
-                        consider("<think>",    "</think>");
-                        consider("<thinking>", "</thinking>");
-                    }
-                    return best;
-                }
+                struct Out {
+                    std::string visible;
+                    std::string thinking;
+                };
 
-                std::string filter(std::string piece) {
+                Out feed(std::string piece) {
+                    constexpr size_t kMargin = 12;  // longest closing tag = "</thinking>"
                     buf += piece;
-                    std::string out;
-                    // Longest open we care about is "<thinking>" (10).
-                    // Longest close is "</thinking>" (11).  Keep that many
-                    // trailing chars unflushed so a partial tag can complete.
-                    constexpr size_t open_margin  = 10;
-                    constexpr size_t close_margin = 12;
+                    Out out;
                     for (;;) {
-                        if (in_drop) {
-                            size_t p = buf.find(close_needle);
-                            if (p == std::string::npos) {
-                                if (buf.size() > close_margin)
-                                    buf.erase(0, buf.size() - close_margin);
-                                return out;
-                            }
-                            buf.erase(0, p + std::strlen(close_needle));
-                            in_drop = false;
-                            close_needle = nullptr;
-                        } else {
-                            Open o = find_open();
-                            if (o.pos == std::string::npos) {
-                                size_t safe = buf.size() > open_margin
-                                                 ? buf.size() - open_margin : 0;
+                        if (phase == OUTSIDE) {
+                            size_t t1 = buf.find("<think>");
+                            size_t t2 = buf.find("<thinking>");
+                            size_t openThink = std::min(
+                                t1 == std::string::npos ? std::string::npos : t1,
+                                t2 == std::string::npos ? std::string::npos : t2);
+                            size_t openTool = buf.find("<tool_call>");
+                            size_t firstOpen = std::min(
+                                openThink == std::string::npos ? std::string::npos : openThink,
+                                openTool  == std::string::npos ? std::string::npos : openTool);
+
+                            if (firstOpen == std::string::npos) {
+                                size_t safe = buf.size() > kMargin
+                                                 ? buf.size() - kMargin : 0;
                                 if (safe > 0) {
-                                    out.append(buf, 0, safe);
+                                    out.visible.append(buf, 0, safe);
                                     buf.erase(0, safe);
                                 }
                                 return out;
                             }
-                            out.append(buf, 0, o.pos);
-                            buf.erase(0, o.after);
-                            in_drop = true;
-                            close_needle = o.close;
+                            out.visible.append(buf, 0, firstOpen);
+                            if (firstOpen == openThink) {
+                                bool is_long = (openThink == t2);
+                                size_t tag_len = is_long ? 10 : 7;
+                                buf.erase(0, firstOpen + tag_len);
+                                phase = IN_THINK;
+                            } else {
+                                buf.erase(0, firstOpen + 11);   // "<tool_call>"
+                                phase = IN_TOOL;
+                            }
+                        } else if (phase == IN_THINK) {
+                            size_t c1 = buf.find("</think>");
+                            size_t c2 = buf.find("</thinking>");
+                            size_t close = std::min(
+                                c1 == std::string::npos ? std::string::npos : c1,
+                                c2 == std::string::npos ? std::string::npos : c2);
+                            if (close == std::string::npos) {
+                                size_t safe = buf.size() > kMargin
+                                                 ? buf.size() - kMargin : 0;
+                                if (safe > 0) {
+                                    if (!drop_think) out.thinking.append(buf, 0, safe);
+                                    buf.erase(0, safe);
+                                }
+                                return out;
+                            }
+                            if (!drop_think) out.thinking.append(buf, 0, close);
+                            bool is_long = (close == c2);
+                            size_t tag_len = is_long ? 11 : 8;
+                            buf.erase(0, close + tag_len);
+                            phase = OUTSIDE;
+                        } else {  // IN_TOOL
+                            size_t close = buf.find("</tool_call>");
+                            if (close == std::string::npos) {
+                                if (buf.size() > kMargin)
+                                    buf.erase(0, buf.size() - kMargin);
+                                return out;
+                            }
+                            buf.erase(0, close + 12);  // "</tool_call>"
+                            phase = OUTSIDE;
                         }
                     }
                 }
-                std::string flush() {
-                    std::string out;
-                    if (!in_drop) out = std::move(buf);
+
+                Out flush() {
+                    Out out;
+                    if (phase == OUTSIDE)               out.visible  = std::move(buf);
+                    else if (phase == IN_THINK && !drop_think) out.thinking = std::move(buf);
                     buf.clear();
-                    in_drop = false;
-                    close_needle = nullptr;
+                    phase = OUTSIDE;
                     return out;
                 }
-            } strip;
-            strip.strip_think = ctx.no_think;
+            } router;
+            router.drop_think = ctx.no_think;
 
             // ---- thinking-prefix guard ---------------------------------
             // Some templates (Qwen3 / DeepSeek-R1 in thinking mode) inject
@@ -1770,18 +1792,34 @@ static void handle_chat_stream(ServerCtx & ctx,
             } thinkGuard;
 
             // ---- on_token callback: stream OpenAI-shape deltas ----------
+            // Visible content goes to delta.content; thinking text goes to
+            // delta.reasoning_content (the OpenAI-standard field for
+            // reasoning models). The bundle's webui already knows how to
+            // render reasoning_content as a separate collapsible block.
+            auto emit_routed = [&](const ContentRouter::Out & r) {
+                if (!r.visible.empty()) {
+                    ordered_json delta;
+                    delta["choices"] = json::array({{
+                        {"index", 0},
+                        {"delta", {{"content", r.visible}}},
+                        {"finish_reason", nullptr},
+                    }});
+                    emit_data(safe_dump(delta));
+                }
+                if (!r.thinking.empty()) {
+                    ordered_json delta;
+                    delta["choices"] = json::array({{
+                        {"index", 0},
+                        {"delta", {{"reasoning_content", r.thinking}}},
+                        {"finish_reason", nullptr},
+                    }});
+                    emit_data(safe_dump(delta));
+                }
+            };
             ctx.engine.on_token([&](const std::string & piece) {
                 std::string after_guard = thinkGuard.feed(piece);
                 if (after_guard.empty()) return;
-                std::string visible = strip.filter(after_guard);
-                if (visible.empty()) return;
-                ordered_json delta;
-                delta["choices"] = json::array({{
-                    {"index", 0},
-                    {"delta", {{"content", visible}}},
-                    {"finish_reason", nullptr},
-                }});
-                emit_data(safe_dump(delta));
+                emit_routed(router.feed(after_guard));
             });
 
             // ---- on_tool callback: emit BOTH custom events and an inline
@@ -1850,32 +1888,12 @@ static void handle_chat_stream(ServerCtx & ctx,
                 emit_data(safe_dump(err));
             }
 
-            // Drain whatever the guard / strip state machines were holding.
-            // Order matters: thinkGuard's leftover bytes still need to go
-            // through the tag-stripper.
+            // Drain whatever the guard / router were holding.  Order matters:
+            // thinkGuard's leftover bytes still need to go through the
+            // content router.
             std::string guarded_tail = thinkGuard.flush();
-            if (!guarded_tail.empty()) {
-                std::string after = strip.filter(guarded_tail);
-                if (!after.empty()) {
-                    ordered_json delta;
-                    delta["choices"] = json::array({{
-                        {"index", 0},
-                        {"delta", {{"content", after}}},
-                        {"finish_reason", nullptr},
-                    }});
-                    emit_data(safe_dump(delta));
-                }
-            }
-            std::string tail = strip.flush();
-            if (!tail.empty()) {
-                ordered_json delta;
-                delta["choices"] = json::array({{
-                    {"index", 0},
-                    {"delta", {{"content", tail}}},
-                    {"finish_reason", nullptr},
-                }});
-                emit_data(safe_dump(delta));
-            }
+            if (!guarded_tail.empty()) emit_routed(router.feed(guarded_tail));
+            emit_routed(router.flush());
 
             // For client-tools mode, emit the assembled tool_calls array as
             // a single delta so OpenAI clients (and our webui) see them.
