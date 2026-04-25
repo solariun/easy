@@ -1740,40 +1740,43 @@ static void handle_chat_stream(ServerCtx & ctx,
                 res_evt["is_error"] = r.is_error;
                 emit_event("easyai.tool_result", res_evt.dump());
 
-                // Compose an inline markdown summary that any markdown
-                // renderer will display nicely.  We use a <details> HTML
-                // block (allowed by marked.js with its default settings)
-                // so the tool result is collapsible.
-                auto html_escape_inline = [](const std::string & s){
-                    std::string o; o.reserve(s.size());
-                    for (char ch : s) {
-                        switch (ch) {
-                            case '<': o += "&lt;"; break;
-                            case '>': o += "&gt;"; break;
-                            case '&': o += "&amp;"; break;
-                            default:  o += ch;
-                        }
-                    }
-                    return o;
-                };
+                // Compose a CLEAN markdown blockquote so every renderer can
+                // display it without HTML sanitisation eating the tags.
+                // Format:
+                //
+                //   > 🔧 **`tool_name`** `(args)`
+                //   > result line 1
+                //   > result line 2
+                //
+                // Multi-line results get a "> " prefix on every line so the
+                // whole thing stays inside the same blockquote.
                 std::string clipped = r.content;
-                if (clipped.size() > 4096) {
-                    clipped.resize(4096);
+                if (clipped.size() > 1500) {
+                    clipped.resize(1500);
                     clipped += "\n…[truncated]";
                 }
                 std::string args = c.arguments_json;
-                if (args.size() > 600) { args.resize(600); args += "…"; }
+                if (args.size() > 300) { args.resize(300); args += "…"; }
+
+                // Backticks inside `name(args)` need to be escaped so they
+                // don't break the inline-code spans.
+                auto bt_escape = [](std::string s){
+                    std::string out; out.reserve(s.size());
+                    for (char c : s) { if (c == '`') out += "\\`"; else out += c; }
+                    return out;
+                };
 
                 std::ostringstream md;
-                md << "\n\n<details class=\"easyai-tool\""
-                   << (r.is_error ? " data-error=\"1\"" : "") << ">"
-                   << "<summary>"
-                   << (r.is_error ? "❌ " : "🔧 ")
-                   << "<code>" << html_escape_inline(c.name)
-                   << "(" << html_escape_inline(args) << ")</code>"
-                   << "</summary>\n\n```\n"
-                   << clipped
-                   << "\n```\n\n</details>\n\n";
+                md << "\n\n> " << (r.is_error ? "❌ " : "🔧 ")
+                   << "**`" << bt_escape(c.name) << "`**"
+                   << " `(" << bt_escape(args) << ")`"
+                   << "\n";
+                md << "> ";
+                for (char ch : clipped) {
+                    md << ch;
+                    if (ch == '\n') md << "> ";
+                }
+                md << "\n\n";
 
                 ordered_json delta;
                 delta["choices"] = json::array({{
@@ -2396,19 +2399,6 @@ int main(int argc, char ** argv) {
                 "[aria-label*=\"camera\" i],[data-testid*=\"audio-record\" i]"
                 "{display:none !important;visibility:hidden !important;"
                 " width:0 !important;height:0 !important;overflow:hidden !important;}"
-
-                // Style tweaks for our inline tool blocks.
-                ".easyai-tool{margin:.5rem 0;border-left:3px solid #4fb0ff;"
-                  "background:rgba(79,176,255,.08);border-radius:6px;"
-                  "padding:.4rem .7rem;font-size:.9em;}"
-                ".easyai-tool[data-error=\"1\"]{border-left-color:#f85149;"
-                  "background:rgba(248,81,73,.08);}"
-                ".easyai-tool>summary{cursor:pointer;color:#4fb0ff;"
-                  "font-weight:600;list-style:none;}"
-                ".easyai-tool[data-error=\"1\"]>summary{color:#f85149;}"
-                ".easyai-tool>summary::-webkit-details-marker{display:none;}"
-                ".easyai-tool pre{margin:.4rem 0 0;font-size:.85em;"
-                  "max-height:18em;overflow-y:auto;}"
               "</style>";
 
             if (!args.webui_icon.empty()) {
