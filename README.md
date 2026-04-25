@@ -4,12 +4,12 @@ A small, opinionated **C++17 library** that turns
 [llama.cpp](https://github.com/ggml-org/llama.cpp) into an *agent engine* you
 can drop into any program. Plus three standalone binaries built on top of it:
 
-| Binary           | What it gives you                                                      |
-|------------------|-------------------------------------------------------------------------|
-| `easyai-cli`     | A drop-in `llama-cli` replacement with the built-in toolbelt baked in.  |
-| `easyai-server`  | An OpenAI-compatible HTTP server with a single-file webui.              |
-| `easyai-agent`   | A demo agent showing every built-in tool plus an inline custom tool.    |
-| `easyai-chat`    | A bare-bones REPL with no tools — useful as a sanity check.             |
+| Binary           | What it gives you                                                                                                                                  |
+|------------------|----------------------------------------------------------------------------------------------------------------------------------------------------|
+| `easyai-cli`     | Drop-in `llama-cli` replacement: local **or** remote OpenAI-compatible endpoint, one-shot scripting (`-p`), tools, presets, optional `<think>` strip. |
+| `easyai-server`  | Drop-in `llama-server` replacement: OpenAI-compat HTTP, embedded webui, Bearer auth, Prometheus `/metrics`, KV-cache controls, flash-attn, mlock.   |
+| `easyai-agent`   | A demo agent showing every built-in tool plus an inline custom tool.                                                                                |
+| `easyai-chat`    | A bare-bones REPL with no tools — useful as a sanity check.                                                                                          |
 
 > **Status** — proof-of-concept. Apple Silicon (Metal) and Linux/Windows
 > Vulkan are wired up out of the box; everything below the `easyai::` API is
@@ -140,11 +140,20 @@ develop/
 
 ```bash
 cd easyai
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release   # see "Build for your hardware" below
 cmake --build build -j
 
-# REPL with everything wired up
+# REPL with everything wired up — local model
 ./build/easyai-cli -m models/qwen2.5-1.5b-instruct-q4_k_m.gguf
+
+# REPL talking to a remote OpenAI-compatible endpoint instead of loading a model
+./build/easyai-cli --url http://127.0.0.1:8080/v1
+./build/easyai-cli --url https://api.openai.com/v1 \
+                   --api-key $OPENAI_API_KEY --remote-model gpt-4o-mini
+
+# One-shot mode (great in scripts — banners on stderr, model text on stdout)
+./build/easyai-cli -m models/qwen2.5-1.5b-instruct-q4_k_m.gguf -p "What is 2+2?"
+result=$(./build/easyai-cli --url http://127.0.0.1:8080/v1 --no-think -p "summarise this commit")
 
 # Open http://127.0.0.1:8080 in a browser
 ./build/easyai-server -m models/qwen2.5-1.5b-instruct-q4_k_m.gguf
@@ -162,11 +171,24 @@ For Claude Code (or any tool that takes an OpenAI-compatible base URL), set
 `http://127.0.0.1:8080/v1` as the base. Any tools the client declares will
 be forwarded; any tools it doesn't declare will use the server's toolbelt.
 
-### GPU backends
+### Build for your hardware
 
-* **macOS** — Metal is enabled automatically.
-* **Linux/Windows + Vulkan SDK** — configure with `-DGGML_VULKAN=ON`.
-* **CPU only** — pass `-ngl 0` (or `.gpu_layers(0)` in code).
+Pick the matching configure command for your machine; rebuild with
+`cmake --build build -j`.
+
+| Hardware                                  | Configure command                                                                  | Notes                                                                                |
+|-------------------------------------------|------------------------------------------------------------------------------------|--------------------------------------------------------------------------------------|
+| **Apple Silicon / Intel Mac (Metal)**     | `cmake -S . -B build -DCMAKE_BUILD_TYPE=Release`                                   | Metal is auto-detected on macOS — nothing extra to set.                              |
+| **NVIDIA GPU (CUDA)**                     | `cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON`                    | Needs the CUDA Toolkit (`nvcc`). Optionally pin GPU arch with `-DCMAKE_CUDA_ARCHITECTURES=89`. |
+| **AMD / Intel / cross-vendor (Vulkan)**   | `cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGGML_VULKAN=ON`                  | Needs the Vulkan SDK on Linux/Windows. Works on AMD RX/Pro, Intel Arc, NVIDIA too.   |
+| **AMD on Linux (ROCm/HIP)**               | `cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGGML_HIP=ON -DAMDGPU_TARGETS=gfx1100` | Replace the gfx ID with your card's. Requires ROCm 6+.                                |
+| **CPU-only (any OS)**                     | `cmake -S . -B build -DCMAKE_BUILD_TYPE=Release`                                   | Then run with `-ngl 0` (CLI/server) or `.gpu_layers(0)` (lib).                       |
+
+Add `-DGGML_OPENBLAS=ON` (Linux) or `-DGGML_BLAS=ON` (macOS uses Accelerate
+automatically) for a faster CPU prompt-eval path.
+
+If both Metal and CUDA libraries are present (rare), keep one and disable
+the other explicitly with `-DGGML_METAL=OFF` / `-DGGML_CUDA=OFF`.
 
 ### Web search
 

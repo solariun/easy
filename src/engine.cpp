@@ -36,6 +36,7 @@ struct Engine::Impl {
     int          max_new_tokens = -1;
     bool         loaded         = false;
     bool         verbose        = false;
+    bool         enable_thinking = true;   // sent to chat templates that use it
     common_chat_tool_choice tool_choice = COMMON_CHAT_TOOL_CHOICE_AUTO;
     bool         parallel_tool_calls    = false;
 
@@ -92,6 +93,7 @@ struct Engine::Impl {
         in.tools                 = chat_tools();
         in.tool_choice           = tool_choice;
         in.parallel_tool_calls   = parallel_tool_calls;
+        in.enable_thinking       = enable_thinking;
         return common_chat_templates_apply(templates.get(), in);
     }
 
@@ -227,6 +229,135 @@ Engine & Engine::tool_choice_none()             { p_->tool_choice = COMMON_CHAT_
 Engine & Engine::parallel_tool_calls(bool e)    { p_->parallel_tool_calls = e; return *this; }
 Engine & Engine::verbose(bool v)                { p_->verbose = v; return *this; }
 
+// ---------------------------------------------------------------------------
+// KV cache & model overrides
+// ---------------------------------------------------------------------------
+namespace {
+
+// Map a ggml_type_name() string ("f16", "q8_0", …) back to the enum.
+// Returns GGML_TYPE_COUNT on miss (used as the "invalid" sentinel).
+ggml_type ggml_type_from_name(const std::string & s) {
+    // Restrict to types that llama.cpp's KV cache actually supports — F32,
+    // F16, BF16, Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, IQ4_NL.  Anything else would
+    // be silently ignored by ggml so we'd rather flag it explicitly.
+    static const ggml_type allowed[] = {
+        GGML_TYPE_F32,  GGML_TYPE_F16,  GGML_TYPE_BF16,
+        GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1,
+        GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_IQ4_NL,
+    };
+    for (auto t : allowed) {
+        if (s == ggml_type_name(t)) return t;
+    }
+    return GGML_TYPE_COUNT;
+}
+
+}  // namespace
+
+Engine & Engine::cache_type_k(const std::string & name) {
+    ggml_type t = ggml_type_from_name(name);
+    if (t == GGML_TYPE_COUNT) {
+        p_->last_error = "cache_type_k: unsupported ggml type '" + name + "'";
+    } else {
+        p_->params.cache_type_k = t;
+    }
+    return *this;
+}
+
+Engine & Engine::cache_type_v(const std::string & name) {
+    ggml_type t = ggml_type_from_name(name);
+    if (t == GGML_TYPE_COUNT) {
+        p_->last_error = "cache_type_v: unsupported ggml type '" + name + "'";
+    } else {
+        p_->params.cache_type_v = t;
+    }
+    return *this;
+}
+
+Engine & Engine::no_kv_offload(bool on) { p_->params.no_kv_offload = on; return *this; }
+Engine & Engine::kv_unified  (bool on) { p_->params.kv_unified    = on; return *this; }
+
+Engine & Engine::add_kv_override(const std::string & spec) {
+    // Parse "key=type:value" — minimal but strict.
+    auto eq = spec.find('=');
+    if (eq == std::string::npos || eq == 0) {
+        p_->last_error = "add_kv_override: missing '=' in '" + spec + "'";
+        return *this;
+    }
+    std::string key  = spec.substr(0, eq);
+    std::string rest = spec.substr(eq + 1);
+    auto colon = rest.find(':');
+    if (colon == std::string::npos) {
+        p_->last_error = "add_kv_override: missing ':' in '" + spec + "' (expected key=type:value)";
+        return *this;
+    }
+    std::string type  = rest.substr(0, colon);
+    std::string value = rest.substr(colon + 1);
+    if (key.size() >= sizeof(((llama_model_kv_override*)0)->key)) {
+        p_->last_error = "add_kv_override: key too long (max 127 chars)";
+        return *this;
+    }
+
+    llama_model_kv_override ov{};
+    std::strncpy(ov.key, key.c_str(), sizeof(ov.key) - 1);
+    ov.key[sizeof(ov.key) - 1] = '\0';
+
+    if (type == "int" || type == "i") {
+        ov.tag     = LLAMA_KV_OVERRIDE_TYPE_INT;
+        ov.val_i64 = std::strtoll(value.c_str(), nullptr, 10);
+    } else if (type == "float" || type == "f") {
+        ov.tag     = LLAMA_KV_OVERRIDE_TYPE_FLOAT;
+        ov.val_f64 = std::strtod(value.c_str(), nullptr);
+    } else if (type == "bool" || type == "b") {
+        ov.tag      = LLAMA_KV_OVERRIDE_TYPE_BOOL;
+        ov.val_bool = (value == "true" || value == "1" || value == "yes");
+    } else if (type == "str" || type == "s") {
+        ov.tag = LLAMA_KV_OVERRIDE_TYPE_STR;
+        if (value.size() >= sizeof(ov.val_str)) value.resize(sizeof(ov.val_str) - 1);
+        std::strncpy(ov.val_str, value.c_str(), sizeof(ov.val_str) - 1);
+        ov.val_str[sizeof(ov.val_str) - 1] = '\0';
+    } else {
+        p_->last_error = "add_kv_override: unknown type '" + type
+                          + "' (expected int|float|bool|str)";
+        return *this;
+    }
+
+    // The vector must be passed to llama with a final empty-key sentinel; we
+    // append the real entry now and add the sentinel at load() time.
+    p_->params.kv_overrides.push_back(ov);
+    return *this;
+}
+
+// ---------------------------------------------------------------------------
+// Compute / memory knobs
+// ---------------------------------------------------------------------------
+Engine & Engine::flash_attn(bool on) {
+    p_->params.flash_attn_type = on ? LLAMA_FLASH_ATTN_TYPE_ENABLED
+                                    : LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    return *this;
+}
+Engine & Engine::use_mlock(bool on)        { p_->params.use_mlock = on; return *this; }
+Engine & Engine::use_mmap (bool on)        { p_->params.use_mmap  = on; return *this; }
+Engine & Engine::threads_batch(int n)      { p_->params.cpuparams_batch.n_threads = n; return *this; }
+
+Engine & Engine::numa(const std::string & strategy) {
+    if      (strategy == "" || strategy == "off" || strategy == "disabled")
+        p_->params.numa = GGML_NUMA_STRATEGY_DISABLED;
+    else if (strategy == "distribute") p_->params.numa = GGML_NUMA_STRATEGY_DISTRIBUTE;
+    else if (strategy == "isolate")    p_->params.numa = GGML_NUMA_STRATEGY_ISOLATE;
+    else if (strategy == "numactl")    p_->params.numa = GGML_NUMA_STRATEGY_NUMACTL;
+    else if (strategy == "mirror")     p_->params.numa = GGML_NUMA_STRATEGY_MIRROR;
+    else p_->last_error = "numa: unknown strategy '" + strategy + "'";
+    return *this;
+}
+
+// ---------------------------------------------------------------------------
+// Reasoning toggle — propagated through chat-template rendering.
+// ---------------------------------------------------------------------------
+Engine & Engine::enable_thinking(bool on) {
+    p_->enable_thinking = on;
+    return *this;
+}
+
 Engine & Engine::add_tool(Tool t)               { p_->tools.push_back(std::move(t)); return *this; }
 Engine & Engine::clear_tools()                  { p_->tools.clear(); return *this; }
 Engine & Engine::on_token(TokenCallback cb)     { p_->on_token = std::move(cb); return *this; }
@@ -246,6 +377,14 @@ bool Engine::load() {
         }, nullptr);
     }
     ggml_backend_load_all();
+
+    // common_init_from_params asserts that kv_overrides ends with an
+    // empty-key sentinel; honour that contract.
+    if (!p_->params.kv_overrides.empty() &&
+        p_->params.kv_overrides.back().key[0] != '\0') {
+        llama_model_kv_override term{};
+        p_->params.kv_overrides.push_back(term);
+    }
 
     p_->init = common_init_from_params(p_->params);
     if (!p_->init || !p_->init->model() || !p_->init->context()) {

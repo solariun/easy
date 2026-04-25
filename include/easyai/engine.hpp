@@ -61,6 +61,46 @@ class Engine {
     Engine & parallel_tool_calls (bool enable);    // default false
     Engine & verbose       (bool on);              // default false
 
+    // ---------------- KV cache & model overrides ----------------------------
+    // KV cache data type — accepts ggml_type names: "f32", "f16", "bf16",
+    // "q8_0", "q4_0", "q4_1", "q5_0", "q5_1", "iq4_nl". Lower precision
+    // dramatically cuts VRAM / RAM at a small quality cost.  Defaults to f16.
+    // Invalid names are recorded in last_error() and otherwise ignored.
+    Engine & cache_type_k (const std::string & ggml_type_name);
+    Engine & cache_type_v (const std::string & ggml_type_name);
+    // Keep KV cache on CPU even when layers are on GPU — useful when VRAM is
+    // tiny.  Trades GPU bandwidth for capacity.
+    Engine & no_kv_offload(bool on = true);
+    // Use a single unified KV buffer across the input sequences when computing
+    // attention (recent llama.cpp feature; mostly for speculative + parallel).
+    Engine & kv_unified   (bool on = true);
+    // Override a key-value entry in the loaded GGUF.  Format:
+    //   "key=int:42"        "key=float:0.75"
+    //   "key=bool:true"     "key=str:hello"
+    // Repeatable.  Useful for fixing tokenizer or rope parameters at load time.
+    Engine & add_kv_override(const std::string & spec);
+
+    // ---------------- compute / memory knobs --------------------------------
+    // Flash attention — auto, on, off.  Default 'auto' lets llama.cpp decide
+    // based on backend capability.  Pass true to force on.
+    Engine & flash_attn   (bool on = true);
+    // Pin model weights in physical memory so they aren't paged out.  Costs
+    // RAM but improves latency consistency on heavily-loaded hosts.
+    Engine & use_mlock    (bool on = true);
+    // Set to false to disable mmap and read the GGUF straight into RAM.
+    // Slightly slower start-up; sometimes needed on network filesystems.
+    Engine & use_mmap     (bool on = true);
+    // Separate thread pool size for batch (prompt-eval) compute.
+    Engine & threads_batch(int n);
+    // NUMA strategy: "distribute", "isolate", "numactl", "" (default off).
+    Engine & numa         (const std::string & strategy);
+
+    // ---------------- reasoning / thinking ----------------------------------
+    // Toggle the chat-template `enable_thinking` flag (used by Qwen3, R1,
+    // etc.). Default ON: the model sees thinking as enabled and may emit
+    // <think> blocks. Pass false to ask the model not to think aloud.
+    Engine & enable_thinking(bool on = true);
+
     // ---------------- tools -------------------------------------------------
     Engine & add_tool   (Tool t);
     Engine & clear_tools();

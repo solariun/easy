@@ -280,6 +280,13 @@ struct ServerCtx {
     std::string                default_system;
     easyai::Preset             default_preset;  // current "ambient" preset
     std::string                model_id;        // basename of model file
+    std::string                api_key;         // empty = auth disabled
+    bool                       no_think = false;// strip <think> from responses
+
+    // /metrics counters (atomics so /metrics can read without holding engine_mu)
+    std::atomic<uint64_t>      n_requests{0};
+    std::atomic<uint64_t>      n_errors{0};
+    std::atomic<uint64_t>      n_tool_calls{0};
 
     // sampling defaults that survive across requests (set via /v1/preset)
     float def_temperature = 0.7f;
@@ -396,6 +403,8 @@ static void route_chat_completions(ServerCtx & ctx, const httplib::Request & req
     const double top_p_override = get_num("top_p",       -1.0);
     const double top_k_override = get_num("top_k",       -1.0);
 
+    ctx.n_requests.fetch_add(1, std::memory_order_relaxed);
+
     // ===== ENGINE-LOCKED SECTION =========================================
     std::lock_guard<std::mutex> lock(ctx.engine_mu);
 
@@ -467,11 +476,38 @@ static void route_chat_completions(ServerCtx & ctx, const httplib::Request & req
             finish_reason = "stop";
         }
     } catch (const std::exception & e) {
+        ctx.n_errors.fetch_add(1, std::memory_order_relaxed);
         res.status = 500;
         res.set_content(error_json(std::string("engine error: ") + e.what(),
                                    "internal_error"),
                         "application/json");
         return;
+    }
+
+    if (!tool_calls.empty()) ctx.n_tool_calls.fetch_add(tool_calls.size(),
+                                                        std::memory_order_relaxed);
+
+    // Optional server-side <think>…</think> stripping (default: keep visible).
+    if (ctx.no_think && !content.empty()) {
+        std::string out;
+        out.reserve(content.size());
+        size_t i = 0;
+        while (i < content.size()) {
+            size_t a = content.find("<think>",     i);
+            size_t b = content.find("<thinking>",  i);
+            size_t open = std::min(a == std::string::npos ? std::string::npos : a,
+                                   b == std::string::npos ? std::string::npos : b);
+            if (open == std::string::npos) { out.append(content, i, std::string::npos); break; }
+            out.append(content, i, open - i);
+            size_t ca = content.find("</think>",    open);
+            size_t cb = content.find("</thinking>", open);
+            size_t close = std::min(ca == std::string::npos ? std::string::npos : ca,
+                                    cb == std::string::npos ? std::string::npos : cb);
+            if (close == std::string::npos) break;  // unterminated → drop tail
+            size_t close_end = content.find('>', close) + 1;
+            i = close_end;
+        }
+        content = std::move(out);
     }
 
     res.status = 200;
@@ -535,26 +571,98 @@ static void route_health(ServerCtx & ctx, const httplib::Request &,
     res.set_content(j.dump(), "application/json");
 }
 
+// ---------------------------------------------------------------------------
+// GET /metrics  →  Prometheus-style text exposition.
+// Always available when --metrics was passed at start-up.
+// ---------------------------------------------------------------------------
+static void route_metrics(ServerCtx & ctx, const httplib::Request &,
+                          httplib::Response & res) {
+    std::ostringstream o;
+    o << "# HELP easyai_requests_total Total /v1/chat/completions requests received.\n"
+      << "# TYPE easyai_requests_total counter\n"
+      << "easyai_requests_total " << ctx.n_requests.load() << "\n"
+      << "# HELP easyai_errors_total Total chat-completion handler errors.\n"
+      << "# TYPE easyai_errors_total counter\n"
+      << "easyai_errors_total " << ctx.n_errors.load() << "\n"
+      << "# HELP easyai_tool_calls_total Total tool_calls returned to clients.\n"
+      << "# TYPE easyai_tool_calls_total counter\n"
+      << "easyai_tool_calls_total " << ctx.n_tool_calls.load() << "\n";
+    res.set_content(o.str(), "text/plain; version=0.0.4");
+}
+
+// ---------------------------------------------------------------------------
+// Bearer-token auth check.  Returns true to continue; on failure the response
+// is filled with 401 and the caller should bail.
+// ---------------------------------------------------------------------------
+static bool require_auth(const ServerCtx & ctx, const httplib::Request & req,
+                         httplib::Response & res) {
+    if (ctx.api_key.empty()) return true;  // auth disabled
+    auto it = req.headers.find("Authorization");
+    std::string expected = "Bearer " + ctx.api_key;
+    if (it == req.headers.end() || it->second != expected) {
+        res.status = 401;
+        res.set_content(error_json("missing or invalid Bearer token",
+                                   "authentication_error"),
+                        "application/json");
+        return false;
+    }
+    return true;
+}
+
 // ============================================================================
 // main
 // ============================================================================
 
 [[noreturn]] static void die_usage(const char * argv0) {
     std::fprintf(stderr,
-        "Usage: %s -m model.gguf [options]\n"
-        "  -m, --model <path>           GGUF model file (required)\n"
-        "  -s, --system-file <path>     Server default system prompt (text file)\n"
+        "Usage: %s -m model.gguf [options]\n\n"
+        "Required:\n"
+        "  -m, --model <path>           GGUF model file\n"
+        "\nNetwork:\n"
+        "      --host <addr>            Bind address (default 127.0.0.1).\n"
+        "                                Use 0.0.0.0 to listen on every IPv4\n"
+        "                                interface (LAN, docker, etc.).\n"
+        "      --port <n>               TCP port (default 8080)\n"
+        "      --max-body <bytes>       Max request body size (default 8 MiB)\n"
+        "\nDefault system prompt + tools:\n"
+        "  -s, --system-file <path>     Server-default system prompt from file\n"
         "      --system <text>          Inline system prompt\n"
-        "      --host <addr>            Bind address (default 127.0.0.1)\n"
-        "      --port <n>               Port (default 8080)\n"
-        "  -c, --ctx <n>                Context size (default 8192)\n"
-        "      --ngl <n>                GPU layers (-1=auto)\n"
-        "  -t, --threads <n>            CPU threads\n"
         "      --no-tools               Don't expose the built-in toolbelt\n"
         "      --sandbox <dir>          Root for fs_* tools (default '.')\n"
+        "\nModel tuning (apply on top of --preset):\n"
         "      --preset <name>          Ambient preset (default 'balanced')\n"
-        "      --max-body <bytes>       Max request body size (default 8 MiB)\n"
-        "  -h, --help                   Show this help and exit\n",
+        "      --temperature <f>        Override temperature (0.0-2.0)\n"
+        "      --top-p <f>              Override nucleus sampling p\n"
+        "      --top-k <n>              Override top-k\n"
+        "      --min-p <f>              Override min-p\n"
+        "      --repeat-penalty <f>     Override repeat penalty\n"
+        "      --max-tokens <n>         Cap tokens generated per request\n"
+        "      --seed <u32>             RNG seed (0 = random)\n"
+        "\nCompute / memory:\n"
+        "  -c, --ctx <n>                Context size (default 8192)\n"
+        "      --batch <n>              Logical batch size (default = ctx)\n"
+        "      --ngl <n>                GPU layers (-1=auto, 0=CPU)\n"
+        "  -t, --threads <n>            CPU threads\n"
+        "\nKV cache (all optional):\n"
+        " -ctk, --cache-type-k <type>   K-cache dtype (f32|f16|bf16|q8_0|q4_0|q4_1|q5_0|q5_1|iq4_nl)\n"
+        " -ctv, --cache-type-v <type>   V-cache dtype (same options)\n"
+        "-nkvo, --no-kv-offload         Keep KV cache on CPU even with GPU layers\n"
+        "      --kv-unified             Use a single unified KV buffer across sequences\n"
+        "      --override-kv <k=t:v>    Override a GGUF metadata entry (repeatable)\n"
+        "                                Types: int|float|bool|str\n"
+        "\nllama-server compatibility:\n"
+        "  -a,  --alias <name>          Public model id reported by /v1/models\n"
+        "       --api-key <key>         Require Bearer auth on every /v1 route\n"
+        "  -fa, --flash-attn            Force flash attention on\n"
+        "  -tb, --threads-batch <n>     Threads used for prompt-eval batches\n"
+        "  -np, --parallel <n>          Accepted for compat; warns when >1\n"
+        "       --mlock                 mlock model weights into RAM\n"
+        "       --no-mmap               Disable mmap (read GGUF straight in)\n"
+        "       --numa <strategy>       distribute|isolate|numactl|mirror\n"
+        "       --metrics               Expose Prometheus /metrics endpoint\n"
+        "       --reasoning <on|off>    Enable model thinking (default on)\n"
+        "       --no-think              Strip <think>...</think> from replies\n"
+        "\n  -h, --help                   Show this help and exit\n",
         argv0);
     std::exit(1);
 }
@@ -563,15 +671,45 @@ struct ServerArgs {
     std::string model_path;
     std::string system_path;
     std::string system_inline;
-    std::string host       = "127.0.0.1";
+    std::string host       = "127.0.0.1";   // pass 0.0.0.0 for any-iface
     int         port       = 8080;
     int         n_ctx      = 8192;
+    int         n_batch    = 0;             // 0 = follow ctx
     int         ngl        = -1;
     int         n_threads  = 0;
     bool        load_tools = true;
     std::string sandbox    = ".";
     std::string preset     = "balanced";
     size_t      max_body   = 8u * 1024u * 1024u;
+
+    // sampling overrides (apply on top of preset)
+    float       temperature    = -1.0f;
+    float       top_p          = -1.0f;
+    int         top_k          = -1;
+    float       min_p          = -1.0f;
+    float       repeat_penalty = -1.0f;
+    int         max_tokens     = -1;
+    uint32_t    seed           = 0u;
+
+    // KV cache controls
+    std::string cache_type_k;
+    std::string cache_type_v;
+    bool        no_kv_offload = false;
+    bool        kv_unified    = false;
+    std::vector<std::string> kv_overrides;
+
+    // llama-server compatibility / production knobs
+    std::string alias;            // exposed as model id in /v1/models
+    std::string api_key;          // Bearer token required if set
+    std::string numa;             // distribute|isolate|numactl|mirror
+    int         threads_batch  = 0;
+    int         parallel       = 1;
+    bool        flash_attn     = false;
+    bool        mlock          = false;
+    bool        no_mmap        = false;
+    bool        metrics        = false;
+    bool        reasoning      = true;   // enable_thinking flag default ON
+    bool        no_think       = false;  // strip <think>…</think> from /v1 responses
 };
 
 static ServerArgs parse_args(int argc, char ** argv) {
@@ -594,6 +732,36 @@ static ServerArgs parse_args(int argc, char ** argv) {
         else if (s == "--sandbox")                   a.sandbox        = need(i, "--sandbox");
         else if (s == "--preset")                    a.preset         = need(i, "--preset");
         else if (s == "--max-body")                  a.max_body       = (size_t) std::atoll(need(i, "--max-body"));
+        else if (s == "--batch")                     a.n_batch        = std::atoi(need(i, "--batch"));
+        // sampling overrides
+        else if (s == "--temperature" || s == "--temp") a.temperature  = std::atof(need(i, "--temperature"));
+        else if (s == "--top-p")                     a.top_p          = std::atof(need(i, "--top-p"));
+        else if (s == "--top-k")                     a.top_k          = std::atoi(need(i, "--top-k"));
+        else if (s == "--min-p")                     a.min_p          = std::atof(need(i, "--min-p"));
+        else if (s == "--repeat-penalty")            a.repeat_penalty = std::atof(need(i, "--repeat-penalty"));
+        else if (s == "--max-tokens")                a.max_tokens     = std::atoi(need(i, "--max-tokens"));
+        else if (s == "--seed")                      a.seed           = (uint32_t) std::strtoul(need(i, "--seed"), nullptr, 10);
+        // KV cache
+        else if (s == "-ctk" || s == "--cache-type-k") a.cache_type_k  = need(i, "-ctk");
+        else if (s == "-ctv" || s == "--cache-type-v") a.cache_type_v  = need(i, "-ctv");
+        else if (s == "-nkvo" || s == "--no-kv-offload") a.no_kv_offload = true;
+        else if (s == "--kv-unified")                a.kv_unified     = true;
+        else if (s == "--override-kv")               a.kv_overrides.push_back(need(i, "--override-kv"));
+        // llama-server compat
+        else if (s == "-a"  || s == "--alias")       a.alias          = need(i, "-a");
+        else if (s == "--api-key")                   a.api_key        = need(i, "--api-key");
+        else if (s == "--numa")                      a.numa           = need(i, "--numa");
+        else if (s == "-tb" || s == "--threads-batch") a.threads_batch = std::atoi(need(i, "-tb"));
+        else if (s == "-np" || s == "--parallel")    a.parallel       = std::atoi(need(i, "-np"));
+        else if (s == "-fa" || s == "--flash-attn")  a.flash_attn     = true;
+        else if (s == "--mlock")                     a.mlock          = true;
+        else if (s == "--no-mmap")                   a.no_mmap        = true;
+        else if (s == "--metrics")                   a.metrics        = true;
+        else if (s == "--reasoning") {
+            std::string v = need(i, "--reasoning");
+            a.reasoning = (v == "on" || v == "1" || v == "true" || v == "yes");
+        }
+        else if (s == "--no-think")                  a.no_think       = true;
         else if (s == "-h" || s == "--help")         die_usage(argv[0]);
         else { std::fprintf(stderr, "unknown arg: %s\n", s.c_str()); die_usage(argv[0]); }
     }
@@ -635,11 +803,15 @@ int main(int argc, char ** argv) {
         ctx->model_id = p;
     }
 
-    // Start with ambient preset.
-    if (const easyai::Preset * pp = easyai::find_preset(args.preset)) {
-        ctx->apply_preset(*pp);
-    } else {
-        ctx->apply_preset(*easyai::find_preset("balanced"));
+    // Start with ambient preset, then overlay any explicit numeric overrides.
+    {
+        easyai::Preset base = *easyai::find_preset("balanced");
+        if (const easyai::Preset * pp = easyai::find_preset(args.preset)) base = *pp;
+        if (args.temperature >= 0) base.temperature = args.temperature;
+        if (args.top_p       >= 0) base.top_p       = args.top_p;
+        if (args.top_k       >= 0) base.top_k       = args.top_k;
+        if (args.min_p       >= 0) base.min_p       = args.min_p;
+        ctx->apply_preset(base);
     }
 
     // Default toolbelt — opt-out via --no-tools.
@@ -653,13 +825,39 @@ int main(int argc, char ** argv) {
         ctx->default_tools.push_back(easyai::tools::fs_grep     (args.sandbox));
     }
 
+    // -------- production knobs / auth --------------------------------------
+    ctx->api_key  = args.api_key;
+    ctx->no_think = args.no_think;
+    if (!args.alias.empty()) ctx->model_id = args.alias;
+
+    if (args.parallel > 1) {
+        std::fprintf(stderr,
+            "[easyai-server] note: --parallel %d requested but the engine is "
+            "single-context; requests are still serialised.\n", args.parallel);
+    }
+
     // -------- configure & load engine ------------------------------------
     ctx->engine.model      (args.model_path)
                .context    (args.n_ctx)
                .gpu_layers (args.ngl)
                .system     (default_system)
                .verbose    (false);
-    if (args.n_threads > 0) ctx->engine.threads(args.n_threads);
+    if (args.n_threads > 0)     ctx->engine.threads(args.n_threads);
+    if (args.threads_batch > 0) ctx->engine.threads_batch(args.threads_batch);
+    if (args.n_batch   > 0)  ctx->engine.batch  (args.n_batch);
+    if (args.seed      > 0)  ctx->engine.seed   (args.seed);
+    if (args.max_tokens >= 0) ctx->engine.max_tokens(args.max_tokens);
+    if (args.repeat_penalty > 0) ctx->engine.repeat_penalty(args.repeat_penalty);
+    if (!args.cache_type_k.empty()) ctx->engine.cache_type_k(args.cache_type_k);
+    if (!args.cache_type_v.empty()) ctx->engine.cache_type_v(args.cache_type_v);
+    if (args.no_kv_offload)  ctx->engine.no_kv_offload(true);
+    if (args.kv_unified)     ctx->engine.kv_unified(true);
+    if (args.flash_attn)     ctx->engine.flash_attn(true);
+    if (args.mlock)          ctx->engine.use_mlock(true);
+    if (args.no_mmap)        ctx->engine.use_mmap(false);
+    if (!args.numa.empty())  ctx->engine.numa(args.numa);
+    if (!args.reasoning)     ctx->engine.enable_thinking(false);
+    for (const auto & ov : args.kv_overrides) ctx->engine.add_kv_override(ov);
     for (const auto & t : ctx->default_tools) ctx->engine.add_tool(t);
     ctx->engine.set_sampling(ctx->def_temperature, ctx->def_top_p,
                              ctx->def_top_k, ctx->def_min_p);
@@ -703,9 +901,21 @@ int main(int argc, char ** argv) {
         res.set_content(kWebUI, "text/html; charset=utf-8");
     });
     svr.Get ("/health",               [&](const auto & q, auto & r){ route_health  (ctx_ref, q, r); });
-    svr.Get ("/v1/models",            [&](const auto & q, auto & r){ route_models  (ctx_ref, q, r); });
-    svr.Post("/v1/chat/completions",  [&](const auto & q, auto & r){ route_chat_completions(ctx_ref, q, r); });
-    svr.Post("/v1/preset",            [&](const auto & q, auto & r){ route_preset  (ctx_ref, q, r); });
+    if (args.metrics) {
+        svr.Get ("/metrics",          [&](const auto & q, auto & r){ route_metrics (ctx_ref, q, r); });
+    }
+    svr.Get ("/v1/models",            [&](const auto & q, auto & r){
+        if (!require_auth(ctx_ref, q, r)) return;
+        route_models(ctx_ref, q, r);
+    });
+    svr.Post("/v1/chat/completions",  [&](const auto & q, auto & r){
+        if (!require_auth(ctx_ref, q, r)) return;
+        route_chat_completions(ctx_ref, q, r);
+    });
+    svr.Post("/v1/preset",            [&](const auto & q, auto & r){
+        if (!require_auth(ctx_ref, q, r)) return;
+        route_preset(ctx_ref, q, r);
+    });
 
     // Last-chance error handler — never let a thrown exception propagate
     // out of the HTTP layer (httplib would close the socket abruptly).

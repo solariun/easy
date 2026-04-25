@@ -54,9 +54,37 @@ brew install cmake curl
 
 ### 1.3 First build
 
+#### 1.3.1 Pick the right configure command for your hardware
+
+| Target                            | Configure command                                                                  |
+|-----------------------------------|------------------------------------------------------------------------------------|
+| **Apple Silicon / Intel Mac (Metal)** | `cmake -S . -B build -DCMAKE_BUILD_TYPE=Release`                                |
+| **NVIDIA GPU (CUDA)**             | `cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON`                    |
+| **AMD / Intel / cross-vendor (Vulkan)** | `cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGGML_VULKAN=ON`            |
+| **AMD on Linux (ROCm/HIP)**       | `cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGGML_HIP=ON -DAMDGPU_TARGETS=gfx1100` |
+| **CPU-only (any OS)**             | `cmake -S . -B build -DCMAKE_BUILD_TYPE=Release` (then run with `-ngl 0`)          |
+
+**NVIDIA / CUDA** — install the CUDA Toolkit so `nvcc` is on `PATH`. If
+CMake complains about an unknown architecture, pin one explicitly:
+`-DCMAKE_CUDA_ARCHITECTURES=89` (e.g. for RTX 4090) or use `native`.
+
+**AMD / Vulkan** — install the Vulkan SDK
+([LunarG](https://vulkan.lunarg.com/sdk/home) on Win/macOS, distro
+`vulkan-tools libvulkan-dev` on Linux). On Linux, also install the GPU
+driver's Vulkan ICD (`mesa-vulkan-drivers` for AMD/Intel, NVIDIA driver
+ships its own).
+
+**AMD / ROCm** — set `AMDGPU_TARGETS` to your card's gfx version.
+Check with `rocminfo`.
+
+**CPU-only** — same configure command as Metal but always pass `-ngl 0` at
+runtime (or `engine.gpu_layers(0)` in code) so layers stay on CPU.
+
+#### 1.3.2 Build
+
 ```bash
 cd easyai
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release   # use the right line above
 cmake --build build -j
 ```
 
@@ -367,6 +395,41 @@ if (turn.finish_reason == "tool_calls") {
 
 ## Part 4 — recipes
 
+### 4.0 `easyai-cli` against any OpenAI-compatible endpoint
+
+`easyai-cli` runs a REPL in two modes that share the same UI: local model
+(`-m model.gguf`) or remote server (`--url <api-base>`). Same preset
+commands, same `/help`, same `--no-think` switch.
+
+```bash
+# point at easyai-server running on the LAN
+./build/easyai-cli --url http://10.0.0.5:8080/v1
+
+# point at openai.com (env vars EASYAI_API_KEY or OPENAI_API_KEY also work)
+./build/easyai-cli --url https://api.openai.com/v1 \
+                   --api-key sk-... \
+                   --remote-model gpt-4o-mini
+
+# point at a llama-server / vLLM / ollama endpoint — anything that speaks /v1
+./build/easyai-cli --url http://127.0.0.1:11434/v1 --remote-model llama3.1:8b
+```
+
+One-shot mode for scripting:
+
+```bash
+# Grab a one-line answer; banners go to stderr so capturing stdout is clean.
+answer=$(./build/easyai-cli -m model.gguf -p "summarise: $(cat file.txt)")
+
+# In remote mode with thinking suppressed:
+./build/easyai-cli --url http://localhost:8080/v1 --no-think \
+    -p "explain BGP route reflectors in two sentences" \
+    > brief.md
+```
+
+`--no-think` strips `<think>…</think>` (and `<thinking>…</thinking>`) blocks
+from output. The filter is streaming-aware and works even when the open or
+close tag is split across two model-emitted token chunks.
+
 ### 4.1 Web search
 
 `web_search` works out of the box — it talks to DuckDuckGo's HTML endpoint
@@ -393,7 +456,59 @@ state. To run `easyai-cli` without any tools at all:
 
 For the server: same flag, `--no-tools`.
 
-### 4.4 Behind a reverse proxy
+### 4.4 Production deployment — replacing `llama-server`
+
+`easyai-server` is a drop-in replacement for `llama-server` for almost
+every flag a deployment script cares about. A long-running production
+launch looks like:
+
+```bash
+./build/easyai-server \
+    --model      /var/lib/easyai/models/ai.gguf \
+    --alias      SolariunAI_Box \
+    --host       0.0.0.0 --port 8080 \
+    --ctx        128000 \
+    --ngl        99 \
+    --threads    8  --threads-batch 8 \
+    --flash-attn \
+    --cache-type-k q8_0 --cache-type-v q8_0 \
+    --mlock --no-mmap \
+    --preset balanced --temperature 0.6 --top-p 0.9 --top-k 20 \
+    --api-key    "$EASYAI_API_KEY" \
+    --metrics \
+    --system-file /etc/easyai/system.txt \
+    --sandbox    /var/lib/easyai/workspace
+```
+
+Flag map vs. `llama-server`:
+
+| llama-server flag        | easyai-server flag       |
+|--------------------------|--------------------------|
+| `-m / --model`           | `-m / --model`           |
+| `--host` / `--port`      | `--host` / `--port`      |
+| `-a / --alias`           | `-a / --alias`           |
+| `-c / --ctx-size`        | `-c / --ctx`             |
+| `--n-gpu-layers`         | `--ngl`                  |
+| `-t / --threads`         | `-t / --threads`         |
+| `-tb / --threads-batch`  | `-tb / --threads-batch`  |
+| `-fa / --flash-attn`     | `-fa / --flash-attn`     |
+| `-ctk / -ctv`            | `-ctk / -ctv`            |
+| `--mlock` / `--no-mmap`  | `--mlock` / `--no-mmap`  |
+| `--api-key`              | `--api-key`              |
+| `--metrics`              | `--metrics`              |
+| `--reasoning <on/off>`   | `--reasoning <on/off>`   |
+| `--override-kv`          | `--override-kv`          |
+| `-np / --parallel`       | accepted; warns since the engine is single-context |
+
+When `--api-key` is set, every `/v1/*` request must carry
+`Authorization: Bearer <key>`. `/`, `/health`, and `/metrics` stay open
+(useful for liveness probes and Prometheus scrapes).
+
+`/metrics` exposes Prometheus-style counters
+(`easyai_requests_total`, `easyai_errors_total`, `easyai_tool_calls_total`)
+that you can wire into Grafana or alertmanager.
+
+### 4.5 Behind a reverse proxy
 
 The server speaks plain HTTP and supports CORS. Stick nginx/Caddy in front
 to add TLS, auth, and rate limiting. Example Caddyfile:
@@ -407,7 +522,7 @@ ai.example.com {
 }
 ```
 
-### 4.5 Multiple models, one host
+### 4.6 Multiple models, one host
 
 Run one `easyai-server` per model on different ports, then add a tiny
 proxy that maps `model` field → upstream port. The single-mutex design

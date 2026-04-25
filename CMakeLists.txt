@@ -72,6 +72,13 @@ if (EASYAI_BUILD_EXAMPLES)
 
     add_executable(easyai-cli examples/cli.cpp)
     target_link_libraries(easyai-cli PRIVATE easyai)
+    # nlohmann::json is vendored by llama.cpp at vendor/nlohmann/json.hpp
+    target_include_directories(easyai-cli PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../llama.cpp/vendor)
+    if (EASYAI_WITH_CURL AND CURL_FOUND)
+        target_link_libraries(easyai-cli PRIVATE CURL::libcurl)
+        target_compile_definitions(easyai-cli PRIVATE EASYAI_HAVE_CURL=1)
+    endif()
 
     add_executable(easyai-server examples/server.cpp)
     target_link_libraries(easyai-server PRIVATE easyai cpp-httplib)
