@@ -1345,6 +1345,7 @@ struct ServerCtx {
     // Webui customisation (built once at start-up so the / handler can just
     // hand back the prebuilt buffer).
     std::string                webui_html;      // HTML with title substituted
+    std::string                webui_bundle_js; // bundle.js with brand strings substituted
     std::string                webui_icon;      // raw icon bytes (empty = none)
     std::string                webui_icon_mime; // "image/x-icon" etc.
 
@@ -2025,9 +2026,12 @@ static bool require_auth(const ServerCtx & ctx, const httplib::Request & req,
         "\nWebui:\n"
         "       --webui <mode>          'modern' (default — embedded llama-server-\n"
         "                                derived bundle) or 'minimal' (small inline UI)\n"
-        "       --webui-title <text>    Title shown in the browser tab (default 'easyai')\n"
-        "       --webui-icon <path>     Favicon file (.ico|.png|.svg|.gif|.jpg|.webp)\n"
-        "                                served at /favicon and /favicon.ico\n"
+        "       --webui-title <text>    Title in the browser tab AND the sidebar\n"
+        "                                brand (default 'Box EasyAI')\n"
+        "       --webui-icon <path>     Favicon file (.ico|.png|.svg|.gif|.jpg|.webp);\n"
+        "                                also rendered before the brand title in the\n"
+        "                                sidebar / topbar\n"
+        "       --webui-placeholder <s> Input box placeholder (default 'Type a message…')\n"
         "\n  -h, --help                   Show this help and exit\n",
         argv0);
     std::exit(1);
@@ -2078,9 +2082,10 @@ struct ServerArgs {
     bool        no_think       = false;  // strip <think>…</think> from /v1 responses
 
     // webui rebrand
-    std::string webui_title    = "easyai";
+    std::string webui_title    = "Box EasyAI";
     std::string webui_icon;              // optional path to .ico/.png/.svg
     std::string webui_mode     = "modern"; // "modern" (embedded llama-server fork) | "minimal" (inline)
+    std::string webui_placeholder = "Type a message…";
 };
 
 static ServerArgs parse_args(int argc, char ** argv) {
@@ -2135,6 +2140,7 @@ static ServerArgs parse_args(int argc, char ** argv) {
         else if (s == "--no-think")                  a.no_think       = true;
         else if (s == "--webui-title")               a.webui_title    = need(i, "--webui-title");
         else if (s == "--webui-icon")                a.webui_icon     = need(i, "--webui-icon");
+        else if (s == "--webui-placeholder")         a.webui_placeholder = need(i, "--webui-placeholder");
         else if (s == "--webui")                     a.webui_mode     = need(i, "--webui");
         else if (s == "-h" || s == "--help")         die_usage(argv[0]);
         else { std::fprintf(stderr, "unknown arg: %s\n", s.c_str()); die_usage(argv[0]); }
@@ -2416,6 +2422,46 @@ int main(int argc, char ** argv) {
                 html.insert(pos + head_open.size(), inj.str());
             }
             ctx->webui_html = std::move(html);
+
+            // ----- bundle.js text-substitute (real, not just CSS) ------
+            // The Svelte bundle has hard-coded brand strings inside string
+            // literals — DOM scrubbers can't catch the welcome <h1> or the
+            // input placeholder.  Patch them now, once, into a buffer
+            // we'll serve from /bundle.js.
+            std::string js(reinterpret_cast<const char *>(bundle_js),
+                            bundle_js_len);
+
+            // Page-title surface (already pinned by document.title interceptor,
+            // but we also clean these up so view-source / window.title is correct).
+            js = str_replace_all(js, "llama.cpp - AI Chat Interface", title);
+            js = str_replace_all(js,
+                "Initializing connection to llama.cpp server...",
+                "Initializing connection to " + title + " server…");
+            js = str_replace_all(js, "} - llama.cpp", "} - " + title);
+
+            // Sidebar / topbar brand markup.  When the operator gave us a
+            // --webui-icon we splice an <img> in front of the title text.
+            // The bundle uses single-quoted JS strings for these fragments,
+            // so embedded double-quotes in the HTML attribute don't need
+            // to be escaped.
+            std::string brand_h1;
+            if (!args.webui_icon.empty()) {
+                brand_h1 = "><img src=\"/favicon\" alt=\"\" "
+                           "style=\"display:inline-block;width:1.05em;height:1.05em;"
+                           "vertical-align:-2px;margin-right:.4em;border-radius:4px\">"
+                         + title + "</h1>";
+            } else {
+                brand_h1 = ">" + title + "</h1>";
+            }
+            js = str_replace_all(js, ">llama.cpp</h1>", brand_h1);
+
+            // Input placeholder.
+            if (!args.webui_placeholder.empty()) {
+                js = str_replace_all(js, "Type a message...", args.webui_placeholder);
+                js = str_replace_all(js, "Type a message",    args.webui_placeholder);
+            }
+
+            ctx->webui_bundle_js = std::move(js);
         } else
 #endif
         {
@@ -2524,9 +2570,18 @@ int main(int argc, char ** argv) {
             res.set_header("Cross-Origin-Opener-Policy",   "same-origin");
             res.set_content(ctx_ref.webui_html, "text/html; charset=utf-8");
         });
-        svr.Get("/bundle.js", [](const httplib::Request &, httplib::Response & res) {
-            res.set_content(reinterpret_cast<const char*>(bundle_js), bundle_js_len,
-                            "application/javascript; charset=utf-8");
+        svr.Get("/bundle.js", [&](const httplib::Request &, httplib::Response & res) {
+            // Serve the customised bundle (brand / placeholder / icon
+            // substitutions baked in at startup) when available; fall back
+            // to the raw embedded bytes otherwise.
+            if (!ctx_ref.webui_bundle_js.empty()) {
+                res.set_content(ctx_ref.webui_bundle_js,
+                                "application/javascript; charset=utf-8");
+            } else {
+                res.set_content(reinterpret_cast<const char*>(bundle_js),
+                                bundle_js_len,
+                                "application/javascript; charset=utf-8");
+            }
         });
         svr.Get("/bundle.css", [](const httplib::Request &, httplib::Response & res) {
             res.set_content(reinterpret_cast<const char*>(bundle_css), bundle_css_len,
