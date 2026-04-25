@@ -2516,6 +2516,62 @@ int main(int argc, char ** argv) {
                 "};"
 
                 // SSE → activity pill state machine.
+                // ---- per-message thinking panel ----------------------------
+                // Reasoning content (delta.reasoning_content) is appended into
+                // a small <details> panel placed at the top of the latest
+                // assistant message bubble.  Plain text body, gray monospace,
+                // max-height cap, click to expand.  When the next visible
+                // delta.content arrives (or the stream finishes) we collapse
+                // the panel.  A NEW panel will be created if the model thinks
+                // again later in the same message.
+                "const THINK=new WeakMap();"      // msg → currently-open panel
+                "const findLastAssistantMsg=()=>{"
+                  "const all=document.querySelectorAll("
+                    "'[aria-label=\"Assistant message with actions\"]');"
+                  "return all.length?all[all.length-1]:null;"
+                "};"
+                "const ensureThinkPanel=(msg)=>{"
+                  "let p=THINK.get(msg);"
+                  "if(p&&document.contains(p))return p;"
+                  "p=document.createElement('details');"
+                  "p.className='__easyai-thinking';"
+                  "p.open=true;"
+                  "p.style.cssText="
+                    "'margin:.5rem 0;padding:.35rem .55rem;"
+                    " border-left:2px solid #b97df3;"
+                    " background:rgba(185,125,243,.06);"
+                    " border-radius:4px;"
+                    " font-size:.7rem;color:#8b949e;"
+                    " font-family:ui-monospace,SFMono-Regular,Menlo,monospace;"
+                    " line-height:1.5;';"
+                  "p.innerHTML="
+                    "'<summary style=\"cursor:pointer;color:#b97df3;"
+                      "font-weight:600;font-size:.7rem;list-style:none;"
+                      "outline:none;user-select:none\">▾ thinking…</summary>'"
+                    "+'<div class=\"t\" style=\"margin-top:.4rem;"
+                      "white-space:pre-wrap;max-height:18em;"
+                      "overflow-y:auto;padding-right:.3rem\"></div>';"
+                  "msg.insertBefore(p,msg.firstChild);"
+                  "THINK.set(msg,p);"
+                  "return p;"
+                "};"
+                "function appendThinking(text){"
+                  "const msg=findLastAssistantMsg();"
+                  "if(!msg)return;"
+                  "const p=ensureThinkPanel(msg);"
+                  "const t=p.querySelector('.t');"
+                  "if(t){t.textContent+=text;t.scrollTop=t.scrollHeight;}"
+                "};"
+                "function closeThinking(){"
+                  "const msg=findLastAssistantMsg();"
+                  "if(!msg)return;"
+                  "const p=THINK.get(msg);"
+                  "if(!p)return;"
+                  "p.open=false;"
+                  "const sum=p.querySelector('summary');"
+                  "if(sum)sum.textContent='▸ thinking';"
+                  "THINK.delete(msg);"
+                "};"
                 "async function monitorSSE(stream){"
                   "const set=window.__easyaiSetStatus||(()=>{});"
                   "set('answering');"
@@ -2554,12 +2610,31 @@ int main(int argc, char ** argv) {
                         "if(j.timings){lastTimings=j.timings;"
                         "if(window.__easyaiPushTimings)window.__easyaiPushTimings(j.timings);}"
                         "const ch=j.choices&&j.choices[0];"
-                        "if(ch&&ch.delta&&typeof ch.delta.content==='string'){"
-                          "const c=ch.delta.content;"
-                          "if(!inThink&&/<think(?:ing)?>/i.test(c)){inThink=true;set('thinking');}"
-                          "else if(inThink&&/<\\/think(?:ing)?>/i.test(c)){inThink=false;set('answering');}"
+                        "if(ch&&ch.delta){"
+                          // -- THINKING PANEL --------------------------------
+                          // Append reasoning chunks to a small collapsible
+                          // panel placed at the top of the latest assistant
+                          // message.  Plain text body, gray monospace, max-
+                          // height capped so long reasoning doesn't blow up
+                          // the layout.  The user can click to expand or
+                          // collapse.
+                          "if(typeof ch.delta.reasoning_content==='string'){"
+                            "appendThinking(ch.delta.reasoning_content);"
+                            "set('thinking');"
+                          "}"
+                          // -- VISIBLE CONTENT -------------------------------
+                          "if(typeof ch.delta.content==='string'){"
+                            "const c=ch.delta.content;"
+                            // first visible content after thinking → close panel
+                            "if(c.length>0)closeThinking();"
+                            // legacy in-content think detection (very rare now)
+                            "if(!inThink&&/<think(?:ing)?>/i.test(c)){inThink=true;set('thinking');}"
+                            "else if(inThink&&/<\\/think(?:ing)?>/i.test(c)){inThink=false;set('answering');}"
+                            "else if(!inThink)set('answering');"
+                          "}"
                         "}"
                         "if(ch&&ch.finish_reason){"
+                          "closeThinking();"
                           "const t=lastTimings;"
                           "let msg='';"
                           "if(t&&t.predicted_n&&t.predicted_ms){"
