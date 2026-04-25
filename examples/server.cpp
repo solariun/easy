@@ -2465,69 +2465,17 @@ int main(int argc, char ** argv) {
                 "}"
               "})();</script>";
 
-            // ----- two floating panels in Shadow DOM ------------------------
-            //   Status pill   — centred just above the input bar (so it
-            //                   visually sits right below the last assistant
-            //                   response). Shows the live generation phase
-            //                   and post-completion stats.
-            //   Tone chip     — bottom-left, near the model name on the
-            //                   input row. Picks the named sampling profile
-            //                   the fetch interceptor injects on every
-            //                   /v1/chat/completions request.
-            // Both are mounted inside Shadow DOM attached to <html> so the
-            // Svelte body subtree can't wipe them.
+            // ----- floating tone chip + per-message status injection -------
+            //   Tone chip   — its own Shadow DOM host, bottom-left, beside
+            //                 where the bundle paints the model badge.
+            //   Per-msg     — for each assistant message, we append a small
+            //   status        live status indicator (thinking / answering /
+            //                 fetching · <tool>) inline next to the
+            //                 copy/edit/fork/delete actions.  The bundle's
+            //                 own stats line still appears below the message
+            //                 once generation completes.
             inj <<
               "<script>(()=>{"
-
-                // --- status pill ---------------------------------------
-                "const STATUS_ID='__easyaiStatusHost';"
-                "let statusRoot=null;"
-                "const ensureStatus=()=>{"
-                  "let h=document.getElementById(STATUS_ID);"
-                  "if(h&&statusRoot)return statusRoot;"
-                  "if(!document.documentElement)return null;"
-                  "h=document.createElement('div');"
-                  "h.id=STATUS_ID;"
-                  "h.setAttribute('aria-hidden','false');"
-                  "h.style.cssText="
-                    "'all:initial;position:fixed;bottom:5.2rem;'+"
-                    "'left:50%;transform:translateX(-50%);'+"
-                    "'z-index:2147483647;pointer-events:none;'+"
-                    "'font:14px/1 -apple-system,system-ui,sans-serif;';"
-                  "document.documentElement.appendChild(h);"
-                  "const root=h.attachShadow({mode:'open'});"
-                  "root.innerHTML="
-                    "'<style>"
-                      ":host,*{box-sizing:border-box}"
-                      ".pill{pointer-events:auto;display:inline-flex;"
-                        "align-items:center;gap:.5rem;"
-                        "background:rgba(15,19,24,.94);"
-                        "border:1px solid #2a313b;border-radius:999px;"
-                        "padding:.3rem .8rem;color:#8b949e;"
-                        "font:.78rem -apple-system,system-ui,sans-serif;"
-                        "backdrop-filter:blur(6px);"
-                        "box-shadow:0 2px 12px rgba(0,0,0,.35);}"
-                      ".dot{width:.55rem;height:.55rem;border-radius:50%;"
-                        "background:#3fb950;flex-shrink:0;}"
-                      ".dot.thinking{background:#b97df3;animation:p 1.2s infinite}"
-                      ".dot.answering{background:#1f6feb;animation:p .9s infinite}"
-                      ".dot.fetching{background:#4fb0ff;animation:p .6s infinite}"
-                      ".dot.error{background:#f85149}"
-                      ".label{color:#e6edf3}"
-                      ".stats{color:#8b949e;font-family:ui-monospace,monospace;font-size:.7rem}"
-                      ".sep{color:#3a414b;display:none}"
-                      ".stats:not(:empty)+.sep{display:inline}"
-                      "@keyframes p{0%,100%{opacity:1}50%{opacity:.35}}"
-                    "</style>'+"
-                    "'<div class=\"pill\">"
-                      "<span class=\"dot\"></span>"
-                      "<span class=\"label\">idle</span>"
-                      "<span class=\"sep\">·</span>"
-                      "<span class=\"stats\"></span>"
-                    "</div>';"
-                  "statusRoot=root;"
-                  "return root;"
-                "};"
 
                 // --- tone chip -----------------------------------------
                 "const TONE_ID='__easyaiToneHost';"
@@ -2581,30 +2529,91 @@ int main(int argc, char ** argv) {
                   "return root;"
                 "};"
 
-                "const ensureBoth=()=>{ensureStatus();ensureTone();};"
-                "if(document.documentElement)ensureBoth();"
-                "document.addEventListener('DOMContentLoaded',ensureBoth);"
+                "if(document.documentElement)ensureTone();"
+                "document.addEventListener('DOMContentLoaded',ensureTone);"
                 "setInterval(()=>{"
-                  "if(!document.getElementById(STATUS_ID)){statusRoot=null;ensureStatus();}"
                   "if(!document.getElementById(TONE_ID)){toneRoot=null;ensureTone();}"
                 "},1000);"
 
-                // Public helper: set the status pill's activity state.
-                "window.__easyaiSetStatus=(state,extra)=>{"
-                  "const r=ensureStatus();if(!r)return;"
-                  "const dot=r.querySelector('.dot');"
-                  "const lab=r.querySelector('.label');"
-                  "const sta=r.querySelector('.stats');"
-                  "if(!dot||!lab||!sta)return;"
-                  "dot.className='dot '+(state==='complete'||state==='idle'?'':state||'');"
-                  "lab.textContent={"
-                    "thinking:'thinking',answering:'answering',"
-                    "fetching:extra?('fetching · '+extra):'fetching',"
-                    "complete:'complete',error:'error',idle:'idle'"
-                  "}[state]||state;"
-                  "sta.textContent=(state==='complete'&&extra)?extra:'';"
+                // --- per-message inline status chip -----------------------
+                // For every <... aria-label='Assistant message with actions'>
+                // we attach a small status indicator inside the action row
+                // (next to copy/edit/fork/delete).  The chip is updated by
+                // window.__easyaiSetStatus(state, extra) called from the
+                // SSE monitor below.  Bundle re-renders are handled by the
+                // MutationObserver re-attaching when the chip is missing.
+                "const CHIP_MARK='__eaiChip';"
+                "const STATE_DOT={"
+                  "thinking:'#b97df3',answering:'#1f6feb',"
+                  "fetching:'#4fb0ff',error:'#f85149',"
+                  "complete:'#3fb950',idle:'#5b626a'"
                 "};"
-                "window.__easyaiSetStatus('idle');"
+                "const findActionRow=(msg)=>{"
+                  // Heuristic: the action row is the parent that contains
+                  // the most siblings of role='button' / <button>. Walk all
+                  // descendant buttons and return the parent with the
+                  // highest button count (>=2).
+                  "const buttons=msg.querySelectorAll('button,[role=\"button\"]');"
+                  "let best=null,bestCount=1;"
+                  "buttons.forEach(b=>{"
+                    "const p=b.parentElement;"
+                    "if(!p)return;"
+                    "const c=p.querySelectorAll('button,[role=\"button\"]').length;"
+                    "if(c>bestCount){bestCount=c;best=p;}"
+                  "});"
+                  "return best;"
+                "};"
+                "const attachChip=(msg)=>{"
+                  "if(msg[CHIP_MARK]&&document.contains(msg[CHIP_MARK]))return;"
+                  "const row=findActionRow(msg);if(!row)return;"
+                  "const chip=document.createElement('span');"
+                  "chip.style.cssText="
+                    "'display:none;align-items:center;gap:.3rem;'+"
+                    "'margin-left:.5rem;padding:.1rem .55rem;"
+                    " border:1px solid #2a313b;border-radius:999px;"
+                    " color:#8b949e;background:rgba(15,19,24,.6);"
+                    " font:.7rem -apple-system,system-ui,sans-serif;';"
+                  "chip.innerHTML="
+                    "'<span class=\"d\" style=\"width:.45rem;height:.45rem;"
+                      "border-radius:50%;background:#5b626a\"></span>"
+                    "<span class=\"l\"></span>';"
+                  "row.appendChild(chip);"
+                  "msg[CHIP_MARK]=chip;"
+                "};"
+                "const scanMessages=()=>{"
+                  "document.querySelectorAll("
+                    "'[aria-label=\"Assistant message with actions\"]'"
+                  ").forEach(attachChip);"
+                "};"
+                "const mo=new MutationObserver(scanMessages);"
+                "if(document.body)mo.observe(document.body,{childList:true,subtree:true});"
+                "document.addEventListener('DOMContentLoaded',()=>{"
+                  "scanMessages();"
+                  "mo.observe(document.body,{childList:true,subtree:true});"
+                "});"
+
+                // Public helper: drives the inline chip on the LATEST
+                // assistant message (the one currently streaming).
+                "window.__easyaiSetStatus=(state,extra)=>{"
+                  "scanMessages();"
+                  "const all=document.querySelectorAll("
+                    "'[aria-label=\"Assistant message with actions\"]'"
+                  ");"
+                  "if(!all.length)return;"
+                  "const last=all[all.length-1];"
+                  "const chip=last[CHIP_MARK];"
+                  "if(!chip)return;"
+                  "if(state==='complete'||state==='idle'){"
+                    "chip.style.display='none';"
+                    "return;"
+                  "}"
+                  "chip.style.display='inline-flex';"
+                  "const dot=chip.querySelector('.d');"
+                  "const lab=chip.querySelector('.l');"
+                  "if(dot)dot.style.background=STATE_DOT[state]||STATE_DOT.idle;"
+                  "if(lab)lab.textContent=state==='fetching'&&extra"
+                    "?('fetching · '+extra):state;"
+                "};"
               "})();</script>";
 
             // ----- CSS hiding for features we don't support ------------------
