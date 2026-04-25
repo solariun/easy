@@ -65,7 +65,7 @@ engine.add_tool(
 * `easyai::tools::*` — built-in tools:
   * `datetime` (no deps)
   * `web_fetch` (libcurl, HTML→text)
-  * `web_search` (SearXNG JSON API)
+  * `web_search` (DuckDuckGo HTML, no API key, no external service)
   * `fs_read_file`, `fs_write_file`, `fs_list_dir`, `fs_glob`, `fs_grep`
     (sandboxed to a root directory you provide)
 * `easyai::presets` — named sampling profiles
@@ -135,8 +135,7 @@ client that expects one.
 ```
 develop/
 ├── easyai/        # this project
-├── llama.cpp/     # cloned next to it (https://github.com/ggml-org/llama.cpp)
-└── searxng/       # optional, used by web_search at runtime
+└── llama.cpp/     # cloned next to it (https://github.com/ggml-org/llama.cpp)
 ```
 
 ```bash
@@ -169,12 +168,12 @@ be forwarded; any tools it doesn't declare will use the server's toolbelt.
 * **Linux/Windows + Vulkan SDK** — configure with `-DGGML_VULKAN=ON`.
 * **CPU only** — pass `-ngl 0` (or `.gpu_layers(0)` in code).
 
-### Web search via SearXNG
+### Web search
 
-`web_search` reads `EASYAI_SEARXNG_URL` (default `http://127.0.0.1:8080` —
-note: same default port as easyai-server, so move one if you run both).
-The local `searxng/` sibling repo can serve it. Make sure `json` is enabled
-in your SearXNG `settings.yml` under `search.formats`.
+`web_search` hits DuckDuckGo's HTML endpoint (`html.duckduckgo.com/html/`)
+directly and parses the result page. No API key, no external service to
+run, no environment variable to set. Works as long as the host has outbound
+HTTPS to duckduckgo.com.
 
 ---
 

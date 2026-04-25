@@ -10,7 +10,7 @@ C++17 program". By the end you will know how to:
 * write a custom tool, with typed parameters
 * tune the sampler with presets and runtime overrides
 * debug common issues (context overflow, malformed tool calls, GPU
-  fallback, SearXNG configuration)
+  fallback)
 
 ---
 
@@ -23,8 +23,7 @@ easyai expects llama.cpp as a sibling directory:
 ```
 develop/
 ├── easyai/        # this project
-├── llama.cpp/     # https://github.com/ggml-org/llama.cpp
-└── searxng/       # optional, only needed for the web_search tool
+└── llama.cpp/     # https://github.com/ggml-org/llama.cpp
 ```
 
 Clone llama.cpp if you haven't:
@@ -46,7 +45,6 @@ git clone https://github.com/ggml-org/llama.cpp
 | Optional        | Used by             |
 |-----------------|---------------------|
 | libcurl         | `web_fetch`, `web_search` |
-| A SearXNG host  | `web_search`              |
 
 On macOS:
 
@@ -73,7 +71,7 @@ build/libeasyai.dylib # the library
 ```
 
 If the configure step says `easyai: libcurl found — web_fetch / web_search enabled`,
-you can skip the SearXNG section if you only care about `web_fetch`.
+both web tools will work out of the box (no extra service to run).
 
 ### 1.4 Get a model
 
@@ -369,26 +367,16 @@ if (turn.finish_reason == "tool_calls") {
 
 ## Part 4 — recipes
 
-### 4.1 SearXNG locally
+### 4.1 Web search
 
-```bash
-cd ../searxng
-make run                       # follow the project's quickstart
-# Then make sure JSON is enabled in settings.yml:
-#   search:
-#     formats:
-#       - html
-#       - json
-```
+`web_search` works out of the box — it talks to DuckDuckGo's HTML endpoint
+directly via libcurl. There is nothing to configure and no API key.
 
-Tell easyai where it is:
-
-```bash
-export EASYAI_SEARXNG_URL=http://127.0.0.1:8080
-./build/easyai-cli -m … 
-```
-
-(Or set it inside your shell profile.)
+If DDG starts rate-limiting your IP (rare), the tool returns an explicit
+error message instead of silently failing. If you need a different backend
+(Bing, Brave, your own SearXNG), the implementation lives in
+`src/builtin_tools.cpp::web_search()` — copy that handler, swap the URL and
+the regex pair, and register your variant via `engine.add_tool(my_search())`.
 
 ### 4.2 Forcing CPU-only
 

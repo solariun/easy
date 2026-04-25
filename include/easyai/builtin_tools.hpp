@@ -14,8 +14,9 @@ Tool datetime();   // returns current UTC + local time in ISO-8601
 // web_fetch:  GET a URL, return text (HTML stripped of tags + trimmed).
 Tool web_fetch();
 
-// web_search: query a SearXNG instance (env EASYAI_SEARXNG_URL,
-// default "http://127.0.0.1:8080") and return top results as text.
+// web_search: search the web via DuckDuckGo's HTML endpoint (no API key, no
+// external service required) and return the top results as a numbered list
+// of title / url / snippet.
 Tool web_search();
 
 // ---------- filesystem --------------------------------------------------

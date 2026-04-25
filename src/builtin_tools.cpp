@@ -80,6 +80,48 @@ static std::string url_encode(const std::string & v) {
     return out;
 }
 
+// Decodes a percent-encoded form-urlencoded string ('+' → space, '%XX' → byte).
+// Tolerant of malformed input — leaves bad sequences as-is rather than failing.
+static std::string url_decode(const std::string & s) {
+    std::string out;
+    out.reserve(s.size());
+    for (size_t i = 0; i < s.size(); ++i) {
+        char c = s[i];
+        if (c == '+') {
+            out += ' ';
+        } else if (c == '%' && i + 2 < s.size() &&
+                   std::isxdigit((unsigned char) s[i + 1]) &&
+                   std::isxdigit((unsigned char) s[i + 2])) {
+            char hex[3] = { s[i + 1], s[i + 2], 0 };
+            out += static_cast<char>(std::strtol(hex, nullptr, 16));
+            i += 2;
+        } else {
+            out += c;
+        }
+    }
+    return out;
+}
+
+// DuckDuckGo wraps result URLs in `/l/?uddg=ENCODED_URL[&rut=...]` redirects.
+// If `href` carries that wrapper, extract and decode the uddg param.
+// Falls back to returning the href unchanged (or with the protocol prefixed if
+// it's protocol-relative) when there's no wrapper.
+static std::string decode_ddg_redirect(const std::string & href) {
+    static const std::string marker = "uddg=";
+    size_t k = href.find(marker);
+    if (k == std::string::npos) {
+        if (href.compare(0, 4, "http") == 0) return href;
+        if (href.compare(0, 2, "//")  == 0)  return "https:" + href;
+        return href;
+    }
+    k += marker.size();
+    size_t end = href.find('&', k);
+    std::string enc = href.substr(k, end == std::string::npos
+                                       ? std::string::npos
+                                       : end - k);
+    return url_decode(enc);
+}
+
 #if defined(EASYAI_HAVE_CURL)
 static size_t curl_write_cb(void * buf, size_t sz, size_t n, void * ud) {
     auto * out = static_cast<std::string *>(ud);
@@ -123,6 +165,52 @@ static bool http_get(const std::string & url,
         err = "HTTP " + std::to_string(http_code);
         return false;
     }
+    if ((long) body.size() > max_bytes) body.resize(max_bytes);
+    return true;
+}
+
+// POST application/x-www-form-urlencoded.  Used by the DDG search backend
+// because POST is far less likely than GET to hit the bot/captcha gate.
+static bool http_post_form(const std::string & url,
+                           const std::string & form_body,
+                           std::string & body, std::string & err,
+                           long timeout_s = 20,
+                           long max_bytes = 4 * 1024 * 1024) {
+    CURL * c = curl_easy_init();
+    if (!c) { err = "curl_easy_init failed"; return false; }
+
+    body.clear();
+    curl_easy_setopt(c, CURLOPT_URL,             url.c_str());
+    curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION,  1L);
+    curl_easy_setopt(c, CURLOPT_MAXREDIRS,       5L);
+    curl_easy_setopt(c, CURLOPT_TIMEOUT,         timeout_s);
+    // A real-browser User-Agent is required by html.duckduckgo.com.
+    curl_easy_setopt(c, CURLOPT_USERAGENT,
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_5) AppleWebKit/605.1.15 "
+        "(KHTML, like Gecko) Version/16.6 Safari/605.1.15");
+    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION,   curl_write_cb);
+    curl_easy_setopt(c, CURLOPT_WRITEDATA,       &body);
+    curl_easy_setopt(c, CURLOPT_NOSIGNAL,        1L);
+    curl_easy_setopt(c, CURLOPT_ACCEPT_ENCODING, "");
+    curl_easy_setopt(c, CURLOPT_POST,            1L);
+    curl_easy_setopt(c, CURLOPT_POSTFIELDS,      form_body.c_str());
+    curl_easy_setopt(c, CURLOPT_POSTFIELDSIZE,   (long) form_body.size());
+
+    curl_slist * headers = nullptr;
+    headers = curl_slist_append(headers,
+        "Content-Type: application/x-www-form-urlencoded");
+    headers = curl_slist_append(headers,
+        "Accept: text/html,application/xhtml+xml");
+    curl_easy_setopt(c, CURLOPT_HTTPHEADER, headers);
+
+    CURLcode rc = curl_easy_perform(c);
+    long http_code = 0;
+    curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &http_code);
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(c);
+
+    if (rc != CURLE_OK)   { err = curl_easy_strerror(rc); return false; }
+    if (http_code >= 400) { err = "HTTP " + std::to_string(http_code); return false; }
     if ((long) body.size() > max_bytes) body.resize(max_bytes);
     return true;
 }
@@ -189,22 +277,35 @@ Tool web_fetch() {
 }
 
 // ============================================================================
-// web_search  (SearXNG JSON API)
+// web_search — DuckDuckGo HTML scraper
+// ----------------------------------------------------------------------------
+// No external service required: we POST the query to html.duckduckgo.com and
+// parse the resulting HTML for the result list.  DDG's HTML page has a stable
+// class-based markup (`result__a`, `result__snippet`) that's been the same for
+// years; if/when that changes, only this function needs updating.
+//
+// We POST instead of GET because DDG is much more aggressive about throwing
+// CAPTCHAs at GET requests from scripted clients.
+//
+// The URLs returned by DDG are wrapped in a tracking redirect of the form
+// `//duckduckgo.com/l/?uddg=ENCODED_URL&rut=...`; decode_ddg_redirect() unwraps
+// them so the caller (the LLM) gets real, fetchable URLs.
+//
+// No global state, no env vars — works out of the box.
 // ============================================================================
-//
-// We hit `${SEARXNG_URL}/search?q=...&format=json`. SearXNG must be configured
-// to allow the `json` format (search.formats in settings.yml).
-//
 Tool web_search() {
     return Tool::builder("web_search")
-        .describe("Search the web via a SearXNG instance. Returns a list of "
-                  "title / url / snippet results.")
-        .param("query",      "string",  "Search query", true)
-        .param("max_results","integer", "Maximum results to return (default 5)", false)
+        .describe("Search the web (DuckDuckGo). Returns a numbered list of "
+                  "title / url / snippet results. Pair with web_fetch to read "
+                  "any of the returned URLs.")
+        .param("query",       "string",  "Search query", true)
+        .param("max_results", "integer", "Maximum results to return "
+                                         "(default 5, max 20)", false)
         .handle([](const ToolCall & c) {
 #if !defined(EASYAI_HAVE_CURL)
             (void) c;
-            return ToolResult::error("web_search unavailable: easyai built without libcurl");
+            return ToolResult::error(
+                "web_search unavailable: easyai built without libcurl");
 #else
             std::string query;
             if (!args::get_string(c.arguments_json, "query", query) || query.empty()) {
@@ -215,64 +316,75 @@ Tool web_search() {
             if (max_results < 1)  max_results = 1;
             if (max_results > 20) max_results = 20;
 
-            const char * env = std::getenv("EASYAI_SEARXNG_URL");
-            std::string base = env ? env : "http://127.0.0.1:8080";
-            while (!base.empty() && base.back() == '/') base.pop_back();
-
-            std::string url = base + "/search?q=" + url_encode(query)
-                            + "&format=json&safesearch=1&language=en";
+            // POST html.duckduckgo.com/html/  with a form-encoded query.
+            // kl=us-en pins the locale so results are reproducible.
+            const std::string url       = "https://html.duckduckgo.com/html/";
+            const std::string post_body = "q=" + url_encode(query) + "&kl=us-en";
             std::string body, err;
-            if (!http_get(url, {"Accept: application/json"}, body, err)) {
-                return ToolResult::error("search failed (" + base + "): " + err);
+            if (!http_post_form(url, post_body, body, err)) {
+                return ToolResult::error("search failed: " + err);
+            }
+            if (body.empty()) {
+                return ToolResult::error("search failed: empty response");
             }
 
-            // Lightweight extraction of the top-N {title,url,content} entries
-            // from the SearXNG JSON. Avoids pulling a JSON dep.
+            // ----- parse HTML --------------------------------------------------
+            // Each result block contains:
+            //   <a class="result__a" href="REDIRECT">TITLE_HTML</a>
+            //   ...
+            //   <a class="result__snippet" ...>SNIPPET_HTML</a>     (most cases)
+            //     OR
+            //   <div class="result__snippet">SNIPPET_HTML</div>     (some)
+            //
+            // We iterate over title matches and look for the *next* snippet
+            // element after each title's match end.
+            //
+            // The regexes use [\s\S] for "any char incl. newline" because
+            // std::regex's "." doesn't match newlines by default.
+            static const std::regex re_title(
+                R"DDG(<a[^>]*class\s*=\s*"[^"]*result__a[^"]*"[^>]*href\s*=\s*"([^"]+)"[^>]*>([\s\S]*?)</a>)DDG",
+                std::regex::icase);
+            static const std::regex re_snippet(
+                R"DDG(<(?:a|div)[^>]*class\s*=\s*"[^"]*result__snippet[^"]*"[^>]*>([\s\S]*?)</(?:a|div)>)DDG",
+                std::regex::icase);
+
             std::ostringstream out;
-            out << "Top results for: " << query << "\n";
-            size_t pos = body.find("\"results\"");
-            if (pos == std::string::npos) {
-                return ToolResult::error("no results array in SearXNG response");
-            }
-            int    count = 0;
-            size_t i = body.find('[', pos);
-            if (i == std::string::npos) {
-                return ToolResult::error("malformed SearXNG response");
-            }
+            out << "Top web results for: " << query << "\n";
+            int count = 0;
 
-            auto pull = [](const std::string & s, size_t from, const std::string & key,
-                           std::string & out_val) -> bool {
-                std::string needle = "\"" + key + "\":";
-                size_t k = s.find(needle, from);
-                if (k == std::string::npos) return false;
-                k += needle.size();
-                while (k < s.size() && std::isspace((unsigned char) s[k])) ++k;
-                if (k >= s.size() || s[k] != '"') return false;
-                ++k;
-                out_val.clear();
-                while (k < s.size() && s[k] != '"') {
-                    if (s[k] == '\\' && k + 1 < s.size()) { out_val += s[k+1]; k += 2; }
-                    else                                  { out_val += s[k];   ++k;  }
+            auto t_end = std::sregex_iterator();
+            for (auto it = std::sregex_iterator(body.begin(), body.end(), re_title);
+                 it != t_end && count < max_results; ++it) {
+
+                std::string href  = (*it)[1].str();
+                std::string title = strip_html((*it)[2].str());
+                std::string real  = decode_ddg_redirect(href);
+                if (real.empty() || title.empty()) continue;
+
+                // Look for a snippet inside the next ~2 KiB of HTML after this
+                // title (snippets sit immediately below their titles in the DOM).
+                size_t after = it->position(0) + it->length(0);
+                std::string tail = body.substr(after,
+                    std::min<size_t>(2048, body.size() - after));
+                std::string snippet;
+                std::smatch sm;
+                if (std::regex_search(tail, sm, re_snippet)) {
+                    snippet = strip_html(sm[1].str());
                 }
-                return true;
-            };
 
-            while (count < max_results) {
-                size_t obj = body.find('{', i + 1);
-                size_t end = body.find('}', i + 1);
-                if (obj == std::string::npos || end == std::string::npos) break;
-                if (obj > end) break;
-                std::string title, urlv, content;
-                pull(body, obj, "title",   title);
-                pull(body, obj, "url",     urlv);
-                pull(body, obj, "content", content);
-                if (urlv.empty()) break;
-                out << "\n" << (count + 1) << ". " << title << "\n   " << urlv
-                    << "\n   " << clip(content, 300) << "\n";
+                out << "\n" << (count + 1) << ". " << title
+                    << "\n   " << real
+                    << "\n   " << clip(snippet, 300) << "\n";
                 ++count;
-                i = end;
             }
-            if (count == 0) return ToolResult::ok("No results.");
+
+            if (count == 0) {
+                // DDG occasionally serves a CAPTCHA / "anomaly" interstitial
+                // when it thinks we're a bot — surface that explicitly.
+                return ToolResult::error(
+                    "no results parsed (DuckDuckGo may have rate-limited the "
+                    "request; try again in a minute)");
+            }
             return ToolResult::ok(clip(out.str(), 8 * 1024));
 #endif
         })
