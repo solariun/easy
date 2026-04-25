@@ -36,6 +36,7 @@
 #   ./install_easyai_server.sh --service-port 8080
 #   ./install_easyai_server.sh --service-host 0.0.0.0
 #   ./install_easyai_server.sh --ctx-size 32768
+#   ./install_easyai_server.sh --ngl 99            # GPU layers (-1=auto, 0=CPU)
 #   ./install_easyai_server.sh --no-mlock --use-mmap
 #   ./install_easyai_server.sh --webui-title "AI Box"
 #   ./install_easyai_server.sh --webui-icon /path/to/logo.svg   # ico|png|svg|gif|jpg|webp
@@ -93,6 +94,7 @@ system_file="$config_dir/system.txt"
 api_key_file="$config_dir/api_key"
 
 ctx_size=128000
+ngl=99                                        # --ngl <n>  (-1=auto, 0=CPU only, 99=all layers)
 webui_title="easyai"                          # --webui-title <text>
 webui_icon=""                                 # --webui-icon <path/to/.ico|.png|.svg|.gif|.jpg|.webp>
 webui_icon_dest="$config_dir/favicon"         # final installed path under /etc/easyai
@@ -144,6 +146,7 @@ while [[ $# -gt 0 ]]; do
         --service-port)     service_port="$2"; shift 2 ;;
         --alias)            service_alias="$2"; shift 2 ;;
         --ctx-size)         ctx_size="$2"; shift 2 ;;
+        --ngl|--n-gpu-layers) ngl="$2"; shift 2 ;;
         --threads)          n_threads_default="$2"; shift 2 ;;
         --threads-batch)    n_threads_batch_default="$2"; shift 2 ;;
         --preset)           preset="$2"; shift 2 ;;
@@ -259,6 +262,7 @@ printf '    service_host     = %s\n' "$service_host"
 printf '    service_port     = %s\n' "$service_port"
 printf '    service_alias    = %s\n' "$service_alias"
 printf '    ctx_size         = %s\n' "$ctx_size"
+printf '    ngl              = %s   (-1=auto, 0=CPU only, 99=all GPU layers)\n' "$ngl"
 printf '    threads / batch  = %s / %s\n' "$n_threads_default" "$n_threads_batch_default"
 printf '    preset           = %s  thinking=%s\n' "$preset" "$thinking"
 printf '    KV cache         = K=%s  V=%s  flash_attn=%s\n' "$cache_type_k" "$cache_type_v" "$enable_flash_attn"
@@ -386,6 +390,37 @@ if [[ $do_build -eq 1 ]]; then
     popd >/dev/null
 fi
 
+# ---------- post-build sanity: which GPU backend was actually compiled? ----
+# We honour what the build produced over what the user asked for, so a CPU-
+# only binary doesn't spam GPU-related errors at runtime via --ngl.
+detected_backends=""
+while IFS= read -r so; do
+    name=$(basename "$so" | sed -E 's/^libggml-([a-z0-9]+)\.so.*/\1/')
+    case "$name" in
+        base|cpu) ;;
+        *) detected_backends="$detected_backends $name" ;;
+    esac
+done < <(find "$easyai_dir/build" -maxdepth 8 -name 'libggml-*.so*' 2>/dev/null | sort -u)
+detected_backends=$(echo "$detected_backends" | xargs -n1 2>/dev/null | sort -u | tr '\n' ',' | sed 's/,$//; s/,/, /g')
+
+if [[ -z "$detected_backends" ]]; then
+    if [[ "$ngl" -ne 0 ]]; then
+        warn "build is CPU-only (no libggml-{vulkan,cuda,hip,metal}.so found)"
+        warn "forcing --ngl 0 in the systemd unit"
+        ngl=0
+    fi
+else
+    log "GPU backends compiled into the build: $detected_backends"
+    if [[ "$backend_resolved" != "cpu" ]]; then
+        # Sanity: the chosen backend actually produced a library?
+        case "$backend_resolved" in
+            vulkan) [[ "$detected_backends" == *vulkan* ]] || warn "asked for vulkan but no libggml-vulkan.so was produced" ;;
+            cuda)   [[ "$detected_backends" == *cuda*   ]] || warn "asked for cuda but no libggml-cuda.so was produced" ;;
+            hip)    [[ "$detected_backends" == *hip*    ]] || warn "asked for hip but no libggml-hip.so was produced" ;;
+        esac
+    fi
+fi
+
 # ---------- install binaries ------------------------------------------------
 if [[ $do_build -eq 1 ]]; then
     log "installing binaries to $install_prefix/bin"
@@ -393,12 +428,23 @@ if [[ $do_build -eq 1 ]]; then
     sudo install -Dm755 "$easyai_dir/build/easyai-cli"    "$install_prefix/bin/easyai-cli"
     sudo install -Dm755 "$easyai_dir/build/easyai-agent"  "$install_prefix/bin/easyai-agent" || true
     sudo install -Dm755 "$easyai_dir/build/easyai-chat"   "$install_prefix/bin/easyai-chat"  || true
-    # libeasyai.so + dynamically-loaded llama / ggml libs
+    # libeasyai.so + dynamically-loaded llama / ggml libs.
+    #
+    # llama.cpp's targets land under several subdirs of build/_deps/llama.cpp/
+    # (src/, common/, ggml/src/, ggml/src/ggml-*/) and use versioned SONAMEs
+    # like libllama.so.0.  We need ALL of them — both the bare *.so symlinks
+    # and the actual *.so.N files they point at — so the runtime loader can
+    # resolve everything libeasyai.so depends on.
     sudo install -Dm644 "$easyai_dir/build/libeasyai.so" "$install_prefix/lib/libeasyai.so" || true
-    for so in "$easyai_dir/build/_deps/llama.cpp/bin/"*.so; do
-        [[ -f "$so" ]] || continue
-        sudo install -Dm644 "$so" "$install_prefix/lib/$(basename "$so")"
-    done
+    while IFS= read -r so; do
+        [[ -f "$so" || -L "$so" ]] || continue
+        # `cp -P` preserves the symlink chain so libllama.so → libllama.so.0
+        # → libllama.so.0.10.0 all land alongside each other.
+        sudo cp -Pf "$so" "$install_prefix/lib/$(basename "$so")"
+    done < <(find "$easyai_dir/build" \
+                  \( -name 'libllama*.so*' -o -name 'libggml*.so*' \
+                  -o -name 'libllama-common*.so*' -o -name 'libllava*.so*' \
+                  -o -name 'libcpp-httplib*.so*' \) -print 2>/dev/null)
     sudo ldconfig || true
 
     if [[ $do_presets -eq 1 ]]; then
@@ -559,6 +605,7 @@ if [[ $do_service -eq 1 ]]; then
     args+=( --host "$service_host" --port "$service_port" )
     args+=( --alias "$service_alias" )
     args+=( -c "$ctx_size" )
+    args+=( --ngl "$ngl" )
     args+=( -t "$n_threads_default" -tb "$n_threads_batch_default" )
     args+=( --preset "$preset" )
     args+=( --sandbox "$service_workspace" )
