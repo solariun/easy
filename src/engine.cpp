@@ -682,6 +682,23 @@ std::string Engine::backend_summary() const { return p_->backend_summary; }
 int         Engine::n_ctx()         const { return p_->ctx() ? llama_n_ctx(p_->ctx()) : p_->params.n_ctx; }
 std::string Engine::model_path()    const { return p_->params.model.path; }
 
+Engine::PerfData Engine::perf_data() const {
+    PerfData out;
+    if (!p_->loaded || !p_->ctx()) return out;
+    auto d = llama_perf_context(p_->ctx());
+    out.n_prompt_tokens    = d.n_p_eval;
+    out.n_predicted_tokens = d.n_eval;
+    out.prompt_ms          = d.t_p_eval_ms;
+    out.predicted_ms       = d.t_eval_ms;
+    out.n_ctx_used = llama_memory_seq_pos_max(llama_get_memory(p_->ctx()), 0) + 1;
+    if (out.n_ctx_used < 0) out.n_ctx_used = 0;
+    return out;
+}
+
+void Engine::perf_reset() {
+    if (p_->loaded && p_->ctx()) llama_perf_context_reset(p_->ctx());
+}
+
 // ---------------------------------------------------------------------------
 // set_sampling — rebuild the underlying common_sampler with new values.
 // We free the old one (so its KV-state and grammar arrays are reclaimed) and

@@ -1609,6 +1609,11 @@ static void handle_chat_stream(ServerCtx & ctx,
             ctx.reset_engine_defaults();
             prepare_engine_for_request(ctx, *req_state);
 
+            // Snapshot perf counters BEFORE this request so we can diff
+            // them out at the end (llama_perf_context() returns cumulative
+            // values across the lifetime of the llama_context).
+            const auto perf_before = ctx.engine.perf_data();
+
             // ---- emit helpers --------------------------------------------
             auto emit_data = [&sink](const std::string & ev) {
                 std::string s = "data: " + ev + "\n\n";
@@ -1740,43 +1745,19 @@ static void handle_chat_stream(ServerCtx & ctx,
                 res_evt["is_error"] = r.is_error;
                 emit_event("easyai.tool_result", res_evt.dump());
 
-                // Compose a CLEAN markdown blockquote so every renderer can
-                // display it without HTML sanitisation eating the tags.
-                // Format:
-                //
-                //   > 🔧 **`tool_name`** `(args)`
-                //   > result line 1
-                //   > result line 2
-                //
-                // Multi-line results get a "> " prefix on every line so the
-                // whole thing stays inside the same blockquote.
-                std::string clipped = r.content;
-                if (clipped.size() > 1500) {
-                    clipped.resize(1500);
-                    clipped += "\n…[truncated]";
-                }
-                std::string args = c.arguments_json;
-                if (args.size() > 300) { args.resize(300); args += "…"; }
-
-                // Backticks inside `name(args)` need to be escaped so they
-                // don't break the inline-code spans.
-                auto bt_escape = [](std::string s){
-                    std::string out; out.reserve(s.size());
-                    for (char c : s) { if (c == '`') out += "\\`"; else out += c; }
-                    return out;
-                };
-
+                // Minimal inline indicator: a single italicised line so
+                // the user sees something happened, without the full body
+                // cluttering the saved chat (the result is still available
+                // via the easyai.tool_result custom SSE event).  Errors
+                // surface a short reason so the model's next turn makes sense.
                 std::ostringstream md;
-                md << "\n\n> " << (r.is_error ? "❌ " : "🔧 ")
-                   << "**`" << bt_escape(c.name) << "`**"
-                   << " `(" << bt_escape(args) << ")`"
-                   << "\n";
-                md << "> ";
-                for (char ch : clipped) {
-                    md << ch;
-                    if (ch == '\n') md << "> ";
+                md << "\n*" << (r.is_error ? "❌ " : "🔧 ") << c.name;
+                if (r.is_error) {
+                    std::string reason = r.content;
+                    if (reason.size() > 80) { reason.resize(80); reason += "…"; }
+                    md << " — " << reason;
                 }
-                md << "\n\n";
+                md << "*\n";
 
                 ordered_json delta;
                 delta["choices"] = json::array({{
@@ -1844,13 +1825,36 @@ static void handle_chat_stream(ServerCtx & ctx,
                 emit_data(delta.dump());
             }
 
-            // Final close-out chunk — empty delta + finish_reason.
+            // Final close-out chunk — empty delta + finish_reason + the
+            // llama-server-style `timings` block the embedded webui
+            // consumes to show tokens/s, Reading/Generation phases, and
+            // context usage.  We also include OpenAI-standard `usage` so
+            // generic clients see the prompt/completion counts.
+            const auto perf_after = ctx.engine.perf_data();
+            const int  prompt_n     = std::max(0, perf_after.n_prompt_tokens    - perf_before.n_prompt_tokens);
+            const int  predicted_n  = std::max(0, perf_after.n_predicted_tokens - perf_before.n_predicted_tokens);
+            const double prompt_ms    = std::max(0.0, perf_after.prompt_ms    - perf_before.prompt_ms);
+            const double predicted_ms = std::max(0.0, perf_after.predicted_ms - perf_before.predicted_ms);
+
             ordered_json done_delta;
             done_delta["choices"] = json::array({{
                 {"index", 0},
                 {"delta", json::object()},
                 {"finish_reason", finish_reason},
             }});
+            done_delta["timings"] = {
+                {"prompt_n",     prompt_n},
+                {"prompt_ms",    prompt_ms},
+                {"predicted_n",  predicted_n},
+                {"predicted_ms", predicted_ms},
+                {"cache_n",      perf_before.n_ctx_used},
+                {"agentic",      !req_state->client_tools},
+            };
+            done_delta["usage"] = {
+                {"prompt_tokens",     prompt_n},
+                {"completion_tokens", predicted_n},
+                {"total_tokens",      prompt_n + predicted_n},
+            };
             emit_data(done_delta.dump());
             emit_data("[DONE]");
 
@@ -2347,33 +2351,87 @@ int main(int argc, char ** argv) {
                 "});"
               "})();</script>";
 
-            // ----- fetch interceptor: stub or 404 endpoints we don't expose ---
-            // Without this, the Svelte app gets red error toasts for /authorize,
-            // /token, /register, /models/load, /cors-proxy, /properties, etc.
+            // ----- fetch interceptor: stub unsupported endpoints AND inject
+            //       sampling overrides from the tone dropdown ----------------
             inj <<
               "<script>(()=>{"
                 "const orig=window.fetch.bind(window);"
                 "const stub=(b,s=200)=>new Response(JSON.stringify(b),{"
                   "status:s,headers:{'Content-Type':'application/json'}"
                 "});"
-                "const empty=stub({},200);"
                 "const reject=stub({error:{message:'not supported on easyai-server'}},501);"
-                "window.fetch=(input,init)=>{"
+                "const TONES={"
+                  "deterministic:{t:0.0,top_p:1.0,top_k:1},"
+                  "precise:{t:0.2,top_p:0.95,top_k:40},"
+                  "balanced:{t:0.7,top_p:0.95,top_k:40},"
+                  "creative:{t:1.0,top_p:0.95,top_k:40}"
+                "};"
+                "try{window.__easyaiTone=localStorage.getItem('easyai-tone')||'balanced';}"
+                  "catch(e){window.__easyaiTone='balanced';}"
+                "window.fetch=async(input,init)=>{"
                   "let url=typeof input==='string'?input:(input&&input.url)||'';"
                   "try{const u=new URL(url,location.origin);url=u.pathname;}catch(e){}"
-                  // OAuth paths — we use bearer keys, not OAuth.
                   "if(url==='/authorize'||url==='/token'||url==='/register'"
                     "||url.startsWith('/.well-known/')) return reject;"
-                  // Model swapping — we have one model loaded at startup.
                   "if(url==='/models/load'||url==='/models/unload') return reject;"
-                  // CORS proxy / pyodide bootstrap files — not on easyai.
                   "if(url==='/cors-proxy'||url.startsWith('/home/web_user/')"
                     "||url==='/dev/poll') return reject;"
-                  // /properties is the model-properties endpoint they expose.
-                  // We don't, so return an empty object so the UI doesn't error.
                   "if(url==='/properties') return stub({});"
+                  // Inject tone-based sampling when the request body doesn't
+                  // already pin those fields.
+                  "if(url.endsWith('/v1/chat/completions')&&init&&init.body){"
+                    "try{"
+                      "const body=JSON.parse(init.body);"
+                      "const t=TONES[window.__easyaiTone];"
+                      "if(t){"
+                        "if(body.temperature===undefined)body.temperature=t.t;"
+                        "if(body.top_p===undefined)body.top_p=t.top_p;"
+                        "if(body.top_k===undefined)body.top_k=t.top_k;"
+                      "}"
+                      "init={...init,body:JSON.stringify(body)};"
+                    "}catch(e){}"
+                  "}"
                   "return orig(input,init);"
                 "};"
+              "})();</script>";
+
+            // ----- tone dropdown chip (fixed bottom-right) ------------------
+            inj <<
+              "<style>"
+                "#easyai-tone-chip{position:fixed;bottom:.55rem;right:.85rem;"
+                  "z-index:9999;background:rgba(15,19,24,.92);"
+                  "border:1px solid #2a313b;border-radius:999px;"
+                  "padding:.25rem .65rem;display:flex;align-items:center;"
+                  "gap:.4rem;font:.78rem -apple-system,system-ui,sans-serif;"
+                  "color:#8b949e;backdrop-filter:blur(6px);"
+                  "box-shadow:0 2px 12px rgba(0,0,0,.35);}"
+                "#easyai-tone-chip select{background:transparent;color:#e6edf3;"
+                  "border:0;font:inherit;cursor:pointer;outline:none;"
+                  "padding:.05rem .15rem;}"
+                "#easyai-tone-chip select option{background:#15191f;color:#e6edf3;}"
+              "</style>"
+              "<script>(()=>{"
+                "const ensure=()=>{"
+                  "if(document.getElementById('easyai-tone-chip'))return;"
+                  "if(!document.body)return;"
+                  "const w=document.createElement('div');"
+                  "w.id='easyai-tone-chip';"
+                  "w.innerHTML='<span>tone</span><select id=\"easyai-tone-sel\">"
+                    "<option value=\"deterministic\">deterministic</option>"
+                    "<option value=\"precise\">precise</option>"
+                    "<option value=\"balanced\">balanced</option>"
+                    "<option value=\"creative\">creative</option>"
+                  "</select>';"
+                  "document.body.appendChild(w);"
+                  "const s=w.querySelector('select');"
+                  "s.value=window.__easyaiTone||'balanced';"
+                  "s.onchange=()=>{"
+                    "window.__easyaiTone=s.value;"
+                    "try{localStorage.setItem('easyai-tone',s.value);}catch(e){}"
+                  "};"
+                "};"
+                "document.addEventListener('DOMContentLoaded',ensure);"
+                "setInterval(ensure,800);"
               "})();</script>";
 
             // ----- CSS hiding for features we don't support ------------------

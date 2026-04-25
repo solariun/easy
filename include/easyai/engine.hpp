@@ -174,6 +174,19 @@ class Engine {
     int                         n_ctx()             const;  // configured context window
     std::string                 model_path()        const;
 
+    // Performance counters (cumulative since the last perf_reset).  Used by
+    // the HTTP server to emit per-request timings in the SSE stream that the
+    // webui renders (tokens/s, prompt/gen times, KV cache pressure).
+    struct PerfData {
+        int    n_prompt_tokens    = 0;   // tokens in the prompt that needed eval
+        int    n_predicted_tokens = 0;   // tokens generated
+        double prompt_ms          = 0.0; // total prompt-eval wall time
+        double predicted_ms       = 0.0; // total generation wall time
+        int    n_ctx_used         = 0;   // tokens currently in the KV cache
+    };
+    PerfData perf_data()  const;
+    void     perf_reset();
+
    private:
     struct Impl;
     std::unique_ptr<Impl> p_;
