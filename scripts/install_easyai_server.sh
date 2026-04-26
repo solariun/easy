@@ -347,8 +347,20 @@ fetch_repo() {
     local dir="$1" repo="$2" ref="$3"
     if [[ -d "$dir/.git" ]]; then
         if [[ $do_upgrade -eq 1 ]]; then
-            log "git fetch in $dir"
+            log "git fetch + pull --ff-only in $dir"
             git -C "$dir" fetch --tags --prune --force
+            # When the user pinned an explicit ref via --ref / --llama-ref,
+            # the checkout below moves to it; otherwise fast-forward the
+            # current branch to its upstream so the working tree actually
+            # advances. --ff-only refuses to merge / rebase silently — if
+            # the operator has local commits we want them to know, not have
+            # us silently wipe them.
+            if [[ -z "$ref" ]]; then
+                if ! git -C "$dir" pull --ff-only; then
+                    warn "git pull --ff-only failed in $dir — local changes block the upgrade"
+                    warn "resolve manually (git status / git stash / git reset) or pass --ref <sha>"
+                fi
+            fi
         fi
     else
         log "cloning $repo → $dir"
@@ -359,6 +371,10 @@ fetch_repo() {
         log "checking out ref '$ref' in $dir"
         git -C "$dir" checkout "$ref"
     fi
+    # Show the resulting HEAD so logs make the upgrade visible.
+    local head_short
+    head_short=$(git -C "$dir" rev-parse --short HEAD 2>/dev/null || echo "?")
+    log "  $dir at $head_short"
 }
 
 # llama.cpp must sit next to easyai (CMakeLists looks at ../llama.cpp).
