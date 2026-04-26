@@ -315,7 +315,241 @@ std::string extract_think_block(std::string & s) {
     return reasoning.substr(a, b - a);
 }
 
-}  // namespace
+// Markdown-style fake tool-call recovery.
+// ---------------------------------------------------------------------------
+// Some Qwen3 fine-tunes, when they "lose confidence" in the <tool_call>
+// XML format mid-conversation (typically after a few real tool calls,
+// some of which errored), give up on the syntax and instead emit a
+// *visual* indicator in markdown that mimics how chat UIs render tool
+// invocations.  Observed shape:
+//
+//     *🔧 datetime*
+//     *🔧 web_search(query="Hugging Face Daily Papers latest")*
+//
+// or with bold instead of italics: `**🔧 web_fetch(url="...")**`.
+//
+// The engine sees these as plain content with tool_calls=0, treats it as
+// the final answer, and the user sees an empty-looking bubble.  We
+// recover by scanning for the pattern, parsing the args, and re-emitting
+// real common_chat_tool_call entries so the agentic loop continues.
+//
+// Heuristic — the marker must contain the wrench emoji (🔧, UTF-8
+// F0 9F 94 A7) so we don't misfire on legitimate prose.
+namespace {
+
+bool is_ws(char c) {
+    return c == ' ' || c == '\t' || c == '\r' || c == '\n';
+}
+
+std::string trim_str(std::string s) {
+    size_t a = 0, b = s.size();
+    while (a < b && is_ws(s[a])) ++a;
+    while (b > a && is_ws(s[b - 1])) --b;
+    return s.substr(a, b - a);
+}
+
+// Convert a free-form `key=value, key="quoted", key=12` argument list
+// into a JSON object string.  Tolerant of either single or double
+// quotes, and of bare numeric / boolean values.
+std::string kv_args_to_json(const std::string & args) {
+    std::ostringstream out;
+    out << "{";
+    bool first = true;
+    size_t i = 0;
+    while (i < args.size()) {
+        while (i < args.size() && (is_ws(args[i]) || args[i] == ',')) ++i;
+        if (i >= args.size()) break;
+        // Key: identifier chars + dashes/dots.
+        size_t k0 = i;
+        while (i < args.size() &&
+               (std::isalnum((unsigned char) args[i]) || args[i] == '_' ||
+                args[i] == '-' || args[i] == '.')) ++i;
+        if (i == k0) break;
+        std::string key = args.substr(k0, i - k0);
+        while (i < args.size() && is_ws(args[i])) ++i;
+        if (i >= args.size() || args[i] != '=') break;
+        ++i;  // past '='
+        while (i < args.size() && is_ws(args[i])) ++i;
+        if (i >= args.size()) break;
+        // Value: quoted or bare.
+        std::string raw_val;
+        bool quoted = false;
+        if (args[i] == '"' || args[i] == '\'') {
+            char q = args[i++];
+            std::string buf;
+            while (i < args.size() && args[i] != q) {
+                if (args[i] == '\\' && i + 1 < args.size()) {
+                    buf += args[i + 1];
+                    i += 2;
+                    continue;
+                }
+                buf += args[i++];
+            }
+            if (i < args.size()) ++i;  // past closing quote
+            raw_val = std::move(buf);
+            quoted = true;
+        } else {
+            size_t v0 = i;
+            while (i < args.size() && args[i] != ',' && !is_ws(args[i])) ++i;
+            raw_val = args.substr(v0, i - v0);
+        }
+        if (!first) out << ",";
+        first = false;
+        // JSON escape the key.
+        out << "\"";
+        for (char c : key) {
+            if (c == '"' || c == '\\') out << '\\';
+            out << c;
+        }
+        out << "\":";
+        // Decide value type: quoted -> string; bare numeric / bool / null -> as-is.
+        if (!quoted) {
+            // Numeric?
+            bool numeric = !raw_val.empty();
+            for (size_t j = 0; j < raw_val.size() && numeric; ++j) {
+                char c = raw_val[j];
+                if (j == 0 && (c == '-' || c == '+')) continue;
+                if (c >= '0' && c <= '9') continue;
+                if (c == '.' || c == 'e' || c == 'E') continue;
+                numeric = false;
+            }
+            if (numeric)                                            { out << raw_val; continue; }
+            if (raw_val == "true" || raw_val == "false" || raw_val == "null") {
+                out << raw_val;
+                continue;
+            }
+        }
+        out << "\"";
+        for (char c : raw_val) {
+            if (c == '"' || c == '\\') out << '\\';
+            else if (c == '\n')        { out << "\\n"; continue; }
+            else if (c == '\r')        { out << "\\r"; continue; }
+            else if (c == '\t')        { out << "\\t"; continue; }
+            out << c;
+        }
+        out << "\"";
+    }
+    out << "}";
+    return out.str();
+}
+
+// Find every `*🔧 NAME(...)*` (or `**🔧 NAME(...)**`) pattern in `text`.
+// Returns the list of recovered tool_calls AND fills `out_marker_spans`
+// with the [begin, end) byte ranges of the markers so the caller can
+// strip them from the visible content.
+struct MdMarkerSpan { size_t begin; size_t end; };
+std::vector<common_chat_tool_call>
+recover_markdown_tool_calls(const std::string & text,
+                            std::vector<MdMarkerSpan> * out_marker_spans) {
+    std::vector<common_chat_tool_call> out;
+    // 🔧 (wrench, U+1F527) in UTF-8.
+    static const char wrench[]   = "\xF0\x9F\x94\xA7";
+    static const char hammer_w[] = "\xF0\x9F\x9B\xA0";  // 🛠 base; we accept variants
+    size_t pos = 0;
+    while (pos < text.size()) {
+        // Find next '*' that may start a marker.
+        size_t a = text.find('*', pos);
+        if (a == std::string::npos) break;
+        size_t star_begin = a;
+        size_t i = a + 1;
+        if (i < text.size() && text[i] == '*') ++i;  // **
+        // Skip whitespace after the leading stars.
+        while (i < text.size() && (text[i] == ' ' || text[i] == '\t')) ++i;
+        // Check for the wrench emoji.
+        bool has_emoji = false;
+        if (i + 4 <= text.size() && std::memcmp(&text[i], wrench, 4) == 0) {
+            i += 4;
+            has_emoji = true;
+        } else if (i + 4 <= text.size() && std::memcmp(&text[i], hammer_w, 4) == 0) {
+            i += 4;
+            has_emoji = true;
+            // Skip optional VS16 (U+FE0F, EF B8 8F) emoji presentation selector.
+            if (i + 3 <= text.size() &&
+                (unsigned char) text[i]     == 0xEF &&
+                (unsigned char) text[i + 1] == 0xB8 &&
+                (unsigned char) text[i + 2] == 0x8F) i += 3;
+        }
+        if (!has_emoji) { pos = star_begin + 1; continue; }
+        while (i < text.size() && (text[i] == ' ' || text[i] == '\t')) ++i;
+        // Tool name: identifier chars.
+        size_t n0 = i;
+        while (i < text.size() &&
+               (std::isalnum((unsigned char) text[i]) || text[i] == '_')) ++i;
+        if (i == n0) { pos = star_begin + 1; continue; }
+        std::string name = text.substr(n0, i - n0);
+        // Optional `(args)` block — match parens with depth + quote awareness.
+        std::string args_inner;
+        bool got_args = false;
+        if (i < text.size() && text[i] == '(') {
+            size_t arg_begin = i + 1;
+            int depth = 1;
+            bool in_str = false;
+            char q = 0;
+            bool esc = false;
+            size_t j = arg_begin;
+            for (; j < text.size() && depth > 0; ++j) {
+                char c = text[j];
+                if (esc) { esc = false; continue; }
+                if (in_str) {
+                    if (c == '\\') esc = true;
+                    else if (c == q) in_str = false;
+                    continue;
+                }
+                if (c == '"' || c == '\'') { in_str = true; q = c; continue; }
+                if (c == '(') ++depth;
+                else if (c == ')') --depth;
+            }
+            if (depth == 0) {
+                args_inner = text.substr(arg_begin, (j - 1) - arg_begin);
+                i = j;
+                got_args = true;
+            } else {
+                // Unbalanced parens — bail on this candidate.
+                pos = star_begin + 1;
+                continue;
+            }
+        }
+        while (i < text.size() && (text[i] == ' ' || text[i] == '\t')) ++i;
+        // Closing star(s).
+        if (i < text.size() && text[i] == '*') {
+            ++i;
+            if (i < text.size() && text[i] == '*') ++i;
+        } else {
+            // No closing star — this may still be a one-line pattern at
+            // end-of-stream; accept as long as we already captured a name.
+        }
+        size_t end = i;
+        // Eat trailing newline so the content strips cleanly.
+        if (end < text.size() && text[end] == '\n') ++end;
+
+        common_chat_tool_call tc;
+        tc.name      = std::move(name);
+        tc.arguments = got_args ? kv_args_to_json(trim_str(args_inner)) : std::string("{}");
+        out.push_back(std::move(tc));
+        if (out_marker_spans) out_marker_spans->push_back({ star_begin, end });
+        pos = end;
+    }
+    return out;
+}
+
+// Strip the spans returned by recover_markdown_tool_calls from `s`.
+std::string strip_marker_spans(const std::string & s,
+                               const std::vector<MdMarkerSpan> & spans) {
+    if (spans.empty()) return s;
+    std::string out;
+    out.reserve(s.size());
+    size_t cursor = 0;
+    for (const auto & sp : spans) {
+        if (sp.begin > cursor) out.append(s, cursor, sp.begin - cursor);
+        cursor = sp.end;
+    }
+    if (cursor < s.size()) out.append(s, cursor, s.size() - cursor);
+    return trim_str(out);
+}
+
+}  // namespace (markdown-recovery helpers)
+
+}  // namespace (top-level helpers)
 
 // ===========================================================================
 // Engine::Impl
@@ -535,6 +769,28 @@ struct Engine::Impl {
                 if (verbose) std::fprintf(stderr,
                     "[easyai] recovered %zu tool call(s) from malformed output (%s)\n",
                     msg.tool_calls.size(), recovery_kind);
+            }
+        }
+
+        // 2c) Markdown-marker recovery — when the model abandons the
+        //     <tool_call> XML and instead writes `*🔧 toolname(args)*`
+        //     as plain content (typically after a few real calls some
+        //     of which errored), the engine would otherwise return the
+        //     markers as the FINAL answer (tool_calls=0) and the chat
+        //     loop terminates with the user seeing two italicised
+        //     wrench lines as the "reply".  Recover the intent and
+        //     surface real tool_calls so the agentic loop continues.
+        if (msg.tool_calls.empty() && !msg.content.empty() &&
+                msg.content.find("\xF0\x9F\x94\xA7") != std::string::npos) {
+            std::vector<MdMarkerSpan> spans;
+            auto recovered = recover_markdown_tool_calls(msg.content, &spans);
+            if (!recovered.empty()) {
+                msg.tool_calls = std::move(recovered);
+                msg.content    = strip_marker_spans(msg.content, spans);
+                if (verbose) std::fprintf(stderr,
+                    "[easyai] recovered %zu tool call(s) from markdown markers "
+                    "(model abandoned <tool_call> syntax — agentic loop continues)\n",
+                    msg.tool_calls.size());
             }
         }
         return msg;
