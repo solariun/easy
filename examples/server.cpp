@@ -2030,6 +2030,26 @@ static void route_models(ServerCtx & ctx, const httplib::Request &,
 }
 
 // ---------------------------------------------------------------------------
+// GET /v1/tools  →  tool catalog so the webui can render a popover with
+// {name, description} pairs.  Read-only; no auth needed when the rest of
+// /v1/* is open, gated by require_auth otherwise (wired at route mount).
+// ---------------------------------------------------------------------------
+static void route_tools(ServerCtx & ctx, const httplib::Request &,
+                        httplib::Response & res) {
+    ordered_json arr = json::array();
+    for (const auto & t : ctx.default_tools) {
+        ordered_json e;
+        e["name"]        = t.name;
+        e["description"] = t.description;
+        arr.push_back(std::move(e));
+    }
+    ordered_json env;
+    env["object"] = "list";
+    env["data"]   = std::move(arr);
+    res.set_content(env.dump(), "application/json");
+}
+
+// ---------------------------------------------------------------------------
 // POST /v1/preset  body: {"preset": "creative"}  → ambient defaults change.
 // ---------------------------------------------------------------------------
 static void route_preset(ServerCtx & ctx, const httplib::Request & req,
@@ -2395,6 +2415,25 @@ int main(int argc, char ** argv) {
             //   - a <style> that hides MCP-related UI sections
             std::string html(reinterpret_cast<const char *>(index_html),
                               index_html_len);
+
+            // Strip the bundle's hard-coded inline favicon: the embedded
+            // index.html ships a giant <link rel="icon" href="data:...">
+            // base64 data URL with the orange llama-cpp logo.  We want
+            // /favicon (which serves either --webui-icon or our embedded
+            // brain SVG) to win, so erase the bundle's link tag entirely.
+            // We then unconditionally inject our own link below — this
+            // also covers the case where the operator did NOT pass
+            // --webui-icon (default brain SVG).
+            {
+                const std::string needle = "<link rel=\"icon\"";
+                size_t p = html.find(needle);
+                if (p != std::string::npos) {
+                    size_t end = html.find('>', p);
+                    if (end != std::string::npos) {
+                        html.erase(p, end + 1 - p);
+                    }
+                }
+            }
 
             std::ostringstream inj;
 
@@ -2986,6 +3025,113 @@ int main(int argc, char ** argv) {
                   "return root;"
                 "};"
 
+                // --- TOOLS BADGE (sibling of tone, click → popover with
+                //                  catalog + per-tool descriptions) ----
+                "const TOOLS_ID='__easyaiToolsHost';"
+                "let toolsRoot=null,toolsHost=null;"
+                "const ensureTools=()=>{"
+                  "let h=document.getElementById(TOOLS_ID);"
+                  "if(h&&toolsRoot){toolsHost=h;return toolsRoot;}"
+                  "if(!document.documentElement)return null;"
+                  "h=document.createElement('div');"
+                  "h.id=TOOLS_ID;"
+                  "h.setAttribute('aria-hidden','false');"
+                  "h.style.cssText="
+                    "'all:initial;position:fixed;top:0px;left:0px;"
+                    "z-index:2147483646;pointer-events:none;"
+                    "font:14px/1 -apple-system,system-ui,sans-serif;';"
+                  "document.documentElement.appendChild(h);"
+                  "toolsHost=h;"
+                  "const root=h.attachShadow({mode:'open'});"
+                  "root.innerHTML="
+                    "`<style>"
+                      ":host,*{box-sizing:border-box}"
+                      ".badge{pointer-events:auto;display:inline-flex;"
+                        "align-items:center;gap:.4rem;"
+                        "background:rgba(30,33,38,.85);"
+                        "border:1px solid #2a313b;border-radius:.5rem;"
+                        "padding:.32rem .6rem;color:#c9d1d9;"
+                        "font:.78rem -apple-system,system-ui,sans-serif;"
+                        "cursor:pointer;"
+                        "transition:background .15s ease;"
+                        "user-select:none;"
+                      "}"
+                      ".badge:hover{background:rgba(45,49,55,.9)}"
+                      ".badge svg{width:14px;height:14px;flex-shrink:0;"
+                        "stroke:#8b949e;stroke-width:2;fill:none;"
+                        "stroke-linecap:round;stroke-linejoin:round}"
+                      ".count{color:#8b949e;font-size:.7rem}"
+                      ".pop{position:absolute;bottom:calc(100% + .35rem);"
+                        "left:0;display:none;pointer-events:auto;"
+                        "min-width:14rem;max-width:22rem;"
+                        "background:#0f1318;border:1px solid #2a313b;"
+                        "border-radius:.5rem;padding:.45rem .5rem;"
+                        "box-shadow:0 6px 24px rgba(0,0,0,.5);"
+                        "color:#c9d1d9;font-size:.72rem;"
+                        "max-height:60vh;overflow-y:auto}"
+                      ".pop.open{display:block}"
+                      ".pop .row{padding:.32rem .35rem;border-radius:.3rem;"
+                        "cursor:default;display:flex;flex-direction:column;"
+                        "gap:.15rem;line-height:1.35}"
+                      ".pop .row+.row{border-top:1px solid #1f242b}"
+                      ".pop .row:hover{background:rgba(91,141,238,.08)}"
+                      ".pop .name{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;"
+                        "font-size:.72rem;color:#5b8dee;font-weight:600}"
+                      ".pop .desc{color:#8b949e;font-size:.68rem;"
+                        "white-space:pre-wrap;line-height:1.4}"
+                      ".pop .empty{color:#8b949e;padding:.4rem .35rem}"
+                    "</style>"
+                    "<div style=\"position:relative;display:inline-block\">"
+                      "<label class=\"badge\" data-trigger=\"1\">"
+                        "<svg viewBox=\"0 0 24 24\">"
+                          // Wrench icon
+                          "<path d=\"M14.7 6.3a3.5 3.5 0 0 1 4.6 4.6l-2.8-2.8-1.8 1.8 2.8 2.8a3.5 3.5 0 0 1-4.6-4.6\"/>"
+                          "<path d=\"M5 19l8.5-8.5\"/>"
+                        "</svg>"
+                        "<span>tools</span>"
+                        "<span class=\"count\"></span>"
+                      "</label>"
+                      "<div class=\"pop\" role=\"dialog\" aria-label=\"available tools\"></div>"
+                    "</div>`;"
+                  "const badge=root.querySelector('.badge');"
+                  "const pop=root.querySelector('.pop');"
+                  "const cnt=root.querySelector('.count');"
+                  "const renderList=(tools)=>{"
+                    "if(!tools||!tools.length){"
+                      "pop.innerHTML='<div class=\"empty\">no tools registered</div>';"
+                      "cnt.textContent='0';return;"
+                    "}"
+                    "cnt.textContent=String(tools.length);"
+                    "let html='';"
+                    "for(const t of tools){"
+                      "const name=(t.name||'').replace(/[<>&]/g,c=>"
+                        "c==='<'?'&lt;':c==='>'?'&gt;':'&amp;');"
+                      "const desc=(t.description||'').replace(/[<>&]/g,c=>"
+                        "c==='<'?'&lt;':c==='>'?'&gt;':'&amp;');"
+                      "html+='<div class=\"row\" title=\"'+desc+'\">'+"
+                        "'<span class=\"name\">'+name+'</span>'+"
+                        "'<span class=\"desc\">'+desc+'</span>'+"
+                      "'</div>';"
+                    "}"
+                    "pop.innerHTML=html;"
+                  "};"
+                  "renderList([]);"
+                  "fetch('/v1/tools').then(r=>r.json()).then(j=>{"
+                    "renderList((j&&j.data)||[]);"
+                  "}).catch(()=>{renderList([]);});"
+                  "badge.addEventListener('click',(e)=>{"
+                    "e.preventDefault();e.stopPropagation();"
+                    "pop.classList.toggle('open');"
+                  "});"
+                  // Close on outside click.
+                  "document.addEventListener('click',(e)=>{"
+                    "if(!toolsHost)return;"
+                    "if(!toolsHost.contains(e.target))pop.classList.remove('open');"
+                  "});"
+                  "toolsRoot=root;"
+                  "return root;"
+                "};"
+
                 // Anchor both hosts via getBoundingClientRect of the
                 // prompt form.  The metrics bar sits ~36px above the form;
                 // the tone chip sits at the form's bottom-right (where the
@@ -3039,6 +3185,19 @@ int main(int argc, char ** argv) {
                     "toneHost.style.top=badgeY+'px';"
                     "toneHost.style.left=(r.left+12)+'px';"
                     "toneHost.style.transform='translateY(-50%)';"
+                    // Tools badge sits to the right of the tone badge.
+                    // We measure tone's rendered width (its shadow root
+                    // exposes the .badge element via the host bbox)
+                    // and offset by that + a small gap.
+                    "if(toolsHost){"
+                      "let toneWidth=120;"
+                      "const tBox=toneHost.getBoundingClientRect();"
+                      "if(tBox.width>20)toneWidth=tBox.width;"
+                      "toolsHost.style.bottom='';"
+                      "toolsHost.style.top=badgeY+'px';"
+                      "toolsHost.style.left=(r.left+12+toneWidth+8)+'px';"
+                      "toolsHost.style.transform='translateY(-50%)';"
+                    "}"
                   "}else{"
                     // Fallback: viewport-anchored bottom strip.  Same
                     // bottom/top swap concern: clear top before setting
@@ -3051,18 +3210,25 @@ int main(int argc, char ** argv) {
                     "toneHost.style.bottom='1rem';"
                     "toneHost.style.left='1rem';"
                     "toneHost.style.transform='none';"
+                    "if(toolsHost){"
+                      "toolsHost.style.top='';"
+                      "toolsHost.style.bottom='1rem';"
+                      "toolsHost.style.left='9rem';"
+                      "toolsHost.style.transform='none';"
+                    "}"
                   "}"
                 "};"
 
-                "if(document.documentElement){ensureBar();ensureTone();reposition();}"
+                "if(document.documentElement){ensureBar();ensureTone();ensureTools();reposition();}"
                 "document.addEventListener('DOMContentLoaded',()=>{"
-                  "ensureBar();ensureTone();reposition();"
+                  "ensureBar();ensureTone();ensureTools();reposition();"
                 "});"
                 "window.addEventListener('resize',reposition);"
                 "window.addEventListener('scroll',reposition,true);"
                 "setInterval(()=>{"
                   "if(!document.getElementById(BAR_ID)){barRoot=null;ensureBar();}"
                   "if(!document.getElementById(TONE_ID)){toneRoot=null;ensureTone();}"
+                  "if(!document.getElementById(TOOLS_ID)){toolsRoot=null;ensureTools();}"
                   "reposition();"
                 "},250);"
 
@@ -3260,11 +3426,16 @@ int main(int argc, char ** argv) {
                   "const ta=document.querySelector('textarea');"
                   "if(!ta)return;"
                   "if(locked){"
+                    "window.__easyaiCtxFull=true;"
                     "if(ta.dataset.easyaiLockedReason===reason)return;"
                     "ta.dataset.easyaiLockedReason=reason;"
                     "ta.dataset.easyaiPrevPlaceholder=ta.placeholder||'';"
+                    "ta.dataset.easyaiPrevBorder=ta.style.border||'';"
+                    "ta.dataset.easyaiPrevOpacity=ta.style.opacity||'';"
                     "ta.placeholder=reason;"
                     "ta.disabled=true;"
+                    "ta.style.border='1px solid #f85149';"
+                    "ta.style.opacity='.55';"
                     "const form=ta.closest('form');"
                     "if(form){"
                       "form.querySelectorAll('button').forEach(b=>{"
@@ -3273,9 +3444,14 @@ int main(int argc, char ** argv) {
                       "});"
                     "}"
                   "}else if(ta.dataset.easyaiLockedReason){"
+                    "window.__easyaiCtxFull=false;"
                     "ta.placeholder=ta.dataset.easyaiPrevPlaceholder||'';"
+                    "ta.style.border=ta.dataset.easyaiPrevBorder||'';"
+                    "ta.style.opacity=ta.dataset.easyaiPrevOpacity||'';"
                     "delete ta.dataset.easyaiLockedReason;"
                     "delete ta.dataset.easyaiPrevPlaceholder;"
+                    "delete ta.dataset.easyaiPrevBorder;"
+                    "delete ta.dataset.easyaiPrevOpacity;"
                     "ta.disabled=false;"
                     "const form=ta.closest('form');"
                     "if(form)form.querySelectorAll('button[disabled]').forEach(b=>{b.disabled=false;});"
@@ -3291,16 +3467,23 @@ int main(int argc, char ** argv) {
                   //   Prefer ctx_used (post-turn KV fill from the engine).
                   //   Fall back to cache_n + prompt_n + predicted_n only
                   //   if the server didn't send ctx_used (older build).
-                  //   Once we've seen a real number, stick to it across
-                  //   the live-streaming synthetic timings — those carry
-                  //   only predicted_n and would wipe the session total
-                  //   to a tiny per-turn count.
+                  //   During live streaming, show lastSessionUsed PLUS
+                  //   the live token count so the user sees the bar move
+                  //   while generation runs — snaps to the real value
+                  //   when the final timings arrive at finish_reason.
                   "let used=lastSessionUsed;"
                   "if(t&&typeof t.ctx_used==='number'&&t.ctx_used>0){"
                     "used=t.ctx_used;lastSessionUsed=used;"
                   "}else if(t&&!t.live){"
                     "const u=(t.cache_n||0)+(t.prompt_n||0)+(t.predicted_n||0);"
                     "if(u>used){used=u;lastSessionUsed=used;}"
+                  "}else if(t&&t.live&&typeof t.predicted_n==='number'){"
+                    // Live overlay: previous-session base + this turn's
+                    // running token count.  Doesn't account for the new
+                    // turn's prompt_n (we won't know that until finish),
+                    // so we visually under-report by prompt_n during
+                    // streaming.  Acceptable trade-off for live motion.
+                    "used=lastSessionUsed+t.predicted_n;"
                   "}"
                   "const total=(t&&t.n_ctx)||window.__easyaiNCtx||0;"
                   "if(total&&!window.__easyaiNCtx)window.__easyaiNCtx=total;"
@@ -3421,9 +3604,47 @@ int main(int argc, char ** argv) {
                 " }"
               "</style>";
 
-            if (!args.webui_icon.empty()) {
-                inj << "<link rel=\"icon\" href=\"/favicon\">";
-            }
+            // Always point the browser at our /favicon route — that
+            // route serves either --webui-icon (when the operator gave
+            // one) or the embedded AI-brain.svg as the default.  We also
+            // keep an observer running that re-asserts our link if the
+            // Svelte app later mounts its own (Svelte often replaces
+            // <head> children on hydration).
+            inj << "<link id=\"__easyaiFavicon\" rel=\"icon\" href=\"/favicon\">";
+            inj << "<script>(()=>{"
+                << "console.log('[easyai-inject] block6 favicon-keeper');"
+                << "const want='/favicon';"
+                << "const ours=()=>document.getElementById('__easyaiFavicon');"
+                << "const nuke=()=>{"
+                  << "document.querySelectorAll('link[rel~=\"icon\"]').forEach(l=>{"
+                    << "if(l.id!=='__easyaiFavicon')l.remove();"
+                  << "});"
+                  << "let our=ours();"
+                  << "if(!our){"
+                    << "our=document.createElement('link');"
+                    << "our.id='__easyaiFavicon';"
+                    << "our.rel='icon';"
+                    << "our.href=want;"
+                    << "document.head&&document.head.appendChild(our);"
+                  << "}else if(our.getAttribute('href')!==want){"
+                    << "our.setAttribute('href',want);"
+                  << "}"
+                << "};"
+                << "nuke();"
+                << "if(document.head){"
+                  << "new MutationObserver(nuke).observe("
+                    << "document.head,{childList:true,subtree:false,attributes:true,"
+                    << "attributeFilter:['href','rel']});"
+                << "}"
+                << "document.addEventListener('DOMContentLoaded',()=>{"
+                  << "nuke();"
+                  << "if(document.head){"
+                    << "new MutationObserver(nuke).observe("
+                      << "document.head,{childList:true,subtree:false,attributes:true,"
+                      << "attributeFilter:['href','rel']});"
+                  << "}"
+                << "});"
+                << "})();</script>";
 
             // Splice immediately after <head>.
             const std::string head_open = "<head>";
@@ -3673,6 +3894,10 @@ int main(int argc, char ** argv) {
     svr.Get ("/v1/models",            [&](const auto & q, auto & r){
         if (!require_auth(ctx_ref, q, r)) return;
         route_models(ctx_ref, q, r);
+    });
+    svr.Get ("/v1/tools",             [&](const auto & q, auto & r){
+        if (!require_auth(ctx_ref, q, r)) return;
+        route_tools(ctx_ref, q, r);
     });
     svr.Post("/v1/chat/completions",  [&](const auto & q, auto & r){
         if (!require_auth(ctx_ref, q, r)) return;
