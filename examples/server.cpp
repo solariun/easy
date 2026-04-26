@@ -1959,12 +1959,24 @@ static void handle_chat_stream(ServerCtx & ctx,
             // and crashes the stats component when it gets a primitive.
             // Leaving the field out makes the renderer fall back to the
             // top-level timings, which is what we want.
+            // Cumulative session usage for the bar's ctx counter.
+            // perf_after.n_ctx_used is the live KV-cache fill — exactly
+            // how many tokens of n_ctx the chat history is occupying
+            // RIGHT NOW, including system prompt + every prior turn.
+            // We also send n_ctx so the webui doesn't need /props for
+            // the denominator.  cache_n keeps its prior meaning (tokens
+            // already in cache before THIS turn started) for callers
+            // that cared about the prefix-match cache hit ratio.
+            const int n_ctx_total = ctx.engine.n_ctx();
+            const int n_ctx_used  = perf_after.n_ctx_used;
             done_delta["timings"] = {
                 {"prompt_n",     prompt_n},
                 {"prompt_ms",    prompt_ms},
                 {"predicted_n",  predicted_n},
                 {"predicted_ms", predicted_ms},
                 {"cache_n",      perf_before.n_ctx_used},
+                {"ctx_used",     n_ctx_used},
+                {"n_ctx",        n_ctx_total},
             };
             done_delta["usage"] = {
                 {"prompt_tokens",     prompt_n},
@@ -3229,34 +3241,96 @@ int main(int argc, char ** argv) {
                 // timings via __easyaiPushTimings, and we paint into the
                 // .ctx and .last spans of the bar.
                 "let lastTimings=null;"
+                "let lastSessionUsed=0;"   // sticky cumulative ctx used
                 "window.__easyaiNCtx=0;"
                 "fetch('/props').then(r=>r.json()).then(j=>{"
                   "window.__easyaiNCtx="
                     "(j.default_generation_settings&&j.default_generation_settings.n_ctx)||0;"
                   "renderOverview();"
                 "}).catch(()=>{});"
+                // Soft + hard thresholds for the context-window guard.
+                // Soft (>=85%): bar turns amber as a warning.
+                // Hard (>=98%): bar turns red AND we disable the textarea
+                //               + Send button so the user can't fire a
+                //               request that would overflow.  The user
+                //               clears the conversation (or shrinks ctx)
+                //               via the bundle's own UI to reset.
+                "const CTX_SOFT=0.85,CTX_HARD=0.98;"
+                "const setInputLocked=(locked,reason)=>{"
+                  "const ta=document.querySelector('textarea');"
+                  "if(!ta)return;"
+                  "if(locked){"
+                    "if(ta.dataset.easyaiLockedReason===reason)return;"
+                    "ta.dataset.easyaiLockedReason=reason;"
+                    "ta.dataset.easyaiPrevPlaceholder=ta.placeholder||'';"
+                    "ta.placeholder=reason;"
+                    "ta.disabled=true;"
+                    "const form=ta.closest('form');"
+                    "if(form){"
+                      "form.querySelectorAll('button').forEach(b=>{"
+                        "if(b.type==='submit'||/send|enviar/i.test(b.getAttribute('aria-label')||''))"
+                          "b.disabled=true;"
+                      "});"
+                    "}"
+                  "}else if(ta.dataset.easyaiLockedReason){"
+                    "ta.placeholder=ta.dataset.easyaiPrevPlaceholder||'';"
+                    "delete ta.dataset.easyaiLockedReason;"
+                    "delete ta.dataset.easyaiPrevPlaceholder;"
+                    "ta.disabled=false;"
+                    "const form=ta.closest('form');"
+                    "if(form)form.querySelectorAll('button[disabled]').forEach(b=>{b.disabled=false;});"
+                  "}"
+                "};"
                 "function renderOverview(){"
                   "const r=ensureBar();if(!r)return;"
                   "const ctxEl=r.querySelector('.ctx');"
                   "const lastEl=r.querySelector('.last');"
                   "if(!ctxEl||!lastEl)return;"
                   "const t=lastTimings;"
-                  "if(!t){"
-                    "ctxEl.textContent=window.__easyaiNCtx?('0 / '+window.__easyaiNCtx+' (0%)'):'—';"
-                    "lastEl.textContent='—';"
-                    "return;"
+                  // Cumulative session usage:
+                  //   Prefer ctx_used (post-turn KV fill from the engine).
+                  //   Fall back to cache_n + prompt_n + predicted_n only
+                  //   if the server didn't send ctx_used (older build).
+                  //   Once we've seen a real number, stick to it across
+                  //   the live-streaming synthetic timings — those carry
+                  //   only predicted_n and would wipe the session total
+                  //   to a tiny per-turn count.
+                  "let used=lastSessionUsed;"
+                  "if(t&&typeof t.ctx_used==='number'&&t.ctx_used>0){"
+                    "used=t.ctx_used;lastSessionUsed=used;"
+                  "}else if(t&&!t.live){"
+                    "const u=(t.cache_n||0)+(t.prompt_n||0)+(t.predicted_n||0);"
+                    "if(u>used){used=u;lastSessionUsed=used;}"
                   "}"
-                  "const used=(t.cache_n||0)+(t.prompt_n||0)+(t.predicted_n||0);"
-                  "const total=window.__easyaiNCtx||0;"
-                  "const pct=total?Math.round(used/total*100):0;"
-                  "ctxEl.textContent="
-                    "total?(used.toLocaleString()+' / '+total.toLocaleString()+' ('+pct+'%)')"
-                    ":used.toLocaleString();"
-                  "if(t.predicted_n&&t.predicted_ms){"
+                  "const total=(t&&t.n_ctx)||window.__easyaiNCtx||0;"
+                  "if(total&&!window.__easyaiNCtx)window.__easyaiNCtx=total;"
+                  "const pct=total?used/total:0;"
+                  "if(total){"
+                    "ctxEl.textContent="
+                      "used.toLocaleString()+' / '+total.toLocaleString()+"
+                      "' ('+Math.round(pct*100)+'%)';"
+                  "}else{"
+                    "ctxEl.textContent=used.toLocaleString();"
+                  "}"
+                  // Color the ctx number based on pressure.
+                  "ctxEl.style.color="
+                    "pct>=CTX_HARD?'#f85149':"
+                    "pct>=CTX_SOFT?'#d29922':"
+                    "'#e6edf3';"
+                  // Lock input if we've crossed the hard threshold.
+                  "if(total){"
+                    "if(pct>=CTX_HARD){"
+                      "setInputLocked(true,'context full ('+Math.round(pct*100)+"
+                        "'%) — clear the chat to continue');"
+                    "}else{"
+                      "setInputLocked(false);"
+                    "}"
+                  "}"
+                  "if(t&&t.predicted_n&&t.predicted_ms){"
                     "const tps=(t.predicted_n/(t.predicted_ms/1000));"
                     "lastEl.textContent="
                       "t.predicted_n+' tok · '+(t.predicted_ms/1000).toFixed(1)+'s · '+tps.toFixed(1)+' t/s';"
-                  "}else{"
+                  "}else if(!t){"
                     "lastEl.textContent='—';"
                   "}"
                 "};"
