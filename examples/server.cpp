@@ -2400,49 +2400,38 @@ int main(int argc, char ** argv) {
                 "});"
               "})();</script>";
 
-            // ----- shrink the bundle's native Reasoning panel ---------------
-            // The Svelte bundle now paints a <details><summary>Reasoning</…>
+            // ----- hide the bundle's native Reasoning panel -----------------
+            // The Svelte bundle paints its own <details><summary>Reasoning</…>
             // for each turn whose delta.reasoning_content is non-empty.  We
-            // want it visible but smaller than the regular message body so
-            // the thinking trace doesn't dominate the bubble. We can't
-            // selector-target it (class names are hashed), so observe and
-            // tag by visible summary text.
+            // already render our own (blue, brain-iconed, monospace) custom
+            // panel above the message body, so the bundle's copy is just a
+            // duplicate — hide it.  Class names are hashed so we observe
+            // and match by visible summary text.
             inj <<
               "<script>(()=>{"
-                "const STYLE='font-size:.72rem;line-height:1.45;color:var(--fallback-bc,#8b949e);"
-                  "font-family:ui-monospace,SFMono-Regular,Menlo,monospace;';"
-                "const SUMMARY_STYLE='font-size:.72rem;font-weight:600;opacity:.85;';"
                 "const isReasoning=(t)=>{"
                   "if(!t)return false;t=t.trim();"
                   "return t==='Reasoning'||t==='Reasoning...'||/^Reasoning\\b/i.test(t);"
                 "};"
-                "const shrink=()=>{"
+                "const hide=()=>{"
                   "document.querySelectorAll('details > summary').forEach(s=>{"
                     "const txt=(s.innerText||s.textContent||'').trim();"
                     "if(!isReasoning(txt))return;"
                     "const d=s.closest('details');"
-                    "if(!d||d.dataset.easyaiShrunk)return;"
-                    "d.dataset.easyaiShrunk='1';"
-                    "d.style.cssText+=';'+STYLE;"
-                    "s.style.cssText+=';'+SUMMARY_STYLE;"
-                    // Default open during streaming so the user sees the
-                    // reasoning unfold; the SSE finish_reason handler
-                    // collapses it once the answer is done.
-                    "d.open=true;"
+                    "if(!d||d.dataset.easyaiHidden)return;"
+                    "d.dataset.easyaiHidden='1';"
+                    "d.style.setProperty('display','none','important');"
                   "});"
                 "};"
-                // Exposed so monitorSSE (different IIFE scope) can collapse
-                // every reasoning panel when finish_reason arrives.
-                "window.__easyaiCollapseReasoning=()=>{"
-                  "document.querySelectorAll('details[data-easyai-shrunk=\"1\"]').forEach(d=>{"
-                    "d.open=false;"
-                  "});"
-                "};"
+                // Kept as a no-op so existing call sites in monitorSSE
+                // (window.__easyaiCollapseReasoning) keep linking; our
+                // custom panel handles its own collapse via closeThinking.
+                "window.__easyaiCollapseReasoning=()=>{};"
                 "let n=0;"
-                "const tick=()=>{shrink();if(++n<60)setTimeout(tick,300);};"
+                "const tick=()=>{hide();if(++n<60)setTimeout(tick,300);};"
                 "document.addEventListener('DOMContentLoaded',()=>{"
                   "tick();"
-                  "new MutationObserver(shrink).observe(document.body,"
+                  "new MutationObserver(hide).observe(document.body,"
                     "{childList:true,subtree:true,characterData:true});"
                 "});"
               "})();</script>";
@@ -2499,18 +2488,14 @@ int main(int argc, char ** argv) {
                 "};"
 
                 // SSE → activity pill state machine.
-                // ---- per-message thinking panel (DISABLED by default) ------
-                // Originally we injected our own collapsible reasoning panel
-                // into each assistant bubble (gray monospace, max-height cap,
-                // click to expand).  This worked back when the bundle's
-                // native renderer could not see reasoning_content.  Now that
-                // our streaming pipeline routes reasoning through
-                // delta.reasoning_content correctly, the bundle paints its
-                // own "Reasoning" details panel on top of ours, producing
-                // two glued-together panels.  Set window.__easyaiCustomThink
-                // = true at runtime to bring our panel back (kept on purpose
-                // so we can revisit it if the bundle's panel ever regresses).
-                "window.__easyaiCustomThink=false;"
+                // ---- per-message thinking panel (ENABLED) ------------------
+                // We render our own collapsible reasoning panel into each
+                // assistant bubble: blue-accented, brain-iconed, monospace
+                // gray body, max-height cap, click to expand.  The bundle's
+                // own native "Reasoning" panel is hidden via the observer
+                // a few blocks below to avoid duplication.  Toggle the
+                // flag below to fall back to the bundle's panel.
+                "window.__easyaiCustomThink=true;"
                 "const THINK=new WeakMap();"      // msg → currently-open panel
                 "const findLastAssistantMsg=()=>{"
                   "const all=document.querySelectorAll("
@@ -2523,18 +2508,25 @@ int main(int argc, char ** argv) {
                   "p=document.createElement('details');"
                   "p.className='__easyai-thinking';"
                   "p.open=true;"
+                  // Blue accent (was purple) + brain icon in summary, per
+                  // user request 2026-04-26.  Open during streaming, the
+                  // SSE handler closes it on first content delta or finish.
                   "p.style.cssText="
                     "'margin:.5rem 0;padding:.35rem .55rem;"
-                    " border-left:2px solid #b97df3;"
-                    " background:rgba(185,125,243,.06);"
+                    " border-left:2px solid #5b8dee;"
+                    " background:rgba(91,141,238,.06);"
                     " border-radius:4px;"
                     " font-size:.7rem;color:#8b949e;"
                     " font-family:ui-monospace,SFMono-Regular,Menlo,monospace;"
                     " line-height:1.5;';"
                   "p.innerHTML="
-                    "'<summary style=\"cursor:pointer;color:#b97df3;"
-                      "font-weight:600;font-size:.7rem;list-style:none;"
-                      "outline:none;user-select:none\">▾ thinking…</summary>'"
+                    "'<summary style=\"cursor:pointer;color:#5b8dee;"
+                      "font-weight:600;font-size:.72rem;list-style:none;"
+                      "outline:none;user-select:none;display:flex;"
+                      "align-items:center;gap:.35rem\">"
+                      "<span style=\"font-size:.9rem;line-height:1\">🧠</span>"
+                      "<span class=\"sumlabel\">thinking…</span>"
+                    "</summary>'"
                     "+'<div class=\"t\" style=\"margin-top:.4rem;"
                       "white-space:pre-wrap;max-height:18em;"
                       "overflow-y:auto;padding-right:.3rem\"></div>';"
@@ -2557,8 +2549,8 @@ int main(int argc, char ** argv) {
                   "const p=THINK.get(msg);"
                   "if(!p)return;"
                   "p.open=false;"
-                  "const sum=p.querySelector('summary');"
-                  "if(sum)sum.textContent='▸ thinking';"
+                  "const lab=p.querySelector('.sumlabel');"
+                  "if(lab)lab.textContent='thinking';"
                   "THINK.delete(msg);"
                 "};"
                 "async function monitorSSE(stream){"
@@ -2568,6 +2560,28 @@ int main(int argc, char ** argv) {
                   "const dec=new TextDecoder();"
                   "let buf='',inThink=false,inToolCallTag=false,startMs=performance.now();"
                   "let lastTimings=null;"
+                  // Live metrics: count emitted chunks (close enough to
+                  // tokens for UX) and clock the elapsed time so the chip
+                  // and the bar can show "234 tok · 4.2s · 55 t/s" while
+                  // generation is still in flight.  Updated on every
+                  // delta below; rendered through liveTick().
+                  "let liveTok=0,liveStart=0;"
+                  "const liveExtra=()=>{"
+                    "const elapsed=Math.max(1,performance.now()-liveStart);"
+                    "const tps=liveTok/(elapsed/1000);"
+                    "return{"
+                      "tokens:liveTok,"
+                      "elapsedMs:elapsed,"
+                      "tps:tps,"
+                      "live:true,"
+                    "};"
+                  "};"
+                  "let lastState='answering';"
+                  "const liveTick=setInterval(()=>{"
+                    "if(liveTok>0&&lastState!=='complete'&&lastState!=='error')"
+                      "set(lastState,liveExtra());"
+                  "},200);"
+                  "const setLive=(s,e)=>{lastState=s;set(s,e);};"
                   "try{while(true){"
                     "const{value,done}=await reader.read();"
                     "if(done)break;"
@@ -2585,13 +2599,13 @@ int main(int argc, char ** argv) {
                       "const data=dataLines.join('\\n');"
                       "if(!data||data==='[DONE]')continue;"
                       "if(evtType==='easyai.tool_call'){"
-                        "try{const j=JSON.parse(data);set('fetching',j.name||'tool');}"
-                        "catch(e){set('fetching');}"
+                        "try{const j=JSON.parse(data);setLive('fetching',j.name||'tool');}"
+                        "catch(e){setLive('fetching');}"
                         "continue;"
                       "}"
                       "if(evtType==='easyai.tool_result'){"
                         // Back to whatever generation phase we're in.
-                        "set(inThink?'thinking':'answering');"
+                        "setLive(inThink?'thinking':'answering',liveExtra());"
                         "continue;"
                       "}"
                       "try{"
@@ -2600,29 +2614,39 @@ int main(int argc, char ** argv) {
                         "if(window.__easyaiPushTimings)window.__easyaiPushTimings(j.timings);}"
                         "const ch=j.choices&&j.choices[0];"
                         "if(ch&&ch.delta){"
+                          // Any reasoning or content delta = a new chunk.
+                          // Counting CHUNKS (not characters) is closer to
+                          // token count for UX purposes — the model emits
+                          // ~one chunk per token in the streaming path.
+                          "if(liveStart===0)liveStart=performance.now();"
                           // -- THINKING PANEL --------------------------------
-                          // Append reasoning chunks to a small collapsible
-                          // panel placed at the top of the latest assistant
-                          // message.  Plain text body, gray monospace, max-
-                          // height capped so long reasoning doesn't blow up
-                          // the layout.  The user can click to expand or
-                          // collapse.
                           "if(typeof ch.delta.reasoning_content==='string'){"
+                            "liveTok++;"
                             "appendThinking(ch.delta.reasoning_content);"
-                            "set('thinking');"
+                            "setLive('thinking',liveExtra());"
                           "}"
                           // -- VISIBLE CONTENT -------------------------------
                           "if(typeof ch.delta.content==='string'){"
                             "const c=ch.delta.content;"
-                            // first visible content after thinking → close panel
+                            "liveTok++;"
                             "if(c.length>0)closeThinking();"
-                            // legacy in-content think detection (very rare now)
-                            "if(!inThink&&/<think(?:ing)?>/i.test(c)){inThink=true;set('thinking');}"
-                            "else if(inThink&&/<\\/think(?:ing)?>/i.test(c)){inThink=false;set('answering');}"
-                            "else if(!inThink)set('answering');"
+                            "if(!inThink&&/<think(?:ing)?>/i.test(c)){inThink=true;setLive('thinking',liveExtra());}"
+                            "else if(inThink&&/<\\/think(?:ing)?>/i.test(c)){inThink=false;setLive('answering',liveExtra());}"
+                            "else if(!inThink)setLive('answering',liveExtra());"
+                          "}"
+                          // Push our own synthetic timings so the bar's
+                          // 'last' field tracks live tok/s mid-stream.
+                          "if(window.__easyaiPushTimings){"
+                            "const now=performance.now();"
+                            "if(liveStart>0)window.__easyaiPushTimings({"
+                              "predicted_n:liveTok,"
+                              "predicted_ms:now-liveStart,"
+                              "live:true,"
+                            "});"
                           "}"
                         "}"
                         "if(ch&&ch.finish_reason){"
+                          "clearInterval(liveTick);"
                           "closeThinking();"
                           "if(window.__easyaiCollapseReasoning)window.__easyaiCollapseReasoning();"
                           "const t=lastTimings;"
@@ -2631,27 +2655,53 @@ int main(int argc, char ** argv) {
                             "const tps=(t.predicted_n/(t.predicted_ms/1000)).toFixed(1);"
                             "msg=t.predicted_n+' tok · '+(t.predicted_ms/1000).toFixed(1)+'s · '+tps+' t/s';"
                           "}"
-                          "set('complete',msg);"
+                          "setLive('complete',msg);"
                         "}"
                       "}catch(e){}"
                     "}"
-                  "}}catch(e){set('error');}"
+                  "}}catch(e){clearInterval(liveTick);setLive('error');}"
                 "}"
               "})();</script>";
 
-            // ----- floating tone chip + per-message status injection -------
-            //   Tone chip   — its own Shadow DOM host, bottom-left, beside
-            //                 where the bundle paints the model badge.
+            // ----- live metrics bar + tone chip + per-message status -------
+            //   Metrics bar — its own Shadow DOM host, anchored ABOVE the
+            //                 prompt textarea.  Live-updates ctx / token
+            //                 count / elapsed / t/s while the model is
+            //                 streaming, then freezes on finish_reason.
+            //   Tone chip   — separate Shadow DOM host, anchored at the
+            //                 right edge of the prompt form so it sits
+            //                 visually next to the model-name badge and
+            //                 the send arrow.  Both hosts use fixed
+            //                 positioning anchored via getBoundingClientRect
+            //                 of the form so layout follows the bundle.
             //   Per-msg     — for each assistant message, we append a small
-            //   status        live status indicator (thinking / answering /
-            //                 fetching · <tool>) inline next to the
-            //                 copy/edit/fork/delete actions.  The bundle's
-            //                 own stats line still appears below the message
-            //                 once generation completes.
+            //   status        live status indicator inline next to the
+            //                 copy/edit/fork/delete actions; chip text is
+            //                 updated by window.__easyaiSetStatus.
             inj <<
               "<script>(()=>{"
 
-                // --- combined bar (tone + overview) above the textarea ---
+                // --- shared style snippets ---
+                "const SHARED_STYLE='"
+                  ":host,*{box-sizing:border-box}"
+                  ".pill{pointer-events:auto;display:inline-flex;"
+                    "align-items:center;gap:.55rem;"
+                    "background:rgba(15,19,24,.92);"
+                    "border:1px solid #2a313b;border-radius:999px;"
+                    "padding:.22rem .7rem;color:#8b949e;"
+                    "font:.72rem -apple-system,system-ui,sans-serif;"
+                    "backdrop-filter:blur(6px);"
+                    "box-shadow:0 2px 12px rgba(0,0,0,.35);}"
+                  ".grp{display:inline-flex;align-items:center;gap:.3rem}"
+                  ".sep{color:#3a414b}"
+                  ".v{color:#e6edf3}"
+                  ".mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.7rem}"
+                  "select{background:transparent;color:#e6edf3;border:0;"
+                    "font:inherit;cursor:pointer;outline:none;padding:0 .15rem}"
+                  "select option{background:#15191f;color:#e6edf3}"
+                  "';"
+
+                // --- METRICS BAR (above textarea) ---
                 "const BAR_ID='__easyaiBarHost';"
                 "let barRoot=null,barHost=null;"
                 "const ensureBar=()=>{"
@@ -2661,38 +2711,46 @@ int main(int argc, char ** argv) {
                   "h=document.createElement('div');"
                   "h.id=BAR_ID;"
                   "h.setAttribute('aria-hidden','false');"
-                  // Position is set dynamically by reposition() below — we
-                  // anchor at the very bottom initially and slide up to
-                  // sit right above the input textarea.
                   "h.style.cssText="
-                    "'all:initial;position:fixed;bottom:7rem;'+"
-                    "'left:50%;transform:translateX(-50%);'+"
-                    "'z-index:2147483646;pointer-events:none;'+"
-                    "'max-width:calc(100vw - 2rem);'+"
-                    "'font:14px/1 -apple-system,system-ui,sans-serif;';"
+                    "'all:initial;position:fixed;top:0px;left:0px;"
+                    "z-index:2147483646;pointer-events:none;"
+                    "font:14px/1 -apple-system,system-ui,sans-serif;';"
                   "document.documentElement.appendChild(h);"
                   "barHost=h;"
                   "const root=h.attachShadow({mode:'open'});"
-                  "root.innerHTML="
-                    "'<style>"
-                      ":host,*{box-sizing:border-box}"
-                      ".bar{pointer-events:auto;display:inline-flex;"
-                        "align-items:center;gap:.6rem;flex-wrap:wrap;"
-                        "background:rgba(15,19,24,.92);"
-                        "border:1px solid #2a313b;border-radius:999px;"
-                        "padding:.25rem .8rem;color:#8b949e;"
-                        "font:.74rem -apple-system,system-ui,sans-serif;"
-                        "backdrop-filter:blur(6px);"
-                        "box-shadow:0 2px 12px rgba(0,0,0,.35);}"
-                      ".grp{display:inline-flex;align-items:center;gap:.35rem}"
-                      ".sep{color:#3a414b}"
-                      ".v{color:#e6edf3}"
-                      ".mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.7rem}"
-                      "select{background:transparent;color:#e6edf3;border:0;"
-                        "font:inherit;cursor:pointer;outline:none;padding:0 .15rem}"
-                      "select option{background:#15191f;color:#e6edf3}"
-                    "</style>'+"
-                    "'<div class=\"bar\">"
+                  "root.innerHTML='<style>'+SHARED_STYLE+'</style>'+"
+                    "'<div class=\"pill\">"
+                      "<span class=\"grp mono\">"
+                        "<span>ctx</span><span class=\"v ctx\">—</span>"
+                      "</span>"
+                      "<span class=\"sep\">·</span>"
+                      "<span class=\"grp mono\">"
+                        "<span>last</span><span class=\"v last\">—</span>"
+                      "</span>"
+                    "</div>';"
+                  "barRoot=root;"
+                  "return root;"
+                "};"
+
+                // --- TONE CHIP (anchored at right edge of form) ---
+                "const TONE_ID='__easyaiToneHost';"
+                "let toneRoot=null,toneHost=null;"
+                "const ensureTone=()=>{"
+                  "let h=document.getElementById(TONE_ID);"
+                  "if(h&&toneRoot){toneHost=h;return toneRoot;}"
+                  "if(!document.documentElement)return null;"
+                  "h=document.createElement('div');"
+                  "h.id=TONE_ID;"
+                  "h.setAttribute('aria-hidden','false');"
+                  "h.style.cssText="
+                    "'all:initial;position:fixed;top:0px;left:0px;"
+                    "z-index:2147483646;pointer-events:none;"
+                    "font:14px/1 -apple-system,system-ui,sans-serif;';"
+                  "document.documentElement.appendChild(h);"
+                  "toneHost=h;"
+                  "const root=h.attachShadow({mode:'open'});"
+                  "root.innerHTML='<style>'+SHARED_STYLE+'</style>'+"
+                    "'<div class=\"pill\">"
                       "<span class=\"grp\">"
                         "<span>tone</span>"
                         "<select>"
@@ -2702,14 +2760,6 @@ int main(int argc, char ** argv) {
                           "<option value=\"creative\">creative</option>"
                         "</select>"
                       "</span>"
-                      "<span class=\"sep\">|</span>"
-                      "<span class=\"grp mono\">"
-                        "<span>ctx</span><span class=\"v ctx\">—</span>"
-                      "</span>"
-                      "<span class=\"sep\">·</span>"
-                      "<span class=\"grp mono\">"
-                        "<span>last</span><span class=\"v last\">—</span>"
-                      "</span>"
                     "</div>';"
                   "const sel=root.querySelector('select');"
                   "sel.value=window.__easyaiTone||'balanced';"
@@ -2717,42 +2767,42 @@ int main(int argc, char ** argv) {
                     "window.__easyaiTone=sel.value;"
                     "try{localStorage.setItem('easyai-tone',sel.value);}catch(e){}"
                   "};"
-                  "barRoot=root;"
+                  "toneRoot=root;"
                   "return root;"
                 "};"
 
-                // To make a clean gap *below* the input form, we inject a
-                // margin-bottom into whatever ancestor of the textarea is
-                // pinned to the viewport bottom (usually the form), then
-                // park the bar inside that gap.  The lift runs on every
-                // body mutation so a Svelte re-render can't undo it.
-                "const LIFT=44;"
-                "const liftInput=()=>{"
-                  "const ta=document.querySelector('textarea');"
-                  "if(!ta)return;"
-                  "const target=ta.closest('form')||ta.parentElement;"
-                  // Idempotent — re-applying the same value is harmless,
-                  // and it survives Svelte re-renders that reset inline
-                  // styles without our knowing.
-                  "if(target)target.style.setProperty('margin-bottom',LIFT+'px','important');"
-                "};"
-                // Bar sits in the lifted gap, just below the input form
-                // and a few px off the viewport edge.
+                // Anchor both hosts via getBoundingClientRect of the
+                // prompt form.  The metrics bar sits ~36px above the form;
+                // the tone chip sits at the form's bottom-right (where the
+                // model name badge + send arrow live in the bundle).
                 "const reposition=()=>{"
-                  "if(!barHost)return;"
-                  "liftInput();"
-                  "barHost.style.bottom='0.5rem';"
+                  "const ta=document.querySelector('textarea');"
+                  "if(!ta||!barHost||!toneHost)return;"
+                  "const form=ta.closest('form')||ta.parentElement;"
+                  "if(!form)return;"
+                  "const r=form.getBoundingClientRect();"
+                  // Metrics bar — above the form, centered horizontally.
+                  "barHost.style.top=(Math.max(4,r.top-34))+'px';"
+                  "barHost.style.left=(r.left+r.width/2)+'px';"
+                  "barHost.style.transform='translateX(-50%)';"
+                  // Tone chip — vertical-center against the form, hugging
+                  // its right edge with a small inset.
+                  "toneHost.style.top=(r.top+r.height/2)+'px';"
+                  "toneHost.style.left=(r.right-12)+'px';"
+                  "toneHost.style.transform='translate(-100%,-50%)';"
                 "};"
 
-                "if(document.documentElement){ensureBar();reposition();}"
+                "if(document.documentElement){ensureBar();ensureTone();reposition();}"
                 "document.addEventListener('DOMContentLoaded',()=>{"
-                  "ensureBar();reposition();"
+                  "ensureBar();ensureTone();reposition();"
                 "});"
                 "window.addEventListener('resize',reposition);"
+                "window.addEventListener('scroll',reposition,true);"
                 "setInterval(()=>{"
                   "if(!document.getElementById(BAR_ID)){barRoot=null;ensureBar();}"
+                  "if(!document.getElementById(TONE_ID)){toneRoot=null;ensureTone();}"
                   "reposition();"
-                "},500);"
+                "},250);"
 
                 // --- per-message inline status chip -----------------------
                 // For every <... aria-label='Assistant message with actions'>
@@ -2785,6 +2835,22 @@ int main(int argc, char ** argv) {
                   "walk(msg,0);"
                   "return best;"
                 "};"
+                // Inject a stylesheet ONCE for the pulsing dot keyframes.
+                // Using a single global rule beats inlining @keyframes per
+                // chip and lets us toggle the animation just by adding /
+                // removing the .pulse class on the dot.
+                "if(!document.getElementById('__easyaiChipStyles')){"
+                  "const st=document.createElement('style');"
+                  "st.id='__easyaiChipStyles';"
+                  "st.textContent="
+                    "'@keyframes __easyaiPulse{"
+                      "0%,100%{opacity:1}"
+                      "50%{opacity:.25}"
+                    "}"
+                    ".__easyaiDot.pulse{"
+                      "animation:__easyaiPulse 1.05s ease-in-out infinite}';"
+                  "document.head&&document.head.appendChild(st);"
+                "}"
                 "const attachChip=(msg)=>{"
                   "if(msg[CHIP_MARK]&&document.contains(msg[CHIP_MARK]))return;"
                   "const row=findActionRow(msg);if(!row)return;"
@@ -2800,7 +2866,7 @@ int main(int argc, char ** argv) {
                     "'font:.72rem -apple-system,system-ui,sans-serif;'+"
                     "'flex-shrink:0;white-space:nowrap;';"
                   "chip.innerHTML="
-                    "'<span class=\"d\" style=\"width:.45rem;height:.45rem;"
+                    "'<span class=\"d __easyaiDot\" style=\"width:.45rem;height:.45rem;"
                       "border-radius:50%;background:#5b626a;flex-shrink:0\"></span>"
                     "<span class=\"l\"></span>';"
                   "row.appendChild(chip);"
@@ -2839,10 +2905,31 @@ int main(int argc, char ** argv) {
                   "chip.style.display='inline-flex';"
                   "const dot=chip.querySelector('.d');"
                   "const lab=chip.querySelector('.l');"
-                  "if(dot)dot.style.background=STATE_DOT[state]||STATE_DOT.idle;"
-                  "if(lab)lab.textContent="
-                    "state==='fetching'&&extra?('fetching · '+extra):"
-                    "(state==='complete'&&extra?extra:state);"
+                  "if(dot){"
+                    "dot.style.background=STATE_DOT[state]||STATE_DOT.idle;"
+                    // Pulse while we're actively working; stop on
+                    // terminal states so the user sees the difference at
+                    // a glance.
+                    "const active=(state==='thinking'||state==='answering'||state==='fetching');"
+                    "if(active)dot.classList.add('pulse');"
+                    "else dot.classList.remove('pulse');"
+                  "}"
+                  "if(lab){"
+                    "let txt=state;"
+                    "if(state==='complete'&&typeof extra==='string'&&extra){"
+                      "txt=extra;"
+                    "}else if(state==='fetching'&&typeof extra==='string'&&extra){"
+                      "txt='fetching · '+extra;"
+                    "}else if(extra&&typeof extra==='object'&&extra.live){"
+                      // Live metrics: state + tok count + elapsed + t/s.
+                      "const sec=(extra.elapsedMs/1000).toFixed(1);"
+                      "const tps=extra.tps?extra.tps.toFixed(1):'0.0';"
+                      "txt=state+' · '+extra.tokens+' tok · '+sec+'s · '+tps+' t/s';"
+                    "}else if(state==='fetching'&&extra&&extra.tokens){"
+                      "txt='fetching';"
+                    "}"
+                    "lab.textContent=txt;"
+                  "}"
                 "};"
 
                 // --- overview values inside the combined bar ----------------
