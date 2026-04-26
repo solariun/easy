@@ -1654,8 +1654,24 @@ static void handle_chat_stream(ServerCtx & ctx,
             // This is exactly what tools/server/server-task.cpp does, so the
             // embedded webui's native parsers (.choices[0].delta.content +
             // .choices[0].delta.reasoning_content) light up correctly.
-            common_chat_params chat_p =
-                ctx.engine.chat_params_for_current_state(true);
+            //
+            // IMPORTANT: many chat templates (Qwen3-* in particular) raise
+            // a Jinja exception if there's no user message in history, so
+            // we must push the last user message BEFORE calling
+            // chat_params_for_current_state — otherwise the render throws.
+            // Once it's pushed we call chat_continue() (or generate_one
+            // for client-tool mode) which doesn't re-push.
+            ctx.engine.push_message("user", req_state->last_user);
+            const bool user_already_pushed = true;
+
+            common_chat_params chat_p;
+            try {
+                chat_p = ctx.engine.chat_params_for_current_state(true);
+            } catch (const std::exception & e) {
+                std::fprintf(stderr,
+                    "[easyai-server] chat_params render threw: %s — "
+                    "falling back to generic parser\n", e.what());
+            }
             common_chat_parser_params parser_params(chat_p);
             parser_params.parse_tool_calls = true;
             parser_params.reasoning_format = COMMON_REASONING_FORMAT_AUTO;
@@ -1760,14 +1776,18 @@ static void handle_chat_stream(ServerCtx & ctx,
             std::vector<std::pair<std::string, std::string>> tool_calls;
             std::vector<std::string> tool_call_ids;
             try {
+                // The user message has ALREADY been pushed above (so the
+                // chat_params render works for templates that require it).
+                // Use generate_one / chat_continue here so we don't push
+                // it a second time.
+                (void) user_already_pushed;
                 if (req_state->client_tools) {
-                    ctx.engine.push_message("user", req_state->last_user);
                     auto turn = ctx.engine.generate_one();
                     tool_calls    = std::move(turn.tool_calls);
                     tool_call_ids = std::move(turn.tool_call_ids);
                     finish_reason = turn.tool_calls.empty() ? "stop" : "tool_calls";
                 } else {
-                    ctx.engine.chat(req_state->last_user);
+                    ctx.engine.chat_continue();
                 }
             } catch (const std::exception & e) {
                 ctx.n_errors.fetch_add(1, std::memory_order_relaxed);

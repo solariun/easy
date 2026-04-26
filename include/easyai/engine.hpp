@@ -152,6 +152,13 @@ class Engine {
     // The returned string is the final assistant message content.
     std::string chat(const std::string & user_message);
 
+    // Same as chat() but assumes the user message is ALREADY the last
+    // entry in history (e.g. you called push_message("user", ...) before
+    // and want to render+inspect the chat template's params without
+    // duplicating the user message).  Used by the HTTP streaming path
+    // that needs the rendered common_chat_params at on_token wiring time.
+    std::string chat_continue();
+
     // Generate exactly ONE assistant turn from the current history. Returns
     // the parsed message (so the caller can inspect tool_calls and decide
     // whether to dispatch them or forward them to a remote client).

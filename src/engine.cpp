@@ -626,6 +626,11 @@ std::string Engine::chat(const std::string & user_message) {
     if (!p_->loaded) { p_->last_error = "engine not loaded"; return {}; }
 
     p_->history.push_back({ "user", user_message, {}, {}, "", "", "" });
+    return chat_continue();
+}
+
+std::string Engine::chat_continue() {
+    if (!p_->loaded) { p_->last_error = "engine not loaded"; return {}; }
 
     constexpr int kMaxToolHops = 8;
     std::string final_text;
