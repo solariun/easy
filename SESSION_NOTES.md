@@ -152,6 +152,9 @@ two layers:
 ## 5. Recent commits (most recent first)
 
 ```
+709684b  THE missing piece: set reasoning_format on common_chat_templates_inputs
+3a94bd3  Fix Jinja crash: push user msg before chat_params render in streaming
+882abed  Add SESSION_NOTES.md
 e03705e  installer: --upgrade now actually does git pull, not just git fetch
 15e6056  Streaming pipeline: incremental common_chat_parse + diff (llama-server parity)
 204e376  Real per-message thinking panel via DOM injection
@@ -170,20 +173,72 @@ c6a09d6  Single combined bar above the textarea (tone + ctx + last)
 
 `git log --oneline | head -30` for the rest.
 
+### Recent rabbit-hole notes
+
+- **Why thinking was rendering inline as message body** (root cause found
+  in `709684b`): `Engine::Impl::render()` left `common_chat_templates_inputs::
+  reasoning_format` defaulted to `NONE`.  Every PEG parser builder under
+  `common/chat.cpp` does `auto extract_reasoning = inputs.reasoning_format
+  != COMMON_REASONING_FORMAT_NONE;` — with NONE, the parser leaves
+  `<think>...</think>` inside `msg.content`, our diff dumps it as
+  `delta.content`, and the webui paints it as the regular reply.  Fixed
+  by setting `in.reasoning_format = COMMON_REASONING_FORMAT_AUTO`.
+  AS OF 2026-04-26 this fix is unverified on the user's AI box.
+
+- **Why streaming was crashing with "No user query found in messages"**
+  (fixed in `3a94bd3`): Qwen3 templates raise a Jinja exception if the
+  history doesn't contain a user message at template-apply time.  We were
+  calling `Engine::chat_params_for_current_state(true)` BEFORE pushing the
+  user message into history.  Fix: push first, then render.  Required
+  splitting `Engine::chat()` into `chat()` (does push + chat_continue) and
+  the new `chat_continue()` (assumes user is already last in history) so
+  the streaming path can render in between.
+
+- **Engine::chat_continue()** (added in `3a94bd3`) is what the streaming
+  HTTP path now calls in agentic mode.  Same multi-hop loop as `chat()`
+  minus the initial `push_message("user", …)`.
+
 ## 6. Known issues / pending validation
 
-- **Webui rendering not yet visually confirmed by user**: the most recent
-  changes (commit `15e6056` / `204e376`) move thinking to
-  `delta.reasoning_content` and inject a per-message panel via DOM.  Last
-  user feedback said it still wasn't rendering as a panel.  Need to verify
-  on the AI box with a Qwen3-thinking model.
-- **Qwen3-thinking sometimes emits `</think>` then stops** without firing
-  the tool call.  System prompt has a `NEVER announce a tool call without
-  making it` rule; partial mitigation but model-dependent.
-- **Core dump report on Linux** (mentioned without trace).  Last
-  diagnosable crash was the UTF-8 strict `dump()` issue, fixed via
-  `safe_dump` in commit `f1282e4`.  If a new core appears, ask for
-  `journalctl -u easyai-server -n 200 --no-pager`.
+- **(A) Webui thinking-panel rendering** — pending visual confirmation.
+  Commit `709684b` should make the per-message Shadow-DOM thinking panel
+  light up by routing reasoning to `delta.reasoning_content` correctly.
+  User has yet to test the upgraded build on the AI box.  If thinking
+  STILL renders inline after upgrade, the parser is likely not extracting
+  reasoning despite reasoning_format=AUTO — need to debug `chat_p.parser`
+  contents and the per-token `common_chat_parse` return.
+
+- **(B) Qwen3-thinking model stops after `</think>` without answering** —
+  user reports this happens reliably on `easyai-server` with Qwen3.6-35B-A3
+  but NOT on plain `llama-server` with the same model.  Concrete output
+  showed model thinking for many paragraphs, then "Let's go." → `</think>`
+  → finish_reason=stop, no actual answer.  Hypothesis: our default
+  system prompt + tool list (7 builtins) overload the model into a
+  "what tools do I have / can I trust them" loop.  Diagnostic plan:
+
+      1. ssh to AI box; sudo systemctl edit --full easyai-server.service
+      2. remove --system-file from ExecStart, add --no-tools
+      3. sudo systemctl restart easyai-server, ask same question
+      4. if model now answers → tools/system are the problem; consider
+         shorter default system prompt or making tools opt-in
+      5. if model still stops → bug in our chat_continue / agentic loop;
+         add --verbose, capture journalctl, share
+
+- **Core dump under heavy load** — UTF-8 dump crash fixed in `f1282e4`,
+  Jinja crash fixed in `3a94bd3`.  If new core appears, ask for
+  `journalctl -u easyai-server -n 200 --no-pager` BEFORE chasing.
+
+- **llama-server parity reference**: when the user reports that
+  `llama-server` does X correctly and we don't, look at `llama.cpp/tools/
+  server/server-{task,chat,context}.cpp` for their stream pipeline.
+  We've already mirrored:
+      - common_chat_parse(text, is_partial=true, params) per token
+      - common_chat_msg_diff::compute_diffs(prev, new)
+      - server_chat_msg_diff_to_json_oaicompat-style delta envelope
+        (.reasoning_content + .content + tool_calls)
+  Differences that may still matter: their reasoning_format passed at
+  task params construction time; their handling of `multi_step_tool`
+  flag in chat templates; their default sampling params.
 
 ## 7. Common pitfalls / debugging tips
 
