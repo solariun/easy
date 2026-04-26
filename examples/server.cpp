@@ -1759,13 +1759,31 @@ static void handle_chat_stream(ServerCtx & ctx,
             ctx.engine.on_tool([&](const easyai::ToolCall & c, const easyai::ToolResult & r) {
                 ctx.n_tool_calls.fetch_add(1, std::memory_order_relaxed);
 
+                // The embedded webui's stream parser ignores the SSE
+                // `event:` field and inspects every `data:` line as if it
+                // were an OpenAI chunk — i.e. it does parsed.choices[0]
+                // unguarded.  Our custom payloads have no .choices, so the
+                // bundle throws "undefined is not an object" on every one.
+                // Add an empty choices[] stub so the bundle's destructure
+                // is harmless; our own monitorSSE keys off `evtType` and
+                // never reads .choices on these payloads.
                 ordered_json call_evt;
+                call_evt["choices"]   = json::array({{
+                    {"index", 0},
+                    {"delta", json::object()},
+                    {"finish_reason", nullptr},
+                }});
                 call_evt["name"]      = c.name;
                 call_evt["arguments"] = c.arguments_json;
                 call_evt["id"]        = c.id;
                 emit_event("easyai.tool_call", safe_dump(call_evt));
 
                 ordered_json res_evt;
+                res_evt["choices"]  = json::array({{
+                    {"index", 0},
+                    {"delta", json::object()},
+                    {"finish_reason", nullptr},
+                }});
                 res_evt["name"]     = c.name;
                 res_evt["content"]  = r.content;
                 res_evt["is_error"] = r.is_error;
@@ -2867,8 +2885,16 @@ int main(int argc, char ** argv) {
                   // Match the bundle model-badge look: rounded rectangle
                   // (not full pill), subtle dark fill, thin border, small
                   // icon + label.  Slider-knob icon for "tone".
+                  // NOTE: backticks (JS template literal) on the outer
+                  // strings — the inline SVG inside the CSS background-image
+                  // contains xmlns='http://...' (single quotes), and the
+                  // <label class="badge"> uses double quotes.  Mixing both
+                  // inside a JS string requires backticks; otherwise the
+                  // first inner quote terminates the literal early and the
+                  // parser explodes on the bare `http` identifier (which
+                  // is exactly what was killing the tone-badge IIFE).
                   "root.innerHTML="
-                    "'<style>"
+                    "`<style>"
                       ":host,*{box-sizing:border-box}"
                       ".badge{pointer-events:auto;display:inline-flex;"
                         "align-items:center;gap:.4rem;"
@@ -2894,8 +2920,8 @@ int main(int argc, char ** argv) {
                         "background-repeat:no-repeat;background-position:right center;"
                         "background-size:.55rem auto}"
                       ".badge select option{background:#15191f;color:#e6edf3}"
-                    "</style>'+"
-                    "'<label class=\"badge\">"
+                    "</style>`+"
+                    "`<label class=\"badge\">"
                       // Sliders icon (tabler-ish): two horizontal rails
                       // with knob handles, matches the geometric flat look
                       // of the bundle's model badge cube icon.
@@ -2911,7 +2937,7 @@ int main(int argc, char ** argv) {
                         "<option value=\"balanced\">balanced</option>"
                         "<option value=\"creative\">creative</option>"
                       "</select>"
-                    "</label>';"
+                    "</label>`;"
                   "const sel=root.querySelector('select');"
                   "sel.value=window.__easyaiTone||'balanced';"
                   "sel.onchange=()=>{"
