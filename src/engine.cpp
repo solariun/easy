@@ -157,8 +157,9 @@ struct Engine::Impl {
     common_chat_tool_choice tool_choice = COMMON_CHAT_TOOL_CHOICE_AUTO;
     bool         parallel_tool_calls    = false;
 
-    TokenCallback on_token;
-    ToolCallback  on_tool;
+    TokenCallback    on_token;
+    ToolCallback     on_tool;
+    HopResetCallback on_hop_reset;
 
     std::string last_error;
     std::string backend_summary;
@@ -500,8 +501,9 @@ Engine & Engine::enable_thinking(bool on) {
 
 Engine & Engine::add_tool(Tool t)               { p_->tools.push_back(std::move(t)); return *this; }
 Engine & Engine::clear_tools()                  { p_->tools.clear(); return *this; }
-Engine & Engine::on_token(TokenCallback cb)     { p_->on_token = std::move(cb); return *this; }
-Engine & Engine::on_tool(ToolCallback cb)       { p_->on_tool  = std::move(cb); return *this; }
+Engine & Engine::on_token(TokenCallback cb)         { p_->on_token     = std::move(cb); return *this; }
+Engine & Engine::on_tool(ToolCallback cb)           { p_->on_tool      = std::move(cb); return *this; }
+Engine & Engine::on_hop_reset(HopResetCallback cb)  { p_->on_hop_reset = std::move(cb); return *this; }
 
 bool Engine::load() {
     if (p_->loaded) return true;
@@ -639,7 +641,9 @@ std::string Engine::chat(const std::string & user_message) {
 std::string Engine::chat_continue() {
     if (!p_->loaded) { p_->last_error = "engine not loaded"; return {}; }
 
-    constexpr int kMaxToolHops = 8;
+    constexpr int kMaxToolHops      = 8;
+    constexpr int kMaxThoughtRetries = 2;   // budget for "thought-only" retries
+    int thought_retries = 0;
     std::string final_text;
 
     for (int hop = 0; hop < kMaxToolHops; ++hop) {
@@ -649,6 +653,51 @@ std::string Engine::chat_continue() {
 
         common_chat_msg msg = p_->parse_assistant(raw, chat_p);
         msg.role = "assistant";
+
+        if (p_->verbose) {
+            std::fprintf(stderr,
+                "[easyai] hop %d: raw=%zu content=%zu reasoning=%zu tool_calls=%zu\n",
+                hop, raw.size(), msg.content.size(),
+                msg.reasoning_content.size(), msg.tool_calls.size());
+            if (!raw.empty()) {
+                const size_t tail = std::min<size_t>(140, raw.size());
+                std::fprintf(stderr, "[easyai] hop %d raw tail: %.*s\n",
+                    hop, (int) tail, raw.c_str() + raw.size() - tail);
+            }
+        }
+
+        // Detect "thought-only" turn — model emitted reasoning but produced
+        // neither content nor tool_calls.  Some Qwen3 fine-tunes (the
+        // user's eng_v5 in particular) terminate after </think> when they
+        // intended to call a tool but failed to emit the tool_call header.
+        // Discard the empty turn, clear KV, and retry — sampling is
+        // stochastic so the second pass usually produces a real answer.
+        const bool thought_only =
+            msg.tool_calls.empty()
+            && msg.content.empty()
+            && !msg.reasoning_content.empty();
+
+        if (thought_only && thought_retries < kMaxThoughtRetries
+                         && hop + 1 < kMaxToolHops) {
+            ++thought_retries;
+            if (p_->verbose) std::fprintf(stderr,
+                "[easyai] hop %d: thought-only turn — clearing KV and retrying (%d/%d)\n",
+                hop, thought_retries, kMaxThoughtRetries);
+            llama_memory_clear(llama_get_memory(p_->ctx()), true);
+            if (p_->on_hop_reset) p_->on_hop_reset();
+            continue;
+        }
+
+        // If we exhausted retries on a thought-only turn, fall back to
+        // promoting reasoning_content into content so the user at least
+        // sees the model's thoughts instead of an empty bubble.
+        if (msg.tool_calls.empty() && msg.content.empty()
+                && !msg.reasoning_content.empty()) {
+            msg.content = msg.reasoning_content;
+            if (p_->verbose) std::fprintf(stderr,
+                "[easyai] hop %d: retry budget exhausted — promoting reasoning to content\n", hop);
+        }
+
         p_->history.push_back(msg);
 
         if (msg.tool_calls.empty()) {

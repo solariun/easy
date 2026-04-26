@@ -1717,7 +1717,19 @@ static void handle_chat_stream(ServerCtx & ctx,
                     return;
                 }
                 new_msg.role = "assistant";
-                auto diffs = common_chat_msg_diff::compute_diffs(prev_msg, new_msg);
+                std::vector<common_chat_msg_diff> diffs;
+                try {
+                    diffs = common_chat_msg_diff::compute_diffs(prev_msg, new_msg);
+                } catch (const std::exception &) {
+                    // compute_diffs is strict about monotonic tool_calls
+                    // growth; incremental parses sometimes assemble a
+                    // tool_call and then "unassemble" it as later tokens
+                    // arrive (e.g. the parser briefly treats partial
+                    // arguments as complete).  Rather than killing the
+                    // stream, hold prev_msg on the last good state and
+                    // wait for the next token to settle.
+                    return;
+                }
                 prev_msg = new_msg;
                 for (const auto & d : diffs) emit_diff(d);
             });
@@ -1766,6 +1778,18 @@ static void handle_chat_stream(ServerCtx & ctx,
                 emit_data(safe_dump(delta));
 
                 // Reset incremental-parse state for the next iteration.
+                accumulated.clear();
+                prev_msg = common_chat_msg{};
+                prev_msg.role = "assistant";
+            });
+
+            // Engine fires this when chat_continue() throws away a turn and
+            // restarts (e.g. thought-only retry path for Qwen3 fine-tunes
+            // that terminate after </think> without an answer).  We need to
+            // drop our incremental-parse state so the next hop's tokens are
+            // diff'd from a clean baseline instead of being concatenated to
+            // the discarded turn's reasoning.
+            ctx.engine.on_hop_reset([&]() {
                 accumulated.clear();
                 prev_msg = common_chat_msg{};
                 prev_msg.role = "assistant";
@@ -2376,6 +2400,53 @@ int main(int argc, char ** argv) {
                 "});"
               "})();</script>";
 
+            // ----- shrink the bundle's native Reasoning panel ---------------
+            // The Svelte bundle now paints a <details><summary>Reasoning</…>
+            // for each turn whose delta.reasoning_content is non-empty.  We
+            // want it visible but smaller than the regular message body so
+            // the thinking trace doesn't dominate the bubble. We can't
+            // selector-target it (class names are hashed), so observe and
+            // tag by visible summary text.
+            inj <<
+              "<script>(()=>{"
+                "const STYLE='font-size:.72rem;line-height:1.45;color:var(--fallback-bc,#8b949e);"
+                  "font-family:ui-monospace,SFMono-Regular,Menlo,monospace;';"
+                "const SUMMARY_STYLE='font-size:.72rem;font-weight:600;opacity:.85;';"
+                "const isReasoning=(t)=>{"
+                  "if(!t)return false;t=t.trim();"
+                  "return t==='Reasoning'||t==='Reasoning...'||/^Reasoning\\b/i.test(t);"
+                "};"
+                "const shrink=()=>{"
+                  "document.querySelectorAll('details > summary').forEach(s=>{"
+                    "const txt=(s.innerText||s.textContent||'').trim();"
+                    "if(!isReasoning(txt))return;"
+                    "const d=s.closest('details');"
+                    "if(!d||d.dataset.easyaiShrunk)return;"
+                    "d.dataset.easyaiShrunk='1';"
+                    "d.style.cssText+=';'+STYLE;"
+                    "s.style.cssText+=';'+SUMMARY_STYLE;"
+                    // Default open during streaming so the user sees the
+                    // reasoning unfold; the SSE finish_reason handler
+                    // collapses it once the answer is done.
+                    "d.open=true;"
+                  "});"
+                "};"
+                // Exposed so monitorSSE (different IIFE scope) can collapse
+                // every reasoning panel when finish_reason arrives.
+                "window.__easyaiCollapseReasoning=()=>{"
+                  "document.querySelectorAll('details[data-easyai-shrunk=\"1\"]').forEach(d=>{"
+                    "d.open=false;"
+                  "});"
+                "};"
+                "let n=0;"
+                "const tick=()=>{shrink();if(++n<60)setTimeout(tick,300);};"
+                "document.addEventListener('DOMContentLoaded',()=>{"
+                  "tick();"
+                  "new MutationObserver(shrink).observe(document.body,"
+                    "{childList:true,subtree:true,characterData:true});"
+                "});"
+              "})();</script>";
+
             // ----- fetch interceptor: stub unsupported endpoints AND inject
             //       sampling overrides from the tone dropdown ----------------
             inj <<
@@ -2428,14 +2499,18 @@ int main(int argc, char ** argv) {
                 "};"
 
                 // SSE → activity pill state machine.
-                // ---- per-message thinking panel ----------------------------
-                // Reasoning content (delta.reasoning_content) is appended into
-                // a small <details> panel placed at the top of the latest
-                // assistant message bubble.  Plain text body, gray monospace,
-                // max-height cap, click to expand.  When the next visible
-                // delta.content arrives (or the stream finishes) we collapse
-                // the panel.  A NEW panel will be created if the model thinks
-                // again later in the same message.
+                // ---- per-message thinking panel (DISABLED by default) ------
+                // Originally we injected our own collapsible reasoning panel
+                // into each assistant bubble (gray monospace, max-height cap,
+                // click to expand).  This worked back when the bundle's
+                // native renderer could not see reasoning_content.  Now that
+                // our streaming pipeline routes reasoning through
+                // delta.reasoning_content correctly, the bundle paints its
+                // own "Reasoning" details panel on top of ours, producing
+                // two glued-together panels.  Set window.__easyaiCustomThink
+                // = true at runtime to bring our panel back (kept on purpose
+                // so we can revisit it if the bundle's panel ever regresses).
+                "window.__easyaiCustomThink=false;"
                 "const THINK=new WeakMap();"      // msg → currently-open panel
                 "const findLastAssistantMsg=()=>{"
                   "const all=document.querySelectorAll("
@@ -2468,6 +2543,7 @@ int main(int argc, char ** argv) {
                   "return p;"
                 "};"
                 "function appendThinking(text){"
+                  "if(!window.__easyaiCustomThink)return;"
                   "const msg=findLastAssistantMsg();"
                   "if(!msg)return;"
                   "const p=ensureThinkPanel(msg);"
@@ -2475,6 +2551,7 @@ int main(int argc, char ** argv) {
                   "if(t){t.textContent+=text;t.scrollTop=t.scrollHeight;}"
                 "};"
                 "function closeThinking(){"
+                  "if(!window.__easyaiCustomThink)return;"
                   "const msg=findLastAssistantMsg();"
                   "if(!msg)return;"
                   "const p=THINK.get(msg);"
@@ -2547,6 +2624,7 @@ int main(int argc, char ** argv) {
                         "}"
                         "if(ch&&ch.finish_reason){"
                           "closeThinking();"
+                          "if(window.__easyaiCollapseReasoning)window.__easyaiCollapseReasoning();"
                           "const t=lastTimings;"
                           "let msg='';"
                           "if(t&&t.predicted_n&&t.predicted_ms){"

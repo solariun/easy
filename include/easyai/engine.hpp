@@ -34,8 +34,14 @@ struct common_chat_params;
 
 namespace easyai {
 
-using TokenCallback = std::function<void(const std::string & piece)>;
-using ToolCallback  = std::function<void(const ToolCall &, const ToolResult &)>;
+using TokenCallback    = std::function<void(const std::string & piece)>;
+using ToolCallback     = std::function<void(const ToolCall &, const ToolResult &)>;
+// Fires at the start of every multi-hop iteration AFTER the first.
+// Streaming layers register this to drop their per-turn accumulators
+// (e.g. the running raw-text buffer + previous parsed message used to
+// compute SSE diffs) so that retries (thought-only loops, tool-result
+// follow-ups) don't bleed state across turns.
+using HopResetCallback = std::function<void()>;
 
 class Engine {
    public:
@@ -112,8 +118,9 @@ class Engine {
     Engine & clear_tools();
 
     // ---------------- callbacks --------------------------------------------
-    Engine & on_token (TokenCallback cb);
-    Engine & on_tool  (ToolCallback  cb);
+    Engine & on_token     (TokenCallback    cb);
+    Engine & on_tool      (ToolCallback     cb);
+    Engine & on_hop_reset (HopResetCallback cb);
 
     // ---------------- lifecycle --------------------------------------------
     bool load();              // loads gguf + builds context. returns true on success.
