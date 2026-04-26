@@ -2949,6 +2949,10 @@ int main(int argc, char ** argv) {
                   "}"
                   "if(r){"
                     // Metrics bar — above the form, centered horizontally.
+                    // CRITICAL: clear `bottom` from any prior fallback tick;
+                    // setting top+bottom simultaneously stretches the host
+                    // to 0 effective height and the inner pill disappears.
+                    "barHost.style.bottom='';"
                     "barHost.style.top=(Math.max(4,r.top-34))+'px';"
                     "barHost.style.left=(r.left+r.width/2)+'px';"
                     "barHost.style.transform='translateX(-50%)';"
@@ -2967,16 +2971,19 @@ int main(int argc, char ** argv) {
                         "badgeY=er.top+er.height/2;break;"
                       "}"
                     "}"
+                    "toneHost.style.bottom='';"
                     "toneHost.style.top=badgeY+'px';"
                     "toneHost.style.left=(r.left+12)+'px';"
                     "toneHost.style.transform='translateY(-50%)';"
                   "}else{"
-                    // Fallback: viewport-anchored bottom strip.
-                    "barHost.style.top='auto';"
+                    // Fallback: viewport-anchored bottom strip.  Same
+                    // bottom/top swap concern: clear top before setting
+                    // bottom or the host gets stuck offscreen.
+                    "barHost.style.top='';"
                     "barHost.style.bottom='6.5rem';"
                     "barHost.style.left='50%';"
                     "barHost.style.transform='translateX(-50%)';"
-                    "toneHost.style.top='auto';"
+                    "toneHost.style.top='';"
                     "toneHost.style.bottom='1rem';"
                     "toneHost.style.left='1rem';"
                     "toneHost.style.transform='none';"
@@ -3043,39 +3050,42 @@ int main(int argc, char ** argv) {
                   "document.head&&document.head.appendChild(st);"
                 "}"
                 // Build a chip element with the inline action-row look.
+                // Default visible so user sees something the moment SSE
+                // starts; setStatus updates the label/dot.  setStatus(idle)
+                // hides it explicitly.
                 "const buildChip=()=>{"
                   "const chip=document.createElement('span');"
-                  // Default to display:none — flipped to inline-flex by
-                  // setStatus when a real state arrives.  align-self:center
-                  // keeps the chip baseline-locked with the icon buttons
-                  // in the row regardless of font size.
                   "chip.style.cssText="
-                    "'display:none;align-items:center;gap:.3rem;'+"
+                    "'display:inline-flex;align-items:center;gap:.35rem;'+"
                     "'align-self:center;vertical-align:middle;line-height:1;'+"
-                    "'margin:0 0 0 .5rem;padding:.18rem .6rem;'+"
+                    "'margin:0 0 0 .5rem;padding:.2rem .65rem;'+"
                     "'border:1px solid #2a313b;border-radius:999px;'+"
-                    "'color:#8b949e;background:rgba(15,19,24,.6);'+"
+                    "'color:#c9d1d9;background:rgba(20,26,32,.85);'+"
                     "'font:.72rem -apple-system,system-ui,sans-serif;'+"
-                    "'flex-shrink:0;white-space:nowrap;';"
+                    "'flex-shrink:0;white-space:nowrap;'+"
+                    "'box-shadow:0 1px 3px rgba(0,0,0,.3);';"
                   "chip.innerHTML="
-                    "'<span class=\"d __easyaiDot\" style=\"width:.45rem;height:.45rem;"
-                      "border-radius:50%;background:#5b626a;flex-shrink:0\"></span>"
-                    "<span class=\"l\"></span>';"
+                    "'<span class=\"d __easyaiDot\" style=\"width:.5rem;height:.5rem;"
+                      "border-radius:50%;background:#5b8dee;flex-shrink:0\"></span>"
+                    "<span class=\"l\">starting…</span>';"
                   "return chip;"
                 "};"
                 // attachChip(msg): place the chip in the best available
                 // anchor.  During streaming the bundle has NOT yet rendered
                 // the copy/edit/fork/delete row, so findActionRow returns
-                // null — in that case anchor the chip directly to the
-                // assistant bubble (with a top margin so it stacks below
-                // the message body) and tag chip.dataset.fallback='1'.
-                // On every later scan, if a real action row has appeared,
-                // migrate the chip into it (cleaning the fallback flag).
+                // null — in that case overlay the chip on the assistant
+                // bubble using position:absolute (top-right, anchored to
+                // msg whose position becomes relative).  That guarantees
+                // visibility regardless of the bubble's internal layout.
+                // Once a real action row appears, we migrate the chip
+                // into it inline and drop the absolute positioning.
                 "const attachChip=(msg)=>{"
                   "let chip=msg[CHIP_MARK];"
                   "const row=findActionRow(msg);"
                   "if(chip&&document.contains(chip)){"
                     "if(row&&chip.dataset.fallback==='1'&&!row.contains(chip)){"
+                      "chip.style.position='static';"
+                      "chip.style.top='';chip.style.right='';"
                       "chip.style.margin='0 0 0 .5rem';"
                       "row.appendChild(chip);"
                       "delete chip.dataset.fallback;"
@@ -3088,13 +3098,15 @@ int main(int argc, char ** argv) {
                     "row.appendChild(chip);"
                   "}else{"
                     "chip.dataset.fallback='1';"
-                    "chip.style.margin='.45rem 0 0 0;display:none;align-self:flex-start';"
-                    // Re-apply the base styles after overwriting margin/
-                    // display/align — Edge case: cssText set above wins
-                    // unless we layer.  Use a safer route: just override
-                    // the few properties that differ in fallback mode.
-                    "chip.style.alignSelf='flex-start';"
-                    "chip.style.margin='.45rem 0 0 0';"
+                    // Anchor the bubble for absolute positioning if it
+                    // doesn't already have a positioning context.
+                    "const cs=getComputedStyle(msg);"
+                    "if(cs.position==='static')msg.style.position='relative';"
+                    "chip.style.position='absolute';"
+                    "chip.style.top='.4rem';"
+                    "chip.style.right='.6rem';"
+                    "chip.style.margin='0';"
+                    "chip.style.zIndex='10';"
                     "msg.appendChild(chip);"
                   "}"
                   "msg[CHIP_MARK]=chip;"
@@ -3244,6 +3256,37 @@ int main(int argc, char ** argv) {
                 "  border-left:2px solid #b97df3 !important;"
                 "  padding-left:.6rem !important;margin:.4rem 0 !important;"
                 "  opacity:.85;"
+                " }"
+
+                // Shrink the assistant message body to a comfortable read
+                // size, closer to our chip / tone-badge font.  We target
+                // the prose-style markdown wrapper inside the assistant
+                // bubble while leaving the user message and code blocks
+                // alone (code blocks have their own monospace size that
+                // we don't want to mess with).
+                " [aria-label=\"Assistant message with actions\"]{"
+                "  font-size:.85rem !important;"
+                "  line-height:1.55 !important;"
+                " }"
+                " [aria-label=\"Assistant message with actions\"] p,"
+                " [aria-label=\"Assistant message with actions\"] li,"
+                " [aria-label=\"Assistant message with actions\"] blockquote{"
+                "  font-size:.85rem !important;line-height:1.55 !important;"
+                " }"
+                " [aria-label=\"Assistant message with actions\"] h1{"
+                "  font-size:1.05rem !important;"
+                " }"
+                " [aria-label=\"Assistant message with actions\"] h2{"
+                "  font-size:.98rem !important;"
+                " }"
+                " [aria-label=\"Assistant message with actions\"] h3,"
+                " [aria-label=\"Assistant message with actions\"] h4{"
+                "  font-size:.92rem !important;"
+                " }"
+                // Don't shrink code/pre — they have their own visual rules.
+                " [aria-label=\"Assistant message with actions\"] code,"
+                " [aria-label=\"Assistant message with actions\"] pre{"
+                "  font-size:.78rem !important;"
                 " }"
               "</style>";
 
