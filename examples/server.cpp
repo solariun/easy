@@ -1684,6 +1684,14 @@ static void handle_chat_stream(ServerCtx & ctx,
             common_chat_msg prev_msg;
             prev_msg.role = "assistant";
             const bool drop_thinking = ctx.no_think;
+            // Tracks whether ANY content delta has been emitted during
+            // this request.  When the parser blows up on malformed
+            // tool_call syntax (Qwen-style doubled-brace JSON, etc.) the
+            // partial parses all throw and the engine silently falls
+            // back to msg.content=raw.  Without this flag the client
+            // would see an empty bubble — see the post-chat_continue
+            // last-resort emit below.
+            bool any_content_emitted = false;
 
             auto emit_diff = [&](const common_chat_msg_diff & d) {
                 ordered_json delta = ordered_json::object();
@@ -1692,6 +1700,7 @@ static void handle_chat_stream(ServerCtx & ctx,
                 }
                 if (!d.content_delta.empty()) {
                     delta["content"] = d.content_delta;
+                    any_content_emitted = true;
                 }
                 // tool_call deltas: skipped — we already surface them via
                 // the easyai.tool_call / easyai.tool_result custom events.
@@ -1799,6 +1808,7 @@ static void handle_chat_stream(ServerCtx & ctx,
             std::string finish_reason = "stop";
             std::vector<std::pair<std::string, std::string>> tool_calls;
             std::vector<std::string> tool_call_ids;
+            std::string engine_final_content;     // captured from chat_continue
             try {
                 // The user message has ALREADY been pushed above (so the
                 // chat_params render works for templates that require it).
@@ -1811,7 +1821,7 @@ static void handle_chat_stream(ServerCtx & ctx,
                     tool_call_ids = std::move(turn.tool_call_ids);
                     finish_reason = turn.tool_calls.empty() ? "stop" : "tool_calls";
                 } else {
-                    ctx.engine.chat_continue();
+                    engine_final_content = ctx.engine.chat_continue();
                 }
             } catch (const std::exception & e) {
                 ctx.n_errors.fetch_add(1, std::memory_order_relaxed);
@@ -1830,6 +1840,24 @@ static void handle_chat_stream(ServerCtx & ctx,
                 auto diffs = common_chat_msg_diff::compute_diffs(prev_msg, final_msg);
                 for (const auto & d : diffs) emit_diff(d);
             } catch (...) { /* best-effort drain */ }
+
+            // Last-resort fallback: when EVERY partial parse threw (which
+            // happens when the model emits malformed Qwen-style tool_call
+            // syntax), on_token returned silently for every token and the
+            // client never got a content delta.  The engine itself fell
+            // back to msg.content=raw inside parse_assistant; surface that
+            // as one synthesised delta so the bubble isn't empty.
+            if (!any_content_emitted && !engine_final_content.empty()
+                    && !req_state->client_tools) {
+                ordered_json env;
+                env["choices"] = json::array({{
+                    {"index", 0},
+                    {"delta", {{"content", engine_final_content}}},
+                    {"finish_reason", nullptr},
+                }});
+                emit_data(safe_dump(env));
+                any_content_emitted = true;
+            }
 
             // For client-tools mode, emit the assembled tool_calls array as
             // a single delta so OpenAI clients (and our webui) see them.

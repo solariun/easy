@@ -30,29 +30,113 @@ static std::string trim(std::string s) {
     return s;
 }
 
+// Strip HTML to plain text without ever touching std::regex.  The
+// libstdc++ regex implementation is recursive on backtracking patterns
+// like   <(script|style)[^>]*>[\s\S]*?</\1>   and crashes the process
+// (SIGSEGV from stack overflow) on adversarial / oversized HTML — which
+// is exactly what web_fetch sees when an LLM picks a beefy news page.
+// Forward-only scanning + char-by-char whitespace collapse: O(n), zero
+// recursion, no stack risk regardless of input.
 static std::string strip_html(const std::string & html) {
-    // Drop <script>/<style> blocks, then all remaining tags. Collapse ws.
-    static const std::regex re_block(R"(<(script|style)[^>]*>[\s\S]*?</\1>)",
-                                     std::regex::icase);
-    static const std::regex re_tag  ("<[^>]+>");
-    static const std::regex re_ws   (R"([ \t\r\n]+)");
-    std::string s = std::regex_replace(html, re_block, " ");
-    s = std::regex_replace(s, re_tag, " ");
-    // basic entity unescape
-    struct E { const char * from; const char * to; };
-    static const E ents[] = {
-        {"&nbsp;", " "}, {"&amp;", "&"}, {"&lt;", "<"}, {"&gt;", ">"},
-        {"&quot;", "\""}, {"&#39;", "'"}, {"&apos;", "'"},
+    auto ieq = [](char a, char b) {
+        return std::tolower((unsigned char) a) == std::tolower((unsigned char) b);
     };
-    for (const auto & e : ents) {
-        size_t pos = 0;
-        while ((pos = s.find(e.from, pos)) != std::string::npos) {
-            s.replace(pos, std::strlen(e.from), e.to);
-            pos += std::strlen(e.to);
+    auto starts_with_ci = [&](size_t i, const char * needle) {
+        size_t n = std::strlen(needle);
+        if (i + n > html.size()) return false;
+        for (size_t k = 0; k < n; ++k) {
+            if (!ieq(html[i + k], needle[k])) return false;
         }
+        return true;
+    };
+
+    std::string out;
+    out.reserve(html.size());
+
+    size_t i = 0;
+    while (i < html.size()) {
+        char c = html[i];
+
+        // <script ...>...</script>  and  <style ...>...</style>
+        // Skip the entire block, including any tag-internal noise, by
+        // searching forward for the closing tag.  If we never find it
+        // (truncated HTML), drop the rest.
+        if (c == '<' && i + 1 < html.size()) {
+            const char * tag = nullptr;
+            const char * end = nullptr;
+            if (starts_with_ci(i + 1, "script")
+                    && (i + 7 >= html.size() ||
+                        !std::isalnum((unsigned char) html[i + 7]))) {
+                tag = "<script"; end = "</script>";
+            } else if (starts_with_ci(i + 1, "style")
+                    && (i + 6 >= html.size() ||
+                        !std::isalnum((unsigned char) html[i + 6]))) {
+                tag = "<style"; end = "</style>";
+            }
+            if (tag) {
+                size_t after_open = i + 1;
+                // skip until the '>' of the opening tag
+                while (after_open < html.size() && html[after_open] != '>') {
+                    ++after_open;
+                }
+                if (after_open >= html.size()) break;
+                // search closing tag (case-insensitive)
+                size_t end_len = std::strlen(end);
+                size_t j = after_open + 1;
+                bool found = false;
+                while (j + end_len <= html.size()) {
+                    if (html[j] == '<' && starts_with_ci(j, end)) {
+                        i = j + end_len;
+                        found = true;
+                        break;
+                    }
+                    ++j;
+                }
+                if (!found) break;        // unterminated → drop the rest
+                out += ' ';
+                continue;
+            }
+            // Generic tag: skip to next '>'.  Tags don't nest.
+            size_t j = i + 1;
+            while (j < html.size() && html[j] != '>') ++j;
+            i = (j < html.size()) ? j + 1 : html.size();
+            out += ' ';
+            continue;
+        }
+
+        // Entity decode — small fixed table.
+        if (c == '&') {
+            struct E { const char * from; const char * to; };
+            static const E ents[] = {
+                {"&nbsp;", " "}, {"&amp;", "&"}, {"&lt;", "<"}, {"&gt;", ">"},
+                {"&quot;", "\""}, {"&#39;", "'"}, {"&apos;", "'"},
+            };
+            bool matched = false;
+            for (const auto & e : ents) {
+                size_t flen = std::strlen(e.from);
+                if (i + flen <= html.size()
+                        && html.compare(i, flen, e.from) == 0) {
+                    out += e.to;
+                    i += flen;
+                    matched = true;
+                    break;
+                }
+            }
+            if (matched) continue;
+        }
+
+        // Whitespace collapse: turn any run of [ \t\r\n] into a single space.
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
+            if (!out.empty() && out.back() != ' ') out += ' ';
+            ++i;
+            continue;
+        }
+
+        out += c;
+        ++i;
     }
-    s = std::regex_replace(s, re_ws, " ");
-    return trim(s);
+
+    return trim(out);
 }
 
 static std::string clip(std::string s, size_t n) {
