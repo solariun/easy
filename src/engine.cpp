@@ -696,6 +696,17 @@ std::string Engine::chat_continue() {
             msg.content = msg.reasoning_content;
             if (p_->verbose) std::fprintf(stderr,
                 "[easyai] hop %d: retry budget exhausted — promoting reasoning to content\n", hop);
+            // Also push the synthesized text through on_token so the
+            // streaming HTTP layer (which builds its SSE diffs from the
+            // token stream, not from history) emits a content delta.
+            // Without this, the engine ends up with content in history
+            // but the client only ever saw reasoning_content deltas and
+            // shows an empty bubble.  We feed it as a single chunk —
+            // the partial parser appends it after any prior <think>…
+            // </think> block so it parses cleanly as content.
+            if (p_->on_token && !msg.content.empty()) {
+                p_->on_token(msg.content);
+            }
         }
 
         p_->history.push_back(msg);

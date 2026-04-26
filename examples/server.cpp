@@ -2401,26 +2401,60 @@ int main(int argc, char ** argv) {
               "})();</script>";
 
             // ----- hide the bundle's native Reasoning panel -----------------
-            // The Svelte bundle paints its own <details><summary>Reasoning</…>
-            // for each turn whose delta.reasoning_content is non-empty.  We
-            // already render our own (blue, brain-iconed, monospace) custom
-            // panel above the message body, so the bundle's copy is just a
-            // duplicate — hide it.  Class names are hashed so we observe
-            // and match by visible summary text.
+            // The bundle renders reasoning blocks via a custom Svelte
+            // component (CollapsibleContentBlock) with the wrapper class
+            // "my-2" — NOT as <details><summary>.  We already render our
+            // own blue brain-iconed custom panel above the message body,
+            // so the bundle's copy is just a duplicate — hide it.
+            //
+            // Strategy: walk every element that has "my-2" in its class
+            // list, look at its trimmed innerText (label + body text),
+            // and hide the element when the text starts with "Reasoning"
+            // (covers both "Reasoning" closed and "Reasoning…" streaming
+            // labels, as well as the expanded body whose first line is
+            // still "Reasoning").  Tool-call panels share the same Svelte
+            // component but their label is the tool name, so they don't
+            // match and stay visible.
             inj <<
               "<script>(()=>{"
                 "const isReasoning=(t)=>{"
                   "if(!t)return false;t=t.trim();"
-                  "return t==='Reasoning'||t==='Reasoning...'||/^Reasoning\\b/i.test(t);"
+                  "if(t.length>500)return false;"
+                  "return /^Reasoning(?:\\.\\.\\.|\\u2026|\\b)/i.test(t);"
                 "};"
                 "const hide=()=>{"
-                  "document.querySelectorAll('details > summary').forEach(s=>{"
-                    "const txt=(s.innerText||s.textContent||'').trim();"
+                  // First sweep: anything with my-2 (the wrapper class
+                  // CollapsibleContentBlock receives).
+                  "document.querySelectorAll('[class*=\"my-2\"]').forEach(el=>{"
+                    "if(el.dataset.easyaiHidden)return;"
+                    "const txt=(el.innerText||el.textContent||'').trim();"
                     "if(!isReasoning(txt))return;"
-                    "const d=s.closest('details');"
-                    "if(!d||d.dataset.easyaiHidden)return;"
-                    "d.dataset.easyaiHidden='1';"
-                    "d.style.setProperty('display','none','important');"
+                    "el.dataset.easyaiHidden='1';"
+                    "el.style.setProperty('display','none','important');"
+                  "});"
+                  // Fallback sweep: any leaf element whose trimmed text
+                  // is exactly the Reasoning label.  Walks up to find the
+                  // nearest plausible card wrapper and hides that.
+                  "document.querySelectorAll('span,div,h1,h2,h3,h4,p').forEach(el=>{"
+                    "if(el.children.length)return;"
+                    "const t=(el.innerText||el.textContent||'').trim();"
+                    "if(!t||!/^Reasoning(\\.\\.\\.|\\u2026)?$/i.test(t))return;"
+                    "let p=el;"
+                    "for(let i=0;i<8&&p;i++){"
+                      "if(p.dataset&&p.dataset.easyaiHidden)return;"
+                      "if(p.className&&/\\bmy-2\\b|\\bcollapse\\b|\\bcard\\b/i.test(p.className+'')){"
+                        "p.dataset.easyaiHidden='1';"
+                        "p.style.setProperty('display','none','important');"
+                        "return;"
+                      "}"
+                      "p=p.parentElement;"
+                    "}"
+                    // Last-resort: hide just the label so the empty
+                    // shell doesn't take vertical space.
+                    "if(!el.dataset.easyaiHidden){"
+                      "el.dataset.easyaiHidden='1';"
+                      "el.style.setProperty('display','none','important');"
+                    "}"
                   "});"
                 "};"
                 // Kept as a no-op so existing call sites in monitorSSE
@@ -2428,7 +2462,7 @@ int main(int argc, char ** argv) {
                 // custom panel handles its own collapse via closeThinking.
                 "window.__easyaiCollapseReasoning=()=>{};"
                 "let n=0;"
-                "const tick=()=>{hide();if(++n<60)setTimeout(tick,300);};"
+                "const tick=()=>{hide();if(++n<120)setTimeout(tick,300);};"
                 "document.addEventListener('DOMContentLoaded',()=>{"
                   "tick();"
                   "new MutationObserver(hide).observe(document.body,"
@@ -2732,7 +2766,9 @@ int main(int argc, char ** argv) {
                   "return root;"
                 "};"
 
-                // --- TONE CHIP (anchored at right edge of form) ---
+                // --- TONE BADGE (same look as the bundle's model badge,
+                //                 anchored at bottom-LEFT of the form, same
+                //                 vertical height as the model badge) ----
                 "const TONE_ID='__easyaiToneHost';"
                 "let toneRoot=null,toneHost=null;"
                 "const ensureTone=()=>{"
@@ -2749,18 +2785,54 @@ int main(int argc, char ** argv) {
                   "document.documentElement.appendChild(h);"
                   "toneHost=h;"
                   "const root=h.attachShadow({mode:'open'});"
-                  "root.innerHTML='<style>'+SHARED_STYLE+'</style>'+"
-                    "'<div class=\"pill\">"
-                      "<span class=\"grp\">"
-                        "<span>tone</span>"
-                        "<select>"
-                          "<option value=\"deterministic\">deterministic</option>"
-                          "<option value=\"precise\">precise</option>"
-                          "<option value=\"balanced\">balanced</option>"
-                          "<option value=\"creative\">creative</option>"
-                        "</select>"
-                      "</span>"
-                    "</div>';"
+                  // Match the bundle model-badge look: rounded rectangle
+                  // (not full pill), subtle dark fill, thin border, small
+                  // icon + label.  Slider-knob icon for "tone".
+                  "root.innerHTML="
+                    "'<style>"
+                      ":host,*{box-sizing:border-box}"
+                      ".badge{pointer-events:auto;display:inline-flex;"
+                        "align-items:center;gap:.4rem;"
+                        "background:rgba(30,33,38,.85);"
+                        "border:1px solid #2a313b;border-radius:.5rem;"
+                        "padding:.32rem .6rem;color:#c9d1d9;"
+                        "font:.78rem -apple-system,system-ui,sans-serif;"
+                        "cursor:pointer;"
+                        "transition:background .15s ease;"
+                      "}"
+                      ".badge:hover{background:rgba(45,49,55,.9)}"
+                      ".badge svg{width:14px;height:14px;flex-shrink:0;"
+                        "stroke:#8b949e;stroke-width:2;fill:none;"
+                        "stroke-linecap:round;stroke-linejoin:round}"
+                      ".badge select{background:transparent;color:inherit;"
+                        "border:0;font:inherit;cursor:pointer;outline:none;"
+                        "padding:0;appearance:none;-webkit-appearance:none;"
+                        "padding-right:.9rem;"
+                        "background-image:url(\"data:image/svg+xml;utf8,"
+                          "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 10 6' fill='none'"
+                          " stroke='%238b949e' stroke-width='1.5' stroke-linecap='round'"
+                          " stroke-linejoin='round'><polyline points='1 1 5 5 9 1'/></svg>\");"
+                        "background-repeat:no-repeat;background-position:right center;"
+                        "background-size:.55rem auto}"
+                      ".badge select option{background:#15191f;color:#e6edf3}"
+                    "</style>'+"
+                    "'<label class=\"badge\">"
+                      // Sliders icon (tabler-ish): two horizontal rails
+                      // with knob handles, matches the geometric flat look
+                      // of the bundle's model badge cube icon.
+                      "<svg viewBox=\"0 0 24 24\">"
+                        "<line x1=\"4\" y1=\"7\" x2=\"20\" y2=\"7\"/>"
+                        "<line x1=\"4\" y1=\"17\" x2=\"20\" y2=\"17\"/>"
+                        "<circle cx=\"10\" cy=\"7\" r=\"2.4\" fill=\"#0d1117\"/>"
+                        "<circle cx=\"15\" cy=\"17\" r=\"2.4\" fill=\"#0d1117\"/>"
+                      "</svg>"
+                      "<select aria-label=\"tone\">"
+                        "<option value=\"deterministic\">deterministic</option>"
+                        "<option value=\"precise\">precise</option>"
+                        "<option value=\"balanced\">balanced</option>"
+                        "<option value=\"creative\">creative</option>"
+                      "</select>"
+                    "</label>';"
                   "const sel=root.querySelector('select');"
                   "sel.value=window.__easyaiTone||'balanced';"
                   "sel.onchange=()=>{"
@@ -2785,11 +2857,30 @@ int main(int argc, char ** argv) {
                   "barHost.style.top=(Math.max(4,r.top-34))+'px';"
                   "barHost.style.left=(r.left+r.width/2)+'px';"
                   "barHost.style.transform='translateX(-50%)';"
-                  // Tone chip — vertical-center against the form, hugging
-                  // its right edge with a small inset.
-                  "toneHost.style.top=(r.top+r.height/2)+'px';"
-                  "toneHost.style.left=(r.right-12)+'px';"
-                  "toneHost.style.transform='translate(-100%,-50%)';"
+                  // Tone badge — anchored at the form's bottom-LEFT,
+                  // vertically aligned with where the bundle's model badge
+                  // sits at bottom-right.  We probe for any chip-shaped
+                  // element near the bottom-right that's not the send
+                  // button so we can match its exact y-centre; if we
+                  // can't find one we fall back to a fixed inset.
+                  "let badgeY=r.bottom-26;"
+                  "const cand=form.querySelectorAll("
+                    "'[class*=badge i],[data-testid*=model i],"
+                    "[aria-label*=model i],span,div'"
+                  ");"
+                  "for(const el of cand){"
+                    "const t=(el.innerText||el.textContent||'').trim();"
+                    "if(!t||t.length>40)continue;"
+                    "if(/^easyai\\b|model:/i.test(t)||/^[a-z][\\w.\\-]+$/i.test(t)){"
+                      "const er=el.getBoundingClientRect();"
+                      "if(er.bottom>r.top+r.height/2){"
+                        "badgeY=er.top+er.height/2;break;"
+                      "}"
+                    "}"
+                  "}"
+                  "toneHost.style.top=badgeY+'px';"
+                  "toneHost.style.left=(r.left+12)+'px';"
+                  "toneHost.style.transform='translateY(-50%)';"
                 "};"
 
                 "if(document.documentElement){ensureBar();ensureTone();reposition();}"
