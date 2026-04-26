@@ -1,19 +1,32 @@
 # easyai
 
-A small, opinionated **C++17 library** that turns
-[llama.cpp](https://github.com/ggml-org/llama.cpp) into an *agent engine* you
-can drop into any program. Plus three standalone binaries built on top of it:
+> **A C++17 framework anyone can use to build AI agents that talk to
+> their own services — no llama.cpp, JSON-Schema, or template-engine
+> knowledge required.**
+
+easyai turns [llama.cpp](https://github.com/ggml-org/llama.cpp) into an
+*agent engine* you can drop into any program in a dozen lines.  You give
+it C++ functions; it gives the model the ability to call them.  That's
+the whole pitch.
+
+It also ships four ready-to-run binaries built on top of the same
+library:
 
 | Binary           | What it gives you                                                                                                                                  |
 |------------------|----------------------------------------------------------------------------------------------------------------------------------------------------|
 | `easyai-cli`     | Drop-in `llama-cli` replacement: local **or** remote OpenAI-compatible endpoint, one-shot scripting (`-p`), tools, presets, optional `<think>` strip. |
-| `easyai-server`  | Drop-in `llama-server` replacement: OpenAI-compat HTTP, embedded webui, Bearer auth, Prometheus `/metrics`, KV-cache controls, flash-attn, mlock.   |
+| `easyai-server`  | Drop-in `llama-server` replacement: OpenAI-compat HTTP **with full SSE streaming**, embedded SvelteKit webui, Bearer auth, Prometheus `/metrics`, KV-cache controls, flash-attn, mlock. |
 | `easyai-agent`   | A demo agent showing every built-in tool plus an inline custom tool.                                                                                |
+| `easyai-recipes` | Tutorial agent paired with `manual.md` — implements `today_is` and `weather` (HTTP-calling) from scratch.                                          |
 | `easyai-chat`    | A bare-bones REPL with no tools — useful as a sanity check.                                                                                          |
 
-> **Status** — proof-of-concept. Apple Silicon (Metal) and Linux/Windows
-> Vulkan are wired up out of the box; everything below the `easyai::` API is
-> raw `llama.cpp`/`ggml`.
+> **Status** — used in production on a Linux Vulkan box (Radeon 680M)
+> as a self-hosted ChatGPT-style assistant.  Apple Silicon (Metal),
+> Linux/Windows Vulkan, NVIDIA CUDA, and AMD ROCm are all wired up out
+> of the box.  `scripts/install_easyai_server.sh` handles the whole
+> Debian/Ubuntu deployment in one command (systemd-coredump,
+> hardened unit, optional `--enable-verbose`, drop-in compat with
+> `install_llama_server.sh`).
 
 ---
 
@@ -201,11 +214,13 @@ HTTPS to duckduckgo.com.
 
 ## Documentation
 
+* [`manual.md`](manual.md) — hands-on developer manual.  Includes a
+  step-by-step **"Recipe book — write your first tools"** chapter
+  (section 3.8) that walks through `examples/recipes.cpp` line by
+  line in a friendly, accessible style.  Best place to start if you
+  want to extend easyai with your own services.
 * [`design.md`](design.md) — architecture, data flow, why we build on top of
   `common/` instead of just `include/llama.h`.
-* [`manual.md`](manual.md) — hands-on developer manual. Beginner walkthrough
-  ("hello, agent") all the way to advanced topics (writing your own tools,
-  customising the chat-template parser, hosting behind a reverse proxy).
 * [`scripts/install_easyai_server.sh`](scripts/install_easyai_server.sh) —
   one-shot Debian/Ubuntu installer; **drop-in replacement** for the
   `install_llama_server.sh` workflow. Clones llama.cpp + easyai, builds

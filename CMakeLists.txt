@@ -71,6 +71,15 @@ if (EASYAI_BUILD_EXAMPLES)
     add_executable(easyai-agent examples/agent.cpp)
     target_link_libraries(easyai-agent PRIVATE easyai)
 
+    # Tutorial agent paired with manual.md → "Writing your own tools".
+    # Demonstrates a zero-parameter tool (today_is) and an HTTP-calling
+    # tool (weather → wttr.in).  Only built when libcurl is available
+    # because the weather recipe links to it directly.
+    if (CURL_FOUND)
+        add_executable(easyai-recipes examples/recipes.cpp)
+        target_link_libraries(easyai-recipes PRIVATE easyai CURL::libcurl)
+    endif()
+
     add_executable(easyai-cli examples/cli.cpp)
     target_link_libraries(easyai-cli PRIVATE easyai)
     # nlohmann::json is vendored by llama.cpp at vendor/nlohmann/json.hpp

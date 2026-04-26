@@ -6,13 +6,15 @@
 #   1. Installs build deps (CMake/Ninja/git/pkg-config + libcurl) and the
 #      backend SDK that matches your hardware (Vulkan / CUDA / ROCm-HIP).
 #   2. Clones llama.cpp + easyai (or uses existing sibling dirs).
-#   3. Builds easyai (libeasyai + easyai-cli + easyai-server) with the
-#      selected GPU backend.
+#   3. Builds easyai (libeasyai + easyai-cli + easyai-server +
+#      easyai-agent + easyai-recipes + easyai-chat) with the selected
+#      GPU backend.
 #   4. Installs the binaries to $prefix/bin.
 #   5. Creates a system user, /var/lib/easyai/{models,workspace}, an
 #      /etc/easyai/system.txt + api_key file.
 #   6. Drops a hardened systemd unit that runs easyai-server with mlock,
-#      flash-attn, q8_0 KV cache, Bearer auth, and Prometheus /metrics.
+#      flash-attn, q8_0 KV cache, Bearer auth, Prometheus /metrics, and
+#      coredump capture (LimitCORE=infinity + systemd-coredump package).
 #   7. (Linux only, optional) AMD-iGPU GTT kernel cmdline tweak; mDNS via
 #      avahi; memlock+nofile limits; system swap off.
 #
@@ -42,6 +44,7 @@
 #   ./install_easyai_server.sh --webui-icon /path/to/logo.svg   # ico|png|svg|gif|jpg|webp
 #   ./install_easyai_server.sh --upgrade             # git pull + rebuild
 #   ./install_easyai_server.sh --enable-now          # systemctl start now
+#   ./install_easyai_server.sh --enable-verbose      # bake --verbose into ExecStart (noisy)
 #   ./install_easyai_server.sh --no-service          # build/install only
 #   ./install_easyai_server.sh -h                    # show this help
 # ============================================================================
@@ -108,6 +111,7 @@ preset="balanced"
 thinking="on"
 enable_metrics=1
 enable_flash_attn=1
+enable_verbose=0                              # adds --verbose to ExecStart (noisy)
 cache_type_k="q8_0"
 cache_type_v="q8_0"
 mlock=1
@@ -157,6 +161,8 @@ while [[ $# -gt 0 ]]; do
         --thinking)         thinking="$2"; shift 2 ;;
         --no-metrics)       enable_metrics=0; shift ;;
         --no-flash-attn)    enable_flash_attn=0; shift ;;
+        --enable-verbose)   enable_verbose=1; shift ;;
+        --no-verbose)       enable_verbose=0; shift ;;
         --cache-type-k)     cache_type_k="$2"; shift 2 ;;
         --cache-type-v)     cache_type_v="$2"; shift 2 ;;
         --no-mlock)         mlock=0; shift ;;
@@ -272,6 +278,7 @@ printf '    preset           = %s  thinking=%s\n' "$preset" "$thinking"
 printf '    KV cache         = K=%s  V=%s  flash_attn=%s\n' "$cache_type_k" "$cache_type_v" "$enable_flash_attn"
 printf '    memory           = mlock=%s  no_mmap=%s\n' "$mlock" "$no_mmap"
 printf '    metrics          = %s\n' "$enable_metrics"
+printf '    verbose          = %s\n' "$enable_verbose"
 printf '    webui_title      = %s\n' "$webui_title"
 printf '    webui_icon       = %s\n' "${webui_icon:-<default — no icon>}"
 printf '    api_key          = %s\n' "$([[ -n "$api_key" ]] && echo "<set>" || echo "<none — server is open>")"
@@ -303,7 +310,8 @@ if [[ $do_install -eq 1 ]]; then
     sudo apt-get update
     sudo apt-get install -y --no-install-recommends \
         build-essential cmake ninja-build git ccache pkg-config curl ca-certificates \
-        libcurl4-openssl-dev libomp-dev libcap2-bin jq
+        libcurl4-openssl-dev libomp-dev libcap2-bin jq \
+        systemd-coredump
 
     case "$backend_resolved" in
         vulkan)
@@ -444,10 +452,14 @@ fi
 # ---------- install binaries ------------------------------------------------
 if [[ $do_build -eq 1 ]]; then
     log "installing binaries to $install_prefix/bin"
-    sudo install -Dm755 "$easyai_dir/build/easyai-server" "$install_prefix/bin/easyai-server"
-    sudo install -Dm755 "$easyai_dir/build/easyai-cli"    "$install_prefix/bin/easyai-cli"
-    sudo install -Dm755 "$easyai_dir/build/easyai-agent"  "$install_prefix/bin/easyai-agent" || true
-    sudo install -Dm755 "$easyai_dir/build/easyai-chat"   "$install_prefix/bin/easyai-chat"  || true
+    sudo install -Dm755 "$easyai_dir/build/easyai-server"  "$install_prefix/bin/easyai-server"
+    sudo install -Dm755 "$easyai_dir/build/easyai-cli"     "$install_prefix/bin/easyai-cli"
+    sudo install -Dm755 "$easyai_dir/build/easyai-agent"   "$install_prefix/bin/easyai-agent"   || true
+    sudo install -Dm755 "$easyai_dir/build/easyai-chat"    "$install_prefix/bin/easyai-chat"    || true
+    # Tutorial agent (today_is + weather).  Only built when libcurl is
+    # present, hence the || true so a CPU-only / no-curl build still
+    # finishes the install step.
+    sudo install -Dm755 "$easyai_dir/build/easyai-recipes" "$install_prefix/bin/easyai-recipes" || true
     # libeasyai.so + dynamically-loaded llama / ggml libs.
     #
     # We install everything into an ISOLATED directory ($prefix/lib/easyai)
@@ -673,6 +685,7 @@ if [[ $do_service -eq 1 ]]; then
     [[ "$mlock"   -eq 1 ]]           && args+=( --mlock )
     [[ "$no_mmap" -eq 1 ]]           && args+=( --no-mmap )
     [[ "$enable_metrics" -eq 1 ]]    && args+=( --metrics )
+    [[ "$enable_verbose" -eq 1 ]]    && args+=( --verbose )
     [[ "$thinking" == "off" ]]       && args+=( --reasoning off )
 
     # api-key sourced from a file at runtime (so it's never visible in `ps`).
@@ -754,6 +767,10 @@ LockPersonality=yes
 RestrictSUIDSGID=yes
 LimitMEMLOCK=infinity
 LimitNOFILE=1048576
+# systemd default is 0, which silently drops crash dumps. Pair this with the
+# systemd-coredump package (added to apt-get deps) so any crash gets captured
+# under /var/lib/systemd/coredump and is inspectable via 'coredumpctl gdb'.
+LimitCORE=infinity
 
 # Allow binding to low ports (only relevant if --service-port < 1024)
 AmbientCapabilities=CAP_NET_BIND_SERVICE
@@ -830,4 +847,8 @@ printf '         -d '\''{"messages":[{"role":"user","content":"hi"}]}'\''\n'
 echo
 printf '  point any OpenAI client at:  http://%s:%s/v1\n' \
     "$([[ "$service_host" == "0.0.0.0" ]] && hostname || echo "$service_host")" "$service_port"
+echo
+printf '  if it crashes:\n'
+printf '    sudo journalctl -u %s -n 200 --no-pager\n' "$service_name"
+printf '    coredumpctl list %s   # then: coredumpctl gdb <PID>\n' "$service_name"
 echo

@@ -368,7 +368,424 @@ if (!pr.applied.empty()) {
 engine.chat(user_line);
 ```
 
-### 3.8 The `generate_one()` escape hatch
+### 3.8 Recipe book — write your first tools, step by step
+
+> **In this chapter, you'll learn to:**
+> * understand what an "AI tool" really is (it's just a C++ function!)
+> * write a tool that returns today's date
+> * write a tool that fetches live weather from the internet
+> * give your agent both tools and watch it answer real questions
+> * recognise when to reach for the more advanced building blocks
+>
+> **You don't need to know:** llama.cpp, JSON Schema, Jinja templates,
+> or anything about how language models work under the hood.
+
+This is the chapter every other chapter has been pointing at.  When
+people ask *"what's so cool about easyai?"* — this is the answer.
+You're going to give a small AI model two new abilities in about
+fifty lines of code, and at the end you'll have a working agent that
+genuinely reaches out to the internet on your behalf.
+
+There's a finished version of everything below in
+**`examples/recipes.cpp`**.  Build it now so you can compare:
+
+```bash
+cmake --build build -j --target easyai-recipes
+```
+
+We'll come back to that binary at the end and run it.
+
+---
+
+#### Chapter opener — what *is* a tool, anyway?
+
+Imagine you hire a brilliant intern.  They're fast, polite, and they
+know almost everything — but they joined the company yesterday so
+they don't know your customer database, they don't have your VPN, and
+they can't see today's calendar.  How do you make them useful?
+
+You give them a phone book of internal services and you tell them:
+*"if anyone asks about a customer, call this number; if they ask about
+billing, call that one."*
+
+That's exactly what a tool is to an AI model.  Each tool you register
+is a phone-book entry.  The model gets to read three things about it:
+
+| Field          | What goes here                                              | Read by    |
+|----------------|-------------------------------------------------------------|------------|
+| **name**       | A short identifier — e.g. `today_is`, `weather`            | the model  |
+| **description**| One sentence: *what does this do, when should I use it?*   | the model  |
+| **handler**    | A normal C++ function that gets called for you             | easyai     |
+
+When the model decides "I should use the weather tool", easyai catches
+that intent, runs your handler with whatever arguments the model picked,
+and feeds the result back so the model can finish its answer.
+
+The whole dance, drawn out:
+
+```
+   user                   model                   easyai            your handler
+    │                        │                       │                     │
+    │  "What's the weather   │                       │                     │
+    │   in São Paulo?"  ───▶ │                       │                     │
+    │                        │  "I'll call            │                     │
+    │                        │   weather(city=…)" ──▶│                     │
+    │                        │                       │  weather(...)  ───▶ │
+    │                        │                       │                     │ … HTTP call …
+    │                        │                       │ ◀──── "São Paulo:   │
+    │                        │ ◀──── tool result ────│       ⛅ +24°C"     │
+    │                        │                       │                     │
+    │  "São Paulo is a       │                       │                     │
+    │   pleasant 24°C…" ◀────│                       │                     │
+```
+
+You write the handler.  Everything else is automatic.
+
+---
+
+#### Recipe 1 — your first tool: "what is today's date?"
+
+Most tiny AI models have **no idea what today's date is**.  Their
+training data ended months (sometimes years) ago.  Ask Qwen2.5-1.5B
+"what's today's date?" and you'll usually get a confident-sounding
+hallucination.
+
+Let's fix that with eight lines.
+
+##### Type this
+
+```cpp
+easyai::Tool today_is() {
+    return easyai::Tool::builder("today_is")
+        .describe("Returns today's date in ISO-8601 format (YYYY-MM-DD, UTC).")
+        .handle([](const easyai::ToolCall &) {
+            auto now = std::chrono::system_clock::now();
+            auto t   = std::chrono::system_clock::to_time_t(now);
+            char buf[16];
+            std::strftime(buf, sizeof(buf), "%Y-%m-%d", std::gmtime(&t));
+            return easyai::ToolResult::ok(buf);
+        })
+        .build();
+}
+```
+
+##### What just happened?
+
+Read it line by line — there's nothing magical:
+
+1. **`Tool::builder("today_is")`** — pick a name for the tool.  Use
+   `snake_case`.  This is the name the model will speak when it wants
+   to use the tool.
+2. **`.describe(...)`** — write a one-line description that you'd give
+   a smart intern.  *"Returns today's date in ISO-8601 format"* is
+   crystal-clear.  *"Useful for date stuff"* would not be.
+3. **`.handle(...)`** — the C++ that does the real work.  Here it's a
+   little lambda that calls the standard library.  No llama.cpp, no
+   JSON, no AI-specific API.
+4. **`ToolResult::ok(buf)`** — pack the string into a success result.
+   Whatever you pass here is what the model sees back as the tool's
+   reply.
+5. **`.build()`** — turn the recipe into the actual `Tool` object.
+
+> **Tip.**  The description is the *only* hint the model has about
+> when to call your tool.  Write it for an LLM, not for your IDE.
+> Be specific, give an example output, mention units.
+
+##### Hand it to the engine
+
+```cpp
+easyai::Engine engine;
+engine.model("models/qwen2.5-1.5b-instruct-q4_k_m.gguf")
+      .add_tool(today_is())     // ← your new tool
+      .load();
+engine.chat("What's the date today?");
+```
+
+That's it.  Eight lines for the tool plus three for the wiring, and
+your agent now has reliable date access.
+
+> **Try it.**  Wrap the snippet above in a `main()`, link against
+> `easyai`, build, and run.  Or just look at `examples/recipes.cpp` —
+> it's the same code, ready to go.
+
+---
+
+#### Recipe 2 — talking to the internet: a "weather" tool
+
+Today's date is fun, but the real point of giving an AI tools is so
+it can reach out to systems you control: your database, your APIs,
+your filesystem, the internet.
+
+Let's write a `weather` tool.  We'll use **wttr.in** — a free,
+no-signup service that takes a city name and replies in plain text:
+
+```
+$ curl 'https://wttr.in/Sao Paulo?format=3'
+São Paulo: ⛅ +24°C
+```
+
+That's the whole API.  Our job is to wrap that in a tool.
+
+We're going to do this in four small steps so nothing feels like a
+leap.
+
+##### Step 1 — Declare the input parameter
+
+This time the tool needs a parameter (`city`).  The builder makes
+that one extra line:
+
+```cpp
+easyai::Tool::builder("weather")
+    .describe("Returns the current weather for a city.  Backed by wttr.in "
+              "— free, no API key, plain-text reply.")
+    .param("city", "string",
+           "City name, e.g. 'Berlin' or 'Sao Paulo'.  Required.",
+           /*required=*/true)
+```
+
+`param(name, type, description, required)` is all you ever need.
+The valid `type` values are:
+
+| `type`      | C++ in your handler             |
+|-------------|---------------------------------|
+| `"string"`  | `std::string` via `args::get_string_or(...)` |
+| `"integer"` | `long long` via `args::get_int_or(...)` |
+| `"number"`  | `double` via `args::get_double_or(...)` |
+| `"boolean"` | `bool` via `args::get_bool_or(...)` |
+| `"array"`   | parse the JSON yourself         |
+| `"object"`  | parse the JSON yourself         |
+
+> **Heads-up.**  Tiny models occasionally forget required parameters.
+> Always validate inside your handler — see step 3.
+
+##### Step 2 — Read the parameter inside the handler
+
+The model packs the arguments into a JSON blob (e.g.
+`{"city":"Sao Paulo"}`).  easyai gives you a tiny scanner so you
+don't need a JSON library:
+
+```cpp
+.handle([](const easyai::ToolCall & call) {
+    std::string city = easyai::args::get_string_or(
+        call.arguments_json, "city", "");
+    if (city.empty()) {
+        return easyai::ToolResult::error("missing 'city' argument");
+    }
+    ...
+```
+
+That **one line** with `get_string_or` replaces the four lines of
+"declare, get, check, default" pattern you'd write in plain C++.
+
+The full helper menu:
+
+| Helper                                              | Returns…                          |
+|-----------------------------------------------------|-----------------------------------|
+| `args::get_string_or(json, key, default)`           | the value, or your default        |
+| `args::get_int_or   (json, key, default)`           | same idea, `long long`            |
+| `args::get_double_or(json, key, default)`           | same idea, `double`               |
+| `args::get_bool_or  (json, key, default)`           | same idea, `bool`                 |
+| `args::has(json, key)`                              | `bool` — did the model fill it in?|
+
+(There's an older `bool args::get_string(json, key, &out)` form
+that's still around when you need to tell *"absent"* apart from
+*"present but empty"*.)
+
+##### Step 3 — Make the actual call
+
+Anything you can do in C++ goes here: hit a REST API, query SQLite,
+shell out to a Python script, send a Slack message, ring a bell on
+the desk next to you.  In our case it's an HTTP GET, and libcurl
+takes about ten lines:
+
+```cpp
+CURL * h = curl_easy_init();
+char * escaped = curl_easy_escape(h, city.c_str(), 0);   // URL-safe
+std::string url = "https://wttr.in/";
+url += escaped ? escaped : city.c_str();
+url += "?format=3";                                       // one-line summary
+if (escaped) curl_free(escaped);
+
+std::string body;
+curl_easy_setopt(h, CURLOPT_URL,            url.c_str());
+curl_easy_setopt(h, CURLOPT_USERAGENT,      "easyai-recipes/0.1");
+curl_easy_setopt(h, CURLOPT_FOLLOWLOCATION, 1L);
+curl_easy_setopt(h, CURLOPT_TIMEOUT,        15L);
+curl_easy_setopt(h, CURLOPT_WRITEFUNCTION,  capture_body);   // see recipes.cpp
+curl_easy_setopt(h, CURLOPT_WRITEDATA,      &body);
+CURLcode rc   = curl_easy_perform(h);
+long     code = 0;
+curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, &code);
+curl_easy_cleanup(h);
+```
+
+> **Don't panic** at the libcurl block — copy and paste it into any
+> tool that needs the network and tweak the URL.  The boilerplate is
+> the same every time.  Half of your future tools will be exactly
+> this shape.
+
+##### Step 4 — Return success or a typed error
+
+```cpp
+if (rc != CURLE_OK) {
+    return easyai::ToolResult::error(
+        std::string("HTTP transport error: ") + curl_easy_strerror(rc));
+}
+if (code >= 400) {
+    return easyai::ToolResult::error(
+        "wttr.in returned HTTP " + std::to_string(code));
+}
+return easyai::ToolResult::ok(body);
+```
+
+Two return flavours, only:
+
+* **`ToolResult::ok(text)`** — the model sees `text` as the reply.
+* **`ToolResult::error(msg)`** — easyai marks the message as a failure
+  so the model knows to recover (try a different tool, ask the user,
+  apologise).
+
+> **Why this matters.**  When a tool errors, well-trained models *do
+> the right thing*.  They don't pretend the call worked.  They tell
+> the user *"the weather service is unavailable, want me to try
+> again later?"*  Use `error` for anything that isn't a success.
+
+---
+
+#### Putting it together — your first running agent
+
+The whole `main()` is in `examples/recipes.cpp`:
+
+```cpp
+easyai::Engine engine;
+engine.model(model_path)
+      .context(4096)
+      .gpu_layers(99)
+      .system("You are a concise assistant.  Use tools whenever they help.")
+      .add_tool(today_is())
+      .add_tool(weather())
+      .on_token([](const std::string & p){ std::cout << p << std::flush; });
+
+if (!engine.load()) {
+    std::fprintf(stderr, "load failed: %s\n", engine.last_error().c_str());
+    return 1;
+}
+engine.chat("What's today's date, and what's the weather in Sao Paulo right now?");
+```
+
+Run it:
+
+```
+$ ./build/easyai-recipes models/qwen2.5-1.5b-instruct-q4_k_m.gguf
+[recipes] backend=Metal  ctx=4096  tools=2
+
+Today is 2026-04-26.  São Paulo currently shows ⛅ +24°C, so light
+clothes with a thin layer for the evening should be perfect.
+```
+
+##### What just happened?
+
+* The model received your one English sentence.
+* It noticed it didn't know the date — so it called `today_is`.
+* It noticed it didn't know the weather — so it called `weather`
+  with `{"city":"Sao Paulo"}`.
+* easyai ran both your handlers, captured both replies, and fed
+  them back into the model.
+* The model wove them into one fluent answer.
+
+You wrote two C++ functions.  easyai did the rest.
+
+---
+
+#### Going further (when you're ready)
+
+This sub-section is a quick tour of doors you can walk through next.
+Each is fully optional.
+
+##### More than one parameter
+
+Mix and match types, mark some as optional, use `_or` helpers to
+thread defaults right through:
+
+```cpp
+easyai::Tool::builder("send_alert")
+    .describe("Push a one-line alert to the on-call channel.")
+    .param("text",       "string",  "Message body.  Required.",                   true)
+    .param("severity",   "string",  "info | warning | critical.  Default 'info'.", false)
+    .param("notify_now", "boolean", "Page on-call immediately?",                   false)
+    .handle([](const easyai::ToolCall & call) {
+        auto text     = easyai::args::get_string_or(call.arguments_json, "text", "");
+        auto severity = easyai::args::get_string_or(call.arguments_json, "severity", "info");
+        auto pageNow  = easyai::args::get_bool_or  (call.arguments_json, "notify_now", false);
+
+        if (text.empty()) return easyai::ToolResult::error("missing 'text'");
+        // … your real send code …
+        return easyai::ToolResult::ok("alert dispatched.");
+    })
+    .build();
+```
+
+##### When the builder isn't enough
+
+The builder makes a flat JSON-Schema (just `properties` + `required`).
+For 95% of tools that's plenty.  Need enums, nested objects, arrays?
+Drop down to **`Tool::make()`** with a hand-written schema:
+
+```cpp
+engine.add_tool(easyai::Tool::make(
+    "create_ticket",
+    "Open a Jira ticket.",
+    R"({
+      "type": "object",
+      "properties": {
+        "project":  { "type": "string" },
+        "summary":  { "type": "string" },
+        "priority": { "type": "string", "enum": ["P0","P1","P2","P3"] },
+        "labels":   { "type": "array", "items": { "type": "string" } }
+      },
+      "required": ["project","summary"]
+    })",
+    [](const easyai::ToolCall & call) {
+        // parse with nlohmann::json (vendored at ../llama.cpp/vendor) …
+        return easyai::ToolResult::ok("JRA-1234");
+    }));
+```
+
+Same engine, same callback shape, full schema control.
+
+##### Where to read more
+
+* **`src/builtin_tools.cpp`** — `web_search`, `web_fetch`, and the
+  filesystem tools.  All written with the exact API you've been using.
+  No internal magic; copy any of them as a starting point.
+* **`examples/agent.cpp`** — every built-in plus a one-liner
+  `flip_coin` for the shortest possible custom tool.
+* [3.3 Sandboxed filesystem tools](#33-sandboxed-filesystem-tools) —
+  expose a directory to the model without giving away the whole disk.
+* [3.5 Listening for tool calls](#35-listening-for-tool-calls-telemetry--ui-hooks)
+  — log every dispatch, light up a UI spinner, push to Prometheus.
+
+##### Ten things you can build in an afternoon
+
+If you want practice, pick one and tell us what you came up with:
+
+1. `now()` — current time in any timezone (parameter `tz`).
+2. `coin_flip()` — heads/tails (no parameters).
+3. `roll_dice()` — `count` + `sides` parameters.
+4. `unit_convert()` — temp/length/weight; HTTP-free.
+5. `wikipedia_summary()` — calls `en.wikipedia.org/api/rest_v1/page/summary/<title>`.
+6. `slack_post()` — your incoming-webhook URL goes in code.
+7. `sqlite_query()` — read-only, parameter `sql`.  Sandbox to one DB.
+8. `git_log()` — last N commits of a sandboxed repo.
+9. `prometheus_query()` — point at your local `/api/v1/query` endpoint.
+10. `home_assistant()` — toggle a light by entity ID.  Now you've
+    built the front-end of a smart home.
+
+> **You're done with the chapter.**  Anything you can call from C++,
+> you can hand to your AI agent.  That's the entire promise of easyai
+> as a framework — and you have everything you need.
+
+### 3.9 The `generate_one()` escape hatch
 
 Use this when you want **one** assistant turn out (no internal tool loop) so
 *you* can decide what to do with any tool calls — exactly what the HTTP

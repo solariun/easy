@@ -26,11 +26,28 @@ internal pieces fit together. It assumes you've at least skimmed the
 
 * **Distributed inference** or batched multi-tenant serving — the engine is
   single-context, single-mutex.
-* **Streaming** at the HTTP layer — the OpenAI endpoint returns a full reply
-  per request. Streaming is a clean follow-up but would force us to maintain
-  a thread-safe SSE plumbing layer that's out of scope for v0.
 * **Speculative decoding, RAG, embeddings** — all already in `llama.cpp`,
   but easyai stays out of their way to keep the surface small.
+
+### What changed since the original v0 plan
+
+* **Streaming is in.** The HTTP layer now mirrors `llama-server`'s
+  incremental pipeline: every generated token is fed to
+  `common_chat_parse(text, is_partial=true, parser_params)`,
+  diffed against the previous parsed message via
+  `common_chat_msg_diff::compute_diffs()`, and emitted as standard
+  OpenAI-shape SSE deltas (`delta.reasoning_content` /
+  `delta.content`).  Tool calls surface via the custom
+  `easyai.tool_call` / `easyai.tool_result` SSE events plus an inline
+  one-line markdown indicator so generic OpenAI clients still see
+  *something* when a tool fires.
+* **Webui is the llama-server SvelteKit bundle.** Embedded at build
+  time via `cmake/xxd.cmake` (`webui/{index.html,bundle.js,
+  bundle.css,loading.html}`).  We ship customisations as runtime
+  patches: at-startup string substitutions on `bundle.js`, plus
+  injected `<script>` blocks that scrub MCP/Sign-in chrome,
+  shrink the bundle's native Reasoning panel, and drive a
+  per-message status pill from the SSE stream.
 
 ---
 
@@ -63,18 +80,30 @@ update both together.
                                                   ▼
               ┌─────────────────────────────────────────────────────┐
               │ render = common_chat_templates_apply(history+tools) │
+              │   reasoning_format = AUTO (extract <think> blocks)  │
               └────────────────────────┬────────────────────────────┘
                                        ▼
               ┌─────────────────────────────────────────────────────┐
               │ tokenize, decode (Metal/Vulkan), sample loop         │
               │ (Engine::Impl::generate_until_done)                  │
+              │   on_token() fires per piece — used by SSE layer     │
               └────────────────────────┬────────────────────────────┘
                                        ▼  raw assistant text
               ┌─────────────────────────────────────────────────────┐
               │ parse = common_chat_parse(raw, parser_arena)         │
-              │   → common_chat_msg { content, tool_calls, ... }     │
+              │   → common_chat_msg { content, reasoning_content,    │
+              │                         tool_calls, ... }            │
               └────────────────────────┬────────────────────────────┘
                                        ▼
+                       thought-only?  (content empty AND
+                       tool_calls empty AND reasoning non-empty)
+                          │
+                          ├─ yes → discard turn, clear KV,
+                          │        fire on_hop_reset, retry
+                          │        (up to 2 retries; then fall
+                          │        back to promoting reasoning
+                          │        → content)
+                          ▼
                               tool_calls.empty() ?
                                 yes ──▶ return content
                                 no  ──▶ for each call: dispatch + push
@@ -94,6 +123,34 @@ Two single-pass exits exist for the HTTP server:
   message to the history without generating. Used by the HTTP server to
   rebuild the conversation per request and by client-side tool-result
   feeding.
+
+A third entry point is used by streaming requests:
+
+* `Engine::chat_continue()` — same multi-hop loop as `chat()` but assumes
+  the user message is *already* the last entry in history. Required because
+  the server pushes the user message first, then renders
+  `chat_params_for_current_state()` to wire the parser, *then* calls into
+  the engine. Splitting the entry points avoids the user message being
+  pushed twice.
+
+### The thought-only retry path
+
+Some fine-tunes (notably custom Qwen3 trims) sometimes terminate the
+turn after `</think>` without emitting either content or a tool_call.
+To avoid surfacing an empty bubble to the user, `chat_continue()`
+detects that condition and:
+
+1. Throws away the empty turn (does NOT push it to history).
+2. Clears the KV cache so the next iteration re-feeds the prompt clean.
+3. Fires `on_hop_reset` so the streaming layer can drop its
+   `accumulated` raw-text buffer and `prev_msg` diff baseline.
+4. Loops back. Sampling is stochastic (`temp > 0`), so the second pass
+   typically completes correctly.
+
+A budget of 2 retries is hard-coded. If both pass-throughs are still
+thought-only, the engine falls back to promoting `reasoning_content`
+into `content` so the user sees the model's thinking instead of an
+empty reply. The behaviour is logged when `Engine::verbose(true)`.
 
 ---
 
@@ -124,8 +181,9 @@ common_chat_templates_ptr   templates;       // Jinja templates (RAII)
 common_sampler            * sampler;         // freed in dtor
 std::vector<common_chat_msg> history;        // conversation
 std::vector<Tool>            tools;          // registered tools
-TokenCallback               on_token;
-ToolCallback                on_tool;
+TokenCallback               on_token;        // per-piece streaming hook
+ToolCallback                on_tool;         // post-dispatch tool hook
+HopResetCallback            on_hop_reset;    // fired when a hop is discarded
 ```
 
 ### KV-cache handling
@@ -253,20 +311,68 @@ under cpp-httplib.
 
 ## 7. The webui
 
-A single `<500-line` HTML file embedded in `server.cpp` as a `constexpr char[]`.
-It POSTs full conversation history each turn (stateless, like the OpenAI API),
-includes a preset bar that hits `POST /v1/preset`, and renders raw text plus
-any returned tool_calls.
+The webui shipped is the compiled SvelteKit bundle from `llama-server`,
+embedded into the easyai-server binary at build time via
+`cmake/xxd.cmake` (one `.hpp` per asset, generated from
+`webui/{index.html,bundle.js,bundle.css,loading.html}`).  Total binary
+size goes from ~1.5 MB to ~8.3 MB; in exchange we get a polished chat
+UI with markdown rendering, code highlighting, preset switching, file
+attachments, and per-message stats — all without us maintaining any
+of it.
 
-Embedded inline because:
+### Customisations: two layers
 
-* one binary, no install path issues
-* no `--www-dir` flag to forget
-* no risk of serving an arbitrary file by mistake
+1. **Build-time string substitution on `bundle.js`** — at server
+   startup we patch a few hard-coded llama.cpp brand strings:
+   * `>llama.cpp</h1>` → `>{title}</h1>` (sidebar + welcome brand)
+   * `llama.cpp - AI Chat Interface` → `{title}` (page title)
+   * `Initializing connection to llama.cpp server...` → `... {title} server …`
+   * `} - llama.cpp` → `} - {title}` (per-conversation page title)
+   * `Type a message...` placeholder, replaced via `--webui-placeholder`
 
-If you want a richer UI (markdown, copy buttons, code highlighting, file
-upload), point a real frontend at `/v1/chat/completions` — the UI in-binary
-is intentionally minimal.
+2. **Runtime DOM injection** into the served `index.html`'s `<head>`
+   via several `<script>` IIFE blocks:
+   * **Title pin** via `Object.defineProperty(document, 'title', {set:})`.
+   * **LocalStorage seeding** to disable MCP defaults and force
+     `keepStatsVisible=true` / `showMessageStats=true`.
+   * **DOM scrubber** — a `MutationObserver` on `<body>` matches
+     visible-text NEEDLES (`/^MCP\b/`, `/^Sign in/`, `/Load model/`,
+     etc.) and hides their containing card / list-item / dialog so
+     unsupported chrome doesn't reach the user.
+   * **`fetch` interceptor** that 501s `/authorize`, `/token`,
+     `/register`, `/.well-known/*`, `/models/load`, `/cors-proxy`,
+     `/dev/poll`, `/home/web_user/*`; stubs `/properties` with `{}`;
+     and tees the SSE response of `/v1/chat/completions` into a
+     status-pill state machine.
+   * **Tone chip + metrics bar** in a Shadow-DOM host
+     (`__easyaiBarHost`) attached to `<html>` (so it survives Svelte
+     body re-renders) — selector for
+     `deterministic / precise / balanced / creative` plus
+     `ctx X/Y · last N tok · s · t/s` overview.
+   * **Per-message status pill** appended to each assistant action
+     toolbar — shows `thinking` / `answering` / `fetching · <tool>` /
+     `complete · 98 tok · 4.4s · 22.3 t/s`.
+   * **Reasoning-panel shrink** — another `MutationObserver` finds
+     `<details>` whose summary text matches `/^Reasoning/i`, applies
+     a smaller monospace gray style so the trace doesn't dominate
+     the bubble, defaults `open=true` during streaming, and
+     auto-collapses on `finish_reason`.
+   * **Legacy custom thinking panel** (`__easyai-thinking`) ships
+     dormant behind `window.__easyaiCustomThink = false`.  Kept for
+     re-enabling on demand if the bundle's native panel ever
+     regresses.
+
+### Why the bundle approach
+
+* Zero install footprint — operators get a single `easyai-server`
+  binary, no `--www-dir` to remember.
+* Existing llama-server users feel at home immediately.
+* Markdown, syntax highlighting, multi-attachment chat, etc. are
+  hard problems we don't need to solve.
+
+The cost is that the bundle hashes class names on every rebuild, so
+*all* customisations must use `aria-label`, `data-testid`, or
+visible-text matching.  Never rely on `[class*=…]`.
 
 ---
 

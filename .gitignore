@@ -8,3 +8,4 @@ models/*.gguf
 .cache/
 .DS_Store
 compile_commands.json
+.claude/

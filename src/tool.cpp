@@ -173,5 +173,36 @@ bool get_bool(const std::string & json, const std::string & key, bool & out) {
     return false;
 }
 
+// _or variants — return the supplied default when the key is missing or
+// the value couldn't be parsed as the requested type.
+
+std::string get_string_or(const std::string & json, const std::string & key,
+                          std::string default_value) {
+    std::string out;
+    return get_string(json, key, out) ? out : std::move(default_value);
+}
+
+long long get_int_or(const std::string & json, const std::string & key,
+                     long long default_value) {
+    long long out = 0;
+    return get_int(json, key, out) ? out : default_value;
+}
+
+double get_double_or(const std::string & json, const std::string & key,
+                     double default_value) {
+    double out = 0.0;
+    return get_double(json, key, out) ? out : default_value;
+}
+
+bool get_bool_or(const std::string & json, const std::string & key,
+                 bool default_value) {
+    bool out = false;
+    return get_bool(json, key, out) ? out : default_value;
+}
+
+bool has(const std::string & json, const std::string & key) {
+    return find_key(json, key) != std::string::npos;
+}
+
 }  // namespace args
 }  // namespace easyai

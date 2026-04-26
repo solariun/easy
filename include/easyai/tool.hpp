@@ -81,12 +81,31 @@ struct Tool {
 
 // Tiny JSON-arg helpers so handlers don't need a JSON dep.
 // They scan the raw arguments_json for top-level "key":value pairs.
-// Return std::nullopt-style behavior via the bool return.
+//
+// Two flavours per type:
+//   get_<T>(json, key, out)               -> bool ; legacy, fills `out` only on success
+//   get_<T>_or(json, key, default)        -> T    ; returns default if missing/wrong type
+//
+// Use `_or` whenever you have a sensible default.  It usually cuts a
+// 4-line "declare, get, check, fallback" pattern down to one line.
 namespace args {
     bool get_string(const std::string & json, const std::string & key, std::string & out);
     bool get_int   (const std::string & json, const std::string & key, long long  & out);
     bool get_double(const std::string & json, const std::string & key, double     & out);
     bool get_bool  (const std::string & json, const std::string & key, bool       & out);
+
+    std::string get_string_or(const std::string & json, const std::string & key,
+                              std::string default_value);
+    long long   get_int_or   (const std::string & json, const std::string & key,
+                              long long default_value);
+    double      get_double_or(const std::string & json, const std::string & key,
+                              double default_value);
+    bool        get_bool_or  (const std::string & json, const std::string & key,
+                              bool default_value);
+
+    // True when `key` appears at top level with any value (string, number,
+    // bool, null, array, object).  Useful for "did the model fill this in?".
+    bool has(const std::string & json, const std::string & key);
 }
 
 }  // namespace easyai

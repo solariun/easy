@@ -152,6 +152,21 @@ two layers:
 ## 5. Recent commits (most recent first)
 
 ```
+(uncommitted as of 2026-04-26 ~12:00 UTC; staged for review:)
+  Engine: thought-only retry path in chat_continue + on_hop_reset callback
+  Engine: verbose hop dump (raw size + tail + msg field sizes)
+  Server: try/catch around compute_diffs in on_token (strict monotonic guard)
+  Server: disable custom __easyai-thinking panel (kept dormant via flag)
+  Server: shrink bundle's native Reasoning panel + open-during-stream / collapse-on-finish
+  Lib: args::get_*_or + args::has helpers (defaults for tool authors)
+  Examples: new examples/recipes.cpp (today_is + weather, wired into CMake)
+  Installer: systemd-coredump dep, LimitCORE=infinity, --enable-verbose flag,
+             coredumpctl hint in post-install summary
+  Docs: README framework framing + status, design.md drops streaming-out-of-scope
+        and adds on_hop_reset / thought-only retry, manual.md ch.3.8 recipe book
+        in for-dummies style
+
+186c20a  Update SESSION_NOTES.md with reasoning-format fix and Bug A/B status.
 709684b  THE missing piece: set reasoning_format on common_chat_templates_inputs
 3a94bd3  Fix Jinja crash: push user msg before chat_params render in streaming
 882abed  Add SESSION_NOTES.md
@@ -198,35 +213,54 @@ c6a09d6  Single combined bar above the textarea (tone + ctx + last)
   HTTP path now calls in agentic mode.  Same multi-hop loop as `chat()`
   minus the initial `push_message("user", …)`.
 
+- **Bug B root cause and fix** (this session, 2026-04-26):
+  Qwen3.6-35B-A3 fine-tune `eng_v5` sometimes terminated the turn after
+  `</think>` without emitting either content or a tool_call — model's
+  last reasoning chunk was literally *"(Let's execute the tools now)"*.
+  Curl trace showed 0 content + 0 tool_calls + finish_reason=stop.
+  Adding `--verbose` confirmed parser was NOT engulfing — model truly
+  emitted EOS.  Fix: in `chat_continue()`, detect
+  `tool_calls.empty() && content.empty() && reasoning_content non-empty`,
+  discard the empty turn, clear KV, fire `on_hop_reset` (new callback
+  that streaming layer hooks to drop accumulated/prev_msg), and loop.
+  Budget = 2 retries.  Final fallback promotes reasoning → content so
+  the user never sees an empty bubble.  Validated via curl: now lands
+  reliably on a real tool_call (web_search) + content reply (~970 chars).
+
+- **`compute_diffs` strict-monotonic exception** discovered while
+  testing the retry path: sometimes the partial parser temporarily
+  assembles a tool_call and then "unassembles" it as more tokens
+  arrive; `common_chat_msg_diff::compute_diffs` throws
+  *"Invalid diff: now finding less tool calls!"*.  Fix: try/catch
+  around the diff in the streaming `on_token` lambda — hold prev_msg
+  on last good state and wait for next token to settle.
+
 ## 6. Known issues / pending validation
 
-- **(A) Webui thinking-panel rendering** — pending visual confirmation.
-  Commit `709684b` should make the per-message Shadow-DOM thinking panel
-  light up by routing reasoning to `delta.reasoning_content` correctly.
-  User has yet to test the upgraded build on the AI box.  If thinking
-  STILL renders inline after upgrade, the parser is likely not extracting
-  reasoning despite reasoning_format=AUTO — need to debug `chat_p.parser`
-  contents and the per-token `common_chat_parse` return.
+- **(A) Webui thinking-panel rendering** — ✅ **FIX VALIDATED**.
+  Commit `709684b` made the per-message reasoning panel light up
+  correctly.  Curl confirmed (812 / 1165 / 2027 reasoning_content
+  deltas across runs vs 0 content deltas pre-fix; bundle now paints
+  its own native panel).  This session also disabled our custom
+  `__easyai-thinking` panel (dormant behind `window.__easyaiCustomThink`)
+  so we don't get two glued panels — only the bundle's "Reasoning"
+  panel renders, font shrunk to 0.72rem mono, default open during
+  streaming, auto-collapse on finish_reason.
 
-- **(B) Qwen3-thinking model stops after `</think>` without answering** —
-  user reports this happens reliably on `easyai-server` with Qwen3.6-35B-A3
-  but NOT on plain `llama-server` with the same model.  Concrete output
-  showed model thinking for many paragraphs, then "Let's go." → `</think>`
-  → finish_reason=stop, no actual answer.  Hypothesis: our default
-  system prompt + tool list (7 builtins) overload the model into a
-  "what tools do I have / can I trust them" loop.  Diagnostic plan:
+- **(B) Qwen3-thinking model stops after `</think>`** —
+  ✅ **FIXED via thought-only retry path** (see "Bug B root cause" above).
+  Validated via curl in this session.  Pending user webui validation.
 
-      1. ssh to AI box; sudo systemctl edit --full easyai-server.service
-      2. remove --system-file from ExecStart, add --no-tools
-      3. sudo systemctl restart easyai-server, ask same question
-      4. if model now answers → tools/system are the problem; consider
-         shorter default system prompt or making tools opt-in
-      5. if model still stops → bug in our chat_continue / agentic loop;
-         add --verbose, capture journalctl, share
-
-- **Core dump under heavy load** — UTF-8 dump crash fixed in `f1282e4`,
-  Jinja crash fixed in `3a94bd3`.  If new core appears, ask for
-  `journalctl -u easyai-server -n 200 --no-pager` BEFORE chasing.
+- **Webui core dump under heavy load** — user reported coredump while
+  using webui.  Did NOT reproduce in this session.  Tooling now in
+  place to capture next occurrence:
+    - `systemd-coredump` package installed (also baked into installer's
+      apt deps so future installs get it)
+    - `LimitCORE=infinity` in service drop-in (also baked into installer's
+      unit template so future installs get it)
+    - `--verbose` available via `--enable-verbose` installer flag (default OFF)
+  Next time it crashes, run `coredumpctl list easyai-server.service`
+  then `coredumpctl gdb <PID>` to get a stack.
 
 - **llama-server parity reference**: when the user reports that
   `llama-server` does X correctly and we don't, look at `llama.cpp/tools/
