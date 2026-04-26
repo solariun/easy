@@ -112,7 +112,7 @@ if (EASYAI_BUILD_EXAMPLES)
     # Embed our brain logo SVG as a default favicon + brand-icon source so
     # the binary ships visually-branded out of the box (no --webui-icon
     # required).
-    set(_brand_in  "${CMAKE_CURRENT_SOURCE_DIR}/src/AI-brain.svg")
+    set(_brand_in  "${CMAKE_CURRENT_SOURCE_DIR}/webui/AI-brain.svg")
     set(_brand_out "${CMAKE_CURRENT_BINARY_DIR}/easyai_brand_svg.hpp")
     list(APPEND EASYAI_WEBUI_HEADERS ${_brand_out})
     add_custom_command(

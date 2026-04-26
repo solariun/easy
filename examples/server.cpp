@@ -2394,6 +2394,10 @@ int main(int argc, char ** argv) {
             // and force our own value back.  Also pre-populates the localStorage
             // flag the bundle uses for "is MCP enabled".
             inj << "<script>(()=>{"
+                // Diagnostic marker — if you see all five [easyai-inject]
+                // logs in DevTools Console, every <script> block parsed.
+                // Missing logs indicate a SyntaxError that killed that block.
+                << "console.log('[easyai-inject] block1 title-pin');"
                 << "const T=" << json(title).dump() << ";"
                 << "try{Object.defineProperty(document,'title',{"
                 <<   "configurable:true,"
@@ -2427,6 +2431,7 @@ int main(int argc, char ** argv) {
             // hide their containing card / list-item / dialog / menu-item.
             inj <<
               "<script>(()=>{"
+                "console.log('[easyai-inject] block2 mcp-scrubber');"
                 "const NEEDLES=["
                   "/^MCP\\b/i,"
                   "/^MCP Server/i,"
@@ -2498,6 +2503,7 @@ int main(int argc, char ** argv) {
             // match and stay visible.
             inj <<
               "<script>(()=>{"
+                "console.log('[easyai-inject] block3 hide-bundle-reasoning');"
                 "const isReasoning=(t)=>{"
                   "if(!t)return false;t=t.trim();"
                   "if(t.length>500)return false;"
@@ -2555,6 +2561,7 @@ int main(int argc, char ** argv) {
             //       sampling overrides from the tone dropdown ----------------
             inj <<
               "<script>(()=>{"
+                "console.log('[easyai-inject] block4 fetch-interceptor + monitorSSE + thinking-panel');"
                 "const orig=window.fetch.bind(window);"
                 "const stub=(b,s=200)=>new Response(JSON.stringify(b),{"
                   "status:s,headers:{'Content-Type':'application/json'}"
@@ -2619,8 +2626,19 @@ int main(int argc, char ** argv) {
                 "};"
                 "const ensureThinkPanel=(msg)=>{"
                   "let p=THINK.get(msg);"
-                  "if(p&&document.contains(p)&&p.parentNode===msg||"
-                     "(p&&document.contains(p)&&msg.contains(p)))return p;"
+                  "if(p&&document.contains(p)&&(p.parentNode===msg||msg.contains(p))){"
+                    // Re-opening case: a previous thinking phase ran,
+                    // closeThinking() collapsed the panel, then a new
+                    // <think>...</think> arrived (e.g. agentic multi-hop
+                    // turn).  Re-open the same panel and reset its
+                    // summary label so the user sees the new thinking.
+                    "if(!p.open){"
+                      "p.open=true;"
+                      "const lab=p.querySelector('.sumlabel');"
+                      "if(lab)lab.textContent='thinking…';"
+                    "}"
+                    "return p;"
+                  "}"
                   // Svelte sometimes re-mounts the assistant bubble during a
                   // generation (state-store flush), giving us a brand-new
                   // `msg` node.  When that happens our WeakMap entry is
@@ -2633,8 +2651,15 @@ int main(int argc, char ** argv) {
                   "const existing=msg.querySelectorAll(':scope .__easyai-thinking');"
                   "if(existing.length>0){"
                     "for(let i=1;i<existing.length;i++)existing[i].remove();"
-                    "THINK.set(msg,existing[0]);"
-                    "return existing[0];"
+                    "const e0=existing[0];"
+                    // Same re-opening logic as above.
+                    "if(!e0.open){"
+                      "e0.open=true;"
+                      "const lab=e0.querySelector('.sumlabel');"
+                      "if(lab)lab.textContent='thinking…';"
+                    "}"
+                    "THINK.set(msg,e0);"
+                    "return e0;"
                   "}"
                   "p=document.createElement('details');"
                   "p.className='__easyai-thinking';"
@@ -2811,6 +2836,7 @@ int main(int argc, char ** argv) {
             //                 updated by window.__easyaiSetStatus.
             inj <<
               "<script>(()=>{"
+                "console.log('[easyai-inject] block5 metrics-bar + tone-badge + chip');"
 
                 // --- shared style snippets ---
                 "const SHARED_STYLE='"
@@ -3238,6 +3264,11 @@ int main(int argc, char ** argv) {
                   "if(t)lastTimings=t;"
                   "renderOverview();"
                 "};"
+
+                // Reached the end of block5 — if you see this in the
+                // console you know the bar/tone/chip IIFE parsed and
+                // executed completely.  No log == SyntaxError further up.
+                "console.log('[easyai-inject] block5 OK — bar/tone/chip live');"
               "})();</script>";
 
             // ----- CSS hiding for features we don't support ------------------
