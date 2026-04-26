@@ -211,6 +211,13 @@ struct Engine::Impl {
         in.tool_choice           = tool_choice;
         in.parallel_tool_calls   = parallel_tool_calls;
         in.enable_thinking       = enable_thinking;
+        // Tell the template builder to wire reasoning extraction into the
+        // PEG parser it produces.  Without this the parser leaves <think>
+        // content inside msg.content, so the streaming code can't split
+        // reasoning_content from content.  AUTO maps to DEEPSEEK (the
+        // canonical "extract <think>...</think> blocks") for every
+        // template that supports thinking.
+        in.reasoning_format      = COMMON_REASONING_FORMAT_AUTO;
         return common_chat_templates_apply(templates.get(), in);
     }
 
