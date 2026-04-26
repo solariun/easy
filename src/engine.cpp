@@ -135,6 +135,186 @@ std::string strip_tool_call_blocks(std::string s) {
     return s;
 }
 
+// Hermes-style tool call recovery.  Some Qwen3 fine-tunes (notably the
+// user's eng_v5 35B-A3) emit tool calls in this XML-ish format instead of
+// the Qwen3 JSON one:
+//
+//     <tool_call>
+//     <function=web_search>
+//     <parameter=query>
+//     top news today
+//     </parameter>
+//     <parameter=max_results>
+//     10
+//     </parameter>
+//     </function>
+//     </tool_call>
+//
+// The PEG parser refuses it and the whole block leaks into msg.content.
+// We rebuild a {name, JSON-arguments} pair by scanning the inner XML.
+// Numeric-looking parameter values are emitted as JSON numbers; everything
+// else is emitted as JSON strings.
+std::vector<common_chat_tool_call> recover_hermes_tool_calls(const std::string & raw) {
+    std::vector<common_chat_tool_call> out;
+    static const std::string open_tag  = "<tool_call>";
+    static const std::string close_tag = "</tool_call>";
+    static const std::string fn_open   = "<function=";
+    static const std::string fn_close  = "</function>";
+    static const std::string par_open  = "<parameter=";
+    static const std::string par_close = "</parameter>";
+
+    auto trim = [](std::string s) {
+        size_t a = 0, b = s.size();
+        while (a < b && std::isspace((unsigned char) s[a])) ++a;
+        while (b > a && std::isspace((unsigned char) s[b - 1])) --b;
+        return s.substr(a, b - a);
+    };
+    auto looks_numeric = [](const std::string & s) {
+        if (s.empty()) return false;
+        size_t i = 0;
+        if (s[0] == '-' || s[0] == '+') ++i;
+        bool seen_digit = false, seen_dot = false;
+        for (; i < s.size(); ++i) {
+            char c = s[i];
+            if (c >= '0' && c <= '9') { seen_digit = true; continue; }
+            if (c == '.' && !seen_dot) { seen_dot = true; continue; }
+            return false;
+        }
+        return seen_digit;
+    };
+    auto json_escape = [](const std::string & s) {
+        std::string o; o.reserve(s.size() + 4);
+        for (char c : s) {
+            switch (c) {
+                case '\\': o += "\\\\"; break;
+                case '"':  o += "\\\""; break;
+                case '\n': o += "\\n";  break;
+                case '\r': o += "\\r";  break;
+                case '\t': o += "\\t";  break;
+                case '\b': o += "\\b";  break;
+                case '\f': o += "\\f";  break;
+                default:
+                    if ((unsigned char) c < 0x20) {
+                        char buf[8];
+                        std::snprintf(buf, sizeof(buf), "\\u%04x", (unsigned) c);
+                        o += buf;
+                    } else {
+                        o += c;
+                    }
+            }
+        }
+        return o;
+    };
+
+    size_t pos = 0;
+    while (true) {
+        size_t a = raw.find(open_tag, pos);
+        if (a == std::string::npos) break;
+        size_t body_begin = a + open_tag.size();
+        size_t b = raw.find(close_tag, body_begin);
+        std::string body = (b == std::string::npos)
+                               ? raw.substr(body_begin)
+                               : raw.substr(body_begin, b - body_begin);
+
+        // Find <function=NAME>...</function> inside the body.
+        size_t fn_a = body.find(fn_open);
+        if (fn_a == std::string::npos) {
+            pos = (b == std::string::npos) ? raw.size() : b + close_tag.size();
+            continue;
+        }
+        size_t name_begin = fn_a + fn_open.size();
+        size_t name_end = body.find('>', name_begin);
+        if (name_end == std::string::npos) {
+            pos = (b == std::string::npos) ? raw.size() : b + close_tag.size();
+            continue;
+        }
+        std::string name = trim(body.substr(name_begin, name_end - name_begin));
+        if (name.empty()) {
+            pos = (b == std::string::npos) ? raw.size() : b + close_tag.size();
+            continue;
+        }
+        size_t fn_b = body.find(fn_close, name_end);
+        std::string fn_body = (fn_b == std::string::npos)
+                                  ? body.substr(name_end + 1)
+                                  : body.substr(name_end + 1, fn_b - (name_end + 1));
+
+        // Walk every <parameter=KEY>VAL</parameter> inside the function body.
+        std::ostringstream args;
+        args << "{";
+        size_t p = 0;
+        bool first = true;
+        while (true) {
+            size_t pa = fn_body.find(par_open, p);
+            if (pa == std::string::npos) break;
+            size_t key_begin = pa + par_open.size();
+            size_t key_end = fn_body.find('>', key_begin);
+            if (key_end == std::string::npos) break;
+            std::string key = trim(fn_body.substr(key_begin, key_end - key_begin));
+            size_t val_begin = key_end + 1;
+            size_t pb = fn_body.find(par_close, val_begin);
+            std::string val = (pb == std::string::npos)
+                                  ? fn_body.substr(val_begin)
+                                  : fn_body.substr(val_begin, pb - val_begin);
+            val = trim(val);
+            if (!first) args << ",";
+            args << "\"" << json_escape(key) << "\":";
+            if (looks_numeric(val))           args << val;
+            else if (val == "true" || val == "false" || val == "null") args << val;
+            else                              args << "\"" << json_escape(val) << "\"";
+            first = false;
+            p = (pb == std::string::npos) ? fn_body.size() : pb + par_close.size();
+        }
+        args << "}";
+
+        common_chat_tool_call tc;
+        tc.name      = std::move(name);
+        tc.arguments = args.str();
+        out.push_back(std::move(tc));
+
+        pos = (b == std::string::npos) ? raw.size() : b + close_tag.size();
+    }
+    return out;
+}
+
+// Extract a <think>...</think> span out of `s`.  Returns reasoning text
+// (without the wrapping tags); `s` is left with the reasoning span removed
+// in-place so the remainder is safe to use as visible content.  Tolerates
+// missing opener (Qwen3 prefills <think>) and unterminated </think>.
+std::string extract_think_block(std::string & s) {
+    static const std::string open_tag  = "<think>";
+    static const std::string close_tag = "</think>";
+
+    size_t close_pos = s.find(close_tag);
+    if (close_pos == std::string::npos) {
+        // No closer at all — nothing safe to extract; leave content alone.
+        return {};
+    }
+    size_t open_pos  = s.find(open_tag);
+    size_t reasoning_begin, span_begin;
+    if (open_pos != std::string::npos && open_pos < close_pos) {
+        // Both tags present — span = [<think> ... </think>].
+        reasoning_begin = open_pos + open_tag.size();
+        span_begin      = open_pos;
+    } else {
+        // Only </think> — Qwen3-style prefill where <think> is implicit.
+        // Treat everything before </think> as reasoning.
+        reasoning_begin = 0;
+        span_begin      = 0;
+    }
+    std::string reasoning = s.substr(reasoning_begin, close_pos - reasoning_begin);
+    s.erase(span_begin, close_pos + close_tag.size() - span_begin);
+    // Trim leading whitespace/newlines that the closing tag left behind.
+    size_t lead = 0;
+    while (lead < s.size() && (s[lead] == '\n' || s[lead] == '\r' ||
+                               s[lead] == ' ' || s[lead] == '\t')) ++lead;
+    if (lead) s.erase(0, lead);
+    // Trim around the reasoning too.
+    size_t a = 0, b = reasoning.size();
+    while (a < b && std::isspace((unsigned char) reasoning[a])) ++a;
+    while (b > a && std::isspace((unsigned char) reasoning[b - 1])) --b;
+    return reasoning.substr(a, b - a);
+}
+
 }  // namespace
 
 // ===========================================================================
@@ -310,27 +490,51 @@ struct Engine::Impl {
         }
         // 1) Try the official parser first.
         common_chat_msg msg;
+        bool parser_threw = false;
         try {
             msg = common_chat_parse(raw, /*is_partial=*/false, pp);
         } catch (const std::exception & e) {
             if (verbose) std::fprintf(stderr,
                 "[easyai] chat parser failed (%s) — attempting recovery\n", e.what());
+            parser_threw = true;
             msg.role    = "assistant";
             msg.content = raw;
         }
 
-        // 2) Recovery pass — if the official parser produced no tool_calls
-        //    but the raw output contains <tool_call> markers, the model
-        //    most likely emitted Qwen-style doubled-brace JSON that the PEG
-        //    grammar refused. Pull what we can out of it by hand.
+        // 2a) When the parser threw and dumped raw into content, we still
+        //     want to keep reasoning separated from visible content so the
+        //     streaming layer doesn't double-render the <think> block (once
+        //     as reasoning_content_delta from the partial parses that DID
+        //     succeed, and again as content_delta from the last-resort
+        //     fallback that re-emits the engine's final text).
+        if (parser_threw && msg.reasoning_content.empty()) {
+            std::string r = extract_think_block(msg.content);
+            if (!r.empty()) {
+                msg.reasoning_content = std::move(r);
+                if (verbose) std::fprintf(stderr,
+                    "[easyai] split <think> block from raw fallback (reasoning=%zu, "
+                    "content=%zu)\n", msg.reasoning_content.size(), msg.content.size());
+            }
+        }
+
+        // 2b) Recovery pass — if the official parser produced no tool_calls
+        //     but the raw output contains <tool_call> markers, the model
+        //     most likely emitted Qwen-style doubled-brace JSON OR the
+        //     Hermes-XML <function=name>/<parameter=key> shape that the PEG
+        //     grammar refused.  Pull what we can out of it by hand.
         if (msg.tool_calls.empty() && raw.find("<tool_call>") != std::string::npos) {
             auto recovered = recover_qwen_tool_calls(raw);
+            const char * recovery_kind = "qwen";
+            if (recovered.empty() || recovered.front().arguments == "{}") {
+                auto hermes = recover_hermes_tool_calls(raw);
+                if (!hermes.empty()) { recovered = std::move(hermes); recovery_kind = "hermes"; }
+            }
             if (!recovered.empty()) {
                 msg.tool_calls = std::move(recovered);
                 msg.content    = strip_tool_call_blocks(msg.content);
                 if (verbose) std::fprintf(stderr,
-                    "[easyai] recovered %zu tool call(s) from malformed output\n",
-                    msg.tool_calls.size());
+                    "[easyai] recovered %zu tool call(s) from malformed output (%s)\n",
+                    msg.tool_calls.size(), recovery_kind);
             }
         }
         return msg;

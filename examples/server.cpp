@@ -1849,16 +1849,49 @@ static void handle_chat_stream(ServerCtx & ctx,
             // client never got a content delta.  The engine itself fell
             // back to msg.content=raw inside parse_assistant; surface that
             // as one synthesised delta so the bubble isn't empty.
+            //
+            // DEFENSIVE: strip any reasoning that we ALREADY streamed via
+            // reasoning_content_delta — otherwise the user sees the same
+            // thinking text twice (in our blue brain panel AND in the
+            // message body).  We do this by removing any <think>…</think>
+            // span from the synthesised content; if the engine already
+            // separated reasoning out (post-2026-04-26 fix in
+            // src/engine.cpp) this is a no-op.
             if (!any_content_emitted && !engine_final_content.empty()
                     && !req_state->client_tools) {
-                ordered_json env;
-                env["choices"] = json::array({{
-                    {"index", 0},
-                    {"delta", {{"content", engine_final_content}}},
-                    {"finish_reason", nullptr},
-                }});
-                emit_data(safe_dump(env));
-                any_content_emitted = true;
+                std::string body = engine_final_content;
+                // Drop everything between <think> and </think> (inclusive)
+                // since reasoning has already been streamed.  Plain string
+                // scan — std::regex blew the stack here once already
+                // (commit 3dec718) so we keep it iterative.
+                {
+                    static const std::string open_tag  = "<think>";
+                    static const std::string close_tag = "</think>";
+                    size_t close_pos = body.find(close_tag);
+                    if (close_pos != std::string::npos) {
+                        size_t open_pos = body.find(open_tag);
+                        size_t span_begin = (open_pos != std::string::npos
+                                              && open_pos < close_pos)
+                                               ? open_pos : 0;
+                        body.erase(span_begin,
+                                   close_pos + close_tag.size() - span_begin);
+                        size_t lead = 0;
+                        while (lead < body.size() &&
+                               (body[lead] == '\n' || body[lead] == '\r' ||
+                                body[lead] == ' '  || body[lead] == '\t')) ++lead;
+                        if (lead) body.erase(0, lead);
+                    }
+                }
+                if (!body.empty()) {
+                    ordered_json env;
+                    env["choices"] = json::array({{
+                        {"index", 0},
+                        {"delta", {{"content", body}}},
+                        {"finish_reason", nullptr},
+                    }});
+                    emit_data(safe_dump(env));
+                    any_content_emitted = true;
+                }
             }
 
             // For client-tools mode, emit the assembled tool_calls array as
@@ -3009,12 +3042,13 @@ int main(int argc, char ** argv) {
                       "animation:__easyaiPulse 1.05s ease-in-out infinite}';"
                   "document.head&&document.head.appendChild(st);"
                 "}"
-                "const attachChip=(msg)=>{"
-                  "if(msg[CHIP_MARK]&&document.contains(msg[CHIP_MARK]))return;"
-                  "const row=findActionRow(msg);if(!row)return;"
+                // Build a chip element with the inline action-row look.
+                "const buildChip=()=>{"
                   "const chip=document.createElement('span');"
-                  // align-self:center keeps the chip baseline-locked with
-                  // the icon buttons in the row regardless of font size.
+                  // Default to display:none — flipped to inline-flex by
+                  // setStatus when a real state arrives.  align-self:center
+                  // keeps the chip baseline-locked with the icon buttons
+                  // in the row regardless of font size.
                   "chip.style.cssText="
                     "'display:none;align-items:center;gap:.3rem;'+"
                     "'align-self:center;vertical-align:middle;line-height:1;'+"
@@ -3027,7 +3061,42 @@ int main(int argc, char ** argv) {
                     "'<span class=\"d __easyaiDot\" style=\"width:.45rem;height:.45rem;"
                       "border-radius:50%;background:#5b626a;flex-shrink:0\"></span>"
                     "<span class=\"l\"></span>';"
-                  "row.appendChild(chip);"
+                  "return chip;"
+                "};"
+                // attachChip(msg): place the chip in the best available
+                // anchor.  During streaming the bundle has NOT yet rendered
+                // the copy/edit/fork/delete row, so findActionRow returns
+                // null — in that case anchor the chip directly to the
+                // assistant bubble (with a top margin so it stacks below
+                // the message body) and tag chip.dataset.fallback='1'.
+                // On every later scan, if a real action row has appeared,
+                // migrate the chip into it (cleaning the fallback flag).
+                "const attachChip=(msg)=>{"
+                  "let chip=msg[CHIP_MARK];"
+                  "const row=findActionRow(msg);"
+                  "if(chip&&document.contains(chip)){"
+                    "if(row&&chip.dataset.fallback==='1'&&!row.contains(chip)){"
+                      "chip.style.margin='0 0 0 .5rem';"
+                      "row.appendChild(chip);"
+                      "delete chip.dataset.fallback;"
+                    "}"
+                    "return;"
+                  "}"
+                  "chip=buildChip();"
+                  "if(row){"
+                    "chip.style.margin='0 0 0 .5rem';"
+                    "row.appendChild(chip);"
+                  "}else{"
+                    "chip.dataset.fallback='1';"
+                    "chip.style.margin='.45rem 0 0 0;display:none;align-self:flex-start';"
+                    // Re-apply the base styles after overwriting margin/
+                    // display/align — Edge case: cssText set above wins
+                    // unless we layer.  Use a safer route: just override
+                    // the few properties that differ in fallback mode.
+                    "chip.style.alignSelf='flex-start';"
+                    "chip.style.margin='.45rem 0 0 0';"
+                    "msg.appendChild(chip);"
+                  "}"
                   "msg[CHIP_MARK]=chip;"
                 "};"
                 "const scanMessages=()=>{"
