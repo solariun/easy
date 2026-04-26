@@ -422,3 +422,293 @@ Things to watch:
 
 The recommended workflow is to pin both `easyai/` and `llama.cpp/` as
 git submodules in your application repo so an upgrade is a single commit.
+
+---
+
+## 10. Stack-overflow audit
+
+> **Why this exists.** On 2026-04-26 the production AI box crashed
+> three times with `SIGSEGV` while the model was reasoning about news
+> queries.  `coredumpctl gdb` showed **94 766 stack frames** — an
+> infinite recursion in libstdc++'s regex engine triggered by
+> `easyai::tools::strip_html` running over an HTML page returned by
+> `web_fetch`.  After fixing that one site we walked the rest of the
+> tree the same way: every place where adversarial input could meet
+> a recursive helper.  This chapter is the report.
+
+The audit is **static** — pattern matching + manual call-graph reading,
+no fuzzing.  It covers everything we link or build, including the
+libcurl-driven internet calls, the LLM-driven tool inputs, and the
+HTTP request parsers.  The boundaries we did **not** cross are noted
+explicitly under "Out of scope" below.
+
+### 10.1  Methodology
+
+For each suspect category we ran a targeted scan:
+
+| Category                       | How we scanned                                                                        |
+|--------------------------------|---------------------------------------------------------------------------------------|
+| `std::regex` usage             | `grep -nE 'std::regex\|regex_(replace\|search\|match)\|sregex_iterator' src/ examples/`|
+| Direct & mutual recursion      | Python AST-ish walker: for each function definition, search its body for its own name; manually validate each hit |
+| Stack-allocated big buffers    | `grep -nE '\b(char\|int\|float\|...)\s+[a-z_]+\s*\[[0-9]+\]'`; sort by declared size  |
+| `alloca` / VLAs                | `grep -nE 'alloca\|__builtin_alloca'` + manual scan for VLA `T name[expr]` patterns   |
+| Internet ingress               | manual reading of `http_get`, `http_post_form`, libcurl callbacks; libcurl options grep |
+| LLM-controlled regexes / globs | search for `args::get_string(..., "pattern", ...)` and `args::get_string(..., "...glob...", ...)` |
+| HTTP request body parsing      | every `json::parse(req.body)` site cross-checked against `set_payload_max_length`     |
+| Per-token hot paths            | call-graph from cpp-httplib worker → `chat_continue` → `generate_until_done` → `on_token` → llama.cpp common |
+
+### 10.2  Confirmed safe
+
+The following code paths are **stack-safe** under any input:
+
+* **No `alloca`, no VLAs, no large stack arrays anywhere.**  The
+  largest stack-allocated buffer in `src/` and `examples/` is
+  `char buf[16]` (in `strip_html`'s replacement and in the recipes
+  example's `today_is`).  All other buffers are 3–8 bytes.
+* **`Engine::Impl::generate_until_done`** is a flat `while`-loop with
+  manual `n_past` counter — no recursion, no large stack frame.
+* **`Engine::chat_continue`** is a `for`-loop with an explicit hop
+  cap (`kMaxToolHops = 8`) and a thought-only retry budget
+  (`kMaxThoughtRetries = 2`).  Bounded depth.
+* **`Engine::recover_qwen_tool_calls` + `walk_balanced_braces` +
+  `strip_tool_call_blocks`** in `src/engine.cpp:49–136` are pure
+  `find()`-based scanners — no recursion, no regex.
+* **`args::find_key` + `read_json_string` + the four `get_*` and
+  `get_*_or` helpers** in `src/tool.cpp` are forward-only iterators
+  over a flat key-value scan.  Confirmed iterative.
+* **`strip_html`** in `src/builtin_tools.cpp:33–143` (this audit's
+  precipitating bug) was rewritten as a forward-only character
+  scanner.  O(n) without recursion regardless of input size or
+  shape.  Replaces three `std::regex_replace` calls.
+* **HTTP request entry depth.**  The deepest call chain we measured
+  from `httplib::ThreadPool::worker` to a leaf in `chat_continue`
+  is **~13 frames**.  With the default 8 MiB pthread stack and the
+  ~200 byte average frame size, we have an effective ceiling of
+  ~40 000 frames — three orders of magnitude headroom.
+
+### 10.3  Eliminated this round
+
+| Site                                              | Risk                                         | Fix                                                                                  |
+|---------------------------------------------------|----------------------------------------------|--------------------------------------------------------------------------------------|
+| `src/builtin_tools.cpp::strip_html` (old)         | `std::regex_replace` with `[\s\S]*?` and a back-reference; libstdc++ recursive engine blew the stack on real-world HTML pages fetched by `web_fetch` (94 766 frames in the production coredump) | Rewrote as forward-only scanner.  Inline `<script>`/`<style>` block skip via `starts_with_ci` probes; no regex, no recursion. |
+| `examples/server.cpp::on_token` lambda            | `common_chat_msg_diff::compute_diffs` throws `"Invalid diff: now finding less tool calls!"` when partial-parse temporarily extracts then unextracts a tool_call — the exception unwound through the engine and tore down the request | Wrapped `compute_diffs` in `try/catch`, hold `prev_msg` on the last good state and wait for the next token to settle |
+| `examples/server.cpp::handle_chat_stream` final pass | When every partial parse threw (malformed Qwen tool_call markup) the loop emitted zero content deltas and the user saw an empty bubble | Capture `engine_final_content = chat_continue()`; emit a synthesised content delta if `any_content_emitted == false` |
+
+### 10.4  Open risks — HIGH
+
+#### 10.4.1  `fs_grep` accepts an LLM-supplied regex
+
+**Site:** `src/builtin_tools.cpp:685–688`.
+
+```cpp
+std::regex::flag_type rf = std::regex::ECMAScript;
+if (ci) rf |= std::regex::icase;
+std::regex rx;
+try { rx = std::regex(pattern, rf); }    // ← pattern from the model
+catch (const std::regex_error & e) { ... }
+```
+
+Then `std::regex_search(line, rx)` is called per file line.  The
+model can put **any** ECMAScript pattern into `pattern` and the
+filesystem the tool walks contains content the model may also
+control (when the operator runs the agent against a workspace).
+Patterns like `(a+)+$` against `"aaaaaa…b"` cause classical
+catastrophic backtracking → stack overflow → SIGSEGV — the same
+class of bug as the `strip_html` incident.
+
+**Why we haven't fixed yet:** ripping `std::regex` out of `fs_grep`
+means re-implementing meaningful subset of regex (alternation,
+quantifiers, character classes) by hand, or pulling in a non-
+backtracking engine (RE2, Hyperscan).  Tracked as work.
+
+**Interim mitigation options:**
+* Reject patterns longer than N chars (cheap, catches most known
+  bombs but not all).
+* Run `regex_search` in a worker thread with a hard timeout.
+* Switch the tool's grammar to **glob-only** (no regex), like
+  `fs_glob`.  The agent loses substring-regex power but gains
+  bounded execution time.
+* Pull in Google's RE2 (no backtracking, linear time, separate
+  compile-time dep).  This is the right long-term answer.
+
+Until one of those lands, **`fs_grep` is unsafe in adversarial
+multi-tenant deployments**.  In single-user mode it's still
+practical because the operator chose to run it.
+
+#### 10.4.2  `nlohmann::json::parse` on the HTTP request body
+
+**Sites:**
+* `examples/server.cpp:1419`  — `json::parse(req.body)` for `/v1/chat/completions`
+* `examples/server.cpp:1973`  — `json::parse(req.body)` for `/v1/preset`
+* `examples/cli.cpp:436, 580`  — JSON parsing of upstream SSE events
+
+`nlohmann::json` builds its DOM via recursive descent on arrays and
+objects.  An attacker who can post to the server can fit roughly
+1.3 million levels of `{"a":` into the default 8 MiB body cap,
+producing roughly 1.3M frames at parse time — well past the 8 MiB
+default thread stack.
+
+**Why this isn't surfacing in production:** typical OpenAI clients
+produce shallow JSON, and our `--api-key` Bearer auth gates the
+chat endpoint when set.  An attacker would need a valid bearer
+token to land the bomb.  Operators running with `--api-key` and a
+non-public Tailscale / VPN front are unaffected.  Public,
+unauthenticated deployments are at risk.
+
+**Mitigations available right now:**
+* Drop `--max-body` to 1 MiB by default in the systemd unit (still
+  fits any reasonable conversation; cuts the depth ceiling by ~8x).
+* Add a SAX-callback wrapper that counts depth and aborts at e.g.
+  256.  `nlohmann::json::sax_parse` makes this trivial.
+
+The second is the right answer.  Open as work.
+
+### 10.5  Open risks — MEDIUM
+
+#### 10.5.1  `web_search` HTML regex still uses `[\s\S]*?`
+
+**Site:** `src/builtin_tools.cpp:435–462`.
+
+```cpp
+static const std::regex re_title(
+    R"DDG(<a[^>]*class\s*=\s*"[^"]*result__a[^"]*"[^>]*href\s*=\s*"([^"]+)"[^>]*>([\s\S]*?)</a>)DDG", ...);
+static const std::regex re_snippet(
+    R"DDG(<(?:a|div)[^>]*class\s*=\s*"[^"]*result__snippet[^"]*"[^>]*>([\s\S]*?)</(?:a|div)>)DDG", ...);
+```
+
+These run on the response body of `html.duckduckgo.com`.  DuckDuckGo
+is not adversarial today, but **a successful DNS hijack or MITM
+proxy of `duckduckgo.com` would feed `std::regex_iterator` into the
+same engine that crashed `strip_html`**.  The `[\s\S]*?` lazy is
+constrained between specific anchors (`</a>`, `</div>`), so the
+backtracking surface is much smaller than `strip_html`'s was — but
+it is non-zero.
+
+**Plan:** rewrite as a forward-only scanner mirroring the new
+`strip_html`.  Same approach, ~50 lines.  Not yet done because the
+risk is purely supply-chain — we'd need DNS or TLS to be
+compromised first.
+
+#### 10.5.2  libcurl write callbacks don't enforce in-flight size cap
+
+**Sites:** `src/builtin_tools.cpp::curl_write_cb` (line 210), used
+by `http_get` and `http_post_form`.
+
+```cpp
+static size_t curl_write_cb(void * buf, size_t sz, size_t n, void * ud) {
+    auto * out = static_cast<std::string *>(ud);
+    out->append(static_cast<char *>(buf), sz * n);
+    return sz * n;
+}
+```
+
+The `max_bytes` cap (`2 MiB` for `http_get`, `4 MiB` for
+`http_post_form`) is applied **after** `curl_easy_perform` returns,
+so a malicious server can stream gigabytes and we'll happily buffer
+all of it in `body`.  This is a **memory** DoS, not a stack one —
+listed here only because it shares the "input size unbounded" smell
+that drove the strip_html fix.
+
+**Fix:** make `curl_write_cb` return `0` when `out->size() + sz*n >
+max_bytes`, which tells libcurl to abort the transfer
+(`CURLE_WRITE_ERROR`).  ~4 lines.  Tracked.
+
+(Bounded already: `CURLOPT_TIMEOUT=20s`, `CURLOPT_MAXREDIRS=5`,
+`CURLOPT_NOSIGNAL=1` — these prevent infinite-redirect loops and
+SIGALRM races.  ✓)
+
+### 10.6  Open risks — LOW (accepted)
+
+#### 10.6.1  llama.cpp common library uses `std::regex`
+
+| File                                       | Per-request? | Pattern shape risk                  |
+|--------------------------------------------|--------------|-------------------------------------|
+| `common/arg.cpp` (4)                       | init only    | n/a (CLI args)                      |
+| `common/common.cpp` (2)                    | init only    | n/a (log setup)                     |
+| `common/json-schema-to-grammar.cpp` (9)    | per request, when client passes `tools` | inputs are JSON-Schema; structurally bounded |
+| `common/json-partial.cpp` (3)              | **per token** | inputs are model output, but patterns are character-class shaped (low backtracking) |
+| `common/regex-partial.cpp` (7)             | **per token** | bespoke partial-regex helper; reviewed by upstream |
+
+We rely on upstream not producing the same kind of bug we just
+fixed.  If it ever happens, we'll see it in the same way (94 000-
+frame coredump in `_M_dfs`) and report upstream.  Worth keeping
+`coredumpctl` configured (which the installer now does).
+
+#### 10.6.2  PEG parser depth in `common/chat.cpp`
+
+The chat-template grammar is generated by llama.cpp's
+`json-schema-to-grammar.cpp` from the model's tool definitions.
+Grammar depth is bounded by the schema depth; for the seven builtin
+tools the schemas are flat (max depth 2 — properties → items).  No
+risk.
+
+#### 10.6.3  Webui DOM helpers (JavaScript)
+
+`renderSidebar` (in the embedded webui assets, not the bundle)
+tail-recurses through itself only after a delete.  The browser's V8
+engine has its own stack cap and would throw `RangeError` long
+before exhausting host memory.  Not a binary risk.
+
+### 10.7  Out of scope
+
+* **Vulkan/CUDA/ROCm shader code** running in the GPU process — own
+  stack discipline, not ours.
+* **Jinja chat-template engine** inside `common_chat_templates_apply`
+  — third-party code; if a template recurses into itself, it fails
+  closed via the existing `try/catch` in `Engine::Impl::render`.
+* **GGUF tensor loading** — happens once at startup, not on the
+  request path.
+
+### 10.8  Coding rules going forward
+
+To stop this class of bug ever reaching production again, the
+following rules apply to all easyai source from this point on:
+
+1. **Never use `std::regex` on input that originates outside the
+   process.**  This includes: the model's output, HTTP request
+   bodies, file contents, environment variables that look
+   user-supplied, anything from libcurl.
+   *Permitted:* `std::regex` on **constants** or on inputs whose
+   size and shape are statically bounded by us (e.g. a fixed-format
+   key from the chat-template arena).
+   *Required alternative for hostile input:* forward-only scanner
+   (the new `strip_html` is the canonical reference), or RE2 if a
+   real regex flavour is needed.
+
+2. **Every libcurl write callback enforces its own max_bytes** by
+   returning `0` once the buffer would exceed the cap.  The
+   post-transfer `body.resize()` is a backstop, not the primary
+   cap.
+
+3. **Every parser of LLM-emitted text is forward-only** (no
+   recursion, no backtracking).  The two current parsers
+   (`recover_qwen_tool_calls`, `walk_balanced_braces`) follow this
+   rule; new ones must too.
+
+4. **Every accepted-from-network JSON enforces a depth limit.**
+   Use `nlohmann::json::sax_parse` with a depth-counting handler
+   that bounds at 256 and rejects deeper input with a `400`.
+
+5. **Tools that accept a `pattern` parameter from the model do not
+   compile it through `std::regex`.**  Either use glob-only
+   matching or RE2.
+
+6. **Hop counters are mandatory in every loop that re-enters the
+   model.**  `chat_continue`'s `kMaxToolHops` and
+   `kMaxThoughtRetries` are the model.  No new loop should be
+   open-ended.
+
+7. **`coredumpctl` and `LimitCORE=infinity` stay in the unit.**
+   They are the only thing that turned the strip_html SIGSEGV from
+   "the box just resets" into "we have a 94 000-frame stack to read."
+
+### 10.9  Open work tracked from this audit
+
+| Priority | Item                                                                                  |
+|----------|---------------------------------------------------------------------------------------|
+| HIGH     | Replace `std::regex` in `fs_grep` with RE2 or restrict to glob-only matching         |
+| HIGH     | Add SAX-based depth-bounded parser for HTTP `req.body` JSON                          |
+| MEDIUM   | Rewrite `web_search`'s DDG result extraction as a forward-only scanner               |
+| MEDIUM   | Move libcurl size cap into the write callback (`curl_write_cb`)                      |
+| LOW      | Add a fuzz harness against `strip_html` and `recover_qwen_tool_calls` (libfuzzer)    |
+| LOW      | Investigate switching to RE2 or a non-backtracking engine repo-wide                  |
