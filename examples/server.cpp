@@ -34,6 +34,11 @@
 
 #include "easyai/easyai.hpp"
 
+// llama.cpp common — for incremental chat parsing during SSE streaming.
+// Not part of easyai's public API; the server is allowed to reach in.
+#include "chat.h"
+#include "common.h"
+
 #include "httplib.h"          // vendored by llama.cpp
 #include "nlohmann/json.hpp"  // vendored by llama.cpp
 
@@ -58,7 +63,8 @@
 #include <string>
 #include <vector>
 
-using nlohmann::json;
+// (chat.h pulls in nlohmann::json + a `using json = nlohmann::ordered_json`
+// alias, so we don't redeclare those here.)
 using nlohmann::ordered_json;
 
 // ============================================================================
@@ -1635,200 +1641,82 @@ static void handle_chat_stream(ServerCtx & ctx,
                               ordered_json::error_handler_t::replace);
             };
 
-            // ---- streaming content router ------------------------------
-            // Routes the model's raw token stream into THREE buckets:
+            // ---- streaming pipeline (llama-server-compatible) -----------
+            // Mirror llama-server's emit pipeline:
+            //   1. accumulate the model's raw text as it streams
+            //   2. after each token, common_chat_parse(text, is_partial=true)
+            //      with the current chat template's reasoning_format/parser,
+            //      which extracts msg.reasoning_content + msg.content
+            //   3. compute common_chat_msg_diff vs the previous parse
+            //   4. emit standard OpenAI-shape SSE deltas with the new
+            //      reasoning_content_delta / content_delta fields
             //
-            //   visible content    → delta.content            (rendered as message body)
-            //   thinking content   → delta.reasoning_content  (rendered as a
-            //                                                  collapsible panel
-            //                                                  by the bundle's
-            //                                                  native renderer)
-            //   <tool_call> bytes  → discarded                (we surface them
-            //                                                  via easyai.tool_call/
-            //                                                  easyai.tool_result
-            //                                                  custom SSE events)
-            //
-            // --no-think causes thinking bytes to be silently dropped too.
-            //
-            // The state machine keeps a small trailing buffer (longest
-            // closing-tag length) so a tag split across token chunks still
-            // matches correctly.
-            struct ContentRouter {
-                enum Phase { OUTSIDE, IN_THINK, IN_TOOL };
-                Phase       phase        = OUTSIDE;
-                bool        drop_think   = false;   // gated by --no-think
-                std::string buf;
+            // This is exactly what tools/server/server-task.cpp does, so the
+            // embedded webui's native parsers (.choices[0].delta.content +
+            // .choices[0].delta.reasoning_content) light up correctly.
+            common_chat_params chat_p =
+                ctx.engine.chat_params_for_current_state(true);
+            common_chat_parser_params parser_params(chat_p);
+            parser_params.parse_tool_calls = true;
+            parser_params.reasoning_format = COMMON_REASONING_FORMAT_AUTO;
+            if (!chat_p.parser.empty()) {
+                try { parser_params.parser.load(chat_p.parser); }
+                catch (...) { /* will fall through to non-PEG parse */ }
+            }
 
-                struct Out {
-                    std::string visible;
-                    std::string thinking;
-                };
+            std::string accumulated;
+            common_chat_msg prev_msg;
+            prev_msg.role = "assistant";
+            const bool drop_thinking = ctx.no_think;
 
-                Out feed(std::string piece) {
-                    constexpr size_t kMargin = 12;  // longest closing tag = "</thinking>"
-                    buf += piece;
-                    Out out;
-                    for (;;) {
-                        if (phase == OUTSIDE) {
-                            size_t t1 = buf.find("<think>");
-                            size_t t2 = buf.find("<thinking>");
-                            size_t openThink = std::min(
-                                t1 == std::string::npos ? std::string::npos : t1,
-                                t2 == std::string::npos ? std::string::npos : t2);
-                            size_t openTool = buf.find("<tool_call>");
-                            size_t firstOpen = std::min(
-                                openThink == std::string::npos ? std::string::npos : openThink,
-                                openTool  == std::string::npos ? std::string::npos : openTool);
-
-                            if (firstOpen == std::string::npos) {
-                                size_t safe = buf.size() > kMargin
-                                                 ? buf.size() - kMargin : 0;
-                                if (safe > 0) {
-                                    out.visible.append(buf, 0, safe);
-                                    buf.erase(0, safe);
-                                }
-                                return out;
-                            }
-                            out.visible.append(buf, 0, firstOpen);
-                            if (firstOpen == openThink) {
-                                bool is_long = (openThink == t2);
-                                size_t tag_len = is_long ? 10 : 7;
-                                buf.erase(0, firstOpen + tag_len);
-                                phase = IN_THINK;
-                            } else {
-                                buf.erase(0, firstOpen + 11);   // "<tool_call>"
-                                phase = IN_TOOL;
-                            }
-                        } else if (phase == IN_THINK) {
-                            size_t c1 = buf.find("</think>");
-                            size_t c2 = buf.find("</thinking>");
-                            size_t close = std::min(
-                                c1 == std::string::npos ? std::string::npos : c1,
-                                c2 == std::string::npos ? std::string::npos : c2);
-                            if (close == std::string::npos) {
-                                size_t safe = buf.size() > kMargin
-                                                 ? buf.size() - kMargin : 0;
-                                if (safe > 0) {
-                                    if (!drop_think) out.thinking.append(buf, 0, safe);
-                                    buf.erase(0, safe);
-                                }
-                                return out;
-                            }
-                            if (!drop_think) out.thinking.append(buf, 0, close);
-                            bool is_long = (close == c2);
-                            size_t tag_len = is_long ? 11 : 8;
-                            buf.erase(0, close + tag_len);
-                            phase = OUTSIDE;
-                        } else {  // IN_TOOL
-                            size_t close = buf.find("</tool_call>");
-                            if (close == std::string::npos) {
-                                if (buf.size() > kMargin)
-                                    buf.erase(0, buf.size() - kMargin);
-                                return out;
-                            }
-                            buf.erase(0, close + 12);  // "</tool_call>"
-                            phase = OUTSIDE;
-                        }
-                    }
+            auto emit_diff = [&](const common_chat_msg_diff & d) {
+                ordered_json delta = ordered_json::object();
+                if (!d.reasoning_content_delta.empty() && !drop_thinking) {
+                    delta["reasoning_content"] = d.reasoning_content_delta;
                 }
-
-                Out flush() {
-                    Out out;
-                    if (phase == OUTSIDE)               out.visible  = std::move(buf);
-                    else if (phase == IN_THINK && !drop_think) out.thinking = std::move(buf);
-                    buf.clear();
-                    phase = OUTSIDE;
-                    return out;
+                if (!d.content_delta.empty()) {
+                    delta["content"] = d.content_delta;
                 }
-            } router;
-            router.drop_think = ctx.no_think;
-
-            // ---- thinking-prefix guard ---------------------------------
-            // Some templates (Qwen3 / DeepSeek-R1 in thinking mode) inject
-            // <think> into the rendered prompt itself, so the model's first
-            // streamed bytes are ALREADY thinking content; the closing
-            // </think> arrives but no opening <think> ever does.  The
-            // webui's parser then can't fold the thinking block.
-            //
-            // We buffer up to 80 chars of the first content and:
-            //   - if we see </think> before <think>  → prepend <think>
-            //   - if we see <think>                  → emit as-is
-            //   - if neither in 80 chars             → emit as-is (no thinking)
-            struct ThinkPrefixGuard {
-                std::string buf;
-                bool        decided = false;
-                std::string feed(std::string piece) {
-                    if (decided) return piece;
-                    buf += piece;
-                    size_t open  = buf.find("<think>");
-                    size_t close = buf.find("</think>");
-                    if (open != std::string::npos &&
-                        (close == std::string::npos || open < close)) {
-                        decided = true;
-                        std::string out = std::move(buf);
-                        buf.clear();
-                        return out;
-                    }
-                    if (close != std::string::npos) {
-                        decided = true;
-                        std::string out = "<think>" + std::move(buf);
-                        buf.clear();
-                        return out;
-                    }
-                    if (buf.size() > 80) {
-                        decided = true;
-                        std::string out = std::move(buf);
-                        buf.clear();
-                        return out;
-                    }
-                    return std::string();
-                }
-                std::string flush() {
-                    decided = true;
-                    std::string out = std::move(buf);
-                    buf.clear();
-                    return out;
-                }
-            } thinkGuard;
-
-            // ---- on_token callback: stream OpenAI-shape deltas ----------
-            // Visible content goes to delta.content; thinking text goes to
-            // delta.reasoning_content (the OpenAI-standard field for
-            // reasoning models). The bundle's webui already knows how to
-            // render reasoning_content as a separate collapsible block.
-            auto emit_routed = [&](const ContentRouter::Out & r) {
-                if (!r.visible.empty()) {
-                    ordered_json delta;
-                    delta["choices"] = json::array({{
-                        {"index", 0},
-                        {"delta", {{"content", r.visible}}},
-                        {"finish_reason", nullptr},
-                    }});
-                    emit_data(safe_dump(delta));
-                }
-                if (!r.thinking.empty()) {
-                    ordered_json delta;
-                    delta["choices"] = json::array({{
-                        {"index", 0},
-                        {"delta", {{"reasoning_content", r.thinking}}},
-                        {"finish_reason", nullptr},
-                    }});
-                    emit_data(safe_dump(delta));
-                }
+                // tool_call deltas: skipped — we already surface them via
+                // the easyai.tool_call / easyai.tool_result custom events.
+                if (delta.empty()) return;
+                ordered_json env;
+                env["choices"] = json::array({{
+                    {"index", 0},
+                    {"delta", delta},
+                    {"finish_reason", nullptr},
+                }});
+                emit_data(safe_dump(env));
             };
+
             ctx.engine.on_token([&](const std::string & piece) {
-                std::string after_guard = thinkGuard.feed(piece);
-                if (after_guard.empty()) return;
-                emit_routed(router.feed(after_guard));
+                accumulated += piece;
+                common_chat_msg new_msg;
+                try {
+                    new_msg = common_chat_parse(accumulated,
+                                                /*is_partial=*/true,
+                                                parser_params);
+                } catch (const std::exception &) {
+                    // Incomplete tag mid-stream — wait for more bytes.
+                    return;
+                }
+                new_msg.role = "assistant";
+                auto diffs = common_chat_msg_diff::compute_diffs(prev_msg, new_msg);
+                prev_msg = new_msg;
+                for (const auto & d : diffs) emit_diff(d);
             });
 
-            // ---- on_tool callback: emit BOTH custom events and an inline
-            // markdown <details> block so any OpenAI-compatible client
-            // (incl. the embedded llama-server-derived webui) can see the
-            // tool activity inline as it happens.  The custom events drive
-            // our minimal webui's tool cards; the markdown block drives the
-            // modern webui (and survives saved conversation history /
-            // copy-paste).
+            // ---- on_tool: surface server-side dispatches to the client ----
+            // Two channels:
+            //   easyai.tool_call / easyai.tool_result custom SSE events for
+            //     our own webui (drives the per-message status pill and any
+            //     sidecar tool log in the future)
+            //   a one-line inline markdown indicator so OpenAI-shape clients
+            //     (incl. the bundle's own renderer) at least show that
+            //     something happened
+            // After firing we reset the incremental-parse state because
+            // the next agentic hop is a fresh model turn — its text starts
+            // from scratch even though it shares the same on_token callback.
             ctx.engine.on_tool([&](const easyai::ToolCall & c, const easyai::ToolResult & r) {
                 ctx.n_tool_calls.fetch_add(1, std::memory_order_relaxed);
 
@@ -1844,11 +1732,6 @@ static void handle_chat_stream(ServerCtx & ctx,
                 res_evt["is_error"] = r.is_error;
                 emit_event("easyai.tool_result", safe_dump(res_evt));
 
-                // Minimal inline indicator: a single italicised line so
-                // the user sees something happened, without the full body
-                // cluttering the saved chat (the result is still available
-                // via the easyai.tool_result custom SSE event).  Errors
-                // surface a short reason so the model's next turn makes sense.
                 std::ostringstream md;
                 md << "\n*" << (r.is_error ? "❌ " : "🔧 ") << c.name;
                 if (r.is_error) {
@@ -1865,6 +1748,11 @@ static void handle_chat_stream(ServerCtx & ctx,
                     {"finish_reason", nullptr},
                 }});
                 emit_data(safe_dump(delta));
+
+                // Reset incremental-parse state for the next iteration.
+                accumulated.clear();
+                prev_msg = common_chat_msg{};
+                prev_msg.role = "assistant";
             });
 
             // ---- run the engine ----------------------------------------
@@ -1888,12 +1776,16 @@ static void handle_chat_stream(ServerCtx & ctx,
                 emit_data(safe_dump(err));
             }
 
-            // Drain whatever the guard / router were holding.  Order matters:
-            // thinkGuard's leftover bytes still need to go through the
-            // content router.
-            std::string guarded_tail = thinkGuard.flush();
-            if (!guarded_tail.empty()) emit_routed(router.feed(guarded_tail));
-            emit_routed(router.flush());
+            // Final non-partial parse to flush any reasoning/content the
+            // partial parses may have held back due to incomplete tags.
+            try {
+                auto final_msg = common_chat_parse(accumulated,
+                                                   /*is_partial=*/false,
+                                                   parser_params);
+                final_msg.role = "assistant";
+                auto diffs = common_chat_msg_diff::compute_diffs(prev_msg, final_msg);
+                for (const auto & d : diffs) emit_diff(d);
+            } catch (...) { /* best-effort drain */ }
 
             // For client-tools mode, emit the assembled tool_calls array as
             // a single delta so OpenAI clients (and our webui) see them.

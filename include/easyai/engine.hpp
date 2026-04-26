@@ -26,6 +26,12 @@
 #include <string>
 #include <vector>
 
+// Forward-declared at global namespace so chat_params_for_current_state can
+// return one without forcing every easyai::Engine consumer to include the
+// hefty common/chat.h.  Callers that actually use the result include it
+// themselves.
+struct common_chat_params;
+
 namespace easyai {
 
 using TokenCallback = std::function<void(const std::string & piece)>;
@@ -186,6 +192,17 @@ class Engine {
     };
     PerfData perf_data()  const;
     void     perf_reset();
+
+    // Render the chat-template state for the current history+tools and
+    // return the resulting common_chat_params.  Exposed so the HTTP layer
+    // can build a parser (with the right PEG arena + reasoning_format)
+    // and call common_chat_parse incrementally during streaming —
+    // matching how llama-server splits reasoning_content from content.
+    // Pass true to include the assistant generation prompt suffix.
+    //
+    // Returns a global-namespace common_chat_params (fully qualified to
+    // dodge ADL into our own easyai:: namespace).
+    ::common_chat_params chat_params_for_current_state(bool add_generation_prompt = true) const;
 
    private:
     struct Impl;

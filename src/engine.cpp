@@ -686,6 +686,11 @@ std::string Engine::backend_summary() const { return p_->backend_summary; }
 int         Engine::n_ctx()         const { return p_->ctx() ? llama_n_ctx(p_->ctx()) : p_->params.n_ctx; }
 std::string Engine::model_path()    const { return p_->params.model.path; }
 
+::common_chat_params Engine::chat_params_for_current_state(bool add_generation_prompt) const {
+    if (!p_->loaded || !p_->templates) return {};
+    return p_->render(add_generation_prompt);
+}
+
 Engine::PerfData Engine::perf_data() const {
     PerfData out;
     if (!p_->loaded || !p_->ctx()) return out;

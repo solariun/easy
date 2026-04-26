@@ -101,7 +101,7 @@ if (EASYAI_BUILD_EXAMPLES)
     endif()
 
     add_executable(easyai-server examples/server.cpp ${EASYAI_WEBUI_HEADERS})
-    target_link_libraries(easyai-server PRIVATE easyai cpp-httplib)
+    target_link_libraries(easyai-server PRIVATE easyai cpp-httplib llama-common)
     # cpp-httplib's include dir isn't PUBLIC-exported; reach in directly.
     target_include_directories(easyai-server PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/../llama.cpp/vendor/cpp-httplib
