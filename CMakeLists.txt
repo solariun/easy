@@ -109,6 +109,21 @@ if (EASYAI_BUILD_EXAMPLES)
         endforeach()
     endif()
 
+    # Embed our brain logo SVG as a default favicon + brand-icon source so
+    # the binary ships visually-branded out of the box (no --webui-icon
+    # required).
+    set(_brand_in  "${CMAKE_CURRENT_SOURCE_DIR}/src/AI-brain.svg")
+    set(_brand_out "${CMAKE_CURRENT_BINARY_DIR}/easyai_brand_svg.hpp")
+    list(APPEND EASYAI_WEBUI_HEADERS ${_brand_out})
+    add_custom_command(
+        DEPENDS "${_brand_in}"
+        OUTPUT  "${_brand_out}"
+        COMMAND ${CMAKE_COMMAND} -DINPUT=${_brand_in} -DOUTPUT=${_brand_out}
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/xxd.cmake
+        COMMENT "[easyai] embed brand asset: AI-brain.svg"
+    )
+    set_source_files_properties(${_brand_out} PROPERTIES GENERATED TRUE)
+
     add_executable(easyai-server examples/server.cpp ${EASYAI_WEBUI_HEADERS})
     target_link_libraries(easyai-server PRIVATE easyai cpp-httplib llama-common)
     # cpp-httplib's include dir isn't PUBLIC-exported; reach in directly.

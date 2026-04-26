@@ -49,6 +49,8 @@
 #include "webui_bundle.js.hpp"
 #include "webui_bundle.css.hpp"
 #include "webui_loading.html.hpp"
+// AI-brain.svg → identifier AI_brain_svg (xxd's '.'/'-' → '_' rule).
+#include "easyai_brand_svg.hpp"
 #endif
 
 #include <atomic>
@@ -2566,7 +2568,23 @@ int main(int argc, char ** argv) {
                 "};"
                 "const ensureThinkPanel=(msg)=>{"
                   "let p=THINK.get(msg);"
-                  "if(p&&document.contains(p))return p;"
+                  "if(p&&document.contains(p)&&p.parentNode===msg||"
+                     "(p&&document.contains(p)&&msg.contains(p)))return p;"
+                  // Svelte sometimes re-mounts the assistant bubble during a
+                  // generation (state-store flush), giving us a brand-new
+                  // `msg` node.  When that happens our WeakMap entry is
+                  // stale, but the previous panel may already have been
+                  // re-parented into the new msg.  Dedupe by DOM query: if
+                  // ANY __easyai-thinking already lives inside the current
+                  // msg, reuse it; if MORE than one exist, keep the first
+                  // and remove duplicates so the user never sees stacked
+                  // empty panels.
+                  "const existing=msg.querySelectorAll(':scope .__easyai-thinking');"
+                  "if(existing.length>0){"
+                    "for(let i=1;i<existing.length;i++)existing[i].remove();"
+                    "THINK.set(msg,existing[0]);"
+                    "return existing[0];"
+                  "}"
                   "p=document.createElement('details');"
                   "p.className='__easyai-thinking';"
                   "p.open=true;"
@@ -2876,39 +2894,60 @@ int main(int argc, char ** argv) {
                 // the tone chip sits at the form's bottom-right (where the
                 // model name badge + send arrow live in the bundle).
                 "const reposition=()=>{"
+                  "if(!barHost||!toneHost)return;"
+                  // Try to find the prompt textarea.  Fall back to fixed
+                  // viewport-bottom positions if anything looks wrong, so
+                  // both hosts ALWAYS show up — better a slightly wrong
+                  // position than an invisible one (the previous bug).
                   "const ta=document.querySelector('textarea');"
-                  "if(!ta||!barHost||!toneHost)return;"
-                  "const form=ta.closest('form')||ta.parentElement;"
-                  "if(!form)return;"
-                  "const r=form.getBoundingClientRect();"
-                  // Metrics bar — above the form, centered horizontally.
-                  "barHost.style.top=(Math.max(4,r.top-34))+'px';"
-                  "barHost.style.left=(r.left+r.width/2)+'px';"
-                  "barHost.style.transform='translateX(-50%)';"
-                  // Tone badge — anchored at the form's bottom-LEFT,
-                  // vertically aligned with where the bundle's model badge
-                  // sits at bottom-right.  We probe for any chip-shaped
-                  // element near the bottom-right that's not the send
-                  // button so we can match its exact y-centre; if we
-                  // can't find one we fall back to a fixed inset.
-                  "let badgeY=r.bottom-26;"
-                  "const cand=form.querySelectorAll("
-                    "'[class*=badge i],[data-testid*=model i],"
-                    "[aria-label*=model i],span,div'"
-                  ");"
-                  "for(const el of cand){"
-                    "const t=(el.innerText||el.textContent||'').trim();"
-                    "if(!t||t.length>40)continue;"
-                    "if(/^easyai\\b|model:/i.test(t)||/^[a-z][\\w.\\-]+$/i.test(t)){"
-                      "const er=el.getBoundingClientRect();"
-                      "if(er.bottom>r.top+r.height/2){"
-                        "badgeY=er.top+er.height/2;break;"
+                  "let r=null;"
+                  "if(ta){"
+                    "const form=ta.closest('form')||ta.parentElement;"
+                    "if(form){"
+                      "const rr=form.getBoundingClientRect();"
+                      // Sanity-check: form must be within the viewport,
+                      // wider than 60 px.  Otherwise this is some hidden
+                      // scratch element.
+                      "if(rr.width>60&&rr.height>20"
+                         "&&rr.bottom>0&&rr.top<window.innerHeight){"
+                        "r=rr;"
                       "}"
                     "}"
                   "}"
-                  "toneHost.style.top=badgeY+'px';"
-                  "toneHost.style.left=(r.left+12)+'px';"
-                  "toneHost.style.transform='translateY(-50%)';"
+                  "if(r){"
+                    // Metrics bar — above the form, centered horizontally.
+                    "barHost.style.top=(Math.max(4,r.top-34))+'px';"
+                    "barHost.style.left=(r.left+r.width/2)+'px';"
+                    "barHost.style.transform='translateX(-50%)';"
+                    // Tone badge — anchored at form's bottom-left, same
+                    // y as the bundle's model badge if we can find it.
+                    "let badgeY=r.bottom-26;"
+                    "const cand=document.querySelectorAll("
+                      "'[class*=badge i],[data-testid*=model i],"
+                      "[aria-label*=model i]'"
+                    ");"
+                    "for(const el of cand){"
+                      "const t=(el.innerText||el.textContent||'').trim();"
+                      "if(!t||t.length>40)continue;"
+                      "const er=el.getBoundingClientRect();"
+                      "if(er.bottom>r.top+r.height/2&&er.bottom<r.bottom+10){"
+                        "badgeY=er.top+er.height/2;break;"
+                      "}"
+                    "}"
+                    "toneHost.style.top=badgeY+'px';"
+                    "toneHost.style.left=(r.left+12)+'px';"
+                    "toneHost.style.transform='translateY(-50%)';"
+                  "}else{"
+                    // Fallback: viewport-anchored bottom strip.
+                    "barHost.style.top='auto';"
+                    "barHost.style.bottom='6.5rem';"
+                    "barHost.style.left='50%';"
+                    "barHost.style.transform='translateX(-50%)';"
+                    "toneHost.style.top='auto';"
+                    "toneHost.style.bottom='1rem';"
+                    "toneHost.style.left='1rem';"
+                    "toneHost.style.transform='none';"
+                  "}"
                 "};"
 
                 "if(document.documentElement){ensureBar();ensureTone();reposition();}"
@@ -3167,11 +3206,20 @@ int main(int argc, char ** argv) {
                 "Initializing connection to " + title + " server…");
             js = str_replace_all(js, "} - llama.cpp", "} - " + title);
 
-            // Sidebar / topbar brand markup.  Just the text — the favicon
-            // stays on the browser tab via the <link rel="icon"> in the
-            // index.html injection, but inline next to the title was
-            // rendering as a broken-image glyph in some browsers.
-            js = str_replace_all(js, ">llama.cpp</h1>", ">" + title + "</h1>");
+            // Sidebar / topbar brand markup.  We prepend an <img> pointing
+            // at /favicon (which serves either the operator's --webui-icon
+            // or the bundled AI-brain.svg) so the brand reads as
+            // "<icon> EasyAi" instead of just text.  The styling keeps the
+            // icon vertically aligned with the title text and sized to the
+            // h1's line-height; brand h1 in the bundle is small (about 1rem),
+            // so 1.05em hits "slightly bigger than the text" for visual
+            // weight.  No external image lookup, no CDN.
+            const std::string brand_html =
+                "><img src=\"/favicon\" alt=\"\" style=\"height:1.05em;"
+                "width:1.05em;vertical-align:-.18em;margin-right:.35em;"
+                "border-radius:4px;background:transparent;display:inline-block\">"
+                + title + "</h1>";
+            js = str_replace_all(js, ">llama.cpp</h1>", brand_html);
 
             // Input placeholder.
             if (!args.webui_placeholder.empty()) {
@@ -3356,16 +3404,25 @@ int main(int argc, char ** argv) {
         });
     }
 
-    // Favicon: serve the operator-supplied icon if --webui-icon was given;
-    // otherwise return 204 No Content so the browser stops asking.
-    svr.Get ("/favicon",              [&](const httplib::Request &, httplib::Response & res){
-        if (ctx_ref.webui_icon.empty()) { res.status = 204; return; }
-        res.set_content(ctx_ref.webui_icon, ctx_ref.webui_icon_mime.c_str());
-    });
-    svr.Get ("/favicon.ico",          [&](const httplib::Request &, httplib::Response & res){
-        if (ctx_ref.webui_icon.empty()) { res.status = 204; return; }
-        res.set_content(ctx_ref.webui_icon, ctx_ref.webui_icon_mime.c_str());
-    });
+    // Favicon: serve the operator-supplied icon when --webui-icon was
+    // given; otherwise serve the embedded brain SVG that ships with the
+    // binary so the page is never branded as a generic globe.
+    auto serve_favicon = [&](const httplib::Request &, httplib::Response & res){
+        if (!ctx_ref.webui_icon.empty()) {
+            res.set_content(ctx_ref.webui_icon, ctx_ref.webui_icon_mime.c_str());
+            return;
+        }
+#if defined(EASYAI_BUILD_WEBUI)
+        // Embedded default — the AI-brain.svg shipped under src/.
+        res.set_content(reinterpret_cast<const char *>(AI_brain_svg),
+                        AI_brain_svg_len, "image/svg+xml");
+#else
+        res.status = 204;
+#endif
+    };
+    svr.Get("/favicon",     serve_favicon);
+    svr.Get("/favicon.ico", serve_favicon);
+    svr.Get("/favicon.svg", serve_favicon);
     svr.Get ("/health",               [&](const auto & q, auto & r){ route_health  (ctx_ref, q, r); });
     if (args.metrics) {
         svr.Get ("/metrics",          [&](const auto & q, auto & r){ route_metrics (ctx_ref, q, r); });

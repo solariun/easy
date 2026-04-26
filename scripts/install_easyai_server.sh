@@ -89,7 +89,7 @@ service_model_link="ai.gguf"
 service_workspace="$service_home/workspace"
 service_host="0.0.0.0"
 service_port=80                                # matches install_llama_server.sh default
-service_alias="easyai"
+service_alias="EasyAi"
 service_name="easyai-server.service"
 
 config_dir="/etc/easyai"
@@ -102,7 +102,7 @@ ctx_size=128000
 # to reduce a user-pinned value).  Default is -1 so a fresh install never
 # hits the "n_gpu_layers already set by user, abort" failure mode.
 ngl=-1
-webui_title="easyai"                          # --webui-title <text>
+webui_title="EasyAi"                          # --webui-title <text>
 webui_icon=""                                 # --webui-icon <path/to/.ico|.png|.svg|.gif|.jpg|.webp>
 webui_icon_dest="$config_dir/favicon"         # final installed path under /etc/easyai
 n_threads_default="$jobs"
