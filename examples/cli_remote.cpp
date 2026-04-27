@@ -500,7 +500,7 @@ struct Options {
     bool        verbose          = false;
     std::string log_file_path;             // explicit --log-file override
     int         max_reasoning    = 0;      // 0 = unlimited (disable runaway abort)
-    bool        retry_on_incomplete = false;
+    bool        retry_on_incomplete = true;    // default ON; --no-retry-on-incomplete to opt out
     bool        no_plan          = false;     // skip auto-registering Plan
     bool        tls_insecure     = false;     // skip peer cert verification
     std::string tls_ca_path;                  // PEM bundle for custom CAs
@@ -579,14 +579,18 @@ void usage(const char * argv0) {
 "                                chars.  Useful for chatty thinking models\n"
 "                                that fall into long deliberation loops on\n"
 "                                niche questions.  0 = unlimited (default).\n"
-"    --retry-on-incomplete      when the server flags a turn as incomplete\n"
+"    --no-retry-on-incomplete   disable the auto-retry-with-nudge for\n"
+"                                incomplete turns (default: ON).  When the\n"
+"                                server flags a turn as incomplete\n"
 "                                (timings.incomplete=true — model produced\n"
 "                                no tool_call AND only a tiny reply, e.g.\n"
-"                                'I'll search…'), drop that turn and re-\n"
-"                                issue the same conversation ONCE.  Default\n"
-"                                off; without this you receive incomplete\n"
-"                                turns transparently and a placeholder is\n"
-"                                rendered after the response.\n"
+"                                'I'll search…'), the client by default\n"
+"                                drops that turn, appends a corrective user\n"
+"                                nudge, and re-issues ONCE.  Use this flag\n"
+"                                if you want the raw incomplete signal\n"
+"                                without recovery.\n"
+"    --retry-on-incomplete      legacy alias for the now-default behaviour;\n"
+"                                kept for backwards compatibility, no-op.\n"
 "    --verbose                  log HTTP+SSE traffic to stderr (timestamps +\n"
 "                                per-piece diagnostics).  When set,\n"
 "                                ALSO writes the same diagnostics PLUS\n"
@@ -664,7 +668,8 @@ bool parse_args(int argc, char ** argv, Options & o) {
         else if (a == "--no-reasoning"
               || a == "--hide-reasoning") o.show_reasoning = false;
         else if (a == "--max-reasoning")     o.max_reasoning      = std::stoi(need(i, "--max-reasoning"));
-        else if (a == "--retry-on-incomplete") o.retry_on_incomplete = true;
+        else if (a == "--retry-on-incomplete")    o.retry_on_incomplete = true;   // legacy no-op (now default)
+        else if (a == "--no-retry-on-incomplete") o.retry_on_incomplete = false;
         else if (a == "--verbose" || a == "-v") o.verbose = true;
         else if (a == "--log-file")       o.log_file_path     = need(i, "--log-file");
         else if (a == "--insecure-tls")   o.tls_insecure = true;
@@ -1102,9 +1107,12 @@ int run_one(easyai::Client & cli, const std::string & prompt,
     // already passed --sandbox we stay quiet — they know about it; the
     // missing tool would be from an explicit --tools filter, where the
     // tip's "pass --sandbox" advice is wrong anyway.
+    // The factory is `easyai::tools::fs_write_file`, but the tool it
+    // builds is registered with the model under the bare name
+    // `write_file` (see builtin_tools.cpp).  Use the registered name.
     if (o.sandbox.empty()
         && prompt_wants_file_write(prompt)
-        && !client_has_tool(cli, "fs_write_file")) {
+        && !client_has_tool(cli, "write_file")) {
         std::fprintf(stderr,
             "%s[easyai-cli-remote] tip:%s your prompt looks like it wants "
             "the model to write a file, but fs_write_file is NOT registered. "
@@ -1153,13 +1161,15 @@ int run_one(easyai::Client & cli, const std::string & prompt,
     if (answer.empty() || cli.last_turn_was_incomplete()) {
         std::fprintf(stdout,
             "%s(incomplete response — the model produced no tool_call and "
-            "only a tiny visible reply.  Common causes: it announced a "
-            "tool but never emitted it, tool-error chain (rate-limit), "
-            "over-prescriptive system prompt, model gave up.  Try "
-            "rephrasing more specifically (e.g. \"use fs_write_file to "
-            "save X to Y\"), or pass --retry-on-incomplete to re-issue "
-            "the same conversation once.)%s\n",
-            st.yellow(), st.reset());
+            "only a tiny visible reply, AND the auto-retry with corrective "
+            "nudge ALSO failed%s. The model is repeatedly announcing a "
+            "tool without emitting it. Try rephrasing more specifically "
+            "(e.g. \"use write_file to save X to Y\"), shorten the prompt, "
+            "or check the tool list — a missing tool the model thinks it "
+            "needs can produce this loop.)%s\n",
+            st.yellow(),
+            o.retry_on_incomplete ? "" : " (auto-retry is OFF)",
+            st.reset());
     }
     return 0;
 }

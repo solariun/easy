@@ -664,20 +664,34 @@ struct Client::Impl {
             }
 
             // Opt-in retry on incomplete turns.  Discards the bad
-            // assistant entry from history (so the conversation handed
-            // back to the caller never carries it) and re-emits the
-            // SAME conversation once.  After one retry we accept
-            // whatever comes — no spiraling, no nudge text injected.
+            // assistant entry from history (we never push it) and
+            // re-emits the conversation ONCE, this time with a
+            // corrective user nudge so the model has something
+            // pointed to react to — a blind retry on the SAME prompt
+            // tends to reproduce the SAME announce-and-stop bailout.
+            //
+            // The nudge stays in history after the retry. That's the
+            // honest record of what we sent, and downstream turns are
+            // fine with it.
             if (turn.incomplete && retry_on_incomplete && !retried_for_incomplete) {
                 retried_for_incomplete = true;
+                nlohmann::json nudge;
+                nudge["role"]    = "user";
+                nudge["content"] =
+                    "Your previous reply only announced an action without "
+                    "emitting any tool_call. Do NOT say \"let me…\", "
+                    "\"I'll…\", or similar setup phrases unless the "
+                    "tool_call follows in the SAME turn. Right now: "
+                    "either call the next tool you actually need to make "
+                    "progress, or give the user the final answer. Pick "
+                    "one and execute it now.";
+                history_json.push_back(nudge);
                 if (verbose) {
                     std::fprintf(stderr,
                         "[easyai-cli] retry_on_incomplete: discarding bad turn "
-                        "(content=%zu, tool_calls=%zu) and re-issuing\n",
+                        "(content=%zu, tool_calls=%zu), nudging, and re-issuing\n",
                         turn.content.size(), turn.tool_calls.size());
                 }
-                // History was NOT yet updated for this turn (we push
-                // below), so nothing to roll back here.  Just loop.
                 continue;
             }
 
