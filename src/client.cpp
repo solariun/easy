@@ -190,6 +190,8 @@ struct Client::Impl {
     bool        tls_insecure    = false;   // skip peer cert verification
     std::string tls_ca_path;                // PEM bundle for custom CAs
     int         max_reasoning_chars = 0;    // 0 = unlimited; >0 aborts SSE on overflow
+    bool        retry_on_incomplete = false;
+    bool        last_was_incomplete = false; // mirror of last turn's timings.incomplete
 
     // Request shape.  -1 / -1.0f / empty == "leave server default in place".
     std::string              model_id;
@@ -346,6 +348,7 @@ struct Client::Impl {
         std::string                  reasoning;
         std::vector<PendingToolCall> tool_calls;
         std::string                  finish_reason = "stop";
+        bool                         incomplete = false;  // mirrors timings.incomplete
     };
 
     bool stream_chat(AssistantTurn & out) {
@@ -418,6 +421,15 @@ struct Client::Impl {
                 }
                 if (ch.contains("finish_reason") && ch["finish_reason"].is_string()) {
                     out.finish_reason = ch["finish_reason"].get<std::string>();
+                }
+                // The server's final SSE chunk carries a `timings` block
+                // with the `incomplete` flag.  Keep the LAST seen value
+                // (later chunks override earlier ones).
+                if (j.contains("timings") && j["timings"].is_object()) {
+                    const auto & tm = j["timings"];
+                    if (tm.contains("incomplete") && tm["incomplete"].is_boolean()) {
+                        out.incomplete = tm["incomplete"].get<bool>();
+                    }
                 }
             }
             return true;
@@ -540,10 +552,33 @@ struct Client::Impl {
     static constexpr int kMaxHops = 8;
 
     std::string run_chat_loop() {
+        last_was_incomplete   = false;
+        bool retried_for_incomplete = false;
+
         for (int hop = 0; hop < kMaxHops; ++hop) {
             AssistantTurn turn;
             if (!stream_chat(turn)) return {};
+
+            // Opt-in retry on incomplete turns.  Discards the bad
+            // assistant entry from history (so the conversation handed
+            // back to the caller never carries it) and re-emits the
+            // SAME conversation once.  After one retry we accept
+            // whatever comes — no spiraling, no nudge text injected.
+            if (turn.incomplete && retry_on_incomplete && !retried_for_incomplete) {
+                retried_for_incomplete = true;
+                if (verbose) {
+                    std::fprintf(stderr,
+                        "[easyai-cli] retry_on_incomplete: discarding bad turn "
+                        "(content=%zu, tool_calls=%zu) and re-issuing\n",
+                        turn.content.size(), turn.tool_calls.size());
+                }
+                // History was NOT yet updated for this turn (we push
+                // below), so nothing to roll back here.  Just loop.
+                continue;
+            }
+
             history_json.push_back(assistant_msg_json(turn));
+            last_was_incomplete = turn.incomplete;
 
             if (turn.finish_reason != "tool_calls" || turn.tool_calls.empty()) {
                 return turn.content;
@@ -618,6 +653,8 @@ Client & Client::verbose         (bool v)          { p_->verbose         = v;   
 Client & Client::tls_insecure    (bool v)          { p_->tls_insecure    = v;   return *this; }
 Client & Client::ca_cert_path    (std::string p)   { p_->tls_ca_path     = std::move(p); return *this; }
 Client & Client::max_reasoning_chars(int n)        { p_->max_reasoning_chars = n; return *this; }
+Client & Client::retry_on_incomplete(bool v)       { p_->retry_on_incomplete = v; return *this; }
+bool     Client::last_turn_was_incomplete() const   { return p_->last_was_incomplete; }
 
 Client & Client::model              (std::string id)     { p_->model_id          = std::move(id);     return *this; }
 Client & Client::system             (std::string prompt) { p_->system_prompt     = std::move(prompt); return *this; }

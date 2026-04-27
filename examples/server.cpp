@@ -1843,7 +1843,8 @@ static void handle_chat_stream(ServerCtx & ctx,
             // back to msg.content=raw.  Without this flag the client
             // would see an empty bubble — see the post-chat_continue
             // last-resort emit below.
-            bool any_content_emitted = false;
+            bool   any_content_emitted   = false;
+            size_t content_bytes_emitted = 0;   // raw delta.content cumulative
 
             auto emit_diff = [&](const common_chat_msg_diff & d) {
                 ordered_json delta = ordered_json::object();
@@ -1853,6 +1854,7 @@ static void handle_chat_stream(ServerCtx & ctx,
                 if (!d.content_delta.empty()) {
                     delta["content"] = d.content_delta;
                     any_content_emitted = true;
+                    content_bytes_emitted += d.content_delta.size();
                 }
                 // tool_call deltas: skipped — we already surface them via
                 // the easyai.tool_call / easyai.tool_result custom events.
@@ -1986,197 +1988,17 @@ static void handle_chat_stream(ServerCtx & ctx,
                 // it a second time.
                 (void) user_already_pushed;
                 if (req_state->client_tools) {
-                    // Thought-only retry budget for client_tools mode —
-                    // mirrors what Engine::chat_continue does on the
-                    // server-side multi-hop path.  Without this, when a
-                    // client (cli-remote, opencode, …) sends tools[] and
-                    // the model thinks "let me search..." but never emits
-                    // the actual <tool_call>, the user sees an empty
-                    // bubble.  Detect {tool_calls=0, content=0, reasoning>0},
-                    // clear KV (history is kept by the engine), fire the
-                    // streaming on_hop_reset hook so accumulated parse
-                    // state is dropped, retry up to 2 times.  Final
-                    // fallback promotes reasoning -> content so the user
-                    // never sees an empty bubble.
-                    // Retry strategy for thought-only turns:
-                    //   attempt 0  — raw retry (KV cleared, history intact).
-                    //                Often enough: KV reset alone changes the
-                    //                stochastic path on the next pass.
-                    //   attempt 1  — push a synthetic user nudge into history,
-                    //                clear KV, retry.  The nudge is a
-                    //                surgical reminder of the format:
-                    //                  "TOOL_CALL_REMINDER: emit the actual
-                    //                   <tool_call>... or answer directly."
-                    //                Pop the nudge from history right after
-                    //                so the conversation we hand back to the
-                    //                client never carries server-internal
-                    //                synthetic turns.
-                    //   attempt 2  — give up; promote reasoning to content
-                    //                in the fallback below so the user sees
-                    //                *something* and the journal explains
-                    //                why.
-                    // Detect "announcement only" content: model emitted a
-                    // short message saying it WILL call a tool but didn't.
-                    // Triggers on phrases like "I'll …", "Let me …", "Now
-                    // I'll …", or any short content ending in ":".  Only
-                    // fires alongside tool_calls.empty() so a real reply
-                    // that happens to contain "I'll" doesn't get retried.
-                    auto looks_like_announcement = [](const std::string & s) {
-                        if (s.empty()) return false;
-                        // Trim trailing whitespace
-                        size_t e = s.size();
-                        while (e > 0 && std::isspace((unsigned char) s[e - 1])) --e;
-                        if (e == 0) return false;
-                        // Sentence-final colon → almost always an announcement.
-                        if (s[e - 1] == ':') return true;
-                        // Lowercase scan for known intent phrases.
-                        std::string lc;
-                        lc.reserve(e);
-                        for (size_t i = 0; i < e; ++i)
-                            lc += (char) std::tolower((unsigned char) s[i]);
-                        static const char * kPhrases[] = {
-                            "i'll ",
-                            "i will ",
-                            "let me ",
-                            "let's ",
-                            "now i'll",
-                            "now let me",
-                            "i'm going to",
-                            "i am going to",
-                            "i'm about to",
-                            "i'm gonna",
-                        };
-                        for (auto p : kPhrases) {
-                            if (lc.find(p) != std::string::npos) return true;
-                        }
-                        return false;
-                    };
-
-                    constexpr int kMaxThoughtRetries = 2;
-                    constexpr size_t kMaxAnnouncementChars = 600;  // real answers are usually longer
-                    int  retries        = 0;
-                    bool nudge_in_hist  = false;  // whether we owe a pop_last
-                    easyai::Engine::GeneratedTurn turn;
-                    while (true) {
-                        turn = ctx.engine.generate_one();
-                        const bool thought_only =
-                            turn.tool_calls.empty()
-                            && turn.content.empty()
-                            && !turn.reasoning.empty();
-                        const bool announcement_only =
-                            turn.tool_calls.empty()
-                            && !turn.content.empty()
-                            && turn.content.size() < kMaxAnnouncementChars
-                            && looks_like_announcement(turn.content);
-                        if ((thought_only || announcement_only) && retries < kMaxThoughtRetries) {
-                            ++retries;
-                            // The engine already pushed an assistant entry
-                            // for this thought-only turn — drop it before
-                            // the next attempt so history stays clean.
-                            ctx.engine.pop_last(1);
-
-                            const char * kind = thought_only
-                                ? "thought-only" : "announcement-only";
-                            if (retries == 2 && !nudge_in_hist) {
-                                ctx.engine.push_message("user",
-                                    "TOOL_CALL_REMINDER: your previous reply "
-                                    "stated an intent to call a tool but did "
-                                    "not emit one.  Either emit the actual "
-                                    "tool_call now using the proper format, "
-                                    "OR answer directly without claiming to "
-                                    "use a tool.  Do NOT just say what you "
-                                    "are going to do.");
-                                nudge_in_hist = true;
-                                std::fprintf(stderr,
-                                    "[easyai-server] client_tools %s "
-                                    "(retry %d/%d): KV reset + nudge injected\n",
-                                    kind, retries, kMaxThoughtRetries);
-                            } else {
-                                std::fprintf(stderr,
-                                    "[easyai-server] client_tools %s "
-                                    "(retry %d/%d): KV reset, plain re-run\n",
-                                    kind, retries, kMaxThoughtRetries);
-                            }
-                            ctx.engine.clear_kv();
-                            // Drop the streaming layer's accumulated parse
-                            // state so the next attempt's tokens aren't
-                            // merged with the discarded turn's reasoning.
-                            accumulated.clear();
-                            prev_msg = common_chat_msg{};
-                            prev_msg.role = "assistant";
-                            continue;
-                        }
-                        break;
-                    }
-                    // Surgically remove the nudge + the recovery turn's
-                    // assistant entry from the engine's history before we
-                    // hand control back to the client.  We KEEP whatever
-                    // turn data we return (out.content / tool_calls) for
-                    // the response — but the conversation the client sees
-                    // on the next turn won't contain our internal nudge.
-                    if (nudge_in_hist) {
-                        // engine pushed: [..., nudge_user, recovery_assistant]
-                        // We pop the assistant first then the nudge.  The
-                        // CLIENT's history (cli-remote / opencode) only
-                        // ever sees its own user msg + the assistant
-                        // reply we synthesised.
-                        ctx.engine.pop_last(2);
-                        // Re-push the recovery assistant as if it was a
-                        // direct response to the client's user message.
-                        ctx.engine.push_message("assistant", turn.content);
-                    }
-                    if (turn.tool_calls.empty() && turn.content.empty()
-                            && !turn.reasoning.empty()) {
-                        // thought-only after retries exhausted
-                        std::fprintf(stderr,
-                            "[easyai-server] client_tools thought-only "
-                            "exhausted retries: promoting reasoning to "
-                            "content.\n");
-                        std::string body =
-                            "(the model planned to use a tool but did not "
-                            "emit the call after " + std::to_string(kMaxThoughtRetries)
-                          + " retries — promoting its reasoning to a visible "
-                            "answer so the bubble isn't empty:)\n\n"
-                          + turn.reasoning;
-                        ordered_json env;
-                        env["choices"] = json::array({{
-                            {"index", 0},
-                            {"delta", {{"content", body}}},
-                            {"finish_reason", nullptr},
-                        }});
-                        emit_data(safe_dump(env));
-                        any_content_emitted = true;
-                        turn.content = std::move(body);
-                    } else if (turn.tool_calls.empty() && !turn.content.empty()
-                                && turn.content.size() < kMaxAnnouncementChars
-                                && looks_like_announcement(turn.content)
-                                && nudge_in_hist) {
-                        // announcement-only after retries exhausted: the
-                        // existing content is the announcement itself.
-                        // Append a server-side hint so the user knows
-                        // the announcement wasn't followed by an action,
-                        // and what to try next.
-                        std::fprintf(stderr,
-                            "[easyai-server] client_tools announcement-only "
-                            "exhausted retries: appending diagnostic note.\n");
-                        std::string suffix =
-                            "\n\n_(server note: the model announced it would "
-                            "call a tool but didn't emit the call even after "
-                          + std::to_string(kMaxThoughtRetries)
-                          + " retries.  Try rephrasing more specifically — "
-                            "e.g. \"use fs_write_file to save X to Y\" — or "
-                            "ask it to answer directly without tools.)_";
-                        ordered_json env;
-                        env["choices"] = json::array({{
-                            {"index", 0},
-                            {"delta", {{"content", suffix}}},
-                            {"finish_reason", nullptr},
-                        }});
-                        emit_data(safe_dump(env));
-                        // any_content_emitted was already true (the
-                        // announcement itself was streamed); just append.
-                        turn.content += suffix;
-                    }
+                    // Pure transport: emit one turn faithfully.  Detection
+                    // of "model didn't deliver" (no tool_calls + tiny
+                    // content) lives in the empty/incomplete-response
+                    // signal computed AFTER the engine returns; both the
+                    // webui and libeasyai-cli read that single flag from
+                    // timings.incomplete and render their own placeholder.
+                    // We do NOT retry, do NOT nudge, do NOT promote
+                    // reasoning to content here — that's policy and
+                    // belongs to the agent / app layer (where the user
+                    // can opt in via --retry-on-incomplete or ignore it).
+                    auto turn = ctx.engine.generate_one();
                     tool_calls    = std::move(turn.tool_calls);
                     tool_call_ids = std::move(turn.tool_call_ids);
                     finish_reason = tool_calls.empty() ? "stop" : "tool_calls";
@@ -2287,24 +2109,45 @@ static void handle_chat_stream(ServerCtx & ctx,
             const double prompt_ms    = std::max(0.0, perf_after.prompt_ms    - perf_before.prompt_ms);
             const double predicted_ms = std::max(0.0, perf_after.predicted_ms - perf_before.predicted_ms);
 
-            // Empty-response detection.  After the streaming loop AND
-            // the last-resort fallback above, if the client still got
-            // zero content_delta, something went wrong — most often a
-            // tool-error chain (DDG rate-limit), an over-prescriptive
-            // system prompt, or the model burning its budget on
-            // reasoning without ever committing to an answer.  We log
-            // it loudly to stderr (visible via journalctl) and tag the
-            // SSE timings with empty=true so the client can render a
-            // helpful placeholder instead of a blank bubble.
-            const bool empty_response =
-                !any_content_emitted && tool_calls.empty();
-            if (empty_response) {
+            // INCOMPLETE-RESPONSE SIGNAL — single transport-level fact
+            // shared between webui and libeasyai-cli.
+            //
+            //   incomplete := tool_calls.empty()
+            //              && content_bytes_emitted < kIncompleteThreshold
+            //
+            // When the model produced no tool_call AND only a tiny
+            // amount of visible content (typically just an
+            // announcement like "Now let me create the file:"), this
+            // turn is materially incomplete: the user got nothing
+            // useful out of it.  Both surfaces (webui + cli-remote)
+            // read this single boolean off `timings.incomplete` and
+            // render their own placeholder.
+            //
+            // We deliberately do NOT do retries / nudges / promote-
+            // reasoning here — that's policy, and lives in libeasyai-
+            // cli (Client::retry_on_incomplete) where the agent can
+            // decide.  The server just states the fact.
+            //
+            // Threshold is intentionally low: 80 bytes is enough to
+            // catch every "Let me search…" / "Now I'll write…" /
+            // "Sure, fetching…" pattern across languages without
+            // relying on natural-language regex.  A real one-liner
+            // answer ("23 °C") fits well under 80 bytes too — but
+            // that's typically a chitchat turn with NO tools sent
+            // anyway, so the user-visible signal is clean.
+            constexpr size_t kIncompleteThreshold = 80;
+            const bool incomplete =
+                tool_calls.empty()
+                && content_bytes_emitted < kIncompleteThreshold;
+            if (incomplete) {
                 std::fprintf(stderr,
-                    "[easyai-server] WARN empty response (no content_delta, "
-                    "no tool_calls).  prompt_n=%d predicted_n=%d "
-                    "finish_reason=%s.  Common causes: tool errors "
-                    "(rate-limit), over-prescriptive system, model gave up.\n",
-                    prompt_n, predicted_n, finish_reason.c_str());
+                    "[easyai-server] WARN incomplete response (content_bytes=%zu, "
+                    "tool_calls=0, prompt_n=%d, predicted_n=%d, finish_reason=%s).  "
+                    "Common causes: model announced a tool but didn't emit it, "
+                    "tool-error chain (rate-limit), over-prescriptive system "
+                    "prompt, model exhausted on a niche question.\n",
+                    content_bytes_emitted, prompt_n, predicted_n,
+                    finish_reason.c_str());
             }
 
             ordered_json done_delta;
@@ -2337,10 +2180,12 @@ static void handle_chat_stream(ServerCtx & ctx,
                 {"cache_n",      perf_before.n_ctx_used},
                 {"ctx_used",     n_ctx_used},
                 {"n_ctx",        n_ctx_total},
-                // Surface the empty-response signal so clients (webui,
-                // cli-remote, third-party SDKs) can render a clear
-                // placeholder instead of a blank bubble.
-                {"empty",        empty_response},
+                // Single transport-level signal (see above).  The webui
+                // injection (block 4 SSE handler) and libeasyai-cli's
+                // Client both read `timings.incomplete` to decide
+                // whether to surface a placeholder / trigger an opt-in
+                // retry.  Server stays policy-free.
+                {"incomplete",   incomplete},
             };
             done_delta["usage"] = {
                 {"prompt_tokens",     prompt_n},
@@ -3284,12 +3129,17 @@ int main(int argc, char ** argv) {
                             "msg=t.predicted_n+' tok · '+(t.predicted_ms/1000).toFixed(1)+'s · '+tps+' t/s';"
                           "}"
                           "setLive('complete',msg);"
-                          // Render a placeholder when the server flagged
-                          // this turn as empty (timings.empty=true) — the
-                          // pre-fix silent failure that left the user
-                          // staring at a blank bubble.  Append a small
-                          // amber notice into the assistant message body.
-                          "if(t&&t.empty){"
+                          // Server-side incomplete-turn signal — single
+                          // boolean coming through on `timings.incomplete`
+                          // when the model produced no tool_call AND only
+                          // a tiny amount of visible content (typically
+                          // an announcement).  Append an amber notice
+                          // into the assistant message body so the user
+                          // sees what happened instead of a silent stall.
+                          // Both this webui and libeasyai-cli read the
+                          // SAME flag, so behaviour is consistent across
+                          // surfaces.
+                          "if(t&&t.incomplete){"
                             "const all=document.querySelectorAll("
                               "'[aria-label=\"Assistant message with actions\"]');"
                             "const last=all.length?all[all.length-1]:null;"
@@ -3303,13 +3153,15 @@ int main(int argc, char ** argv) {
                                 "border-radius:4px;"
                                 "font-size:.78rem;color:#d29922;"
                                 "font-family:ui-monospace,SFMono-Regular,Menlo,monospace;';"
-                              "ph.textContent='(empty response \\u2014 the "
-                                "model finished without producing visible "
-                                "content.  Common causes: tool errors, "
-                                "rate-limit, over-prescriptive system, "
-                                "model exhausted on a niche question.  "
-                                "Check journalctl -u easyai-server for "
-                                "[easyai-server] WARN empty response.)';"
+                              "ph.textContent='(incomplete response \\u2014 "
+                                "the model produced no tool_call and only "
+                                "a tiny visible reply.  Common causes: it "
+                                "announced a tool but never emitted it, "
+                                "tool-error chain (rate-limit), over-"
+                                "prescriptive system prompt, model gave up.  "
+                                "Try rephrasing more specifically, or check "
+                                "journalctl -u easyai-server for the matching "
+                                "[easyai-server] WARN incomplete response line.)';"
                               "last.appendChild(ph);"
                             "}"
                           "}"

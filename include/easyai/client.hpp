@@ -70,6 +70,20 @@ public:
     // questions and you want a hard timeout in tokens, not seconds.
     Client & max_reasoning_chars (int n);
 
+    // Opt-in retry when the server flags a turn as incomplete (no
+    // tool_call + tiny content — typically the "I'll search…" then
+    // EOS pattern).  When true, run_chat_loop discards the bad
+    // assistant entry and re-issues the SAME conversation once.
+    // Default false: receive incomplete turns transparently.
+    Client & retry_on_incomplete (bool v);
+
+    // Whether the LAST turn returned by chat() / chat_continue() was
+    // flagged incomplete by the server (timings.incomplete=true).
+    // Use this to render a placeholder / surface a warning at the
+    // app layer when retry_on_incomplete is off, or after the retry
+    // budget was exhausted.
+    bool last_turn_was_incomplete() const;
+
     // ----- TLS (only meaningful for https:// endpoints) --------------------
     // tls_insecure(true) skips peer certificate verification — useful for
     // local dev with self-signed certs, NEVER for production.  ca_cert_path

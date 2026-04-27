@@ -353,6 +353,7 @@ struct Options {
     bool        show_reasoning   = true;   // default ON; --no-reasoning to opt out
     bool        verbose          = false;
     int         max_reasoning    = 0;      // 0 = unlimited (disable runaway abort)
+    bool        retry_on_incomplete = false;
     bool        no_plan          = false;     // skip auto-registering Plan
     bool        tls_insecure     = false;     // skip peer cert verification
     std::string tls_ca_path;                  // PEM bundle for custom CAs
@@ -422,6 +423,14 @@ void usage(const char * argv0) {
 "                                chars.  Useful for chatty thinking models\n"
 "                                that fall into long deliberation loops on\n"
 "                                niche questions.  0 = unlimited (default).\n"
+"    --retry-on-incomplete      when the server flags a turn as incomplete\n"
+"                                (timings.incomplete=true — model produced\n"
+"                                no tool_call AND only a tiny reply, e.g.\n"
+"                                'I'll search…'), drop that turn and re-\n"
+"                                issue the same conversation ONCE.  Default\n"
+"                                off; without this you receive incomplete\n"
+"                                turns transparently and a placeholder is\n"
+"                                rendered after the response.\n"
 "    --verbose                  log HTTP+SSE traffic to stderr (timestamps +\n"
 "                                per-piece diagnostics)\n"
 "\n"
@@ -487,7 +496,8 @@ bool parse_args(int argc, char ** argv, Options & o) {
         else if (a == "--show-reasoning") o.show_reasoning = true;   // no-op now (kept for compat)
         else if (a == "--no-reasoning"
               || a == "--hide-reasoning") o.show_reasoning = false;
-        else if (a == "--max-reasoning") o.max_reasoning   = std::stoi(need(i, "--max-reasoning"));
+        else if (a == "--max-reasoning")     o.max_reasoning      = std::stoi(need(i, "--max-reasoning"));
+        else if (a == "--retry-on-incomplete") o.retry_on_incomplete = true;
         else if (a == "--verbose" || a == "-v") o.verbose = true;
         else if (a == "--insecure-tls")   o.tls_insecure = true;
         else if (a == "--ca-cert")        o.tls_ca_path  = need(i, "--ca-cert");
@@ -855,17 +865,22 @@ int run_one(easyai::Client & cli, const std::string & prompt,
                      cli.last_error().c_str());
         return 1;
     }
-    // Empty answer with no error => the model finished without
-    // emitting any content_delta.  This used to be a silent failure
-    // (blank prompt waiting for a response that never came).  Render
-    // a yellow placeholder so the user knows something happened, and
-    // suggest --show-reasoning + journalctl as the diagnostic path.
-    if (answer.empty()) {
+    // Single placeholder path, fed by the same `timings.incomplete`
+    // signal the webui consumes — the two surfaces report the same
+    // diagnosis for the same turn.  Triggers when the server flagged
+    // the turn (no tool_call, content < 80 bytes) OR the answer
+    // string came back empty for any other reason.  When
+    // --retry-on-incomplete was on this only fires AFTER the retry
+    // also failed.
+    if (answer.empty() || cli.last_turn_was_incomplete()) {
         std::fprintf(stdout,
-            "%s(empty response — model produced no visible content.  "
-            "Re-run with --show-reasoning + --verbose, and check "
-            "`journalctl -u easyai-server -f` on the box for "
-            "[easyai-server] WARN empty response …)%s\n",
+            "%s(incomplete response — the model produced no tool_call and "
+            "only a tiny visible reply.  Common causes: it announced a "
+            "tool but never emitted it, tool-error chain (rate-limit), "
+            "over-prescriptive system prompt, model gave up.  Try "
+            "rephrasing more specifically (e.g. \"use fs_write_file to "
+            "save X to Y\"), or pass --retry-on-incomplete to re-issue "
+            "the same conversation once.)%s\n",
             st.yellow(), st.reset());
     }
     return 0;
@@ -984,6 +999,7 @@ int main(int argc, char ** argv) {
     if (o.tls_insecure)                cli.tls_insecure(true);
     if (!o.tls_ca_path.empty())        cli.ca_cert_path(o.tls_ca_path);
     if (o.max_reasoning   > 0)         cli.max_reasoning_chars(o.max_reasoning);
+    if (o.retry_on_incomplete)         cli.retry_on_incomplete(true);
 
     // Plan + tools registered up-front so --list-tools (which prints the
     // LOCAL catalog this CLI sends to the model) can show them and the
