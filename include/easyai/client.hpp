@@ -61,12 +61,27 @@ public:
     Client & verbose         (bool v);                      // log SSE lines to stderr
 
     // ----- request shape (fluent) ------------------------------------------
-    Client & model           (std::string id);              // request body field
-    Client & system          (std::string prompt);          // 0..N system msgs
-    Client & temperature     (float t);
-    Client & top_p           (float v);
-    Client & top_k           (int   v);
-    Client & max_tokens      (int   n);
+    // Every sampling/penalty knob below maps directly to the matching
+    // OpenAI / llama-server / easyai-server field; -1.0f / -1 / "" are
+    // "unset, server picks the default".  Multiple knobs can be pinned
+    // at once and the request body only includes the ones you set.
+    Client & model              (std::string id);            // request body field
+    Client & system             (std::string prompt);        // 0..N system msgs
+    Client & temperature        (float t);
+    Client & top_p              (float v);
+    Client & top_k              (int   v);
+    Client & min_p              (float v);                   // llama-server / easyai
+    Client & repeat_penalty     (float v);                   // llama-server / easyai
+    Client & frequency_penalty  (float v);                   // OpenAI standard
+    Client & presence_penalty   (float v);                   // OpenAI standard
+    Client & seed               (long long s);               // -1 = randomise
+    Client & max_tokens         (int   n);
+    Client & stop               (std::vector<std::string> sequences);
+    // Free-form passthrough for fields the public setters above don't cover.
+    // The string MUST be a valid JSON object literal; its keys are merged
+    // into the request body verbatim.  Useful for non-standard server
+    // extensions (e.g. {"reasoning_effort":"high"}).
+    Client & extra_body_json    (std::string raw_json);
 
     // ----- tool registration (mirrors Engine) ------------------------------
     Client & add_tool        (Tool t);

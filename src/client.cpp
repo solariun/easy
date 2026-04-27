@@ -188,13 +188,20 @@ struct Client::Impl {
     int         timeout_seconds = 600;
     bool        verbose         = false;
 
-    // Request shape.
-    std::string model_id;
-    std::string system_prompt;
-    float       temperature = -1.0f;
-    float       top_p       = -1.0f;
-    int         top_k       = -1;
-    int         max_tokens  = -1;
+    // Request shape.  -1 / -1.0f / empty == "leave server default in place".
+    std::string              model_id;
+    std::string              system_prompt;
+    float                    temperature       = -1.0f;
+    float                    top_p             = -1.0f;
+    int                      top_k             = -1;
+    float                    min_p             = -1.0f;
+    float                    repeat_penalty    = -1.0f;
+    float                    frequency_penalty = -2.0f;  // -2 = unset (real OpenAI range starts at -2)
+    float                    presence_penalty  = -2.0f;
+    long long                seed              = -1;
+    int                      max_tokens        = -1;
+    std::vector<std::string> stop_sequences;
+    std::string              extra_body_raw;            // JSON object literal
 
     // Tools (registered locally; their handlers run in this process).
     std::vector<Tool> tools;
@@ -276,15 +283,39 @@ struct Client::Impl {
         if (!model_id.empty()) body["model"] = model_id;
         body["messages"] = messages_array();
         body["stream"]   = true;
-        if (temperature >= 0.0f) body["temperature"] = temperature;
-        if (top_p       >= 0.0f) body["top_p"]       = top_p;
-        if (top_k       >= 0)    body["top_k"]       = top_k;
-        if (max_tokens  >= 0)    body["max_tokens"]  = max_tokens;
+        if (temperature       >= 0.0f) body["temperature"]       = temperature;
+        if (top_p             >= 0.0f) body["top_p"]             = top_p;
+        if (top_k             >= 0)    body["top_k"]             = top_k;
+        if (min_p             >= 0.0f) body["min_p"]             = min_p;
+        if (repeat_penalty    >  0.0f) body["repeat_penalty"]    = repeat_penalty;
+        if (frequency_penalty > -2.0f) body["frequency_penalty"] = frequency_penalty;
+        if (presence_penalty  > -2.0f) body["presence_penalty"]  = presence_penalty;
+        if (seed              >= 0)    body["seed"]              = seed;
+        if (max_tokens        >= 0)    body["max_tokens"]        = max_tokens;
+        if (!stop_sequences.empty()) {
+            ordered_json arr = ordered_json::array();
+            for (const auto & s : stop_sequences) arr.push_back(s);
+            body["stop"] = std::move(arr);
+        }
         if (!tools.empty()) {
             ordered_json tarr = ordered_json::array();
             for (const auto & t : tools) tarr.push_back(tool_to_json(t));
             body["tools"]       = std::move(tarr);
             body["tool_choice"] = "auto";
+        }
+        // Merge user-supplied extras last so they can override anything above.
+        if (!extra_body_raw.empty()) {
+            try {
+                ordered_json extras = ordered_json::parse(extra_body_raw);
+                if (extras.is_object()) {
+                    for (auto it = extras.begin(); it != extras.end(); ++it) {
+                        body[it.key()] = it.value();
+                    }
+                }
+            } catch (...) {
+                // Silently skip — the public setter validates at set time
+                // (or the body simply lacks the extras the caller wanted).
+            }
         }
         return body.dump();
     }
@@ -546,12 +577,19 @@ Client & Client::api_key         (std::string key) { p_->api_key         = std::
 Client & Client::timeout_seconds (int  s)          { p_->timeout_seconds = s;   return *this; }
 Client & Client::verbose         (bool v)          { p_->verbose         = v;   return *this; }
 
-Client & Client::model       (std::string id)     { p_->model_id      = std::move(id);     return *this; }
-Client & Client::system      (std::string prompt) { p_->system_prompt = std::move(prompt); return *this; }
-Client & Client::temperature (float t)            { p_->temperature   = t;                 return *this; }
-Client & Client::top_p       (float v)            { p_->top_p         = v;                 return *this; }
-Client & Client::top_k       (int   v)            { p_->top_k         = v;                 return *this; }
-Client & Client::max_tokens  (int   n)            { p_->max_tokens    = n;                 return *this; }
+Client & Client::model              (std::string id)     { p_->model_id          = std::move(id);     return *this; }
+Client & Client::system             (std::string prompt) { p_->system_prompt     = std::move(prompt); return *this; }
+Client & Client::temperature        (float t)            { p_->temperature       = t;                 return *this; }
+Client & Client::top_p              (float v)            { p_->top_p             = v;                 return *this; }
+Client & Client::top_k              (int   v)            { p_->top_k             = v;                 return *this; }
+Client & Client::min_p              (float v)            { p_->min_p             = v;                 return *this; }
+Client & Client::repeat_penalty     (float v)            { p_->repeat_penalty    = v;                 return *this; }
+Client & Client::frequency_penalty  (float v)            { p_->frequency_penalty = v;                 return *this; }
+Client & Client::presence_penalty   (float v)            { p_->presence_penalty  = v;                 return *this; }
+Client & Client::seed               (long long s)        { p_->seed              = s;                 return *this; }
+Client & Client::max_tokens         (int   n)            { p_->max_tokens        = n;                 return *this; }
+Client & Client::stop               (std::vector<std::string> s) { p_->stop_sequences = std::move(s); return *this; }
+Client & Client::extra_body_json    (std::string raw)    { p_->extra_body_raw    = std::move(raw);    return *this; }
 
 Client & Client::add_tool   (Tool t) { p_->tools.push_back(std::move(t)); return *this; }
 Client & Client::clear_tools()       { p_->tools.clear();                  return *this; }
