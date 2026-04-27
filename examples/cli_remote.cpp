@@ -713,100 +713,10 @@ int run_management(easyai::Client & cli, const Options & o, const Style & st) {
 // ---- callback wiring ------------------------------------------------------
 using easyai::ui::render_plan;
 
-// Per-process spinner + stats handles, captured by the streaming
-// callbacks so they can update progress without each on_token closure
-// taking an explicit Spinner&/StreamStats& parameter.  The lifetime is
-// managed by run_one()/run_repl() which set/clear these around each
-// turn.
-static Spinner     * g_spinner = nullptr;
-static StreamStats * g_stats   = nullptr;
-
-inline void write_through_spinner(const std::string & text) {
-    if (g_spinner) g_spinner->write(text);
-    else { std::fputs(text.c_str(), stdout); std::fflush(stdout); }
-}
-
-void wire_callbacks(easyai::Client & cli, easyai::Plan & plan,
-                    const Options & o, const Style & st) {
-    // Track which stream emitted last so we can insert a newline on the
-    // reasoning↔content transition (otherwise the two glue together as
-    // "...phase.I have created..." in the terminal).
-    enum class StreamKind { NONE, REASON, CONTENT };
-    auto last_kind = std::make_shared<StreamKind>(StreamKind::NONE);
-
-    cli.on_token([last_kind](const std::string & piece_in) {
-        if (g_stats) {
-            ++g_stats->content_pieces;
-            if (g_stats->ms_to_first_tok < 0)
-                g_stats->ms_to_first_tok = g_stats->elapsed_ms();
-        }
-        std::string piece = easyai::text::punctuate_think_tags(piece_in);
-        if (*last_kind == StreamKind::REASON) piece.insert(0, "\n");
-        *last_kind = StreamKind::CONTENT;
-        write_through_spinner(piece);
-    });
-    cli.on_reason([&st, &o, last_kind](const std::string & piece_in) {
-        if (g_stats) ++g_stats->reason_pieces;
-        if (o.show_reasoning) {
-            std::string buf;
-            buf.reserve(piece_in.size() + 16);
-            if (*last_kind == StreamKind::CONTENT) buf += "\n";
-            buf += st.dim();
-            buf += easyai::text::punctuate_think_tags(piece_in);
-            buf += st.reset();
-            write_through_spinner(buf);
-        }
-        *last_kind = StreamKind::REASON;
-        // When show_reasoning is off the heartbeat keeps the spinner
-        // ticking on its own — no explicit refresh needed here.
-    });
-    cli.on_tool([&st, &o](const easyai::ToolCall & call,
-                           const easyai::ToolResult & result) {
-        if (g_stats) {
-            ++g_stats->tool_calls;
-            if (result.is_error) ++g_stats->tool_errors;
-        }
-        const char * marker = result.is_error ? "✗" : "🔧";
-        const char * color  = result.is_error ? st.red() : st.cyan();
-        std::ostringstream ss;
-        ss << "\n" << color << marker << " " << call.name
-           << "(" << trim_for_log(call.arguments_json, 80) << ")"
-           << st.reset();
-        if (result.is_error) {
-            ss << " " << st.red()
-               << trim_for_log(result.content, 100) << st.reset();
-        }
-        ss << "\n";
-        write_through_spinner(ss.str());
-        if (o.verbose) {
-            vlog("%s[tool %s name=%s args_bytes=%zu result_bytes=%zu +%ldms]%s\n",
-                 st.dim(),
-                 result.is_error ? "FAIL" : "ok",
-                 call.name.c_str(),
-                 call.arguments_json.size(),
-                 result.content.size(),
-                 g_stats ? g_stats->elapsed_ms() : 0,
-                 st.reset());
-            std::string args_prev = call.arguments_json;
-            if (args_prev.size() > 240) args_prev = args_prev.substr(0, 240) + "…";
-            for (char & c : args_prev) if (c == '\n' || c == '\r') c = ' ';
-            vlog("%s         args=%s%s\n",
-                 st.dim(), args_prev.c_str(), st.reset());
-            std::string res_prev = result.content;
-            if (res_prev.size() > 240) res_prev = res_prev.substr(0, 240) + "…";
-            for (char & c : res_prev) if (c == '\n' || c == '\r') c = ' ';
-            vlog("%s         result=%s%s\n",
-                 st.dim(), res_prev.c_str(), st.reset());
-        }
-    });
-    plan.on_change([&st](const easyai::Plan & p) {
-        std::ostringstream ss;
-        ss << "\n" << st.yellow() << "── plan ──" << st.reset() << "\n";
-        p.render(ss);
-        ss << "\n";
-        write_through_spinner(ss.str());
-    });
-}
+// Per-turn streaming wiring is set up directly inside run_one() now,
+// using easyai::ui::Streaming.  No globals — the Spinner, StreamStats
+// and Streaming objects all live on the run_one stack frame and are
+// torn down cleanly at end of turn.
 
 // ---- repl helpers ---------------------------------------------------------
 bool is_special(const std::string & line, const std::string & cmd) {
@@ -818,7 +728,8 @@ using easyai::text::prompt_wants_file_write;
 
 using easyai::cli::client_has_tool;
 
-int run_one(easyai::Client & cli, const std::string & prompt,
+int run_one(easyai::Client & cli, easyai::Plan & plan,
+            const std::string & prompt,
             const Options & o, const Style & st) {
     // Tip targets newcomers who've forgotten --sandbox.  If the user
     // already passed --sandbox we stay quiet — they know about it; the
@@ -842,17 +753,19 @@ int run_one(easyai::Client & cli, const std::string & prompt,
             st.bold(),  st.reset());
     }
 
-    Spinner spinner(/*enabled=*/true);
-    StreamStats  stats;  stats.reset();
-    g_spinner = &spinner;
-    g_stats   = &stats;
+    Spinner     spinner(/*enabled=*/true);
+    StreamStats stats;  stats.reset();
 
-    // Show the first spinner frame immediately so the user sees activity
-    // during the request's pre-roll (model loading prompt into KV,
-    // first-token latency).  The heartbeat thread keeps the glyph
-    // animating during dead air (no SSE chunks yet, hidden reasoning,
-    // long tool round-trips); token/tool/plan callbacks drive the
-    // animation faster when data IS flowing.
+    // Attach the canonical streaming UX (spinner-locked content + dim
+    // reasoning + 🔧/✗ tool markers + live plan render) to the client
+    // and plan.  Lifetime: this Streaming object outlives cli.chat()
+    // below, which is the only context in which the lambdas fire.
+    easyai::ui::Streaming(spinner, stats, st)
+        .show_reasoning(o.show_reasoning)
+        .verbose       (o.verbose)
+        .attach        (cli)
+        .attach        (plan);
+
     spinner.initial_draw();
     spinner.start_heartbeat();
 
@@ -860,8 +773,6 @@ int run_one(easyai::Client & cli, const std::string & prompt,
 
     spinner.stop_heartbeat();
     spinner.finish();
-    g_spinner = nullptr;
-    g_stats   = nullptr;
     std::fputc('\n', stdout);
     if (answer.empty() && !cli.last_error().empty()) {
         std::fprintf(stderr, "%serror:%s %s\n", st.red(), st.reset(),
@@ -933,7 +844,7 @@ int run_repl(easyai::Client & cli, easyai::Plan & plan,
             continue;
         }
 
-        run_one(cli, line, o, st);
+        run_one(cli, plan, line, o, st);
     }
     return 0;
 }
@@ -1059,8 +970,9 @@ int main(int argc, char ** argv) {
     if (any_management(o)) {
         rc = run_management(cli, o, st);
     } else {
-        wire_callbacks(cli, plan, o, st);
-        if (!o.prompt.empty()) rc = run_one(cli, o.prompt, o, st);
+        // Streaming wiring happens INSIDE run_one (per-turn) now —
+        // no longer a one-shot wire_callbacks at the top level.
+        if (!o.prompt.empty()) rc = run_one(cli, plan, o.prompt, o, st);
         else                   rc = run_repl(cli, plan, o, st);
     }
     close_log_fp();

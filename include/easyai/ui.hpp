@@ -171,3 +171,69 @@ struct StreamStats {
 };
 
 }  // namespace easyai::ui
+
+
+// ---------- streaming wiring helper ----------------------------------------
+//
+// Forward-declarations so consumers don't pull engine.hpp / client.hpp /
+// plan.hpp transitively unless they actually attach to those types.
+namespace easyai {
+class Engine;
+class Client;
+class Plan;
+struct ToolCall;
+struct ToolResult;
+}
+
+namespace easyai::ui {
+
+// Streaming — fluent helper that wires the canonical SSE/agent-loop
+// streaming UX onto an Engine, Client, or Plan: spinner-locked content
+// writes, dimmed reasoning, tool-call markers (🔧/✗), per-piece
+// transition newlines (so reasoning's last token doesn't glue to
+// content's first), and live plan rendering.
+//
+// Usage:
+//     easyai::ui::Spinner spinner(true);
+//     easyai::ui::StreamStats stats;
+//     easyai::ui::Streaming(spinner, stats, style)
+//         .show_reasoning(true)
+//         .verbose       (true)
+//         .attach        (client)
+//         .attach        (plan);
+//
+// The class holds borrowed references — caller owns the Spinner /
+// StreamStats / Style.  Safe to construct on the stack inside a
+// run_one() / run_repl() body around each turn.
+class Streaming {
+public:
+    Streaming(Spinner & spinner, StreamStats & stats, const Style & style);
+
+    Streaming & show_reasoning(bool v);   // dim reasoning prints (default true)
+    Streaming & verbose       (bool v);   // verbose tool dump via easyai::log
+
+    // Attach the canonical callbacks.  Each returns *this for chaining.
+    Streaming & attach(Engine & engine);  // on_token + on_tool
+    Streaming & attach(Client & client);  // on_token + on_reason + on_tool
+    Streaming & attach(Plan   & plan);    // on_change → render_plan
+
+private:
+    // Helpers shared between Engine/Client attach paths.
+    void on_token_(const std::string & piece);
+    void on_reason_(const std::string & piece);
+    void on_tool_(const ToolCall & call, const ToolResult & result);
+
+    Spinner &     spinner_;
+    StreamStats & stats_;
+    const Style & style_;
+    bool          show_reasoning_ = true;
+    bool          verbose_        = false;
+
+    // Tracks which stream emitted last so we can insert a newline on
+    // the reasoning↔content transition (otherwise the two glue
+    // together as "...phase.I have created..." in the terminal).
+    enum class StreamKind { NONE, REASON, CONTENT };
+    StreamKind last_kind_ = StreamKind::NONE;
+};
+
+}  // namespace easyai::ui

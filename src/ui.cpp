@@ -1,7 +1,11 @@
 #include "easyai/ui.hpp"
 
+#include "easyai/engine.hpp"
+#include "easyai/log.hpp"
 #include "easyai/plan.hpp"
 #include "easyai/presets.hpp"
+#include "easyai/text.hpp"
+#include "easyai/tool.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -153,6 +157,96 @@ void print_tool_row(const std::string & name,
         if (nl == std::string::npos) break;
         i = nl + 1;
     }
+}
+
+// ---------------------------------------------------------------- Streaming
+Streaming::Streaming(Spinner & spinner, StreamStats & stats, const Style & style)
+    : spinner_(spinner), stats_(stats), style_(style) {}
+
+Streaming & Streaming::show_reasoning(bool v) { show_reasoning_ = v; return *this; }
+Streaming & Streaming::verbose       (bool v) { verbose_        = v; return *this; }
+
+void Streaming::on_token_(const std::string & piece_in) {
+    ++stats_.content_pieces;
+    if (stats_.ms_to_first_tok < 0) stats_.ms_to_first_tok = stats_.elapsed_ms();
+    std::string piece = easyai::text::punctuate_think_tags(piece_in);
+    if (last_kind_ == StreamKind::REASON) piece.insert(0, "\n");
+    last_kind_ = StreamKind::CONTENT;
+    spinner_.write(piece);
+}
+
+void Streaming::on_reason_(const std::string & piece_in) {
+    ++stats_.reason_pieces;
+    if (show_reasoning_) {
+        std::string buf;
+        buf.reserve(piece_in.size() + 16);
+        if (last_kind_ == StreamKind::CONTENT) buf += "\n";
+        buf += style_.dim();
+        buf += easyai::text::punctuate_think_tags(piece_in);
+        buf += style_.reset();
+        spinner_.write(buf);
+    }
+    last_kind_ = StreamKind::REASON;
+    // When show_reasoning is off, the spinner heartbeat keeps the glyph
+    // ticking on its own — no explicit refresh needed here.
+}
+
+void Streaming::on_tool_(const ToolCall & call, const ToolResult & result) {
+    ++stats_.tool_calls;
+    if (result.is_error) ++stats_.tool_errors;
+
+    const char * marker = result.is_error ? "✗" : "🔧";
+    const char * color  = result.is_error ? style_.red() : style_.cyan();
+    std::ostringstream ss;
+    ss << "\n" << color << marker << " " << call.name
+       << "(" << easyai::text::trim_for_log(call.arguments_json, 80) << ")"
+       << style_.reset();
+    if (result.is_error) {
+        ss << " " << style_.red()
+           << easyai::text::trim_for_log(result.content, 100)
+           << style_.reset();
+    }
+    ss << "\n";
+    spinner_.write(ss.str());
+
+    if (verbose_) {
+        easyai::log::write(
+            "%s[tool %s name=%s args_bytes=%zu result_bytes=%zu +%ldms]%s\n",
+            style_.dim(),
+            result.is_error ? "FAIL" : "ok",
+            call.name.c_str(),
+            call.arguments_json.size(),
+            result.content.size(),
+            stats_.elapsed_ms(),
+            style_.reset());
+        std::string args_prev = easyai::text::trim_for_log(call.arguments_json, 240);
+        easyai::log::write("%s         args=%s%s\n",
+                           style_.dim(), args_prev.c_str(), style_.reset());
+        std::string res_prev = easyai::text::trim_for_log(result.content, 240);
+        easyai::log::write("%s         result=%s%s\n",
+                           style_.dim(), res_prev.c_str(), style_.reset());
+    }
+}
+
+Streaming & Streaming::attach(Engine & engine) {
+    engine.on_token([this](const std::string & p){ this->on_token_(p); });
+    engine.on_tool ([this](const ToolCall & c, const ToolResult & r){
+        this->on_tool_(c, r);
+    });
+    return *this;
+}
+
+// Streaming::attach(Client &) lives in src/cli_client.cpp — libeasyai-cli.
+
+Streaming & Streaming::attach(Plan & plan) {
+    plan.on_change([this](const Plan & p){
+        std::ostringstream ss;
+        ss << "\n" << style_.yellow() << "── plan ──" << style_.reset() << "\n";
+        p.render(ss);
+        ss << "\n";
+        spinner_.write(ss.str());
+    });
+    return *this;
 }
 
 }  // namespace easyai::ui
