@@ -128,6 +128,19 @@ by creating IMPORTED targets at find_package time.
 - `render_string()` produces a GitHub-style markdown checklist
   (`- [ ] / [~] / [x]`).
 
+**Authoritative datetime + cutoff hint** (`examples/server.cpp`,
+`build_authoritative_preamble` + `prepare_engine_for_request`)
+- Per-request fresh timestamp injected into the system prompt: current
+  date+time+TZ + knowledge-cutoff rule (verify post-cutoff facts via
+  tools or say "not certain").  Default ON via `--inject-datetime on`.
+- Preamble is APPENDED to whichever system message reaches the model:
+  if the client sent its own `system` (opencode / Claude-Code style),
+  we splice the preamble into the LAST one of those; otherwise we
+  append to ctx.default_system.  Either way, exactly one system block
+  reaches the chat template.
+- Per-request override via `X-Easyai-Inject: on|off` HTTP header.
+  Defaults to the server-side flag if header absent or unrecognised.
+
 **Server** (`examples/server.cpp`)
 - cpp-httplib + nlohmann::json (vendored by llama.cpp).
 - Endpoints: `GET /` (webui), `/bundle.{js,css}`, `/loading.html`, `/favicon{.ico}`,

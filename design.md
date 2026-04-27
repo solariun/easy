@@ -323,6 +323,65 @@ self-merge.
 
 ---
 
+## 5c. Authoritative datetime / knowledge-cutoff injection
+
+A real production hazard: every chat-template-friendly model has a
+training cutoff.  Without a fresh wall-clock signal each turn, the
+model will happily insist that "this year" is the year it was
+trained, and confidently misreport leaders, prices, scores, and
+weather.  The fix is well known but worth describing as it lives in
+this codebase, because it interacts subtly with client-supplied
+system prompts.
+
+**What gets injected.** `build_authoritative_preamble(ctx)` produces
+a small system-prompt suffix on every request, freshly stamped:
+
+```
+# AUTHORITATIVE DATE/TIME (do not ignore, do not second-guess)
+Current date and time: 2026-04-26 23:14:08 -0300 (BRT).
+Trust this over any training-data intuition about "today".
+…
+
+# KNOWLEDGE CUTOFF
+Your training data ends around 2024-10.
+For ANY claim about events, people, products, prices, releases,
+leaders, scores, weather, or facts after that cutoff you MUST
+either:
+  1. Call a tool (web_search, web_fetch, datetime, …) to verify, OR
+  2. Explicitly state that you are not certain.
+Never present a post-cutoff fact as known.
+```
+
+Cutoff date comes from `--knowledge-cutoff YYYY-MM` (default
+`2024-10`); date format is `strftime("%Y-%m-%d %H:%M:%S %z (%Z)")`.
+
+**Where it lands in the prompt.** Two cases, controlled by
+`prepare_engine_for_request`:
+
+1. *Client supplied its own `system` message* (the opencode /
+   Claude-Code / OpenAI-SDK pattern).  We walk the request's history
+   in reverse and APPEND the preamble to the last `role:"system"`
+   message we find.  The engine's `default_system` is set to the
+   bare server default — no double system block.
+2. *Client didn't supply a `system` message*.  We append the
+   preamble to `ctx.default_system` and the engine renders that as
+   its lone system message.
+
+Either way exactly one system block reaches the chat template,
+the preamble is in it, and the freshly-rendered timestamp goes
+through the standard chat-templates path (Qwen / Llama / Gemma /
+DeepSeek all preserve system content verbatim).
+
+**Per-request override.** `X-Easyai-Inject: on|off` HTTP header lets
+QA runs disable the preamble without rebooting the server.  Default
+remains on; the override exists for A/B regression suites comparing
+pre-injection behaviour.  We deliberately did NOT make this a body
+field — keeping it in the headers means OpenAI-compat client SDKs
+that don't know about easyai pass through cleanly without trying to
+forward the field to the model.
+
+---
+
 ## 6. The HTTP server
 
 The server is **one-engine**, **one-mutex**, **one-process**. No connection

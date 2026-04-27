@@ -1414,6 +1414,13 @@ struct ChatRequest {
     double                                            top_k_override = -1.0;
     bool                                              stream = false;
     easyai::PresetResult                              preset_inline; // applied=true if peeled
+    // Per-request override of the server-side --inject-datetime flag,
+    // populated from the X-Easyai-Inject HTTP header.  Empty leaves
+    // the server default in effect; "on" forces injection on; "off"
+    // forces it off.  Use sparingly — disabling the preamble removes
+    // a real safety net (the model will start hallucinating "today"
+    // and post-cutoff facts without it).
+    std::string                                       inject_override;
 };
 
 // Returns false on bad request (and writes the error to `res`).
@@ -1479,6 +1486,16 @@ static bool parse_chat_request(const httplib::Request & req,
     if (!out.preset_inline.applied.empty()) {
         out.last_user = out.last_user.substr(out.preset_inline.consumed);
         out.hist.back().second = out.last_user;
+    }
+
+    // Optional per-request override of the authoritative-datetime
+    // injection.  The header lookup uses httplib's case-insensitive
+    // Headers comparator, so any casing reaches us.
+    auto hi = req.headers.find("X-Easyai-Inject");
+    if (hi != req.headers.end()) {
+        std::string v = hi->second;
+        for (auto & c : v) c = (char) std::tolower((unsigned char) c);
+        if (v == "on" || v == "off") out.inject_override = v;
     }
     return true;
 }
@@ -1575,7 +1592,14 @@ static void prepare_engine_for_request(ServerCtx & ctx, const ChatRequest & req)
     std::vector<std::pair<std::string, std::string>> hist_minus_last(
         req.hist.begin(), req.hist.end() - 1);
 
-    if (ctx.inject_datetime) {
+    // Resolve the effective inject toggle: server default + optional
+    // X-Easyai-Inject header override.  Default is on; QA / regression
+    // suites that want to A/B the preamble pass `X-Easyai-Inject: off`.
+    bool inject_now = ctx.inject_datetime;
+    if      (req.inject_override == "on")  inject_now = true;
+    else if (req.inject_override == "off") inject_now = false;
+
+    if (inject_now) {
         const std::string preamble = build_authoritative_preamble(ctx);
         // Find the LAST system message in the client-supplied history.
         // (Most clients put it at index 0, but we walk backwards to be

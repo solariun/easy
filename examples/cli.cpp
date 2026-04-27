@@ -386,10 +386,14 @@ class RemoteBackend final : public Backend {
         std::string api_key;        // optional Bearer token
         std::string model = "easyai";
         std::string system_prompt;
+        std::string sandbox = ".";  // root for fs_* tools when --with-tools is on
         easyai::Preset preset{};
         long timeout_seconds = 300;
         int      max_tokens  = -1;
         long long seed       = -1;
+        bool     with_tools  = false;   // when true, register builtin tools on Client
+        bool     tls_insecure = false;  // skip peer cert verification (https only)
+        std::string ca_cert_path;       // PEM bundle for custom CAs
     };
 
     explicit RemoteBackend(Config c) : cfg_(std::move(c)) {
@@ -443,8 +447,15 @@ class RemoteBackend final : public Backend {
         return o.str();
     }
     std::string last_error() const override { return last_err_; }
-    size_t tool_count() const override { return 0; }
-    std::vector<std::pair<std::string,std::string>> tool_list() const override { return {}; }
+    size_t tool_count() const override {
+        return client_ ? client_->tools().size() : 0;
+    }
+    std::vector<std::pair<std::string,std::string>> tool_list() const override {
+        std::vector<std::pair<std::string,std::string>> out;
+        if (!client_) return out;
+        for (const auto & t : client_->tools()) out.emplace_back(t.name, t.description);
+        return out;
+    }
 
    private:
     void rebuild_client_() {
@@ -455,8 +466,30 @@ class RemoteBackend final : public Backend {
         if (!cfg_.api_key.empty())       client_->api_key(cfg_.api_key);
         if (!cfg_.system_prompt.empty()) client_->system (cfg_.system_prompt);
         push_sampling_();
-        if (cfg_.max_tokens > 0) client_->max_tokens(cfg_.max_tokens);
-        if (cfg_.seed       >= 0) client_->seed     (cfg_.seed);
+        if (cfg_.max_tokens > 0)  client_->max_tokens(cfg_.max_tokens);
+        if (cfg_.seed       >= 0) client_->seed      (cfg_.seed);
+
+        // TLS knobs — both no-ops on http:// and on builds without OpenSSL.
+        if (cfg_.tls_insecure)            client_->tls_insecure(true);
+        if (!cfg_.ca_cert_path.empty())   client_->ca_cert_path(cfg_.ca_cert_path);
+
+        // Optional: register the same built-in tool catalogue the LOCAL
+        // backend uses, dispatched IN THIS PROCESS while the remote model
+        // does the reasoning.  Off by default (--url mode historically
+        // behaved like a vanilla OpenAI streamer); flip on with
+        // --with-tools to turn easyai-cli into a remote agentic CLI.
+        if (cfg_.with_tools) {
+            client_->add_tool(easyai::tools::datetime());
+#if defined(EASYAI_HAVE_CURL)
+            client_->add_tool(easyai::tools::web_search());
+            client_->add_tool(easyai::tools::web_fetch());
+#endif
+            client_->add_tool(easyai::tools::fs_read_file (cfg_.sandbox));
+            client_->add_tool(easyai::tools::fs_list_dir  (cfg_.sandbox));
+            client_->add_tool(easyai::tools::fs_glob      (cfg_.sandbox));
+            client_->add_tool(easyai::tools::fs_grep      (cfg_.sandbox));
+            client_->add_tool(easyai::tools::fs_write_file(cfg_.sandbox));
+        }
     }
     void push_sampling_() {
         if (!client_) return;
@@ -482,6 +515,16 @@ struct CliArgs {
     // remote-mode auth
     std::string api_key;
     std::string remote_model = "easyai";
+
+    // remote-mode TLS knobs (https:// only; no-ops on http://)
+    bool        tls_insecure = false;
+    std::string ca_cert_path;
+
+    // remote-mode optional agentic loop — register libeasyai's builtin
+    // tools on the Client so the remote model can call them and we
+    // dispatch in-process.  Off by default (--url historically was a
+    // vanilla OpenAI streamer).
+    bool        with_tools  = false;
 
     // common config
     std::string system_path;
@@ -526,6 +569,14 @@ struct CliArgs {
         "      --api-key <key>           Bearer token (env: EASYAI_API_KEY,\n"
         "                                 OPENAI_API_KEY also honoured)\n"
         "      --remote-model <name>     Model id to send (default 'easyai')\n"
+        "      --insecure-tls            skip peer cert verification (https,\n"
+        "                                 DEV ONLY — never in prod)\n"
+        "      --ca-cert <path>          trust this CA bundle (PEM) for https://\n"
+        "      --with-tools              register libeasyai's builtin tools on\n"
+        "                                 the Client so the remote model can\n"
+        "                                 call them and we dispatch locally\n"
+        "                                 (datetime, web_search, web_fetch, fs_*).\n"
+        "                                 Default off (vanilla OpenAI streamer).\n"
         "\nCommon options:\n"
         "  -p, --prompt <text>           One-shot: run prompt, print, exit\n"
         "  -s, --system-file <path>      Read system prompt from file\n"
@@ -576,6 +627,9 @@ static CliArgs parse(int argc, char ** argv) {
         else if (s == "--url")                        a.url           = need(i, "--url");
         else if (s == "--api-key")                    a.api_key       = need(i, "--api-key");
         else if (s == "--remote-model")               a.remote_model  = need(i, "--remote-model");
+        else if (s == "--insecure-tls")               a.tls_insecure  = true;
+        else if (s == "--ca-cert")                    a.ca_cert_path  = need(i, "--ca-cert");
+        else if (s == "--with-tools")                 a.with_tools    = true;
         else if (s == "-s" || s == "--system-file")   a.system_path   = need(i, "-s");
         else if (s == "--system")                     a.system_inline = need(i, "--system");
         else if (s == "--preset")                     a.preset        = need(i, "--preset");
@@ -675,21 +729,22 @@ int main(int argc, char ** argv) {
     // ----- build backend ---------------------------------------------------
     std::unique_ptr<Backend> backend;
     if (!args.url.empty()) {
-#if defined(EASYAI_HAVE_CURL)
+        // Remote backend transport now lives in libeasyai-cli (no
+        // libcurl dependency); --url works regardless of EASYAI_HAVE_CURL.
+        // libcurl is still optional for the LOCAL backend's web tools.
         RemoteBackend::Config rc;
         rc.base_url      = args.url;
         rc.api_key       = args.api_key;
         rc.model         = args.remote_model;
         rc.system_prompt = system_prompt;
+        rc.sandbox       = args.sandbox;
         rc.preset        = preset;
         rc.max_tokens    = args.max_tokens;
         rc.seed          = args.seed;
+        rc.with_tools    = args.with_tools;
+        rc.tls_insecure  = args.tls_insecure;
+        rc.ca_cert_path  = args.ca_cert_path;
         backend = std::make_unique<RemoteBackend>(std::move(rc));
-#else
-        std::fprintf(stderr,
-            "[easyai-cli] this binary was built without libcurl; --url is unavailable\n");
-        return 2;
-#endif
     } else {
         LocalBackend::Config lc;
         lc.model_path     = args.model_path;

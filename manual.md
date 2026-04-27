@@ -1555,6 +1555,17 @@ verbose mode as `[easyai] hop 7: …`.
 
 ### 9.0 `easyai-cli` against any OpenAI-compatible endpoint
 
+> Since v0.1.0, `easyai-cli`'s remote backend uses `libeasyai-cli`
+> internally — same agentic loop, same HTTPS support, same SSE
+> handling as `easyai-cli-remote`.  Three flag families that come
+> from the lib:
+>
+> | Flag                         | Effect                                                                |
+> |------------------------------|-----------------------------------------------------------------------|
+> | `--insecure-tls`             | Skip peer certificate verification (DEV ONLY, https only).            |
+> | `--ca-cert <path>`           | Trust a custom CA bundle (PEM) for `https://` endpoints.              |
+> | `--with-tools`               | Register the libeasyai builtin tools on the Client and dispatch them locally — turns `--url` into a remote agentic CLI.  Off by default (vanilla OpenAI streamer behaviour). |
+
 `easyai-cli` runs a REPL in two modes that share the same UI: local model
 (`-m model.gguf`) or remote server (`--url <api-base>`). Same preset
 commands, same `/help`, same `--no-think` switch.
@@ -1738,6 +1749,31 @@ re-run for stack-level detail in `stderr`.
 It's actually fine — the printed line "stopped cleanly" tells the truth.
 Some shells/wrappers report a non-zero code because of the signal, but
 `main()` returned 0.
+
+### Forcing the model to ignore the server-injected datetime (QA only)
+
+The server appends an authoritative date/time + knowledge-cutoff
+preamble to whichever system message reaches the model
+(`--inject-datetime on` is the default).  For regression testing the
+preamble can be disabled per-request without restarting the server:
+
+```bash
+curl http://ai.local:8080/v1/chat/completions \
+     -H 'Content-Type: application/json' \
+     -H 'X-Easyai-Inject: off' \
+     -d '{"model":"easyai","messages":[{"role":"user","content":"What year is it?"}]}'
+```
+
+Header values:
+* `off` — skip the preamble for this request only.
+* `on`  — force injection on this request even when the server was
+          launched with `--inject-datetime off`.
+* (anything else, or absent header) — defer to the server flag.
+
+WHY DEFAULT ON: most production deployments want the model to trust
+the server clock and to flag post-cutoff facts as uncertain.  Turning
+the preamble off removes a real safety net — only do it for A/B QA
+runs where you're explicitly comparing pre-injection behaviour.
 
 ### `easyai::Client` — "HTTPS endpoint requires OpenSSL"
 

@@ -19,7 +19,7 @@ against, plus six ready-to-run binaries:
 
 | Binary               | What it gives you                                                                                                                                  |
 |----------------------|----------------------------------------------------------------------------------------------------------------------------------------------------|
-| `easyai-cli`         | Drop-in `llama-cli` replacement: local **or** remote OpenAI-compatible endpoint, one-shot scripting (`-p`), tools, presets, optional `<think>` strip. |
+| `easyai-cli`         | Drop-in `llama-cli` replacement: local **or** remote OpenAI-compatible endpoint (HTTPS via OpenSSL), one-shot scripting (`-p`), tools, presets, optional `<think>` strip. `--with-tools` opts in to local tool dispatch over a remote model (agentic). `--insecure-tls` / `--ca-cert` for dev/internal CAs. |
 | `easyai-cli-remote`  | Pure agentic CLI built on `libeasyai-cli` — no local model required.  REPL or `-p`, full sampling control (`--temperature`, `--top-p`, `--top-k`, `--min-p`, `--repeat-penalty`, `--frequency-penalty`, `--presence-penalty`, `--seed`, `--max-tokens`, `--stop`), plan tool, server-management subcommands (`--list-models`, `--list-tools`, `--health`, `--props`, `--metrics`, `--set-preset`). |
 | `easyai-server`      | Drop-in `llama-server` replacement: OpenAI-compat HTTP **with full SSE streaming**, embedded SvelteKit webui, Bearer auth, Prometheus `/metrics`, KV-cache controls, flash-attn, mlock. |
 | `easyai-agent`       | A demo agent showing every built-in tool plus an inline custom tool.                                                                                |
