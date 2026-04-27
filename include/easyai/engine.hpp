@@ -158,6 +158,12 @@ class Engine {
     // Direct access for advanced HTTP scenarios.
     void clear_history();
 
+    // Pop the last N entries off history (no-op if N >= history.size).
+    // Used by callers that need to rollback a synthetic nudge they
+    // pushed before a retry, so the conversation handed back to the
+    // client doesn't leak internal-only messages.
+    void pop_last(size_t n = 1);
+
     // ---------------- inference --------------------------------------------
     // chat() runs a full turn including any tool-call/tool-result loops.
     // The returned string is the final assistant message content.

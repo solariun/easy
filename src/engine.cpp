@@ -1050,6 +1050,12 @@ void Engine::clear_kv() {
     if (p_->sampler) common_sampler_reset(p_->sampler);
 }
 
+void Engine::pop_last(size_t n) {
+    while (n-- > 0 && !p_->history.empty()) {
+        p_->history.pop_back();
+    }
+}
+
 std::string Engine::generate() {
     if (!p_->loaded) { p_->last_error = "engine not loaded"; return {}; }
 
@@ -1344,6 +1350,24 @@ Engine::GeneratedTurn Engine::generate_one() {
 
     common_chat_msg msg = p_->parse_assistant(raw, chat_p);
     msg.role = "assistant";
+
+    if (p_->verbose) {
+        // Single-turn equivalent of chat_continue's per-hop dump.  Lets
+        // an operator running --verbose see EXACTLY what the model
+        // emitted in client_tools mode (where a thought-only turn used
+        // to silently produce an empty bubble).  Tail is bounded so a
+        // long generation doesn't flood the journal.
+        std::fprintf(stderr,
+            "[easyai] generate_one: raw=%zu content=%zu reasoning=%zu tool_calls=%zu\n",
+            raw.size(), msg.content.size(),
+            msg.reasoning_content.size(), msg.tool_calls.size());
+        if (!raw.empty()) {
+            const size_t tail = std::min<size_t>(220, raw.size());
+            std::fprintf(stderr, "[easyai] generate_one raw tail: %.*s\n",
+                         (int) tail, raw.c_str() + raw.size() - tail);
+        }
+    }
+
     p_->history.push_back(msg);
 
     out.content   = msg.content;

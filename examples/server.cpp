@@ -1956,8 +1956,26 @@ static void handle_chat_stream(ServerCtx & ctx,
                     // state is dropped, retry up to 2 times.  Final
                     // fallback promotes reasoning -> content so the user
                     // never sees an empty bubble.
+                    // Retry strategy for thought-only turns:
+                    //   attempt 0  — raw retry (KV cleared, history intact).
+                    //                Often enough: KV reset alone changes the
+                    //                stochastic path on the next pass.
+                    //   attempt 1  — push a synthetic user nudge into history,
+                    //                clear KV, retry.  The nudge is a
+                    //                surgical reminder of the format:
+                    //                  "TOOL_CALL_REMINDER: emit the actual
+                    //                   <tool_call>... or answer directly."
+                    //                Pop the nudge from history right after
+                    //                so the conversation we hand back to the
+                    //                client never carries server-internal
+                    //                synthetic turns.
+                    //   attempt 2  — give up; promote reasoning to content
+                    //                in the fallback below so the user sees
+                    //                *something* and the journal explains
+                    //                why.
                     constexpr int kMaxThoughtRetries = 2;
-                    int retries = 0;
+                    int  retries        = 0;
+                    bool nudge_in_hist  = false;  // whether we owe a pop_last
                     easyai::Engine::GeneratedTurn turn;
                     while (true) {
                         turn = ctx.engine.generate_one();
@@ -1967,20 +1985,58 @@ static void handle_chat_stream(ServerCtx & ctx,
                             && !turn.reasoning.empty();
                         if (thought_only && retries < kMaxThoughtRetries) {
                             ++retries;
-                            std::fprintf(stderr,
-                                "[easyai-server] client_tools thought-only "
-                                "(retry %d/%d): clearing KV + retrying\n",
-                                retries, kMaxThoughtRetries);
+                            // The engine already pushed an assistant entry
+                            // for this thought-only turn — drop it before
+                            // the next attempt so history stays clean.
+                            ctx.engine.pop_last(1);
+
+                            if (retries == 2 && !nudge_in_hist) {
+                                ctx.engine.push_message("user",
+                                    "TOOL_CALL_REMINDER: your previous reply "
+                                    "stated an intent to call a tool but did "
+                                    "not emit one.  Either emit the actual "
+                                    "tool_call now using the proper format, "
+                                    "OR answer directly without claiming to "
+                                    "use a tool.  Do NOT just say what you "
+                                    "are going to do.");
+                                nudge_in_hist = true;
+                                std::fprintf(stderr,
+                                    "[easyai-server] client_tools thought-only "
+                                    "(retry %d/%d): KV reset + nudge injected\n",
+                                    retries, kMaxThoughtRetries);
+                            } else {
+                                std::fprintf(stderr,
+                                    "[easyai-server] client_tools thought-only "
+                                    "(retry %d/%d): KV reset, plain re-run\n",
+                                    retries, kMaxThoughtRetries);
+                            }
                             ctx.engine.clear_kv();
-                            // Drop the streaming layer's accumulated state
-                            // so the next attempt's tokens aren't merged
-                            // with the discarded turn's reasoning.
+                            // Drop the streaming layer's accumulated parse
+                            // state so the next attempt's tokens aren't
+                            // merged with the discarded turn's reasoning.
                             accumulated.clear();
                             prev_msg = common_chat_msg{};
                             prev_msg.role = "assistant";
                             continue;
                         }
                         break;
+                    }
+                    // Surgically remove the nudge + the recovery turn's
+                    // assistant entry from the engine's history before we
+                    // hand control back to the client.  We KEEP whatever
+                    // turn data we return (out.content / tool_calls) for
+                    // the response — but the conversation the client sees
+                    // on the next turn won't contain our internal nudge.
+                    if (nudge_in_hist) {
+                        // engine pushed: [..., nudge_user, recovery_assistant]
+                        // We pop the assistant first then the nudge.  The
+                        // CLIENT's history (cli-remote / opencode) only
+                        // ever sees its own user msg + the assistant
+                        // reply we synthesised.
+                        ctx.engine.pop_last(2);
+                        // Re-push the recovery assistant as if it was a
+                        // direct response to the client's user message.
+                        ctx.engine.push_message("assistant", turn.content);
                     }
                     if (turn.tool_calls.empty() && turn.content.empty()
                             && !turn.reasoning.empty()) {
