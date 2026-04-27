@@ -80,11 +80,14 @@ public:
     // questions and you want a hard timeout in tokens, not seconds.
     Client & max_reasoning_chars (int n);
 
-    // Opt-in retry when the server flags a turn as incomplete (no
-    // tool_call + tiny content — typically the "I'll search…" then
-    // EOS pattern).  When true, run_chat_loop discards the bad
-    // assistant entry and re-issues the SAME conversation once.
-    // Default false: receive incomplete turns transparently.
+    // Auto-retry-with-nudge when the server flags a turn as incomplete
+    // (no tool_call + tiny content — typically the "I'll search…"
+    // then EOS pattern).  run_chat_loop discards the bad assistant
+    // entry, appends a corrective user message ("don't announce,
+    // execute"), and re-issues ONCE.  Bounded — no spirals, no nudge
+    // stacking.  Default ON: every consumer of libeasyai-cli gets the
+    // recovery for free.  Pass false to receive raw incomplete turns
+    // transparently (still observable via last_turn_was_incomplete()).
     Client & retry_on_incomplete (bool v);
 
     // Whether the LAST turn returned by chat() / chat_continue() was

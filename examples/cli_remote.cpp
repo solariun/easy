@@ -295,7 +295,7 @@ struct Options {
     bool        verbose          = false;
     std::string log_file_path;             // explicit --log-file override
     int         max_reasoning    = 0;      // 0 = unlimited (disable runaway abort)
-    bool        retry_on_incomplete = true;    // default ON; --no-retry-on-incomplete to opt out
+    bool        retry_on_incomplete = true;    // matches libeasyai-cli default; --no-retry-on-incomplete to opt out
     bool        no_plan          = false;     // skip auto-registering Plan
     bool        tls_insecure     = false;     // skip peer cert verification
     std::string tls_ca_path;                  // PEM bundle for custom CAs

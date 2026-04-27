@@ -201,7 +201,14 @@ struct Client::Impl {
     bool        tls_insecure    = false;   // skip peer cert verification
     std::string tls_ca_path;                // PEM bundle for custom CAs
     int         max_reasoning_chars = 0;    // 0 = unlimited; >0 aborts SSE on overflow
-    bool        retry_on_incomplete = false;
+    // Default ON: when the server flags a turn as incomplete (model
+    // announced a tool but never emitted it, or stopped with a tiny
+    // post-tool-call reply), we discard the bad turn, append a
+    // corrective user nudge ("don't announce, execute"), and re-issue
+    // ONCE.  Bounded — no spirals, no nudge stacking.  Library
+    // consumers who want the raw incomplete signal call
+    // retry_on_incomplete(false).
+    bool        retry_on_incomplete = true;
     bool        last_was_incomplete = false; // mirror of last turn's timings.incomplete
     int         max_tool_hops       = 8;     // agentic loop safety cap; bumped by bash
 
