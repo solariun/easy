@@ -102,6 +102,36 @@ void close_log_tee(std::FILE * fp);
 bool client_has_tool(const Client & client, const std::string & name);
 
 
+// ---------- Management subcommands -----------------------------------------
+//
+// Standard "introspect / drive a remote easyai-server" commands lifted
+// from cli_remote's run_management() so any consumer of libeasyai-cli
+// can ship the same toolbelt.  Each returns a process exit code
+// (0 on success, non-zero on transport / parse failure) and writes
+// the human-readable result to `out`.
+}  // namespace easyai::cli
+namespace easyai::ui { struct Style; }
+namespace easyai::cli {
+
+// /v1/models — list everything the server is willing to serve.
+int print_models       (Client & client, const ui::Style & st, std::FILE * out = stdout);
+// Locally-registered tools (what we send to the model in the
+// request body's tools[]).
+int print_local_tools  (Client & client, const ui::Style & st, std::FILE * out = stdout);
+// /v1/tools — easyai-server extension: catalogue of tools the
+// server registered.
+int print_remote_tools (Client & client, const ui::Style & st, std::FILE * out = stdout);
+// /health — boolean check (prints "ok" / "unhealthy: <reason>").
+int print_health       (Client & client, const ui::Style & st, std::FILE * out = stdout);
+// /props — dump the server's props JSON.
+int print_props        (Client & client, std::FILE * out = stdout);
+// /metrics — dump Prometheus exposition.
+int print_metrics      (Client & client, std::FILE * out = stdout);
+// /v1/preset — set the server's ambient sampling preset.
+int set_preset         (Client & client, const std::string & name,
+                        const ui::Style & st, std::FILE * out = stdout);
+
+
 // ---------- Sandbox dir validation -----------------------------------------
 //
 // Returns true if `path` is empty (caller didn't pass --sandbox) or

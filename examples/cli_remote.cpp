@@ -624,89 +624,16 @@ using easyai::text::trim_for_log;
 using easyai::ui::print_tool_row;
 
 int run_management(easyai::Client & cli, const Options & o, const Style & st) {
-    if (o.list_models) {
-        std::vector<easyai::RemoteModel> ms;
-        if (!cli.list_models(ms)) {
-            std::fprintf(stderr, "%serror:%s %s\n", st.red(), st.reset(),
-                         cli.last_error().c_str());
-            return 1;
-        }
-        for (const auto & m : ms) {
-            std::printf("%s%s%s  (owned_by=%s)\n",
-                        st.bold(), m.id.c_str(), st.reset(), m.owned_by.c_str());
-        }
-        return 0;
-    }
-    if (o.list_tools) {
-        // LOCAL tools — these are what cli-remote sends to the model in
-        // the request body's `tools[]`.  Most useful for users since
-        // it answers "what can the model actually do right now".
-        if (cli.tools().empty()) {
-            std::fprintf(stderr,
-                "%sno tools registered.%s  Use --tools and/or --sandbox to "
-                "enable some.\n", st.dim(), st.reset());
-            return 0;
-        }
-        std::printf("%slocal tools (%zu):%s\n",
-                    st.bold(), cli.tools().size(), st.reset());
-        for (const auto & t : cli.tools()) {
-            print_tool_row(t.name, t.description, st);
-        }
-        return 0;
-    }
-    if (o.list_remote_tools) {
-        // Server-side catalog via /v1/tools (easyai-server extension).
-        std::vector<easyai::RemoteTool> ts;
-        if (!cli.list_remote_tools(ts)) {
-            std::fprintf(stderr, "%serror:%s %s\n", st.red(), st.reset(),
-                         cli.last_error().c_str());
-            return 1;
-        }
-        std::printf("%sremote tools (%zu):%s\n",
-                    st.bold(), ts.size(), st.reset());
-        for (const auto & t : ts) {
-            print_tool_row(t.name, t.description, st);
-        }
-        return 0;
-    }
-    if (o.health) {
-        if (!cli.health()) {
-            std::fprintf(stderr, "%sunhealthy:%s %s\n", st.red(), st.reset(),
-                         cli.last_error().c_str());
-            return 1;
-        }
-        std::printf("%sok%s\n", st.green(), st.reset());
-        return 0;
-    }
-    if (o.props) {
-        std::string body;
-        if (!cli.props(body)) {
-            std::fprintf(stderr, "%serror:%s %s\n", st.red(), st.reset(),
-                         cli.last_error().c_str());
-            return 1;
-        }
-        std::printf("%s\n", body.c_str());
-        return 0;
-    }
-    if (o.metrics) {
-        std::string body;
-        if (!cli.metrics(body)) {
-            std::fprintf(stderr, "%serror:%s %s\n", st.red(), st.reset(),
-                         cli.last_error().c_str());
-            return 1;
-        }
-        std::fputs(body.c_str(), stdout);
-        return 0;
-    }
-    if (!o.set_preset.empty()) {
-        if (!cli.set_preset(o.set_preset)) {
-            std::fprintf(stderr, "%serror:%s %s\n", st.red(), st.reset(),
-                         cli.last_error().c_str());
-            return 1;
-        }
-        std::printf("preset applied: %s\n", o.set_preset.c_str());
-        return 0;
-    }
+    // Thin dispatcher — the actual work lives in easyai::cli helpers
+    // (see include/easyai/cli.hpp).  Each helper returns the process
+    // exit code (0 on success, 1 on transport / parse failure).
+    if (o.list_models)        return easyai::cli::print_models       (cli, st);
+    if (o.list_tools)         return easyai::cli::print_local_tools  (cli, st);
+    if (o.list_remote_tools)  return easyai::cli::print_remote_tools (cli, st);
+    if (o.health)             return easyai::cli::print_health       (cli, st);
+    if (o.props)              return easyai::cli::print_props        (cli);
+    if (o.metrics)            return easyai::cli::print_metrics      (cli);
+    if (!o.set_preset.empty())return easyai::cli::set_preset         (cli, o.set_preset, st);
     return 0;
 }
 
