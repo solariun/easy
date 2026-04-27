@@ -1,11 +1,15 @@
 // libeasyai-cli-side overloads — symbols that touch easyai::Client live
 // here so the engine-only library doesn't drag in the HTTP client.
+#include "easyai/backend.hpp"
 #include "easyai/cli.hpp"
 #include "easyai/client.hpp"
+#include "easyai/presets.hpp"
 #include "easyai/tool.hpp"
 #include "easyai/ui.hpp"
 
 #include <cstdio>
+#include <memory>
+#include <sstream>
 
 namespace easyai::cli {
 
@@ -120,3 +124,109 @@ Streaming & Streaming::attach(Client & client) {
 }
 
 }  // namespace easyai::ui
+
+
+// ============================================================================
+// RemoteBackend — wraps easyai::Client.  Lives in libeasyai-cli because
+// the engine-only library doesn't have access to Client.
+// ============================================================================
+namespace easyai {
+
+struct RemoteBackend::Impl {
+    Config                  cfg;
+    std::unique_ptr<Client> client;
+    std::string             last_err;
+
+    void rebuild() {
+        client = std::make_unique<Client>();
+        client->endpoint(cfg.base_url)
+               .model   (cfg.model)
+               .timeout_seconds((int) cfg.timeout_seconds);
+        if (!cfg.api_key.empty())       client->api_key(cfg.api_key);
+        if (!cfg.system_prompt.empty()) client->system (cfg.system_prompt);
+        push_sampling();
+        if (cfg.max_tokens > 0)  client->max_tokens(cfg.max_tokens);
+        if (cfg.seed       >= 0) client->seed      (cfg.seed);
+        if (cfg.tls_insecure)            client->tls_insecure(true);
+        if (!cfg.ca_cert_path.empty())   client->ca_cert_path(cfg.ca_cert_path);
+
+        if (cfg.with_tools) {
+            cli::Toolbelt()
+                .sandbox   (cfg.sandbox)
+                .allow_bash(cfg.allow_bash)
+                .apply     (*client);
+        }
+    }
+    void push_sampling() {
+        if (!client) return;
+        if (cfg.preset.temperature >= 0) client->temperature(cfg.preset.temperature);
+        if (cfg.preset.top_p       >= 0) client->top_p      (cfg.preset.top_p);
+        if (cfg.preset.top_k       >  0) client->top_k      (cfg.preset.top_k);
+        if (cfg.preset.min_p       >  0) client->min_p      (cfg.preset.min_p);
+    }
+};
+
+RemoteBackend::RemoteBackend(Config c) : p_(std::make_unique<Impl>()) {
+    p_->cfg = std::move(c);
+    if (p_->cfg.preset.name.empty()) {
+        if (const auto * pr = find_preset("balanced")) p_->cfg.preset = *pr;
+    }
+    p_->rebuild();
+}
+RemoteBackend::~RemoteBackend() = default;
+
+bool RemoteBackend::init(std::string & err) {
+    if (p_->cfg.base_url.empty()) {
+        err = "remote backend: --url is required";
+        return false;
+    }
+    return true;
+}
+
+std::string RemoteBackend::chat(const std::string & user_text, const Tokenizer & cb) {
+    p_->client->on_token(cb);
+    std::string answer = p_->client->chat(user_text);
+    if (answer.empty() && !p_->client->last_error().empty()) {
+        p_->last_err = p_->client->last_error();
+        return {};
+    }
+    return answer;
+}
+
+void RemoteBackend::reset() {
+    p_->client->clear_history();
+    p_->last_err.clear();
+}
+
+void RemoteBackend::set_system(const std::string & t) {
+    p_->cfg.system_prompt = t;
+    p_->rebuild();
+}
+
+void RemoteBackend::set_sampling(float t, float p, int k, float m) {
+    if (t >= 0) p_->cfg.preset.temperature = t;
+    if (p >= 0) p_->cfg.preset.top_p       = p;
+    if (k >= 0) p_->cfg.preset.top_k       = k;
+    if (m >= 0) p_->cfg.preset.min_p       = m;
+    p_->push_sampling();
+}
+
+std::string RemoteBackend::info() const {
+    std::ostringstream o;
+    o << "remote " << p_->cfg.base_url
+      << "  (model=" << p_->cfg.model << ")"
+      << (p_->cfg.api_key.empty() ? "" : "  [auth]");
+    return o.str();
+}
+
+std::string RemoteBackend::last_error() const { return p_->last_err; }
+std::size_t RemoteBackend::tool_count() const { return p_->client ? p_->client->tools().size() : 0; }
+
+std::vector<std::pair<std::string,std::string>> RemoteBackend::tool_list() const {
+    std::vector<std::pair<std::string,std::string>> out;
+    if (!p_->client) return out;
+    for (const auto & t : p_->client->tools()) out.emplace_back(t.name, t.description);
+    return out;
+}
+
+}  // namespace easyai

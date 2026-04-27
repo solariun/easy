@@ -93,279 +93,6 @@ void install_sigint() { std::signal(SIGINT, handle_sigint); }
 
 
 // ============================================================================
-//  Backend interface — the abstraction over local engine vs. remote HTTP.
-// ============================================================================
-class Backend {
-   public:
-    using Tokenizer = std::function<void(const std::string &)>;
-
-    virtual ~Backend() = default;
-    virtual bool        init(std::string & err)                                    = 0;
-    virtual std::string chat(const std::string & user_text, const Tokenizer & cb)  = 0;
-    virtual void        reset()                                                    = 0;
-    virtual void        set_system(const std::string & text)                       = 0;
-    virtual void        set_sampling(float temp, float top_p, int top_k, float min_p) = 0;
-    virtual std::string info() const                                               = 0;
-    virtual std::string last_error() const                                         = 0;
-    virtual size_t      tool_count() const                                         = 0;
-    virtual std::vector<std::pair<std::string,std::string>> tool_list() const      = 0;
-};
-
-// ============================================================================
-//  LocalBackend — wraps easyai::Engine.
-// ============================================================================
-class LocalBackend final : public Backend {
-   public:
-    struct Config {
-        std::string model_path;
-        std::string system_prompt;
-        std::string sandbox;            // empty = fs_* tools NOT registered
-        bool        allow_bash = false; // explicit opt-in for the `bash` tool
-        int  n_ctx     = 4096;
-        int  n_batch   = 0;        // 0 = follow ctx
-        int  ngl       = -1;
-        int  n_threads = 0;
-        bool load_tools = true;
-        easyai::Preset preset{};
-        // Sampling overrides (applied after preset).  -1 / 0 means "unset".
-        float repeat_penalty = -1.0f;
-        int   max_tokens     = -1;
-        uint32_t seed        = 0u;
-        // KV cache & GGUF-metadata overrides
-        std::string cache_type_k;       // "" = leave default
-        std::string cache_type_v;
-        bool no_kv_offload = false;
-        bool kv_unified    = false;
-        std::vector<std::string> kv_overrides;
-    };
-
-    explicit LocalBackend(Config c) : cfg_(std::move(c)) {}
-
-    bool init(std::string & err) override {
-        engine_.model      (cfg_.model_path)
-               .context    (cfg_.n_ctx)
-               .gpu_layers (cfg_.ngl)
-               .system     (cfg_.system_prompt)
-               .verbose    (false)
-               .on_token   ([this](const std::string & p){ if (cb_) cb_(p); });
-        if (cfg_.n_threads > 0) engine_.threads(cfg_.n_threads);
-        if (cfg_.n_batch   > 0) engine_.batch  (cfg_.n_batch);
-        if (cfg_.seed      > 0) engine_.seed   (cfg_.seed);
-        if (cfg_.max_tokens >= 0) engine_.max_tokens(cfg_.max_tokens);
-        if (!cfg_.cache_type_k.empty()) engine_.cache_type_k(cfg_.cache_type_k);
-        if (!cfg_.cache_type_v.empty()) engine_.cache_type_v(cfg_.cache_type_v);
-        if (cfg_.no_kv_offload) engine_.no_kv_offload(true);
-        if (cfg_.kv_unified)    engine_.kv_unified(true);
-        for (const auto & ov : cfg_.kv_overrides) engine_.add_kv_override(ov);
-        if (cfg_.preset.name.empty()) {
-            const auto * p = easyai::find_preset("balanced");
-            if (p) cfg_.preset = *p;
-        }
-        engine_.temperature(cfg_.preset.temperature)
-               .top_p      (cfg_.preset.top_p)
-               .top_k      (cfg_.preset.top_k)
-               .min_p      (cfg_.preset.min_p);
-        if (cfg_.repeat_penalty > 0) engine_.repeat_penalty(cfg_.repeat_penalty);
-
-        if (cfg_.load_tools) {
-            easyai::cli::Toolbelt()
-                .sandbox   (cfg_.sandbox)
-                .allow_bash(cfg_.allow_bash)
-                .apply     (engine_);
-        }
-        engine_.on_tool([](const easyai::ToolCall & c, const easyai::ToolResult & r){
-            std::fprintf(stderr,
-                "\n\033[36m[tool] %s -> %s%.200s%s\033[0m\n",
-                c.name.c_str(),
-                r.is_error ? "ERR " : "",
-                r.content.c_str(),
-                r.content.size() > 200 ? "…" : "");
-        });
-
-        if (!engine_.load()) {
-            err = engine_.last_error();
-            return false;
-        }
-        return true;
-    }
-
-    std::string chat(const std::string & user_text, const Tokenizer & cb) override {
-        cb_ = cb;
-        try {
-            return engine_.chat(user_text);
-        } catch (const std::exception & e) {
-            last_err_ = std::string("local engine error: ") + e.what();
-            return {};
-        }
-    }
-
-    void reset() override                              { engine_.clear_history(); }
-    void set_system(const std::string & t) override    { engine_.system(t); engine_.clear_history(); }
-    void set_sampling(float t, float p, int k, float m) override {
-        engine_.set_sampling(t, p, k, m);
-    }
-    std::string info() const override {
-        std::ostringstream o;
-        o << "loaded " << cfg_.model_path
-          << "  backend=" << engine_.backend_summary()
-          << "  ctx=" << engine_.n_ctx()
-          << "  tools=" << engine_.tools().size();
-        return o.str();
-    }
-    std::string last_error() const override { return last_err_.empty() ? engine_.last_error() : last_err_; }
-    size_t tool_count() const override { return engine_.tools().size(); }
-    std::vector<std::pair<std::string,std::string>> tool_list() const override {
-        std::vector<std::pair<std::string,std::string>> out;
-        for (const auto & t : engine_.tools()) out.emplace_back(t.name, t.description);
-        return out;
-    }
-
-   private:
-    Config            cfg_;
-    easyai::Engine    engine_;
-    Tokenizer         cb_;
-    std::string       last_err_;
-};
-
-// ============================================================================
-//  RemoteBackend — talks OpenAI-compatible HTTP via libeasyai-cli.
-//
-//  Was a ~270-line manual curl + SSE parser.  Now it's a thin shim over
-//  easyai::Client which already does:
-//    * HTTP and HTTPS (the latter when libssl-dev was found at configure
-//      time and CPPHTTPLIB_OPENSSL_SUPPORT got compiled in)
-//    * SSE parsing with the same delta.{content,reasoning_content,
-//      tool_calls} routing the easyai-cli-remote binary uses
-//    * History persistence as raw OpenAI-shape JSON strings
-//    * Bearer auth + connection timeouts + fluent sampling overrides
-//
-//  Per-Backend tools are NOT registered on the Client — easyai-cli's
-//  --url mode is meant to behave like a vanilla OpenAI client.  If the
-//  user wants local tool dispatch, they should reach for the
-//  easyai-cli-remote binary instead, which is purpose-built for that.
-// ============================================================================
-
-class RemoteBackend final : public Backend {
-   public:
-    struct Config {
-        std::string base_url;       // e.g. "http://127.0.0.1:8080" (or "/v1")
-        std::string api_key;        // optional Bearer token
-        std::string model = "easyai";
-        std::string system_prompt;
-        std::string sandbox;        // empty = fs_* tools NOT registered (even with --with-tools)
-        bool        allow_bash = false;  // explicit opt-in for the `bash` tool
-        easyai::Preset preset{};
-        long timeout_seconds = 300;
-        int      max_tokens  = -1;
-        long long seed       = -1;
-        bool     with_tools  = false;   // when true, register builtin tools on Client
-        bool     tls_insecure = false;  // skip peer cert verification (https only)
-        std::string ca_cert_path;       // PEM bundle for custom CAs
-    };
-
-    explicit RemoteBackend(Config c) : cfg_(std::move(c)) {
-        if (cfg_.preset.name.empty()) {
-            const auto * p = easyai::find_preset("balanced");
-            if (p) cfg_.preset = *p;
-        }
-        rebuild_client_();
-    }
-
-    bool init(std::string & err) override {
-        if (cfg_.base_url.empty()) {
-            err = "remote backend: --url is required";
-            return false;
-        }
-        return true;
-    }
-
-    std::string chat(const std::string & user_text, const Tokenizer & cb) override {
-        client_->on_token(cb);
-        // libeasyai-cli runs the agentic loop and returns the final visible
-        // content; cb is fired for each delta.content piece along the way.
-        std::string answer = client_->chat(user_text);
-        if (answer.empty() && !client_->last_error().empty()) {
-            last_err_ = client_->last_error();
-            return {};
-        }
-        return answer;
-    }
-
-    void reset() override {
-        client_->clear_history();
-        last_err_.clear();
-    }
-    void set_system(const std::string & t) override {
-        cfg_.system_prompt = t;
-        rebuild_client_();
-    }
-    void set_sampling(float t, float p, int k, float m) override {
-        if (t >= 0) cfg_.preset.temperature = t;
-        if (p >= 0) cfg_.preset.top_p       = p;
-        if (k >= 0) cfg_.preset.top_k       = k;
-        if (m >= 0) cfg_.preset.min_p       = m;
-        push_sampling_();
-    }
-    std::string info() const override {
-        std::ostringstream o;
-        o << "remote " << cfg_.base_url
-          << "  (model=" << cfg_.model << ")"
-          << (cfg_.api_key.empty() ? "" : "  [auth]");
-        return o.str();
-    }
-    std::string last_error() const override { return last_err_; }
-    size_t tool_count() const override {
-        return client_ ? client_->tools().size() : 0;
-    }
-    std::vector<std::pair<std::string,std::string>> tool_list() const override {
-        std::vector<std::pair<std::string,std::string>> out;
-        if (!client_) return out;
-        for (const auto & t : client_->tools()) out.emplace_back(t.name, t.description);
-        return out;
-    }
-
-   private:
-    void rebuild_client_() {
-        client_ = std::make_unique<easyai::Client>();
-        client_->endpoint(cfg_.base_url)
-                .model   (cfg_.model)
-                .timeout_seconds((int) cfg_.timeout_seconds);
-        if (!cfg_.api_key.empty())       client_->api_key(cfg_.api_key);
-        if (!cfg_.system_prompt.empty()) client_->system (cfg_.system_prompt);
-        push_sampling_();
-        if (cfg_.max_tokens > 0)  client_->max_tokens(cfg_.max_tokens);
-        if (cfg_.seed       >= 0) client_->seed      (cfg_.seed);
-
-        // TLS knobs — both no-ops on http:// and on builds without OpenSSL.
-        if (cfg_.tls_insecure)            client_->tls_insecure(true);
-        if (!cfg_.ca_cert_path.empty())   client_->ca_cert_path(cfg_.ca_cert_path);
-
-        // Optional: register the same built-in tool catalogue the LOCAL
-        // backend uses, dispatched IN THIS PROCESS while the remote model
-        // does the reasoning.  Off by default (--url mode historically
-        // behaved like a vanilla OpenAI streamer); flip on with
-        // --with-tools to turn easyai-cli into a remote agentic CLI.
-        if (cfg_.with_tools) {
-            easyai::cli::Toolbelt()
-                .sandbox   (cfg_.sandbox)
-                .allow_bash(cfg_.allow_bash)
-                .apply     (*client_);
-        }
-    }
-    void push_sampling_() {
-        if (!client_) return;
-        if (cfg_.preset.temperature >= 0)  client_->temperature(cfg_.preset.temperature);
-        if (cfg_.preset.top_p       >= 0)  client_->top_p      (cfg_.preset.top_p);
-        if (cfg_.preset.top_k       >  0)  client_->top_k      (cfg_.preset.top_k);
-        if (cfg_.preset.min_p       >  0)  client_->min_p      (cfg_.preset.min_p);
-    }
-
-    Config                              cfg_;
-    std::unique_ptr<easyai::Client>     client_;
-    std::string                         last_err_;
-};
-
-// ============================================================================
 //  Argument parsing
 // ============================================================================
 struct CliArgs {
@@ -599,7 +326,7 @@ int main(int argc, char ** argv) {
     if (args.min_p       >= 0) preset.min_p       = args.min_p;
 
     // ----- build backend ---------------------------------------------------
-    std::unique_ptr<Backend> backend;
+    std::unique_ptr<easyai::Backend> backend;
     if (!args.url.empty()) {
         // Convenience: auto-prepend http:// when the user gives us a
         // bare host[:port] like "ai.local:8080".  HTTPS still needs
@@ -611,7 +338,7 @@ int main(int argc, char ** argv) {
         // Remote backend transport now lives in libeasyai-cli (no
         // libcurl dependency); --url works regardless of EASYAI_HAVE_CURL.
         // libcurl is still optional for the LOCAL backend's web tools.
-        RemoteBackend::Config rc;
+        easyai::RemoteBackend::Config rc;
         rc.base_url      = args.url;
         rc.api_key       = args.api_key;
         rc.model         = args.remote_model;
@@ -624,9 +351,9 @@ int main(int argc, char ** argv) {
         rc.with_tools    = args.with_tools;
         rc.tls_insecure  = args.tls_insecure;
         rc.ca_cert_path  = args.ca_cert_path;
-        backend = std::make_unique<RemoteBackend>(std::move(rc));
+        backend = std::make_unique<easyai::RemoteBackend>(std::move(rc));
     } else {
-        LocalBackend::Config lc;
+        easyai::LocalBackend::Config lc;
         lc.model_path     = args.model_path;
         lc.system_prompt  = system_prompt;
         lc.sandbox        = args.sandbox;
@@ -645,7 +372,7 @@ int main(int argc, char ** argv) {
         lc.no_kv_offload  = args.no_kv_offload;
         lc.kv_unified     = args.kv_unified;
         lc.kv_overrides   = args.kv_overrides;
-        backend = std::make_unique<LocalBackend>(std::move(lc));
+        backend = std::make_unique<easyai::LocalBackend>(std::move(lc));
     }
 
     std::string err;

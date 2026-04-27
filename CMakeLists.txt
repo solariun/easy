@@ -65,6 +65,7 @@ set(EASYAI_SOURCES
     src/ui.cpp
     src/log.cpp
     src/cli.cpp
+    src/backend.cpp
 )
 
 add_library(easyai ${EASYAI_SOURCES})
