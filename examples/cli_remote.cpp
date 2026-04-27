@@ -966,13 +966,22 @@ void write_through_spinner(const std::string & text) {
 
 void wire_callbacks(easyai::Client & cli, easyai::Plan & plan,
                     const Options & o, const Style & st) {
-    cli.on_token([&st, &o](const std::string & piece_in) {
+    // Track which stream emitted last so we can insert a newline on the
+    // reasoning↔content transition (otherwise the two glue together as
+    // "...phase.I have created..." in the terminal).
+    enum class StreamKind { NONE, REASON, CONTENT };
+    auto last_kind = std::make_shared<StreamKind>(StreamKind::NONE);
+
+    cli.on_token([&st, &o, last_kind](const std::string & piece_in) {
         if (g_stats) {
             ++g_stats->content_pieces;
             if (g_stats->ms_to_first_tok < 0)
                 g_stats->ms_to_first_tok = g_stats->elapsed_ms();
         }
-        write_through_spinner(punctuate_think_tags(piece_in));
+        std::string piece = punctuate_think_tags(piece_in);
+        if (*last_kind == StreamKind::REASON) piece.insert(0, "\n");
+        *last_kind = StreamKind::CONTENT;
+        write_through_spinner(piece);
         if (o.verbose) {
             vlog("%s[content %d, +%ldms]%s\n",
                  st.dim(),
@@ -981,16 +990,18 @@ void wire_callbacks(easyai::Client & cli, easyai::Plan & plan,
                  st.reset());
         }
     });
-    cli.on_reason([&st, &o](const std::string & piece_in) {
+    cli.on_reason([&st, &o, last_kind](const std::string & piece_in) {
         if (g_stats) ++g_stats->reason_pieces;
         if (o.show_reasoning) {
             std::string buf;
             buf.reserve(piece_in.size() + 16);
+            if (*last_kind == StreamKind::CONTENT) buf += "\n";
             buf += st.dim();
             buf += punctuate_think_tags(piece_in);
             buf += st.reset();
             write_through_spinner(buf);
         }
+        *last_kind = StreamKind::REASON;
         // When show_reasoning is off the heartbeat keeps the spinner
         // ticking on its own — no explicit refresh needed here.
         if (o.verbose) {
