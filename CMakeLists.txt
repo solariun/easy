@@ -104,7 +104,8 @@ target_include_directories(easyai_cli
     PUBLIC  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
             $<INSTALL_INTERFACE:include>
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
-            ${CMAKE_CURRENT_SOURCE_DIR}/../llama.cpp/vendor)         # cpp-httplib
+            ${CMAKE_CURRENT_SOURCE_DIR}/../llama.cpp/vendor             # nlohmann/json.hpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/../llama.cpp/vendor/cpp-httplib) # httplib.h
 target_link_libraries(easyai_cli
     PUBLIC  easyai             # reuse the Tool/ToolCall/ToolResult types
     PRIVATE cpp-httplib)        # transport
