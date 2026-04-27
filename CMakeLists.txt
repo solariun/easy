@@ -118,6 +118,7 @@ endif()
 set(EASYAI_CLI_SOURCES
     src/client.cpp
     src/cli_client.cpp
+    src/agent.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../llama.cpp/vendor/cpp-httplib/httplib.cpp
 )
 
@@ -167,7 +168,7 @@ endif()
 # ============================================================================
 if (EASYAI_BUILD_EXAMPLES)
     add_executable(easyai-chat examples/chat.cpp)
-    target_link_libraries(easyai-chat PRIVATE easyai)
+    target_link_libraries(easyai-chat PRIVATE easyai easyai_cli)
 
     add_executable(easyai-agent examples/agent.cpp)
     target_link_libraries(easyai-agent PRIVATE easyai)

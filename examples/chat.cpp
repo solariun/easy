@@ -1,60 +1,49 @@
-// examples/chat.cpp — minimal REPL with no tools.
+// examples/chat.cpp — minimal REPL.  Showcases easyai::Agent: the
+// "easy" front door over Engine/Client/Backend.  No spinner, no
+// fancy formatting — just the smallest thing that actually works.
 //
 //   ./easyai-chat -m models/qwen2.5-0.5b-instruct.gguf
+//   ./easyai-chat --url http://127.0.0.1:8080/v1
 //
 #include "easyai/easyai.hpp"
 
 #include <cstdio>
-#include <cstring>
 #include <iostream>
 #include <string>
 
-static void print_usage(const char * argv0) {
-    std::fprintf(stderr,
-        "usage: %s -m model.gguf [-c ctx] [-ngl n] [-t threads] [--system \"prompt\"]\n",
-        argv0);
-}
-
 int main(int argc, char ** argv) {
-    std::string model_path;
+    std::string model_path, url;
     std::string system_prompt = "You are a helpful, concise assistant.";
-    int  n_ctx = 4096, ngl = -1, n_threads = 0;
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
-        auto next = [&](const char * what) -> std::string {
-            if (i + 1 >= argc) { std::fprintf(stderr, "missing value for %s\n", what); std::exit(1); }
-            return argv[++i];
-        };
-        if      (a == "-m")        model_path     = next("-m");
-        else if (a == "-c")        n_ctx          = std::stoi(next("-c"));
-        else if (a == "-ngl")      ngl            = std::stoi(next("-ngl"));
-        else if (a == "-t")        n_threads      = std::stoi(next("-t"));
-        else if (a == "--system")  system_prompt  = next("--system");
-        else { print_usage(argv[0]); return 1; }
+        if      (a == "-m"       && i + 1 < argc) model_path     = argv[++i];
+        else if (a == "--url"    && i + 1 < argc) url            = argv[++i];
+        else if (a == "--system" && i + 1 < argc) system_prompt  = argv[++i];
+        else {
+            std::fprintf(stderr,
+                "usage: %s (-m model.gguf | --url base) [--system PROMPT]\n",
+                argv[0]);
+            return 1;
+        }
     }
-    if (model_path.empty()) { print_usage(argv[0]); return 1; }
-
-    easyai::Engine engine;
-    engine.model(model_path)
-          .context(n_ctx)
-          .gpu_layers(ngl)
-          .system(system_prompt)
-          .on_token([](const std::string & p){ std::cout << p << std::flush; });
-    if (n_threads > 0) engine.threads(n_threads);
-
-    if (!engine.load()) {
-        std::fprintf(stderr, "load failed: %s\n", engine.last_error().c_str());
+    if (model_path.empty() && url.empty()) {
+        std::fprintf(stderr, "need -m model.gguf or --url base\n");
         return 1;
     }
-    std::fprintf(stderr, "[easyai] loaded; backend = %s\n", engine.backend_summary().c_str());
+
+    // Three-line agent: pick a backend, set system, stream tokens.
+    easyai::Agent agent = url.empty()
+                              ? easyai::Agent(model_path)
+                              : easyai::Agent::remote(url);
+    agent.system  (system_prompt)
+         .on_token([](const std::string & p){ std::cout << p << std::flush; });
 
     std::string line;
-    while (true) {
-        std::cout << "\n\033[32m> \033[0m";
-        if (!std::getline(std::cin, line) || line.empty()) break;
+    while (std::cout << "\n\033[32m> \033[0m" && std::getline(std::cin, line)) {
+        if (line.empty()) continue;
         std::cout << "\033[33m";
-        engine.chat(line);
+        agent.ask(line);
         std::cout << "\033[0m\n";
     }
     return 0;

@@ -15,3 +15,4 @@
 #include "log.hpp"
 #include "cli.hpp"
 #include "backend.hpp"
+#include "agent.hpp"
