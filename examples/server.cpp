@@ -3260,12 +3260,10 @@ int main(int argc, char ** argv) {
                   ":host,*{box-sizing:border-box}"
                   ".pill{pointer-events:auto;display:inline-flex;"
                     "align-items:center;gap:.55rem;"
-                    "background:rgba(15,19,24,.92);"
-                    "border:1px solid #2a313b;border-radius:999px;"
-                    "padding:.22rem .7rem;color:#8b949e;"
-                    "font:.72rem -apple-system,system-ui,sans-serif;"
-                    "backdrop-filter:blur(6px);"
-                    "box-shadow:0 2px 12px rgba(0,0,0,.35);}"
+                    "background:rgba(30,33,38,.85);"
+                    "border:1px solid #2a313b;border-radius:.5rem;"
+                    "padding:.28rem .7rem;color:#8b949e;"
+                    "font:.72rem -apple-system,system-ui,sans-serif;}"
                   ".grp{display:inline-flex;align-items:center;gap:.3rem}"
                   ".sep{color:#3a414b}"
                   ".v{color:#e6edf3}"
@@ -3281,15 +3279,17 @@ int main(int argc, char ** argv) {
                 "const ensureBar=()=>{"
                   "let h=document.getElementById(BAR_ID);"
                   "if(h&&barRoot){barHost=h;return barRoot;}"
-                  "if(!document.documentElement)return null;"
+                  "if(h)h.remove();"
                   "h=document.createElement('div');"
                   "h.id=BAR_ID;"
                   "h.setAttribute('aria-hidden','false');"
+                  // No positioning here — reposition() decides whether to
+                  // attach in-flow inside the prompt form (preferred — fixes
+                  // Safari mobile keyboard misalignment) or fall back to
+                  // fixed positioning before the form has mounted.
                   "h.style.cssText="
-                    "'all:initial;position:fixed;top:0px;left:0px;"
-                    "z-index:2147483646;pointer-events:none;"
+                    "'all:initial;display:block;"
                     "font:14px/1 -apple-system,system-ui,sans-serif;';"
-                  "document.documentElement.appendChild(h);"
                   "barHost=h;"
                   "const root=h.attachShadow({mode:'open'});"
                   "root.innerHTML='<style>'+SHARED_STYLE+'</style>'+"
@@ -3314,15 +3314,19 @@ int main(int argc, char ** argv) {
                 "const ensureTone=()=>{"
                   "let h=document.getElementById(TONE_ID);"
                   "if(h&&toneRoot){toneHost=h;return toneRoot;}"
-                  "if(!document.documentElement)return null;"
+                  "if(h)h.remove();"
                   "h=document.createElement('div');"
                   "h.id=TONE_ID;"
                   "h.setAttribute('aria-hidden','false');"
+                  // Like ensureBar: no positioning here. reposition() inserts
+                  // this host as a sibling of the bundle's model-name badge
+                  // inside the prompt form so it flows with the layout —
+                  // fixes Safari-mobile drift and matches the bundle's own
+                  // badge alignment without manual offset math.
                   "h.style.cssText="
-                    "'all:initial;position:fixed;top:0px;left:0px;"
-                    "z-index:2147483646;pointer-events:none;"
+                    "'all:initial;display:inline-flex;align-items:center;"
+                    "vertical-align:middle;"
                     "font:14px/1 -apple-system,system-ui,sans-serif;';"
-                  "document.documentElement.appendChild(h);"
                   "toneHost=h;"
                   "const root=h.attachShadow({mode:'open'});"
                   // Match the bundle model-badge look: rounded rectangle
@@ -3398,15 +3402,15 @@ int main(int argc, char ** argv) {
                 "const ensureTools=()=>{"
                   "let h=document.getElementById(TOOLS_ID);"
                   "if(h&&toolsRoot){toolsHost=h;return toolsRoot;}"
-                  "if(!document.documentElement)return null;"
+                  "if(h)h.remove();"
                   "h=document.createElement('div');"
                   "h.id=TOOLS_ID;"
                   "h.setAttribute('aria-hidden','false');"
+                  // See ensureTone — same in-flow attach via reposition().
                   "h.style.cssText="
-                    "'all:initial;position:fixed;top:0px;left:0px;"
-                    "z-index:2147483646;pointer-events:none;"
+                    "'all:initial;display:inline-flex;align-items:center;"
+                    "vertical-align:middle;"
                     "font:14px/1 -apple-system,system-ui,sans-serif;';"
-                  "document.documentElement.appendChild(h);"
                   "toolsHost=h;"
                   "const root=h.attachShadow({mode:'open'});"
                   "root.innerHTML="
@@ -3498,89 +3502,128 @@ int main(int argc, char ** argv) {
                   "return root;"
                 "};"
 
-                // Anchor both hosts via getBoundingClientRect of the
-                // prompt form.  The metrics bar sits ~36px above the form;
-                // the tone chip sits at the form's bottom-right (where the
-                // model name badge + send arrow live in the bundle).
-                "const reposition=()=>{"
-                  "if(!barHost||!toneHost)return;"
-                  // Try to find the prompt textarea.  Fall back to fixed
-                  // viewport-bottom positions if anything looks wrong, so
-                  // both hosts ALWAYS show up — better a slightly wrong
-                  // position than an invisible one (the previous bug).
-                  "const ta=document.querySelector('textarea');"
-                  "let r=null;"
-                  "if(ta){"
-                    "const form=ta.closest('form')||ta.parentElement;"
-                    "if(form){"
-                      "const rr=form.getBoundingClientRect();"
-                      // Sanity-check: form must be within the viewport,
-                      // wider than 60 px.  Otherwise this is some hidden
-                      // scratch element.
-                      "if(rr.width>60&&rr.height>20"
-                         "&&rr.bottom>0&&rr.top<window.innerHeight){"
-                        "r=rr;"
-                      "}"
-                    "}"
+                // ATTACH STRATEGY (replaces the old getBoundingClientRect /
+                // position:fixed dance which broke on Safari mobile when
+                // the virtual keyboard / dynamic viewport shifted the
+                // prompt form independently from the document):
+                //
+                //   * Preferred path — form found:
+                //       bar  → prepended INSIDE the prompt form, in normal
+                //              block flow (centered above the textarea).
+                //       tone → appended next to the bundle's model-name
+                //              badge so it shares the row.
+                //       tools → appended next to tone.
+                //     All three become real DOM children of the form, so
+                //     the bundle's responsive layout (Safari mobile
+                //     keyboard included) carries them automatically.
+                //
+                //   * Fallback path — form not yet mounted:
+                //       all three pinned via position:fixed at the bottom
+                //       of the viewport so something is visible while the
+                //       Svelte bundle hydrates.
+                //
+                // Re-runs every 250 ms (setInterval below).  Hydration may
+                // rip our hosts out; the parentElement guards put them back.
+                "const detachFixed=(host)=>{"
+                  "host.style.position='';"
+                  "host.style.top='';"
+                  "host.style.left='';"
+                  "host.style.right='';"
+                  "host.style.bottom='';"
+                  "host.style.transform='';"
+                  "host.style.zIndex='';"
+                  "host.style.pointerEvents='';"
+                "};"
+                "const findModelBadge=(form)=>{"
+                  "const cand=form.querySelectorAll("
+                    "'[class*=badge i],[data-testid*=model i],"
+                    "[aria-label*=model i]'"
+                  ");"
+                  "for(const el of cand){"
+                    "if(el===toneHost||el===toolsHost)continue;"
+                    "if(toneHost&&toneHost.contains(el))continue;"
+                    "if(toolsHost&&toolsHost.contains(el))continue;"
+                    "const t=(el.innerText||el.textContent||'').trim();"
+                    "if(t&&t.length<40)return el;"
                   "}"
-                  "if(r){"
-                    // Metrics bar — above the form, centered horizontally.
-                    // CRITICAL: clear `bottom` from any prior fallback tick;
-                    // setting top+bottom simultaneously stretches the host
-                    // to 0 effective height and the inner pill disappears.
-                    "barHost.style.bottom='';"
-                    "barHost.style.top=(Math.max(4,r.top-34))+'px';"
-                    "barHost.style.left=(r.left+r.width/2)+'px';"
-                    "barHost.style.transform='translateX(-50%)';"
-                    // Tone badge — anchored at form's bottom-left, same
-                    // y as the bundle's model badge if we can find it.
-                    "let badgeY=r.bottom-26;"
-                    "const cand=document.querySelectorAll("
-                      "'[class*=badge i],[data-testid*=model i],"
-                      "[aria-label*=model i]'"
-                    ");"
-                    "for(const el of cand){"
-                      "const t=(el.innerText||el.textContent||'').trim();"
-                      "if(!t||t.length>40)continue;"
-                      "const er=el.getBoundingClientRect();"
-                      "if(er.bottom>r.top+r.height/2&&er.bottom<r.bottom+10){"
-                        "badgeY=er.top+er.height/2;break;"
+                  "return null;"
+                "};"
+                "const reposition=()=>{"
+                  "if(!barHost||!toneHost||!toolsHost)return;"
+                  "const ta=document.querySelector('textarea');"
+                  "const form=ta&&(ta.closest('form')||ta.parentElement);"
+                  "const formOk=form&&form.getBoundingClientRect().width>60;"
+                  "if(formOk){"
+                    "if(getComputedStyle(form).position==='static'){"
+                      "form.style.position='relative';"
+                    "}"
+                    // Bar — first child of the form, in block flow.
+                    "if(barHost.parentElement!==form||barHost.dataset.eaiAttach!=='flow'){"
+                      "detachFixed(barHost);"
+                      "barHost.style.cssText="
+                        "'all:initial;display:flex;justify-content:center;"
+                        "padding:.35rem 0 .15rem;width:100%;"
+                        "font:14px/1 -apple-system,system-ui,sans-serif;';"
+                      "barHost.dataset.eaiAttach='flow';"
+                      "form.insertBefore(barHost,form.firstChild);"
+                    "}"
+                    // Tone + tools sit next to the model badge in the same
+                    // row.  Falling back to the form keeps them visible
+                    // even when the badge can't be located.
+                    "const modelBadge=findModelBadge(form);"
+                    "const badgeRow=(modelBadge&&modelBadge.parentElement)||form;"
+                    "if(toneHost.parentElement!==badgeRow||toneHost.dataset.eaiAttach!=='flow'){"
+                      "detachFixed(toneHost);"
+                      "toneHost.style.cssText="
+                        "'all:initial;display:inline-flex;align-items:center;"
+                        "margin:0 .15rem;vertical-align:middle;"
+                        "font:14px/1 -apple-system,system-ui,sans-serif;';"
+                      "toneHost.dataset.eaiAttach='flow';"
+                      "if(modelBadge&&modelBadge.nextSibling){"
+                        "badgeRow.insertBefore(toneHost,modelBadge.nextSibling);"
+                      "}else{"
+                        "badgeRow.appendChild(toneHost);"
                       "}"
                     "}"
-                    "toneHost.style.bottom='';"
-                    "toneHost.style.top=badgeY+'px';"
-                    "toneHost.style.left=(r.left+12)+'px';"
-                    "toneHost.style.transform='translateY(-50%)';"
-                    // Tools badge sits to the right of the tone badge.
-                    // We measure tone's rendered width (its shadow root
-                    // exposes the .badge element via the host bbox)
-                    // and offset by that + a small gap.
-                    "if(toolsHost){"
-                      "let toneWidth=120;"
-                      "const tBox=toneHost.getBoundingClientRect();"
-                      "if(tBox.width>20)toneWidth=tBox.width;"
-                      "toolsHost.style.bottom='';"
-                      "toolsHost.style.top=badgeY+'px';"
-                      "toolsHost.style.left=(r.left+12+toneWidth+8)+'px';"
-                      "toolsHost.style.transform='translateY(-50%)';"
+                    "if(toolsHost.parentElement!==badgeRow||toolsHost.dataset.eaiAttach!=='flow'){"
+                      "detachFixed(toolsHost);"
+                      "toolsHost.style.cssText="
+                        "'all:initial;display:inline-flex;align-items:center;"
+                        "margin:0 .15rem;vertical-align:middle;"
+                        "font:14px/1 -apple-system,system-ui,sans-serif;';"
+                      "toolsHost.dataset.eaiAttach='flow';"
+                      "if(toneHost.nextSibling){"
+                        "badgeRow.insertBefore(toolsHost,toneHost.nextSibling);"
+                      "}else{"
+                        "badgeRow.appendChild(toolsHost);"
+                      "}"
                     "}"
                   "}else{"
-                    // Fallback: viewport-anchored bottom strip.  Same
-                    // bottom/top swap concern: clear top before setting
-                    // bottom or the host gets stuck offscreen.
-                    "barHost.style.top='';"
-                    "barHost.style.bottom='6.5rem';"
-                    "barHost.style.left='50%';"
-                    "barHost.style.transform='translateX(-50%)';"
-                    "toneHost.style.top='';"
-                    "toneHost.style.bottom='1rem';"
-                    "toneHost.style.left='1rem';"
-                    "toneHost.style.transform='none';"
-                    "if(toolsHost){"
-                      "toolsHost.style.top='';"
-                      "toolsHost.style.bottom='1rem';"
-                      "toolsHost.style.left='9rem';"
-                      "toolsHost.style.transform='none';"
+                    // Fallback while hydrating: viewport-anchored bottom strip.
+                    "if(barHost.parentElement!==document.documentElement||barHost.dataset.eaiAttach!=='fixed'){"
+                      "barHost.style.cssText="
+                        "'all:initial;position:fixed;left:50%;bottom:6.5rem;"
+                        "transform:translateX(-50%);z-index:2147483646;"
+                        "pointer-events:none;"
+                        "font:14px/1 -apple-system,system-ui,sans-serif;';"
+                      "barHost.dataset.eaiAttach='fixed';"
+                      "document.documentElement.appendChild(barHost);"
+                    "}"
+                    "if(toneHost.parentElement!==document.documentElement||toneHost.dataset.eaiAttach!=='fixed'){"
+                      "toneHost.style.cssText="
+                        "'all:initial;position:fixed;left:1rem;bottom:1rem;"
+                        "z-index:2147483646;pointer-events:none;"
+                        "font:14px/1 -apple-system,system-ui,sans-serif;';"
+                      "toneHost.dataset.eaiAttach='fixed';"
+                      "document.documentElement.appendChild(toneHost);"
+                    "}"
+                    "if(toolsHost.parentElement!==document.documentElement||toolsHost.dataset.eaiAttach!=='fixed'){"
+                      "toolsHost.style.cssText="
+                        "'all:initial;position:fixed;left:9rem;bottom:1rem;"
+                        "z-index:2147483646;pointer-events:none;"
+                        "font:14px/1 -apple-system,system-ui,sans-serif;';"
+                      "toolsHost.dataset.eaiAttach='fixed';"
+                      "document.documentElement.appendChild(toolsHost);"
                     "}"
                   "}"
                 "};"
@@ -3649,17 +3692,24 @@ int main(int argc, char ** argv) {
                 // Default visible so user sees something the moment SSE
                 // starts; setStatus updates the label/dot.  setStatus(idle)
                 // hides it explicitly.
+                // Per-message chip is now structurally part of the action
+                // row: same border-radius / border / background palette as
+                // the bundle's icon buttons (rounded rect, not full pill;
+                // no drop shadow), same ~icon-row height via padding.  The
+                // pulsing dot + metrics text are preserved verbatim, only
+                // the wrapper visuals change so the chip reads as a
+                // sibling of copy / edit / regenerate / branch / delete.
                 "const buildChip=()=>{"
                   "const chip=document.createElement('span');"
                   "chip.style.cssText="
-                    "'display:inline-flex;align-items:center;gap:.35rem;'+"
+                    "'display:inline-flex;align-items:center;gap:.4rem;'+"
                     "'align-self:center;vertical-align:middle;line-height:1;'+"
-                    "'margin:0 0 0 .5rem;padding:.2rem .65rem;'+"
-                    "'border:1px solid #2a313b;border-radius:999px;'+"
-                    "'color:#c9d1d9;background:rgba(20,26,32,.85);'+"
+                    "'margin:0 0 0 .35rem;padding:.32rem .55rem;'+"
+                    "'border:1px solid #2a313b;border-radius:.5rem;'+"
+                    "'color:#c9d1d9;background:rgba(30,33,38,.85);'+"
                     "'font:.72rem -apple-system,system-ui,sans-serif;'+"
                     "'flex-shrink:0;white-space:nowrap;'+"
-                    "'box-shadow:0 1px 3px rgba(0,0,0,.3);';"
+                    "'box-shadow:none;';"
                   "chip.innerHTML="
                     "'<span class=\"d __easyaiDot\" style=\"width:.5rem;height:.5rem;"
                       "border-radius:50%;background:#5b8dee;flex-shrink:0\"></span>"
