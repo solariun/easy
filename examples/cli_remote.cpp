@@ -972,7 +972,7 @@ void wire_callbacks(easyai::Client & cli, easyai::Plan & plan,
     enum class StreamKind { NONE, REASON, CONTENT };
     auto last_kind = std::make_shared<StreamKind>(StreamKind::NONE);
 
-    cli.on_token([&st, &o, last_kind](const std::string & piece_in) {
+    cli.on_token([last_kind](const std::string & piece_in) {
         if (g_stats) {
             ++g_stats->content_pieces;
             if (g_stats->ms_to_first_tok < 0)
@@ -982,13 +982,6 @@ void wire_callbacks(easyai::Client & cli, easyai::Plan & plan,
         if (*last_kind == StreamKind::REASON) piece.insert(0, "\n");
         *last_kind = StreamKind::CONTENT;
         write_through_spinner(piece);
-        if (o.verbose) {
-            vlog("%s[content %d, +%ldms]%s\n",
-                 st.dim(),
-                 g_stats ? g_stats->content_pieces : 0,
-                 g_stats ? g_stats->elapsed_ms() : 0,
-                 st.reset());
-        }
     });
     cli.on_reason([&st, &o, last_kind](const std::string & piece_in) {
         if (g_stats) ++g_stats->reason_pieces;
@@ -1004,13 +997,6 @@ void wire_callbacks(easyai::Client & cli, easyai::Plan & plan,
         *last_kind = StreamKind::REASON;
         // When show_reasoning is off the heartbeat keeps the spinner
         // ticking on its own — no explicit refresh needed here.
-        if (o.verbose) {
-            vlog("%s[reason %d, +%ldms]%s\n",
-                 st.dim(),
-                 g_stats ? g_stats->reason_pieces : 0,
-                 g_stats ? g_stats->elapsed_ms() : 0,
-                 st.reset());
-        }
     });
     cli.on_tool([&st, &o](const easyai::ToolCall & call,
                            const easyai::ToolResult & result) {
