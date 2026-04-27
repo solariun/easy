@@ -25,7 +25,7 @@ C++17 program". By the end you will know how to:
 |------|---------|--------------|
 | **1** | Getting set up         | Prereqs, repo layout, building, GPUs, models |
 | **2** | Using the binaries     | `easyai-cli`, `easyai-server`, `easyai-cli-remote`, `easyai-agent`, `easyai-chat`, `easyai-recipes` |
-| **3** | Embedding `libeasyai`  | `Engine` API top-to-bottom, callbacks, presets, tools, escape hatches |
+| **3** | Embedding `libeasyai`  | `Agent` (3-line hello), `Backend` (local↔remote), `Engine` API top-to-bottom, callbacks, presets, tools, escape hatches |
 | **4** | Embedding `libeasyai-cli` | `Client` API top-to-bottom — your code drives a remote model with local tools |
 | **5** | Authoring custom tools | Builder API, schemas, sandboxes, error handling, the `Plan` tool, `system_*` tools cookbook |
 | **6** | Deploying easyai-server | Single-binary install, systemd unit, nginx TLS termination, multiple-server fan-out |
@@ -190,11 +190,25 @@ prompt mid-session; `/reset` to wipe history.
 ### 2.2 Hello, server
 
 ```bash
-./build/easyai-server -m models/qwen2.5-1.5b-instruct-q4_k_m.gguf -s system.txt
+./build/easyai-server -m models/qwen2.5-1.5b-instruct-q4_k_m.gguf
+./build/easyai-server -m models/...gguf --sandbox ./work --allow-bash
+./build/easyai-server -m models/...gguf -s system.txt
 ```
 
-Where `system.txt` (any text file) becomes the **default** system prompt
-for any request that doesn't already include one.
+Without `-s`, the server boots up as **Deep** — an expert system
+engineer persona built into the default system prompt.  Deep
+operates a `TIME → THINK → PLAN → EXECUTE → VERIFY` loop and treats
+`datetime` as the first tool call any time the answer touches "now"
+or "today".  Operators who want a different voice supply their own
+`--system "<text>"` or `-s persona.txt` — Deep is the default, not
+hardcoded.
+
+`--sandbox <dir>` enables fs_* tools scoped to `<dir>`; `--allow-bash`
+adds the shell tool.  Both default OFF — fresh installs don't expose
+write access or shell to the model until the operator opts in.
+
+If you pass `-s system.txt`, that text becomes the default system
+prompt for any request that doesn't already include one.
 
 Open `http://127.0.0.1:8080` in a browser to use the bundled webui, or
 talk to it via curl:
@@ -248,6 +262,62 @@ inline `flip_coin` example is six lines.
 
 ## Part 3 — embedding the library
 
+### 3.0 Three-line hello world (`easyai::Agent`)
+
+If you remember nothing else, remember this:
+
+```cpp
+// hello.cpp
+#include "easyai/easyai.hpp"
+
+int main() {
+    easyai::Agent a("models/qwen2.5-1.5b-instruct-q4_k_m.gguf");
+    std::cout << a.ask("What's 2+2?") << "\n";
+}
+```
+
+`Agent` is the friendly Tier-1 façade.  Construct, ask, print.
+Default toolset (datetime + web_search + web_fetch) is wired in;
+fs_* and bash stay off until you opt in via `.sandbox()` or
+`.allow_bash()`.  Streaming output is one chained call away:
+
+```cpp
+easyai::Agent a("model.gguf");
+a.system  ("Be terse.")
+ .sandbox ("./workspace")
+ .preset  ("creative")
+ .on_token([](auto p){ std::cout << p << std::flush; });
+
+a.ask("Read README.md and summarise it.");
+```
+
+A remote model works the same way:
+
+```cpp
+auto a = easyai::Agent::remote("http://127.0.0.1:8080/v1");
+auto a = easyai::Agent::remote("https://api.openai.com/v1",
+                               std::getenv("OPENAI_API_KEY"));
+```
+
+`Agent` is built on top of `Backend` (3.1.5) which is built on top
+of `Engine` (3.1) and `Client` (3.10).  When you need access to the
+underlying knobs, `agent.backend()` is the escape hatch — it returns
+the materialised `Backend &` so you can reach into `Engine::*` /
+`Client::*` setters that `Agent` doesn't surface directly.
+
+CMake:
+
+```cmake
+find_package(easyai 0.1 REQUIRED)
+add_executable(hello hello.cpp)
+target_link_libraries(hello PRIVATE easyai::engine easyai::cli)
+```
+
+`Agent` lives in `libeasyai-cli` (because it can transparently
+dispatch to either flavour of `Backend`), so link both targets.
+If you only need the local engine, drop `easyai::cli` and use
+`easyai::Engine` directly (3.1).
+
 ### 3.1 Minimal hello
 
 ```cpp
@@ -289,6 +359,47 @@ target_link_libraries(hello PRIVATE easyai::engine)
 `easyai::engine` is the link target for `libeasyai.so` (local llama.cpp
 wrapper).  For the OpenAI-protocol client described in 3.9, swap to
 `easyai::cli` (or link both side by side).
+
+### 3.1.5 Backend — local OR remote, same shape
+
+If your program needs to handle EITHER a local `-m model.gguf`
+flavour OR a remote `--url base` flavour without if-tree
+duplication, the abstraction you want is `easyai::Backend`:
+
+```cpp
+std::unique_ptr<easyai::Backend> b;
+if (!url.empty()) {
+    easyai::RemoteBackend::Config rc;
+    rc.base_url = url;
+    rc.api_key  = api_key;
+    rc.with_tools = true;             // dispatch tools locally
+    b = std::make_unique<easyai::RemoteBackend>(std::move(rc));
+} else {
+    easyai::LocalBackend::Config lc;
+    lc.model_path = model_path;
+    lc.sandbox    = "./workspace";
+    lc.allow_bash = true;
+    b = std::make_unique<easyai::LocalBackend>(std::move(lc));
+}
+
+std::string err;
+if (!b->init(err)) { std::cerr << err << "\n"; return 1; }
+
+b->set_system("Be terse.");
+auto reply = b->chat("hello?", [](auto p){ std::cout << p << std::flush; });
+```
+
+`Backend` is the Tier-3 abstraction `Agent` is built on top of.  Use
+it when you want the local↔remote switch but still want to manage the
+chat loop yourself, register custom tools, or hook tool callbacks.
+The `Config` struct exposes every Engine/Client setting that's
+relevant to "configuring an agent" (sampling preset, sandbox,
+allow_bash, KV cache controls for local, TLS/timeout for remote).
+
+`LocalBackend` ships in `libeasyai`; `RemoteBackend` in
+`libeasyai-cli`.  Linking only the engine library gives you the
+local flavour; adding `easyai::cli` adds the remote flavour without
+duplicating the abstract base.
 
 ### 3.2 Adding a tool
 

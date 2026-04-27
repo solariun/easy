@@ -35,8 +35,10 @@ can link `libeasyai-cli` without touching llama.cpp at all.
 ### Goals
 
 1. **Make llama.cpp feel like an SDK.** A C++ developer should be able to
-   load a GGUF file and start an agent loop in ten lines, without learning
-   the `llama_*` C API or the structure of `common_chat_msg`.
+   load a GGUF file and start an agent loop in **three** lines (with
+   `easyai::Agent`), or ten if they want full `Engine` control.  Either
+   way: no `llama_*` C API knowledge, no `common_chat_msg` structure
+   familiarity required.
 2. **Tools are first-class and trivial to write.** Adding a tool should be
    ≤10 lines and require no JSON-schema knowledge.
 3. **Be a credible OpenAI-compatible server.** Anything that posts to
@@ -45,6 +47,12 @@ can link `libeasyai-cli` without touching llama.cpp at all.
 4. **No surprises with memory.** Native resources are owned by RAII types,
    the HTTP server is bounded in payload size, and a single `std::mutex`
    serialises the engine.
+5. **Layered ergonomics — easy by default, all-options reachable.**
+   Beginners must see "wow, three lines and it works."  Experts must see
+   "and I can still set CUDA layers, override KV cache type, register
+   custom tools, hook tool callbacks."  Both have to work in the same
+   library — no parallel codepaths, no Tier-1 sugar that locks you out
+   of Tier-3 power.  That's the **four-tier API rule** (§1b below).
 
 ### Non-goals (for now)
 
@@ -72,6 +80,66 @@ can link `libeasyai-cli` without touching llama.cpp at all.
   injected `<script>` blocks that scrub MCP/Sign-in chrome,
   shrink the bundle's native Reasoning panel, and drive a
   per-message status pill from the SSE stream.
+
+---
+
+## 1b. The four-tier API rule
+
+Codified 2026-04-27 after the `easyai::Agent` extraction landed.
+The library is intentionally layered into four tiers, each
+implemented **on top of the next one down** — never as a parallel
+codepath:
+
+```
+Tier 1: easyai::Agent                                  ← 3-line hello world
+        └─ built on Tier 2/3
+Tier 2: easyai::cli::Toolbelt, ui::Streaming, Agent setters
+        ← fluent customisation
+        └─ built on Tier 3
+Tier 3: easyai::Engine, Client, Backend, Tool::builder
+        ← explicit composables
+        └─ built on Tier 4
+Tier 4: raw llama.cpp handles, raw HTTP, custom Tool handlers
+        ← escape hatches, never a wall
+```
+
+**Why every tier matters:**
+
+- **Tier 1** sells the framework.  Three lines and it works:
+  `Agent("model.gguf").ask("…")`.  If a beginner sees a 30-line
+  setup, they leave.
+- **Tier 2** keeps the obvious customisations obvious.  Want to
+  enable file tools and shell?  `agent.sandbox(d).allow_bash()` —
+  not a 5-step dance involving `Toolbelt`, `add_tool` calls, and
+  `max_tool_hops` plumbing.
+- **Tier 3** is where real applications live.  The example
+  binaries (`easyai-cli-remote`, `easyai-server`) sit here, not
+  Tier 1, because they need fine-grained control over the agent
+  loop, callbacks, and HTTP stream.
+- **Tier 4** is the safety valve.  `agent.backend()` returns the
+  underlying `Backend &`; `engine.raw_handle()` returns the
+  llama.cpp pointer for anyone who needs to call a `llama_*`
+  function we haven't wrapped yet.  Power users never hit a wall.
+
+**Implementation discipline:**
+
+1. Higher tiers are built on top of lower tiers.  `Agent` calls
+   `Backend::chat()`; `Toolbelt::apply()` calls `Engine::add_tool()`.
+   Never duplicate logic.
+2. Lower tiers are always reachable from higher ones.  Every façade
+   exposes the layer below it — `Agent::backend()`, `Backend::tools()`,
+   etc.
+3. Sensible defaults at every tier.  `Agent` registers
+   datetime/web_search/web_fetch by default; fs_* and bash stay off
+   until the user asks for them.  `Client::retry_on_incomplete` is on
+   by default.  `max_tool_hops` is 8 by default but bumps to 99999
+   when bash registers.
+4. Honest documentation.  The bash tool's description in the model's
+   tools list literally reads "NOT a hardened sandbox — runs with
+   your user privileges."  No marketing.
+
+The pattern is intentional: it lets us popularise hard topics (AI,
+systems engineering) without compromising on power.
 
 ---
 
@@ -322,6 +390,80 @@ these in a `std::map<int, PendingToolCall>` so out-of-order arrivals
 self-merge.
 
 ---
+
+## 5d. Backend abstraction (`easyai::Backend` / `LocalBackend` / `RemoteBackend`)
+
+The local↔remote unification.  Every dual-mode CLI / agent we ship
+has the same shape: accept `--model PATH` OR `--url BASE`, build the
+right kind of engine, drive a streaming chat loop.  `Backend` hides
+which side of the fork you ended up on.
+
+```cpp
+class Backend {
+public:
+    virtual bool        init       (std::string & err) = 0;
+    virtual std::string chat       (const std::string & user_text,
+                                    const Tokenizer & cb)               = 0;
+    virtual void        reset      ()                                   = 0;
+    virtual void        set_system (const std::string & text)           = 0;
+    virtual void        set_sampling(float t, float p, int k, float m)  = 0;
+    virtual std::string info       () const                             = 0;
+    virtual std::string last_error () const                             = 0;
+    virtual std::size_t tool_count () const                             = 0;
+    virtual std::vector<std::pair<std::string,std::string>> tool_list() const = 0;
+};
+```
+
+`LocalBackend` wraps `Engine` and ships in **libeasyai**.
+`RemoteBackend` wraps `Client` and ships in **libeasyai-cli** — kept
+in the cli library so the engine-only library doesn't drag in the
+HTTP client.  Each has a public `Config` struct with the full
+relevant knob surface (sandbox, allow_bash, sampling preset, KV
+cache for local, TLS / timeout for remote).
+
+The pImpl on each is a `std::unique_ptr<Impl>` so the public ABI
+stays small and the lib can evolve internally without breaking
+downstream linkers.  Backend's lifetime contract: the caller owns
+the Backend; callbacks captured during `chat(text, cb)` fire
+synchronously and are invalidated when chat returns.
+
+## 5e. The Tier-1 façade (`easyai::Agent`)
+
+`Agent` is the "extremely easy for all skill levels" entry point.
+It owns one `Config` struct (LocalBackend's or RemoteBackend's,
+chosen at construction), defers backend materialisation to the first
+`ask()`, and re-resolves named presets at that point.
+
+```cpp
+struct Agent::Impl {
+    LocalBackend::Config  local_cfg;
+    RemoteBackend::Config remote_cfg;
+    bool                  is_remote = false;
+    std::unique_ptr<Backend> backend;     // built lazily on first ask()
+    Tokenizer             token_cb;
+    std::string           last_err;
+
+    void ensure_started();   // resolve preset name, instantiate backend, init
+};
+```
+
+Construction is cheap (`Agent("model.gguf")` doesn't touch the
+filesystem or load any model); the model only loads when the user
+actually calls `ask()`.  This matches what beginners expect — set
+things up, ask once, get the answer.
+
+The structural fields (model path, URL, sandbox, allow_bash) lock in
+at first `ask()` because the Backend has been instantiated; the
+"soft" fields (`set_system`, sampling overrides, on_token) keep
+working through `Backend::set_*`.  `agent.backend()` returns the
+materialised Backend reference for everything Agent doesn't surface
+directly — that's the Tier-4 escape hatch.
+
+Default toolset matches the rest of the framework: datetime +
+web_search + web_fetch on by default; fs_* and bash off until the
+user opts in via `.sandbox(...) / .allow_bash()`.  Remote mode
+enables `with_tools = true` automatically so the model running on
+the server side can call tools dispatched in the client process.
 
 ## 5c. Authoritative datetime / knowledge-cutoff injection
 
