@@ -1173,6 +1173,25 @@ std::string Engine::chat_continue() {
 
         if (msg.tool_calls.empty()) {
             final_text = msg.content;
+            // Highlight empty-content turns at hop end — usually means
+            // the model thought, decided not to call a tool, and then
+            // emitted EOS without any visible reply.  The streaming
+            // layer's last-resort fallback will paint the bubble with
+            // the engine's promoted reasoning if it ran (logged
+            // upstream), but if even that came up empty, the user's
+            // bubble will be blank — surface it loudly so the operator
+            // can correlate against journalctl.
+            if (final_text.empty() && p_->verbose) {
+                std::fprintf(stderr,
+                    "[easyai] hop %d: WARN final content is EMPTY after %d hop(s); "
+                    "reasoning=%zu tool_calls=%zu — model gave up without an "
+                    "answer.  Common causes: tool error chain (rate limits, "
+                    "network); over-prescriptive system prompt; model "
+                    "exhausted on a niche question.\n",
+                    hop, hop + 1,
+                    msg.reasoning_content.size(),
+                    msg.tool_calls.size());
+            }
             break;
         }
 

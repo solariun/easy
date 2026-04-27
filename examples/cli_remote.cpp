@@ -670,6 +670,19 @@ int run_one(easyai::Client & cli, const std::string & prompt,
                      cli.last_error().c_str());
         return 1;
     }
+    // Empty answer with no error => the model finished without
+    // emitting any content_delta.  This used to be a silent failure
+    // (blank prompt waiting for a response that never came).  Render
+    // a yellow placeholder so the user knows something happened, and
+    // suggest --show-reasoning + journalctl as the diagnostic path.
+    if (answer.empty()) {
+        std::fprintf(stdout,
+            "%s(empty response — model produced no visible content.  "
+            "Re-run with --show-reasoning + --verbose, and check "
+            "`journalctl -u easyai-server -f` on the box for "
+            "[easyai-server] WARN empty response …)%s\n",
+            st.yellow(), st.reset());
+    }
     return 0;
 }
 

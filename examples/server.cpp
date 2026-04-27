@@ -2055,6 +2055,26 @@ static void handle_chat_stream(ServerCtx & ctx,
             const double prompt_ms    = std::max(0.0, perf_after.prompt_ms    - perf_before.prompt_ms);
             const double predicted_ms = std::max(0.0, perf_after.predicted_ms - perf_before.predicted_ms);
 
+            // Empty-response detection.  After the streaming loop AND
+            // the last-resort fallback above, if the client still got
+            // zero content_delta, something went wrong — most often a
+            // tool-error chain (DDG rate-limit), an over-prescriptive
+            // system prompt, or the model burning its budget on
+            // reasoning without ever committing to an answer.  We log
+            // it loudly to stderr (visible via journalctl) and tag the
+            // SSE timings with empty=true so the client can render a
+            // helpful placeholder instead of a blank bubble.
+            const bool empty_response =
+                !any_content_emitted && tool_calls.empty();
+            if (empty_response) {
+                std::fprintf(stderr,
+                    "[easyai-server] WARN empty response (no content_delta, "
+                    "no tool_calls).  prompt_n=%d predicted_n=%d "
+                    "finish_reason=%s.  Common causes: tool errors "
+                    "(rate-limit), over-prescriptive system, model gave up.\n",
+                    prompt_n, predicted_n, finish_reason.c_str());
+            }
+
             ordered_json done_delta;
             done_delta["choices"] = json::array({{
                 {"index", 0},
@@ -2085,6 +2105,10 @@ static void handle_chat_stream(ServerCtx & ctx,
                 {"cache_n",      perf_before.n_ctx_used},
                 {"ctx_used",     n_ctx_used},
                 {"n_ctx",        n_ctx_total},
+                // Surface the empty-response signal so clients (webui,
+                // cli-remote, third-party SDKs) can render a clear
+                // placeholder instead of a blank bubble.
+                {"empty",        empty_response},
             };
             done_delta["usage"] = {
                 {"prompt_tokens",     prompt_n},
@@ -2993,6 +3017,35 @@ int main(int argc, char ** argv) {
                             "msg=t.predicted_n+' tok · '+(t.predicted_ms/1000).toFixed(1)+'s · '+tps+' t/s';"
                           "}"
                           "setLive('complete',msg);"
+                          // Render a placeholder when the server flagged
+                          // this turn as empty (timings.empty=true) — the
+                          // pre-fix silent failure that left the user
+                          // staring at a blank bubble.  Append a small
+                          // amber notice into the assistant message body.
+                          "if(t&&t.empty){"
+                            "const all=document.querySelectorAll("
+                              "'[aria-label=\"Assistant message with actions\"]');"
+                            "const last=all.length?all[all.length-1]:null;"
+                            "if(last&&!last.querySelector('.__easyai-empty')){"
+                              "const ph=document.createElement('div');"
+                              "ph.className='__easyai-empty';"
+                              "ph.style.cssText="
+                                "'margin:.5rem 0;padding:.45rem .65rem;"
+                                "border-left:2px solid #d29922;"
+                                "background:rgba(210,153,34,.08);"
+                                "border-radius:4px;"
+                                "font-size:.78rem;color:#d29922;"
+                                "font-family:ui-monospace,SFMono-Regular,Menlo,monospace;';"
+                              "ph.textContent='(empty response \\u2014 the "
+                                "model finished without producing visible "
+                                "content.  Common causes: tool errors, "
+                                "rate-limit, over-prescriptive system, "
+                                "model exhausted on a niche question.  "
+                                "Check journalctl -u easyai-server for "
+                                "[easyai-server] WARN empty response.)';"
+                              "last.appendChild(ph);"
+                            "}"
+                          "}"
                         "}"
                       "}catch(e){}"
                     "}"
