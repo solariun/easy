@@ -125,6 +125,20 @@ find_package(OpenSSL QUIET)
 if (OpenSSL_FOUND)
     target_compile_definitions(easyai_cli PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT=1)
     target_link_libraries(easyai_cli PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+    # On macOS, cpp-httplib's SSL build calls CFArray* / SecCertificate* /
+    # SecTrust* to load the system keychain — those live in the
+    # CoreFoundation and Security frameworks.  No-op on other platforms.
+    if (APPLE)
+        find_library(EASYAI_COREFOUNDATION CoreFoundation)
+        find_library(EASYAI_SECURITY       Security)
+        if (EASYAI_COREFOUNDATION AND EASYAI_SECURITY)
+            target_link_libraries(easyai_cli PRIVATE
+                ${EASYAI_COREFOUNDATION} ${EASYAI_SECURITY})
+        else()
+            message(WARNING "easyai-cli: CoreFoundation / Security frameworks "
+                            "not found — HTTPS link may fail on macOS")
+        endif()
+    endif()
     message(STATUS "easyai-cli: OpenSSL found — HTTPS endpoints enabled")
 else()
     message(STATUS "easyai-cli: OpenSSL NOT found — HTTPS endpoints will be rejected at runtime")
