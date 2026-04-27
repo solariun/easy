@@ -1,16 +1,44 @@
 # easyai — developer manual
 
-This is the **hands-on** guide. It assumes nothing beyond "I can compile a
+This is the **hands-on** book. It assumes nothing beyond "I can compile a
 C++17 program". By the end you will know how to:
 
 * compile easyai and download a model
 * run `easyai-cli` and talk to it
 * host `easyai-server` and call it from Claude Code, OpenAI SDKs, or curl
-* embed `easyai::Engine` in your own program
+* embed `easyai::Engine` in your own program (local llama.cpp)
+* embed `easyai::Client` in your own program (remote OpenAI-compatible
+  server, with local tools)
+* drive a remote server end-to-end with `easyai-cli-remote`, including
+  a planning tool and live system-observability tools
 * write a custom tool, with typed parameters
 * tune the sampler with presets and runtime overrides
+* deploy easyai-server as a hardened Linux service and operate it
 * debug common issues (context overflow, malformed tool calls, GPU
-  fallback)
+  fallback, TLS, rate limits)
+
+---
+
+## Table of contents
+
+| Part | Chapter | What you get |
+|------|---------|--------------|
+| **1** | Getting set up         | Prereqs, repo layout, building, GPUs, models |
+| **2** | Using the binaries     | `easyai-cli`, `easyai-server`, `easyai-cli-remote`, `easyai-agent`, `easyai-chat`, `easyai-recipes` |
+| **3** | Embedding `libeasyai`  | `Engine` API top-to-bottom, callbacks, presets, tools, escape hatches |
+| **4** | Embedding `libeasyai-cli` | `Client` API top-to-bottom — your code drives a remote model with local tools |
+| **5** | Authoring custom tools | Builder API, schemas, sandboxes, error handling, the `Plan` tool, `system_*` tools cookbook |
+| **6** | Deploying easyai-server | Single-binary install, systemd unit, nginx TLS termination, multiple-server fan-out |
+| **7** | Operating the server   | `/health` and `/metrics`, presets at runtime, log rotation, crash capture |
+| **8** | Performance & tuning   | KV cache types, flash-attn, mlock, ngl auto-fit, prompt-eval throughput, sampler choices |
+| **9** | Recipes (cookbook)     | Real prompts + flag combinations, including the planning agent, papers digest, host triage |
+| **10** | Troubleshooting       | Build, GPU, runtime, model, tool, network, TLS issues |
+| **11** | Design references     | Pointers into `design.md` for the deeper "why" |
+
+> If you're new, read 1 → 2 → 3.  If you want to ship something to a
+> remote model right now, jump to **Part 4**.  If you want to write
+> your own tool, **Part 5** is the cookbook.  If something's broken,
+> **Part 10** has a triage matrix.
 
 ---
 
@@ -920,15 +948,612 @@ cli.set_preset("creative");               // POST /v1/preset
 
 The `easyai-cli-remote` binary (`examples/cli_remote.cpp`) is a
 ready-to-run reference for all of the above — REPL or one-shot, every
-sampling knob exposed as a flag, six management subcommands
-(`--list-models`, `--list-tools`, `--health`, `--props`, `--metrics`,
-`--set-preset NAME`).
+sampling knob exposed as a flag, seven management subcommands
+(`--list-models`, `--list-tools`, `--list-remote-tools`, `--health`,
+`--props`, `--metrics`, `--set-preset NAME`).
 
 ---
 
-## Part 4 — recipes
+## Part 4 — embedding `libeasyai-cli` (remote agent)
 
-### 4.0 `easyai-cli` against any OpenAI-compatible endpoint
+This part is the deep dive on `easyai::Client`.  Use this when the
+*model* lives on another machine (or another process) and you want
+*your* code to drive the conversation with locally-executed tools.
+That's the canonical "agent" architecture — model is rented, brain
+trusts itself, hands stay on your laptop.
+
+### 4.1 What `Client` does for you
+
+* Builds a valid OpenAI `/v1/chat/completions` request body.
+* Streams the SSE response back, splitting `delta.content`,
+  `delta.reasoning_content`, and incremental `delta.tool_calls` into
+  your callbacks as they arrive.
+* When the model emits `finish_reason="tool_calls"`, dispatches the
+  matching `easyai::Tool` *in your process*, captures the result, and
+  re-issues the request with the tool message appended — repeating
+  until the model emits a non-tool `finish_reason`.
+* Caps the agentic loop at 8 hops (matches `Engine::chat_continue`).
+* Stores the conversation as raw OpenAI-shape JSON strings internally
+  so no JSON type ever leaks through the public ABI.
+
+### 4.2 Setting up the client (fluent)
+
+```cpp
+#include "easyai/client.hpp"
+#include "easyai/builtin_tools.hpp"
+#include "easyai/plan.hpp"
+
+easyai::Client cli;
+cli.endpoint("http://ai.local:8080")     // any /v1/chat/completions URL
+   .api_key(std::getenv("OPENAI_API_KEY") ? std::getenv("OPENAI_API_KEY") : "")
+   .model("EasyAi")                       // request body 'model' field
+   .system("You are a planning agent. Be concise.")
+   .timeout_seconds(600)                  // connect + read
+   .verbose(false);                       // true = log SSE traffic to stderr
+```
+
+`endpoint` accepts any HTTP or HTTPS URL.  When the build was linked
+with OpenSSL (default if `libssl-dev` is present at configure time)
+HTTPS just works.  For dev with a self-signed cert:
+
+```cpp
+cli.tls_insecure(true);                  // skip peer cert verification
+// or:
+cli.ca_cert_path("/etc/ssl/certs/internal-ca.pem");  // trust a custom CA
+```
+
+### 4.3 Sampling and penalty knobs
+
+Every standard OpenAI / llama-server / easyai-server field is a
+fluent setter.  Pin only the ones you care about — leaving any of
+them alone keeps the server's default in effect.
+
+```cpp
+cli.temperature(0.2f)
+   .top_p(0.95f)
+   .top_k(40)
+   .min_p(0.05f)               // llama-server / easyai
+   .repeat_penalty(1.1f)       // llama-server / easyai
+   .frequency_penalty(0.0f)    // OpenAI standard, [-2.0, 2.0]
+   .presence_penalty(0.0f)     // OpenAI standard, [-2.0, 2.0]
+   .seed(42)                   // deterministic; -1 = randomise
+   .max_tokens(512)
+   .stop({ "\n\nUSER:", "\n\nQ:" });
+```
+
+For non-standard server fields (`reasoning_effort`, `tool_choice`,
+provider-specific extensions) there's an escape hatch:
+
+```cpp
+cli.extra_body_json(R"({"reasoning_effort":"high","logit_bias":{"50256":-100}})");
+```
+
+The string MUST parse as a JSON object; its keys merge into the
+request body **last**, so they override anything the typed setters
+wrote (handy for emergency one-offs).
+
+### 4.4 Tools (registered locally)
+
+Same `easyai::Tool` type used by `Engine`.  The handler runs in your
+process when the model picks the tool.
+
+```cpp
+// Built-in tools (compiled into libeasyai):
+cli.add_tool(easyai::tools::datetime());
+cli.add_tool(easyai::tools::web_search());
+cli.add_tool(easyai::tools::web_fetch());
+cli.add_tool(easyai::tools::fs_read_file("/data"));   // sandbox to /data
+cli.add_tool(easyai::tools::fs_list_dir ("/data"));
+
+// Built-in plan tool — separate object so you can render its state.
+easyai::Plan plan;
+plan.on_change([](const easyai::Plan & p){
+    std::cout << "\n[plan]\n";
+    p.render(std::cout);
+});
+cli.add_tool(plan.tool());
+
+// Your own tool, inline:
+cli.add_tool(easyai::Tool::builder("flip_coin")
+    .describe("Returns 'heads' or 'tails' with uniform probability.")
+    .handle([](const easyai::ToolCall &){
+        return easyai::ToolResult::ok((std::rand() & 1) ? "heads" : "tails");
+    }).build());
+```
+
+There is **no API difference** between a `Tool` registered on `Engine`
+and one registered on `Client` — your authoring code is portable
+across "local model" and "remote model" deployments.
+
+### 4.5 Streaming callbacks
+
+```cpp
+cli.on_token([](const std::string & piece) {
+    std::fputs(piece.c_str(), stdout);
+    std::fflush(stdout);
+});
+cli.on_reason([](const std::string & piece) {
+    // Optional: render the model's hidden reasoning in dim grey.
+    std::fprintf(stderr, "\033[2m%s\033[0m", piece.c_str());
+});
+cli.on_tool([](const easyai::ToolCall & call,
+                const easyai::ToolResult & r) {
+    std::fprintf(stderr, "[tool] %s%s -> %s\n",
+                 r.is_error ? "FAIL " : "",
+                 call.name.c_str(),
+                 r.content.substr(0, 120).c_str());
+});
+```
+
+`on_reason` is opt-in by design — many UIs hide reasoning by default
+(it's noisy, and some servers don't emit it at all).  `on_token` is
+the visible reply; `on_tool` fires once per dispatched tool round-trip
+(call + result already paired).
+
+### 4.6 Driving the conversation
+
+```cpp
+std::string answer = cli.chat("Resumo dos 3 papers mais citados sobre Mamba este ano.");
+
+if (answer.empty() && !cli.last_error().empty()) {
+    std::fprintf(stderr, "error: %s\n", cli.last_error().c_str());
+    std::exit(1);
+}
+```
+
+`chat()` pushes the user message into history, runs the agentic loop,
+and returns the final visible content.  Successive `chat()` calls
+keep the conversation going (history is preserved).  To start over:
+
+```cpp
+cli.clear_history();
+```
+
+For more control (e.g. injecting tool results from outside), use
+`chat_continue()` after pushing your own messages onto history via
+the lower-level shape — but `chat()` is what 99% of agents want.
+
+### 4.7 Server-management endpoints
+
+Each method maps 1:1 to the matching easyai-server route, returns
+`true` on success, and writes diagnostic detail to `last_error()` on
+failure.  Together they make the lib enough to script and recreate a
+server's state from scratch.
+
+```cpp
+std::vector<easyai::RemoteModel> models;
+cli.list_models(models);                  // GET /v1/models
+
+std::vector<easyai::RemoteTool> tools;
+cli.list_remote_tools(tools);             // GET /v1/tools (easyai extension)
+
+if (!cli.health()) {                       // GET /health
+    std::fprintf(stderr, "down: %s\n", cli.last_error().c_str());
+}
+
+std::string props;
+cli.props(props);                          // GET /props (raw JSON)
+
+std::string prom;
+cli.metrics(prom);                         // GET /metrics (Prometheus text)
+
+cli.set_preset("creative");                // POST /v1/preset
+```
+
+### 4.8 The `easyai-cli-remote` binary as a reference
+
+Everything above is exposed as flags on `examples/cli_remote.cpp`.
+Read its source to see one possible "wire it all up" pattern; lift
+chunks into your own app verbatim.
+
+```bash
+# REPL with the default tool set (datetime, plan, web_search,
+# web_fetch, system_*); EASYAI_URL / EASYAI_API_KEY env vars work too.
+easyai-cli-remote --url http://ai.local:8080
+
+# One-shot scripted call with a custom tool whitelist:
+easyai-cli-remote --url https://api.openai.com \
+  --api-key $OPENAI_API_KEY --model gpt-4o-mini \
+  --tools datetime,plan,web_search,web_fetch \
+  -p "Investigate today's most-cited mamba arxiv papers; produce a 5-bullet summary."
+
+# Pin sampling + add stop sequences:
+easyai-cli-remote --url http://ai.local:8080 \
+  --temperature 0.0 --top-p 0.9 --seed 42 --stop "USER:" --stop "Q:" \
+  -p "Translate the next sentence to PT-BR: ..."
+
+# Non-standard reasoning_effort field via --extra-json:
+easyai-cli-remote --url https://api.openai.com --api-key $K --model o1-preview \
+  --extra-json '{"reasoning_effort":"high"}' \
+  -p "Plan the Mars-mission trajectory."
+
+# List local tools and exit (what the model will be told about):
+easyai-cli-remote --url http://x --list-tools
+
+# List server-side tools (easyai-server-only extension):
+easyai-cli-remote --url http://ai.local:8080 --list-remote-tools
+```
+
+REPL specials inside the interactive mode:
+
+| Command         | Effect                                                  |
+|-----------------|---------------------------------------------------------|
+| `/exit /quit`   | leave                                                   |
+| `/clear`        | clear conversation history (keep tools + system)        |
+| `/reset`        | clear history AND clear plan                            |
+| `/plan`         | re-print the plan checklist                             |
+| `/tools`        | list locally-registered tools                           |
+| `/help`         | show specials                                           |
+
+---
+
+## Part 5 — authoring custom tools
+
+This is the cookbook for adding tools the model can call.  Every tool
+in `libeasyai`'s built-in set was written exactly the way you'll
+write yours.
+
+### 5.1 Anatomy of a Tool
+
+```cpp
+struct Tool {
+    std::string name;
+    std::string description;
+    std::string parameters_json;      // JSON schema
+    ToolHandler handler;              // std::function<ToolResult(const ToolCall &)>;
+};
+```
+
+Four fields.  The first three feed the chat template's tool-call
+section so the model knows what's available; the fourth is your
+function pointer.
+
+### 5.2 Two ways to build a Tool
+
+**Builder** (the typed shorthand, generates the JSON schema for you):
+
+```cpp
+easyai::Tool::builder("weather")
+    .describe("Return the current weather for a city, in metric units.")
+    .param("city", "string", "Name of the city, e.g. 'Lisbon'", /*required=*/true)
+    .param("units", "string", "'metric' (default) or 'imperial'.",  false)
+    .handle([](const easyai::ToolCall & c) -> easyai::ToolResult {
+        std::string city  = easyai::args::get_string_or(c.arguments_json, "city",  "");
+        std::string units = easyai::args::get_string_or(c.arguments_json, "units", "metric");
+        if (city.empty()) return easyai::ToolResult::error("'city' is required");
+        // …call wttr.in…
+        return easyai::ToolResult::ok("23 °C, sunny");
+    })
+    .build();
+```
+
+**`Tool::make`** (raw schema string, when you need nested objects /
+enums / oneOf that the typed param API can't express):
+
+```cpp
+easyai::Tool::make(
+    "rgba_set",
+    "Set the LED RGBA at index.",
+    R"({"type":"object",
+        "properties":{
+          "i":{"type":"integer","minimum":0,"maximum":31},
+          "color":{"type":"object","properties":{
+            "r":{"type":"integer"},"g":{"type":"integer"},
+            "b":{"type":"integer"},"a":{"type":"integer"}
+          },"required":["r","g","b"]}
+        },
+        "required":["i","color"]})",
+    [](const easyai::ToolCall & c) -> easyai::ToolResult {
+        // For nested args, parse the JSON yourself; nlohmann is vendored
+        // by llama.cpp at vendor/nlohmann/json.hpp if you want it.
+        return easyai::ToolResult::ok("set");
+    });
+```
+
+### 5.3 Reading arguments without a JSON dependency
+
+`easyai::args::*` are tiny single-level scanners.  They're enough for
+~95% of tool authors:
+
+```cpp
+std::string  q   = args::get_string_or(c.arguments_json, "q", "");
+long long    max = args::get_int_or   (c.arguments_json, "max", 10);
+bool         dry = args::get_bool_or  (c.arguments_json, "dry_run", false);
+double       t   = args::get_double_or(c.arguments_json, "threshold", 0.5);
+bool         has = args::has          (c.arguments_json, "verbose");
+```
+
+For nested args (objects, arrays of objects), include
+`<nlohmann/json.hpp>` in your handler and parse normally — no easyai
+limitation there.
+
+### 5.4 Returning results
+
+```cpp
+return easyai::ToolResult::ok("the answer is 42");
+return easyai::ToolResult::error("network unreachable");
+```
+
+`error` results are tagged `is_error=true` so the streaming layer can
+render them differently (`✗` instead of `🔧` in the cli-remote
+output).  The model still sees the content — it's just hinted that
+the call failed.
+
+Best practices:
+
+* Keep ok-content short and structured (the model reads it as plain
+  text; line breaks are fine).
+* Truncate raw output to a reasonable budget — 8–16 KB is plenty.
+* Format errors as imperative ("missing 'path' argument") — the
+  model will often retry with the fix.
+
+### 5.5 Sandboxing
+
+The built-in `fs_*` family takes a root directory and refuses to
+escape it (`..` and absolute paths are rejected).  Pattern for your
+own filesystem-touching tools:
+
+```cpp
+easyai::Tool::builder("read_log")
+    .describe("Read the last N lines of a service log under /var/log.")
+    .param("name", "string", "Service name (e.g. 'easyai-server.service').", true)
+    .param("n",    "integer", "How many lines (max 5000). Default 200.",     false)
+    .handle([](const easyai::ToolCall & c) -> easyai::ToolResult {
+        std::string name = args::get_string_or(c.arguments_json, "name", "");
+        if (name.find('/') != std::string::npos)
+            return easyai::ToolResult::error("name must not contain slashes");
+        std::filesystem::path p = std::filesystem::path("/var/log") / (name + ".log");
+        if (!std::filesystem::exists(p))
+            return easyai::ToolResult::error("no log: " + p.string());
+        // …tail the file…
+        return easyai::ToolResult::ok("…");
+    })
+    .build();
+```
+
+### 5.6 The `Plan` tool
+
+`easyai::Plan` is a checklist with four sub-actions exposed as a
+single tool:
+
+```cpp
+easyai::Plan plan;
+cli.add_tool(plan.tool());      // or engine.add_tool(...)
+
+plan.on_change([](const easyai::Plan & p){
+    std::cout << "\n=== plan ===\n";
+    p.render(std::cout);          // GitHub-style "- [ ] / [~] / [x]" checklist
+});
+```
+
+The model is told it can call `plan(action="add"|"start"|"done"|"list", text=…, id=…)`.
+On non-trivial multi-step tasks, prompt it to "use the plan tool to
+break the task into steps and tick them off as you go" — works
+reliably with any tool-call-capable model (Qwen 2.5+, Llama 3+,
+DeepSeek, OpenAI o-series, Anthropic Claude via OpenAI-compat
+proxies).
+
+You can also seed the plan from your code before letting the model
+take over:
+
+```cpp
+plan.add("fetch arxiv listing");
+plan.add("triage by citation count");
+plan.add("draft 5-bullet digest");
+```
+
+### 5.7 Cookbook — system observability tools
+
+`examples/cli_remote.cpp` ships four inline `system_*` tools that
+read `/proc/*` and report back.  The whole pattern is:
+
+1. Read a `/proc` file with `ifstream`.
+2. Parse it (helper functions live in `namespace systools`).
+3. Format a human-readable string.
+4. Return `ToolResult::ok(text)`.
+
+These tools turn the cli-remote process into an observability agent
+that can answer "is the server paging?", "which CPU is hot?", "what
+swap device is configured?" — entirely model-driven.  Look at the
+file from the top (~line 60) for a guided tour with comments.
+
+To add your own:
+
+* `system_disk_usage` — `df -h` worth of info (read `/proc/mounts`,
+  call `statvfs`).
+* `system_processes` — `ps`-equivalent (walk `/proc/<pid>/stat`).
+* `system_network` — interfaces + traffic counters
+  (`/proc/net/dev`).
+
+Copy the existing helpers and ship.
+
+### 5.8 Hot-loading vs. registration
+
+Once you call `cli.add_tool(...)` (or `engine.add_tool(...)`) the
+tool is *registered for the lifetime of that object*.  There's no
+"unregister" — destroy the Client/Engine to drop them.  This is by
+design: the tool list is a property of the conversation contract
+(the model was told what's available); changing it mid-flight would
+confuse the chat-template renderer.
+
+If you need conditional tools per-conversation, build a fresh
+`Client` for that conversation.  `Client` is move-only; constructing
+one is cheap (no I/O until `chat()`).
+
+---
+
+## Part 6 — deploying easyai-server
+
+The official path on Linux is `scripts/install_easyai_server.sh`.
+Run it from a fresh checkout:
+
+```bash
+git clone https://github.com/solariun/easy.git
+git clone https://github.com/ggml-org/llama.cpp.git
+cd easy
+sudo scripts/install_easyai_server.sh \
+    --model /path/to/your-model.gguf \
+    --webui-title "Box AI" \
+    --enable-now
+```
+
+It detects the GPU backend (`nvidia-smi` → CUDA, `rocminfo` → ROCm,
+`vulkaninfo` / AMD `lspci` → Vulkan, else CPU), builds the right
+flavour, installs the libs into `/usr/lib/easyai/` (isolated from
+system), creates an `easyai` system user, and drops a hardened
+systemd unit with `mlock`, flash-attn, q8_0 KV cache, Bearer auth,
+and Prometheus `/metrics`.
+
+### 6.1 Frontend TLS via nginx
+
+`libeasyai-cli` already speaks HTTPS, but easyai-server itself is
+plain HTTP by design.  Terminate TLS at nginx:
+
+```nginx
+server {
+    listen 443 ssl http2;
+    server_name ai.example.com;
+    ssl_certificate     /etc/letsencrypt/live/ai.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/ai.example.com/privkey.pem;
+
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        # SSE keepalive — agentic loops can run minutes:
+        proxy_buffering    off;
+        proxy_read_timeout 600;
+        proxy_send_timeout 600;
+    }
+}
+```
+
+Then point the client at `https://ai.example.com` and the build's
+OpenSSL link will Just Work.
+
+### 6.2 Multiple models
+
+Run one easyai-server per model on different ports
+(`--port 8080` / `--port 8081`).  Have your client switch between
+them via `cli.endpoint(...)` — there is no notion of "model swap"
+inside a single server process by design.
+
+### 6.3 Updating without downtime
+
+```bash
+sudo scripts/install_easyai_server.sh --upgrade
+```
+
+The script does `git fetch` + `git pull --ff-only` + rebuild +
+`systemctl restart easyai-server` in that order.  In-flight SSE
+streams are aborted when the old process dies; the client gets a
+`HTTP request failed: connection closed` error and can retry.
+
+### 6.4 Backups
+
+Stateless except for whatever you put in `/var/lib/easyai/`
+(model files, sandboxed fs_* roots).  Snapshot that directory.
+
+---
+
+## Part 7 — operating the server
+
+### 7.1 Health & metrics
+
+* `GET /health` — JSON status.  Cheap, use it as a liveness probe.
+* `GET /metrics` — Prometheus text exposition (only when `--metrics`
+  was passed).  Counters: `easyai_requests_total`,
+  `easyai_tool_calls_total`, `easyai_errors_total`.
+* `GET /props` — full server config snapshot (n_ctx, model alias,
+  build info).
+
+### 7.2 Live preset switching
+
+```bash
+curl -H 'Content-Type: application/json' \
+     -d '{"preset":"creative"}' \
+     http://ai.local:8080/v1/preset
+```
+
+Or from the lib:
+
+```cpp
+cli.set_preset("creative");
+```
+
+Affects subsequent requests until changed again.  Per-request
+sampling (set in the request body) still wins for that one call.
+
+### 7.3 Verbose mode
+
+`--enable-verbose` (installer flag) or `--verbose` (binary flag) makes
+the engine log raw model output, parser actions, and SSE events to
+stderr.  Tail it with `journalctl -u easyai-server -f`.
+
+### 7.4 Crash capture
+
+`scripts/install_easyai_server.sh` installs `systemd-coredump` and
+sets `LimitCORE=infinity` on the unit.  When the process dies:
+
+```bash
+coredumpctl list easyai-server.service
+coredumpctl gdb <PID>      # opens gdb on the most recent core
+```
+
+---
+
+## Part 8 — performance & tuning
+
+### 8.1 Context size vs. throughput
+
+`-c, --ctx N` sets the model's sequence window.  Bigger ctx = more
+KV cache memory per token.  Rule of thumb on Vulkan/RADV with
+gfx1035: keep ctx + n_predict ≤ what fits in `--ngl auto`.
+
+### 8.2 KV cache quantisation
+
+`--cache-type-k q8_0 --cache-type-v q8_0` cuts KV memory ~3× vs.
+default `f16` with negligible quality loss for chat workloads.  The
+installer ships `q8_0` by default.
+
+### 8.3 flash-attn
+
+`--flash-attn` enables fused attention — faster + less memory on
+backends that support it.  CUDA and Metal: yes.  Vulkan: works on
+RDNA2+ with recent llama.cpp (validated on gfx1035).
+
+### 8.4 mlock
+
+`--mlock` pins the model in RAM so the OS can't page it out under
+pressure.  Required on the AI box because GTT-mapped pages would
+otherwise be swap candidates.  Needs `LimitMEMLOCK=infinity` in the
+systemd unit (the installer sets this).
+
+### 8.5 Sampling
+
+Presets order:
+* `deterministic`  — temp 0.0, greedy.  Best for code / format-strict.
+* `precise`        — temp 0.2.  Default for tool-call workloads.
+* `balanced`       — temp 0.7.  Good general default.
+* `creative`       — temp 1.0, top_p 0.95.  Open-ended writing.
+* `wild`           — temp 1.4 + relaxed.  Brainstorming, comedy.
+
+Per-request: pin temp + top_p + top_k + min_p in the request body
+(via the `--temperature` / `--top-p` / etc. flags on cli-remote, or
+the matching `Client::*` setters in code).
+
+### 8.6 Tool budget
+
+`Engine::chat()` caps at 8 tool hops; `Client::chat()` does the
+same.  A model that runs away calling tools without converging will
+hit the cap and bail out with the last partial answer.  Visible in
+verbose mode as `[easyai] hop 7: …`.
+
+---
+
+## Part 9 — recipes (cookbook)
+
+### 9.0 `easyai-cli` against any OpenAI-compatible endpoint
 
 `easyai-cli` runs a REPL in two modes that share the same UI: local model
 (`-m model.gguf`) or remote server (`--url <api-base>`). Same preset
@@ -963,7 +1588,7 @@ answer=$(./build/easyai-cli -m model.gguf -p "summarise: $(cat file.txt)")
 from output. The filter is streaming-aware and works even when the open or
 close tag is split across two model-emitted token chunks.
 
-### 4.1 Web search
+### 9.1 Web search
 
 `web_search` works out of the box — it talks to DuckDuckGo's HTML endpoint
 directly via libcurl. There is nothing to configure and no API key.
@@ -974,11 +1599,11 @@ error message instead of silently failing. If you need a different backend
 `src/builtin_tools.cpp::web_search()` — copy that handler, swap the URL and
 the regex pair, and register your variant via `engine.add_tool(my_search())`.
 
-### 4.2 Forcing CPU-only
+### 9.2 Forcing CPU-only
 
 Pass `--ngl 0` (CLI/server) or `engine.gpu_layers(0)` (lib).
 
-### 4.3 Force-disable a built-in tool
+### 9.3 Force-disable a built-in tool
 
 Just don't add it. There is no global "remove" — easyai has no global
 state. To run `easyai-cli` without any tools at all:
@@ -989,7 +1614,7 @@ state. To run `easyai-cli` without any tools at all:
 
 For the server: same flag, `--no-tools`.
 
-### 4.4 Production deployment — replacing `llama-server`
+### 9.4 Production deployment — replacing `llama-server`
 
 `easyai-server` is a drop-in replacement for `llama-server` for almost
 every flag a deployment script cares about. A long-running production
@@ -1041,7 +1666,7 @@ When `--api-key` is set, every `/v1/*` request must carry
 (`easyai_requests_total`, `easyai_errors_total`, `easyai_tool_calls_total`)
 that you can wire into Grafana or alertmanager.
 
-### 4.5 Behind a reverse proxy
+### 9.5 Behind a reverse proxy
 
 The server speaks plain HTTP and supports CORS. Stick nginx/Caddy in front
 to add TLS, auth, and rate limiting. Example Caddyfile:
@@ -1055,7 +1680,7 @@ ai.example.com {
 }
 ```
 
-### 4.6 Multiple models, one host
+### 9.6 Multiple models, one host
 
 Run one `easyai-server` per model on different ports, then add a tiny
 proxy that maps `model` field → upstream port. The single-mutex design
@@ -1063,7 +1688,7 @@ inside one server is the right unit; between servers you scale by process.
 
 ---
 
-## Part 5 — troubleshooting
+## Part 10 — troubleshooting
 
 ### "load failed: failed to load model"
 
@@ -1114,16 +1739,122 @@ It's actually fine — the printed line "stopped cleanly" tells the truth.
 Some shells/wrappers report a non-zero code because of the signal, but
 `main()` returned 0.
 
+### `easyai::Client` — "HTTPS endpoint requires OpenSSL"
+
+Configure-time message in the cmake summary:
+
+```
+-- easyai-cli: OpenSSL NOT found — HTTPS endpoints will be rejected at runtime
+```
+
+Install `libssl-dev` (Debian / Ubuntu) or `openssl-devel` (Fedora /
+RHEL), wipe the build dir, and reconfigure.  At runtime the
+`Client::endpoint("https://…")` call will then succeed.
+
+If your server uses a self-signed cert, either:
+
+* `cli.tls_insecure(true);` — DEV ONLY, skips peer verification.
+* `cli.ca_cert_path("/path/to/ca.pem");` — trust a custom CA bundle.
+
+The `cli-remote` binary exposes the same as `--insecure-tls` and
+`--ca-cert PATH`.
+
+### `easyai::Client` — "HTTP request failed: …"
+
+The full text after the colon is what cpp-httplib reported:
+
+* `Connection refused` — the server isn't listening on that
+  host/port. Check `--url` value and `nc -vz host port`.
+* `SSL handshake failed` — TLS mismatch.  Check the cert hostname
+  matches what you're connecting to, the chain is complete, and that
+  your client's CA store has the issuer (or pass `--ca-cert`).
+* `read timeout` — the model is taking longer than
+  `--timeout`.  Bump it (`--timeout 1200`) or raise it in code
+  (`cli.timeout_seconds(1200)`).
+
+### `cli-remote` — `Output: 0 / 128000 (0%)` even after a long reply
+
+The cumulative ctx counter on `easyai-server`'s webui needs the new
+`ctx_used` field that the server only added in commit `d7f638e`.
+On older builds you'll see the per-request count instead — upgrade
+the server or just ignore the bar's percentage.
+
+### Model "abandons" `<tool_call>` mid-conversation, emits markdown
+
+After 2-3 successful tool calls some Qwen3 fine-tunes give up on the
+XML format and output `*🔧 toolname(args)*` in markdown instead.
+Engine recovers automatically (commit `46903e3`); look for this line
+in `journalctl -u easyai-server`:
+
+```
+[easyai] recovered N tool call(s) from markdown markers (model abandoned <tool_call> syntax — agentic loop continues)
+```
+
+If you see the message and the loop continues, you're fine.  If not,
+add `--enable-verbose` and check `journalctl` for `[easyai] hop N
+raw tail:` lines — those show what the model actually emitted, which
+helps tune the system prompt.
+
+### `web_search` — "no results parsed (DuckDuckGo may have rate-limited…)"
+
+DuckDuckGo's HTML endpoint serves a CAPTCHA / "anomaly" page when it
+suspects a bot.  Wait a minute, lower request rate, or use a
+different network.  No API key option exists — that's the point of
+the DDG-HTML approach.
+
+### Conversation feels stale / model insists on outdated info
+
+Knowledge cutoff is real and the model can't tell what date it is
+unless told.  Easiest fix: enable `datetime` in the tool list and
+prompt it to call that first when in doubt.  An even harder
+constraint can be enforced at the server level — see the upcoming
+"authoritative datetime injection" feature on easyai-server (commit
+soon to follow).
+
 ---
 
-## Part 6 — design references
+## Part 11 — design references
 
 If you want to go deeper:
 
-* `design.md` — internal architecture and "why" decisions.
-* `include/easyai/engine.hpp` — every public method, with doc comments.
-* `src/engine.cpp` — the `chat()` loop is annotated step by step.
+* `design.md` — internal architecture and "why" decisions, including
+  Section 0 (full dependency inventory: llama, cpp-httplib,
+  nlohmann::json, libcurl, OpenSSL, …) and Section 5b (the
+  OpenAI-protocol client agentic loop).
+* `include/easyai/engine.hpp` — every public method of the local
+  engine, with doc comments.
+* `include/easyai/client.hpp` — every public method of the OpenAI
+  client lib, mirroring `engine.hpp` shape.
+* `include/easyai/tool.hpp` — `Tool`, `ToolCall`, `ToolResult`,
+  `Tool::Builder` (used identically by `Engine` and `Client`).
+* `include/easyai/plan.hpp` — `Plan` checklist + `Plan::tool()`
+  factory.
+* `include/easyai/builtin_tools.hpp` — factories for `datetime`,
+  `web_search`, `web_fetch`, `fs_*`.
+* `include/easyai/presets.hpp` — sampling presets and the runtime
+  override parser (`/temp`, `creative 0.9`, …).
+* `src/engine.cpp` — the `chat()` loop is annotated step by step;
+  three-layer tool-call recovery (Qwen / Hermes / markdown) lives in
+  `parse_assistant`.
+* `src/client.cpp` — HTTP/SSE transport, agentic loop mirroring
+  `Engine::chat_continue`, request-body assembly with the full
+  sampling/penalty surface.
+* `src/plan.cpp` — multi-action plan tool with `add/start/done/list`.
 * `examples/server.cpp` — the per-request flow is annotated; great
   starting point for a custom HTTP layer.
+* `examples/cli_remote.cpp` — REPL + management subcommands +
+  inline `system_*` tools, doubles as the cookbook for adding your
+  own tool to a `Client`-based agent.
+* `scripts/install_easyai_server.sh` — production deployment as a
+  hardened systemd unit on Linux (CUDA / ROCm / Vulkan / CPU
+  auto-detect, mlock, flash-attn, q8_0 KV).
+* `cmake/easyaiConfig.cmake.in` — the find_package shim;
+  `find_package(easyai 0.1 REQUIRED)` returns
+  `easyai::engine` (libeasyai) and `easyai::cli` (libeasyai-cli) as
+  IMPORTED targets your project links against.
+* `SESSION_NOTES.md` — running project journal: recent commits,
+  pending validations, common pitfalls.  Useful for resuming context
+  in a fresh chat.
+* `README.md` — top-level pitch + selective-build cheatsheet.
 
 Happy hacking.
