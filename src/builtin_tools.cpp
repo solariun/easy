@@ -207,27 +207,84 @@ static std::string decode_ddg_redirect(const std::string & href) {
 }
 
 #if defined(EASYAI_HAVE_CURL)
+
+// Capped write callback — bails out the moment the body exceeds the
+// configured max.  We can't trust the server's Content-Length (or
+// chunked-transfer absence of one), so policing in the callback is the
+// only way to keep RAM bounded against an adversarial endpoint.
+struct HttpSink {
+    std::string * body;
+    size_t        max_bytes;
+    bool          truncated = false;
+};
+
 static size_t curl_write_cb(void * buf, size_t sz, size_t n, void * ud) {
-    auto * out = static_cast<std::string *>(ud);
-    out->append(static_cast<char *>(buf), sz * n);
-    return sz * n;
+    auto * sink = static_cast<HttpSink *>(ud);
+    const size_t incoming = sz * n;
+    const size_t already  = sink->body->size();
+    if (already >= sink->max_bytes) {
+        // Already at the cap — pretend we accepted to keep curl happy
+        // (returning 0 here would force curl to abort with an error,
+        // which we don't want — we just want to truncate).
+        sink->truncated = true;
+        return incoming;
+    }
+    const size_t room = sink->max_bytes - already;
+    const size_t take = (incoming <= room) ? incoming : room;
+    sink->body->append(static_cast<char *>(buf), take);
+    if (take < incoming) sink->truncated = true;
+    return incoming;
+}
+
+// SECURITY: refuse non-http(s) URLs at the top of every fetch.  Without
+// this gate, the model could ask for `file:///etc/passwd`, `gopher://...`,
+// or `dict://internal`, all of which curl supports by default.  We also
+// pin CURLOPT_PROTOCOLS to belt-and-braces the same restriction at the
+// transport layer.
+static bool url_is_safe_scheme(const std::string & url) {
+    auto lower_starts_with = [&](const char * p) {
+        size_t n = std::strlen(p);
+        if (url.size() < n) return false;
+        for (size_t i = 0; i < n; ++i) {
+            char a = url[i], b = p[i];
+            if (a >= 'A' && a <= 'Z') a = (char) (a + 32);
+            if (a != b) return false;
+        }
+        return true;
+    };
+    return lower_starts_with("http://") || lower_starts_with("https://");
 }
 
 static bool http_get(const std::string & url,
                      const std::vector<std::string> & extra_headers,
                      std::string & body, std::string & err,
                      long timeout_s = 20, long max_bytes = 2 * 1024 * 1024) {
+    if (!url_is_safe_scheme(url)) {
+        err = "only http:// and https:// URLs are allowed";
+        return false;
+    }
+
     CURL * c = curl_easy_init();
     if (!c) { err = "curl_easy_init failed"; return false; }
 
     body.clear();
+    HttpSink sink{ &body, (size_t) max_bytes, false };
     curl_easy_setopt(c, CURLOPT_URL, url.c_str());
     curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(c, CURLOPT_MAXREDIRS, 5L);
+#ifdef CURLOPT_PROTOCOLS_STR
+    curl_easy_setopt(c, CURLOPT_PROTOCOLS_STR,         "http,https");
+    curl_easy_setopt(c, CURLOPT_REDIR_PROTOCOLS_STR,   "http,https");
+#else
+    curl_easy_setopt(c, CURLOPT_PROTOCOLS,
+                     (long) (CURLPROTO_HTTP | CURLPROTO_HTTPS));
+    curl_easy_setopt(c, CURLOPT_REDIR_PROTOCOLS,
+                     (long) (CURLPROTO_HTTP | CURLPROTO_HTTPS));
+#endif
     curl_easy_setopt(c, CURLOPT_TIMEOUT, timeout_s);
     curl_easy_setopt(c, CURLOPT_USERAGENT, "easyai/0.1 (+https://github.com/)");
     curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, curl_write_cb);
-    curl_easy_setopt(c, CURLOPT_WRITEDATA, &body);
+    curl_easy_setopt(c, CURLOPT_WRITEDATA, &sink);
     curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(c, CURLOPT_ACCEPT_ENCODING, "");
 
@@ -249,7 +306,6 @@ static bool http_get(const std::string & url,
         err = "HTTP " + std::to_string(http_code);
         return false;
     }
-    if ((long) body.size() > max_bytes) body.resize(max_bytes);
     return true;
 }
 
@@ -260,20 +316,34 @@ static bool http_post_form(const std::string & url,
                            std::string & body, std::string & err,
                            long timeout_s = 20,
                            long max_bytes = 4 * 1024 * 1024) {
+    if (!url_is_safe_scheme(url)) {
+        err = "only http:// and https:// URLs are allowed";
+        return false;
+    }
     CURL * c = curl_easy_init();
     if (!c) { err = "curl_easy_init failed"; return false; }
 
     body.clear();
+    HttpSink sink{ &body, (size_t) max_bytes, false };
     curl_easy_setopt(c, CURLOPT_URL,             url.c_str());
     curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION,  1L);
     curl_easy_setopt(c, CURLOPT_MAXREDIRS,       5L);
+#ifdef CURLOPT_PROTOCOLS_STR
+    curl_easy_setopt(c, CURLOPT_PROTOCOLS_STR,         "http,https");
+    curl_easy_setopt(c, CURLOPT_REDIR_PROTOCOLS_STR,   "http,https");
+#else
+    curl_easy_setopt(c, CURLOPT_PROTOCOLS,
+                     (long) (CURLPROTO_HTTP | CURLPROTO_HTTPS));
+    curl_easy_setopt(c, CURLOPT_REDIR_PROTOCOLS,
+                     (long) (CURLPROTO_HTTP | CURLPROTO_HTTPS));
+#endif
     curl_easy_setopt(c, CURLOPT_TIMEOUT,         timeout_s);
     // A real-browser User-Agent is required by html.duckduckgo.com.
     curl_easy_setopt(c, CURLOPT_USERAGENT,
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_5) AppleWebKit/605.1.15 "
         "(KHTML, like Gecko) Version/16.6 Safari/605.1.15");
     curl_easy_setopt(c, CURLOPT_WRITEFUNCTION,   curl_write_cb);
-    curl_easy_setopt(c, CURLOPT_WRITEDATA,       &body);
+    curl_easy_setopt(c, CURLOPT_WRITEDATA,       &sink);
     curl_easy_setopt(c, CURLOPT_NOSIGNAL,        1L);
     curl_easy_setopt(c, CURLOPT_ACCEPT_ENCODING, "");
     curl_easy_setopt(c, CURLOPT_POST,            1L);
@@ -295,7 +365,6 @@ static bool http_post_form(const std::string & url,
 
     if (rc != CURLE_OK)   { err = curl_easy_strerror(rc); return false; }
     if (http_code >= 400) { err = "HTTP " + std::to_string(http_code); return false; }
-    if ((long) body.size() > max_bytes) body.resize(max_bytes);
     return true;
 }
 #endif
@@ -495,6 +564,12 @@ struct Sandbox {
     }
     // Resolve a user-supplied path inside the sandbox; returns false if it
     // escapes the root.
+    //
+    // SECURITY: the containment check must be PATH-COMPONENT aware, not a
+    // raw string-prefix.  Otherwise a sandbox at "/srv/user" would be
+    // happily satisfied by "/srv/userMALICIOUS/secrets" (same prefix,
+    // different directory tree).  We require canonical to either equal
+    // root or have root + path-separator as its prefix.
     bool resolve(const std::string & in, fs::path & out, std::string & err) const {
         fs::path p = in;
         if (!p.is_absolute()) p = root / p;
@@ -502,9 +577,15 @@ struct Sandbox {
         fs::path canon = fs::weakly_canonical(p, ec);
         if (canon.empty()) canon = p.lexically_normal();
 
-        auto rs = root.string();
-        auto cs = canon.string();
-        if (cs.compare(0, rs.size(), rs) != 0) {
+        const std::string rs = root.string();
+        const std::string cs = canon.string();
+        const bool inside =
+            cs == rs ||
+            (cs.size() > rs.size()
+             && cs.compare(0, rs.size(), rs) == 0
+             && (cs[rs.size()] == fs::path::preferred_separator
+                 || cs[rs.size()] == '/'));
+        if (!inside) {
             err = "path escapes sandbox root: " + cs;
             return false;
         }
@@ -640,14 +721,21 @@ Tool fs_glob(std::string root) {
                 }
             }
             re += "$";
-            std::regex rx(re);
+            std::regex rx;
+            try { rx = std::regex(re); }
+            catch (const std::regex_error & e) {
+                return ToolResult::error(std::string("bad glob pattern: ") + e.what());
+            }
 
             std::ostringstream o;
             int n = 0;
             for (auto & e : fs::recursive_directory_iterator(start)) {
                 if (!e.is_regular_file()) continue;
                 std::string rel = fs::relative(e.path(), sb->root).generic_string();
-                if (std::regex_match(rel, rx)) {
+                bool m = false;
+                try { m = std::regex_match(rel, rx); }
+                catch (const std::regex_error &) { /* unsupported; skip entry */ }
+                if (m) {
                     o << rel << "\n";
                     if (++n >= 500) { o << "...[stopped at 500 matches]\n"; break; }
                 }
