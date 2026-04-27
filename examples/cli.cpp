@@ -30,6 +30,7 @@
 // =============================================================================
 
 #include "easyai/easyai.hpp"
+#include "easyai/client.hpp"   // RemoteBackend uses libeasyai-cli for HTTP/SSE
 
 #include <atomic>
 #include <chrono>
@@ -45,10 +46,11 @@
 #include <string>
 #include <vector>
 
+// libcurl is only used by the LOCAL backend's web tools (web_fetch /
+// web_search) — the REMOTE backend now goes through libeasyai-cli's
+// httplib transport, which has its own HTTPS support via OpenSSL.
 #if defined(EASYAI_HAVE_CURL)
 #include <curl/curl.h>
-#include <nlohmann/json.hpp>
-using nlohmann::json;
 #endif
 
 // ============================================================================
@@ -360,127 +362,34 @@ class LocalBackend final : public Backend {
 };
 
 // ============================================================================
-//  RemoteBackend — talks OpenAI-compatible HTTP via libcurl.
+//  RemoteBackend — talks OpenAI-compatible HTTP via libeasyai-cli.
 //
-//  History is kept client-side (OpenAI's API is stateless). Each chat() does:
-//    1. Append user message.
-//    2. POST /chat/completions with stream=true.
-//    3. Parse SSE chunks; fire on_token for each delta; accumulate full text.
-//    4. Append assistant message.
-//    5. Return final text.
+//  Was a ~270-line manual curl + SSE parser.  Now it's a thin shim over
+//  easyai::Client which already does:
+//    * HTTP and HTTPS (the latter when libssl-dev was found at configure
+//      time and CPPHTTPLIB_OPENSSL_SUPPORT got compiled in)
+//    * SSE parsing with the same delta.{content,reasoning_content,
+//      tool_calls} routing the easyai-cli-remote binary uses
+//    * History persistence as raw OpenAI-shape JSON strings
+//    * Bearer auth + connection timeouts + fluent sampling overrides
 //
-//  Compiled out when libcurl isn't available — we still let the binary build
-//  so people can use easyai-cli purely as a local CLI.
+//  Per-Backend tools are NOT registered on the Client — easyai-cli's
+//  --url mode is meant to behave like a vanilla OpenAI client.  If the
+//  user wants local tool dispatch, they should reach for the
+//  easyai-cli-remote binary instead, which is purpose-built for that.
 // ============================================================================
-#if defined(EASYAI_HAVE_CURL)
-
-namespace {
-
-// libcurl handle owned by unique_ptr with the right deleter.
-struct CurlDeleter { void operator()(CURL * c) const { if (c) curl_easy_cleanup(c); } };
-using CurlPtr = std::unique_ptr<CURL, CurlDeleter>;
-
-// curl_slist owned likewise.
-struct SListDeleter { void operator()(curl_slist * s) const { if (s) curl_slist_free_all(s); } };
-using SListPtr = std::unique_ptr<curl_slist, SListDeleter>;
-
-// Streaming write context for SSE parsing.
-struct StreamCtx {
-    std::string                                buffer;     // bytes still being assembled into events
-    std::string                                final_text; // accumulated assistant content
-    std::function<void(const std::string &)>   on_piece;
-    bool                                       saw_done = false;
-};
-
-// libcurl write callback: called for each chunk of HTTP response body.
-size_t curl_stream_cb(char * ptr, size_t size, size_t nmemb, void * userdata) {
-    auto * ctx = static_cast<StreamCtx *>(userdata);
-    const size_t n = size * nmemb;
-    ctx->buffer.append(ptr, n);
-
-    // SSE events are separated by a blank line. Keep popping complete events
-    // off the front of the buffer until we hit a partial one.
-    for (;;) {
-        size_t pos = ctx->buffer.find("\n\n");
-        if (pos == std::string::npos) break;
-        std::string event = ctx->buffer.substr(0, pos);
-        ctx->buffer.erase(0, pos + 2);
-
-        // An event consists of one or more "field: value" lines. The OpenAI
-        // protocol only ever uses the "data:" field. Concatenate all data:
-        // values inside this event (some servers split them).
-        std::string payload;
-        size_t line_start = 0;
-        while (line_start <= event.size()) {
-            size_t line_end = event.find('\n', line_start);
-            if (line_end == std::string::npos) line_end = event.size();
-            std::string line = event.substr(line_start, line_end - line_start);
-            if (!line.empty() && line.back() == '\r') line.pop_back();
-            if (line.compare(0, 5, "data:") == 0) {
-                size_t v = line.find_first_not_of(" \t", 5);
-                if (v != std::string::npos) {
-                    if (!payload.empty()) payload += '\n';
-                    payload += line.substr(v);
-                } else {
-                    if (!payload.empty()) payload += '\n';
-                }
-            }
-            if (line_end >= event.size()) break;
-            line_start = line_end + 1;
-        }
-
-        if (payload.empty()) continue;
-        if (payload == "[DONE]") { ctx->saw_done = true; continue; }
-
-        try {
-            auto j = json::parse(payload);
-            if (j.contains("choices") && j["choices"].is_array() &&
-                !j["choices"].empty()) {
-                const auto & ch = j["choices"][0];
-                if (ch.contains("delta") && ch["delta"].is_object()) {
-                    const auto & d = ch["delta"];
-                    if (d.contains("content") && d["content"].is_string()) {
-                        std::string piece = d["content"].get<std::string>();
-                        if (!piece.empty()) {
-                            ctx->final_text += piece;
-                            if (ctx->on_piece) ctx->on_piece(piece);
-                        }
-                    }
-                }
-            }
-        } catch (const std::exception &) {
-            // Malformed payload — ignore and keep streaming.
-        }
-    }
-    return n;
-}
-
-// Append "/chat/completions" to the base URL if not already present.
-std::string compose_chat_url(std::string base) {
-    while (!base.empty() && base.back() == '/') base.pop_back();
-    static const std::string suffix = "/chat/completions";
-    if (base.size() >= suffix.size() &&
-        base.compare(base.size() - suffix.size(), suffix.size(), suffix) == 0) {
-        return base;
-    }
-    return base + suffix;
-}
-
-}  // namespace
 
 class RemoteBackend final : public Backend {
    public:
     struct Config {
-        std::string base_url;       // e.g. "http://127.0.0.1:8080/v1"
+        std::string base_url;       // e.g. "http://127.0.0.1:8080" (or "/v1")
         std::string api_key;        // optional Bearer token
         std::string model = "easyai";
         std::string system_prompt;
         easyai::Preset preset{};
         long timeout_seconds = 300;
-        // Optional sampling/decoder overrides — passed through to the server
-        // in the JSON body.  -1 / 0 means "leave it to the server".
-        int      max_tokens = -1;
-        uint32_t seed       = 0u;
+        int      max_tokens  = -1;
+        long long seed       = -1;
     };
 
     explicit RemoteBackend(Config c) : cfg_(std::move(c)) {
@@ -488,133 +397,43 @@ class RemoteBackend final : public Backend {
             const auto * p = easyai::find_preset("balanced");
             if (p) cfg_.preset = *p;
         }
-        url_ = compose_chat_url(cfg_.base_url);
-        if (!cfg_.system_prompt.empty()) {
-            history_.push_back({{"role","system"},{"content",cfg_.system_prompt}});
-        }
+        rebuild_client_();
     }
 
     bool init(std::string & err) override {
-        // Single global init per-process is recommended — cheap to call repeatedly.
-        curl_global_init(CURL_GLOBAL_DEFAULT);
-        if (!cfg_.base_url.empty()) return true;
-        err = "remote backend: --url is required";
-        return false;
+        if (cfg_.base_url.empty()) {
+            err = "remote backend: --url is required";
+            return false;
+        }
+        return true;
     }
 
     std::string chat(const std::string & user_text, const Tokenizer & cb) override {
-        history_.push_back({{"role","user"},{"content",user_text}});
-
-        json body;
-        body["model"]       = cfg_.model;
-        body["messages"]    = history_;
-        body["temperature"] = cfg_.preset.temperature;
-        body["top_p"]       = cfg_.preset.top_p;
-        body["stream"]      = true;
-        // top_k / min_p are non-standard OpenAI fields but supported by
-        // easyai-server, ollama, vLLM, etc. Sent as best-effort hints.
-        if (cfg_.preset.top_k > 0) body["top_k"] = cfg_.preset.top_k;
-        if (cfg_.preset.min_p > 0) body["min_p"] = cfg_.preset.min_p;
-        if (cfg_.max_tokens   > 0) body["max_tokens"] = cfg_.max_tokens;
-        if (cfg_.seed         > 0) body["seed"]       = cfg_.seed;
-
-        const std::string body_str = body.dump();
-
-        StreamCtx ctx;
-        ctx.on_piece = cb;
-
-        CurlPtr curl(curl_easy_init());
-        if (!curl) { last_err_ = "curl_easy_init failed"; return {}; }
-
-        // headers
-        SListPtr headers(curl_slist_append(nullptr, "Content-Type: application/json"));
-        headers.reset(curl_slist_append(headers.release(), "Accept: text/event-stream"));
-        std::string auth;
-        if (!cfg_.api_key.empty()) {
-            auth = "Authorization: Bearer " + cfg_.api_key;
-            headers.reset(curl_slist_append(headers.release(), auth.c_str()));
-        }
-
-        curl_easy_setopt(curl.get(), CURLOPT_URL,             url_.c_str());
-        curl_easy_setopt(curl.get(), CURLOPT_HTTPHEADER,      headers.get());
-        curl_easy_setopt(curl.get(), CURLOPT_POST,            1L);
-        curl_easy_setopt(curl.get(), CURLOPT_POSTFIELDS,      body_str.c_str());
-        curl_easy_setopt(curl.get(), CURLOPT_POSTFIELDSIZE,   (long) body_str.size());
-        curl_easy_setopt(curl.get(), CURLOPT_WRITEFUNCTION,   curl_stream_cb);
-        curl_easy_setopt(curl.get(), CURLOPT_WRITEDATA,       &ctx);
-        curl_easy_setopt(curl.get(), CURLOPT_TIMEOUT,         cfg_.timeout_seconds);
-        curl_easy_setopt(curl.get(), CURLOPT_FOLLOWLOCATION,  1L);
-        curl_easy_setopt(curl.get(), CURLOPT_MAXREDIRS,       5L);
-        curl_easy_setopt(curl.get(), CURLOPT_NOSIGNAL,        1L);
-        curl_easy_setopt(curl.get(), CURLOPT_USERAGENT,       "easyai-cli/0.1");
-
-        CURLcode rc = curl_easy_perform(curl.get());
-        long http_code = 0;
-        curl_easy_getinfo(curl.get(), CURLINFO_RESPONSE_CODE, &http_code);
-
-        if (rc != CURLE_OK) {
-            last_err_ = std::string("curl: ") + curl_easy_strerror(rc);
-            // roll back the user message we tentatively added so the next
-            // call doesn't include it twice.
-            if (!history_.empty()) history_.pop_back();
+        client_->on_token(cb);
+        // libeasyai-cli runs the agentic loop and returns the final visible
+        // content; cb is fired for each delta.content piece along the way.
+        std::string answer = client_->chat(user_text);
+        if (answer.empty() && !client_->last_error().empty()) {
+            last_err_ = client_->last_error();
             return {};
         }
-        if (http_code >= 400) {
-            // Try to surface the server's JSON error if any was buffered.
-            std::string msg = "HTTP " + std::to_string(http_code);
-            if (!ctx.buffer.empty()) {
-                msg += " — " + ctx.buffer.substr(0, 512);
-            }
-            last_err_ = std::move(msg);
-            if (!history_.empty()) history_.pop_back();
-            return {};
-        }
-
-        // ----- non-streaming fallback -------------------------------------
-        // If we asked for stream=true but the server replied with a single
-        // JSON body (some endpoints just ignore the flag), our SSE parser
-        // won't have produced any deltas. In that case parse what's left in
-        // the buffer as a regular chat-completion response.
-        if (ctx.final_text.empty() && !ctx.buffer.empty()) {
-            try {
-                auto j = json::parse(ctx.buffer);
-                if (j.contains("choices") && j["choices"].is_array() &&
-                    !j["choices"].empty()) {
-                    const auto & m = j["choices"][0]["message"];
-                    if (m.contains("content") && m["content"].is_string()) {
-                        ctx.final_text = m["content"].get<std::string>();
-                        if (cb && !ctx.final_text.empty()) cb(ctx.final_text);
-                    }
-                } else if (j.contains("error")) {
-                    last_err_ = "remote error: " + j["error"].dump();
-                    if (!history_.empty()) history_.pop_back();
-                    return {};
-                }
-            } catch (const std::exception &) {
-                // Body wasn't JSON either — leave final_text empty.
-            }
-        }
-
-        // Append assistant turn so future requests see the full conversation.
-        history_.push_back({{"role","assistant"},{"content",ctx.final_text}});
-        return ctx.final_text;
+        return answer;
     }
 
     void reset() override {
-        history_.clear();
-        if (!cfg_.system_prompt.empty()) {
-            history_.push_back({{"role","system"},{"content",cfg_.system_prompt}});
-        }
+        client_->clear_history();
+        last_err_.clear();
     }
     void set_system(const std::string & t) override {
         cfg_.system_prompt = t;
-        reset();
+        rebuild_client_();
     }
     void set_sampling(float t, float p, int k, float m) override {
         if (t >= 0) cfg_.preset.temperature = t;
         if (p >= 0) cfg_.preset.top_p       = p;
         if (k >= 0) cfg_.preset.top_k       = k;
         if (m >= 0) cfg_.preset.min_p       = m;
+        push_sampling_();
     }
     std::string info() const override {
         std::ostringstream o;
@@ -628,13 +447,29 @@ class RemoteBackend final : public Backend {
     std::vector<std::pair<std::string,std::string>> tool_list() const override { return {}; }
 
    private:
-    Config              cfg_;
-    std::string         url_;
-    std::vector<json>   history_;
-    std::string         last_err_;
-};
+    void rebuild_client_() {
+        client_ = std::make_unique<easyai::Client>();
+        client_->endpoint(cfg_.base_url)
+                .model   (cfg_.model)
+                .timeout_seconds((int) cfg_.timeout_seconds);
+        if (!cfg_.api_key.empty())       client_->api_key(cfg_.api_key);
+        if (!cfg_.system_prompt.empty()) client_->system (cfg_.system_prompt);
+        push_sampling_();
+        if (cfg_.max_tokens > 0) client_->max_tokens(cfg_.max_tokens);
+        if (cfg_.seed       >= 0) client_->seed     (cfg_.seed);
+    }
+    void push_sampling_() {
+        if (!client_) return;
+        if (cfg_.preset.temperature >= 0)  client_->temperature(cfg_.preset.temperature);
+        if (cfg_.preset.top_p       >= 0)  client_->top_p      (cfg_.preset.top_p);
+        if (cfg_.preset.top_k       >  0)  client_->top_k      (cfg_.preset.top_k);
+        if (cfg_.preset.min_p       >  0)  client_->min_p      (cfg_.preset.min_p);
+    }
 
-#endif  // EASYAI_HAVE_CURL
+    Config                              cfg_;
+    std::unique_ptr<easyai::Client>     client_;
+    std::string                         last_err_;
+};
 
 // ============================================================================
 //  Argument parsing

@@ -147,7 +147,11 @@ if (EASYAI_BUILD_EXAMPLES)
     endif()
 
     add_executable(easyai-cli examples/cli.cpp)
-    target_link_libraries(easyai-cli PRIVATE easyai)
+    # Links libeasyai-cli (which transitively pulls in libeasyai) so the
+    # RemoteBackend can drive a remote OpenAI-compatible endpoint via
+    # easyai::Client (HTTP + HTTPS via cpp-httplib + OpenSSL).  libcurl
+    # is now only needed for the LOCAL backend's web tools.
+    target_link_libraries(easyai-cli PRIVATE easyai_cli)
     target_include_directories(easyai-cli PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/../llama.cpp/vendor)
     if (EASYAI_WITH_CURL AND CURL_FOUND)

@@ -53,6 +53,7 @@
 #include "easyai_brand_svg.hpp"
 #endif
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -1538,14 +1539,6 @@ static void prepare_engine_for_request(ServerCtx & ctx, const ChatRequest & req)
             ctx.engine.add_tool(make_stub_tool(name, description, params_json));
         }
     }
-    // Re-apply the system prompt every request so the authoritative
-    // date/time injection (if enabled) is FRESH each turn — not cached
-    // from when the engine was first loaded.
-    if (ctx.inject_datetime) {
-        ctx.engine.system(ctx.default_system + build_authoritative_preamble(ctx));
-    } else {
-        ctx.engine.system(ctx.default_system);
-    }
     ctx.engine.set_sampling(
         req.temp_override  >= 0 ? (float) req.temp_override  : -1.0f,
         req.top_p_override >= 0 ? (float) req.top_p_override : -1.0f,
@@ -1557,8 +1550,50 @@ static void prepare_engine_for_request(ServerCtx & ctx, const ChatRequest & req)
                                  req.preset_inline.top_k,
                                  req.preset_inline.min_p);
     }
+
+    // Build the request's history (everything except the final user
+    // message — that one is pushed by the chat loop).  We work on a
+    // mutable copy so we can splice the authoritative-datetime
+    // preamble into whichever system message exists, regardless of
+    // whether the CLIENT supplied one or we fall back to the
+    // server's default.
+    //
+    // Critical scenario: opencode / Claude-Code style clients send
+    // their OWN system message in the messages array.  That message
+    // *replaces* the server's default in practice (the chat template
+    // would render two system blocks otherwise, which most templates
+    // collapse into one with unpredictable order).  We want the
+    // datetime + cutoff hint to ride along regardless of who owns
+    // the system prompt — so we APPEND the preamble to whichever
+    // system message goes into the prompt:
+    //
+    //   * Client sent a system message → append to its content.
+    //   * Client sent no system message → append to ctx.default_system.
+    //
+    // Either way, the preamble is in there exactly once and lands as
+    // part of the model's actual context.
     std::vector<std::pair<std::string, std::string>> hist_minus_last(
         req.hist.begin(), req.hist.end() - 1);
+
+    if (ctx.inject_datetime) {
+        const std::string preamble = build_authoritative_preamble(ctx);
+        // Find the LAST system message in the client-supplied history.
+        // (Most clients put it at index 0, but we walk backwards to be
+        // safe — multi-system histories pick the most recent.)
+        auto it = std::find_if(hist_minus_last.rbegin(), hist_minus_last.rend(),
+            [](const std::pair<std::string,std::string> & m) {
+                return m.first == "system";
+            });
+        if (it != hist_minus_last.rend()) {
+            it->second += preamble;
+            ctx.engine.system(ctx.default_system);
+        } else {
+            ctx.engine.system(ctx.default_system + preamble);
+        }
+    } else {
+        ctx.engine.system(ctx.default_system);
+    }
+
     ctx.engine.replace_history(hist_minus_last);
 }
 
