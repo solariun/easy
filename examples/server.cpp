@@ -1407,7 +1407,8 @@ struct ServerCtx {
 // ---------------------------------------------------------------------------
 struct ChatRequest {
     std::vector<std::pair<std::string, std::string>> hist;          // full history
-    std::string                                       last_user;    // peeled-off
+    std::string                                       last_user;    // peeled-off (only valid when !last_is_tool)
+    bool                                              last_is_tool = false;  // tool-result-injection turn
     bool                                              client_tools = false;
     json                                              tools_blob;   // raw OpenAI tools[]
     double                                            temp_override  = -1.0;
@@ -1447,7 +1448,20 @@ static bool parse_chat_request(const httplib::Request & req,
     }
 
     out.hist.reserve(body["messages"].size());
-    bool last_is_user = false;
+    // OpenAI-style request shape: messages MUST end with role='user' on a
+    // fresh turn, OR with role='tool' when the client has already dispatched
+    // a previous turn's tool_calls and is now feeding the results back so
+    // the model can produce the next visible reply.
+    //
+    // The full conversation (incl. assistant turns with tool_calls and the
+    // tool messages themselves) is passed through into out.hist and
+    // replayed verbatim into the engine via replace_history.  The
+    // (role, content) representation is intentionally lossy on
+    // tool_call_id and tool_name; modern chat templates handle the
+    // association via positional ordering, which is good enough in
+    // practice.  When the user-visible reply requires those fields
+    // (rare), upgrade to a richer history schema.
+    std::string last_role;
     for (const auto & m : body["messages"]) {
         std::string role = m.value("role", "user");
         std::string content;
@@ -1459,15 +1473,18 @@ static bool parse_chat_request(const httplib::Request & req,
             }
         }
         out.hist.emplace_back(role, content);
-        last_is_user = (role == "user");
-        if (last_is_user) out.last_user = content;
+        last_role = role;
+        if (role == "user") out.last_user = content;
     }
-    if (!last_is_user) {
+    if (last_role != "user" && last_role != "tool") {
         res.status = 400;
-        res.set_content(error_json("the final message must have role='user'"),
+        res.set_content(error_json(
+            "the final message must have role='user' or role='tool' "
+            "(got role='" + last_role + "')"),
                         "application/json");
         return false;
     }
+    out.last_is_tool = (last_role == "tool");
 
     out.client_tools = body.contains("tools") && body["tools"].is_array() &&
                         !body["tools"].empty();
@@ -1590,8 +1607,18 @@ static void prepare_engine_for_request(ServerCtx & ctx, const ChatRequest & req)
     //
     // Either way, the preamble is in there exactly once and lands as
     // part of the model's actual context.
-    std::vector<std::pair<std::string, std::string>> hist_minus_last(
-        req.hist.begin(), req.hist.end() - 1);
+    // When last is "tool" (the client is feeding a previous turn's tool
+    // result back), keep the WHOLE conversation in history — the model
+    // needs to see the tool message to produce its next reply.  When
+    // last is "user", peel it off so the chat loop can push it after
+    // the chat-params render (see chat_continue's user-message
+    // requirement for Qwen3-style templates).
+    std::vector<std::pair<std::string, std::string>> hist_minus_last;
+    if (req.last_is_tool) {
+        hist_minus_last = req.hist;          // include the tool message
+    } else {
+        hist_minus_last.assign(req.hist.begin(), req.hist.end() - 1);
+    }
 
     // Resolve the effective inject toggle: server default + optional
     // X-Easyai-Inject header override.  Default is on; QA / regression
@@ -1663,7 +1690,13 @@ static void handle_chat_sync(ServerCtx & ctx, ChatRequest & req,
 
     try {
         if (req.client_tools) {
-            ctx.engine.push_message("user", req.last_user);
+            // Only push the user message when this is a fresh turn — when
+            // last_is_tool, the tool message is already part of history
+            // (replace_history above) and the model is expected to consume
+            // it directly.
+            if (!req.last_is_tool) {
+                ctx.engine.push_message("user", req.last_user);
+            }
             auto turn = ctx.engine.generate_one();
             content       = std::move(turn.content);
             tool_calls    = std::move(turn.tool_calls);
@@ -1772,7 +1805,15 @@ static void handle_chat_stream(ServerCtx & ctx,
             // chat_params_for_current_state — otherwise the render throws.
             // Once it's pushed we call chat_continue() (or generate_one
             // for client-tool mode) which doesn't re-push.
-            ctx.engine.push_message("user", req_state->last_user);
+            //
+            // EXCEPTION: when the request's last message is a tool result
+            // (cli-remote / OpenAI-SDK feeding back a previous turn's
+            // tool_call output), there's already a tool message in
+            // history AND a user message earlier in the same history.
+            // We don't push anything extra in that case.
+            if (!req_state->last_is_tool) {
+                ctx.engine.push_message("user", req_state->last_user);
+            }
             const bool user_already_pushed = true;
 
             common_chat_params chat_p;
