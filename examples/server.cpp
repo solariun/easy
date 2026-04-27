@@ -1944,10 +1944,69 @@ static void handle_chat_stream(ServerCtx & ctx,
                 // it a second time.
                 (void) user_already_pushed;
                 if (req_state->client_tools) {
-                    auto turn = ctx.engine.generate_one();
+                    // Thought-only retry budget for client_tools mode —
+                    // mirrors what Engine::chat_continue does on the
+                    // server-side multi-hop path.  Without this, when a
+                    // client (cli-remote, opencode, …) sends tools[] and
+                    // the model thinks "let me search..." but never emits
+                    // the actual <tool_call>, the user sees an empty
+                    // bubble.  Detect {tool_calls=0, content=0, reasoning>0},
+                    // clear KV (history is kept by the engine), fire the
+                    // streaming on_hop_reset hook so accumulated parse
+                    // state is dropped, retry up to 2 times.  Final
+                    // fallback promotes reasoning -> content so the user
+                    // never sees an empty bubble.
+                    constexpr int kMaxThoughtRetries = 2;
+                    int retries = 0;
+                    easyai::Engine::GeneratedTurn turn;
+                    while (true) {
+                        turn = ctx.engine.generate_one();
+                        const bool thought_only =
+                            turn.tool_calls.empty()
+                            && turn.content.empty()
+                            && !turn.reasoning.empty();
+                        if (thought_only && retries < kMaxThoughtRetries) {
+                            ++retries;
+                            std::fprintf(stderr,
+                                "[easyai-server] client_tools thought-only "
+                                "(retry %d/%d): clearing KV + retrying\n",
+                                retries, kMaxThoughtRetries);
+                            ctx.engine.clear_kv();
+                            // Drop the streaming layer's accumulated state
+                            // so the next attempt's tokens aren't merged
+                            // with the discarded turn's reasoning.
+                            accumulated.clear();
+                            prev_msg = common_chat_msg{};
+                            prev_msg.role = "assistant";
+                            continue;
+                        }
+                        break;
+                    }
+                    if (turn.tool_calls.empty() && turn.content.empty()
+                            && !turn.reasoning.empty()) {
+                        std::fprintf(stderr,
+                            "[easyai-server] client_tools thought-only "
+                            "exhausted retries: promoting reasoning to "
+                            "content.\n");
+                        std::string body =
+                            "(the model planned to use a tool but did not "
+                            "emit the call after " + std::to_string(kMaxThoughtRetries)
+                          + " retries — promoting its reasoning to a visible "
+                            "answer so the bubble isn't empty:)\n\n"
+                          + turn.reasoning;
+                        ordered_json env;
+                        env["choices"] = json::array({{
+                            {"index", 0},
+                            {"delta", {{"content", body}}},
+                            {"finish_reason", nullptr},
+                        }});
+                        emit_data(safe_dump(env));
+                        any_content_emitted = true;
+                        turn.content = std::move(body);
+                    }
                     tool_calls    = std::move(turn.tool_calls);
                     tool_call_ids = std::move(turn.tool_call_ids);
-                    finish_reason = turn.tool_calls.empty() ? "stop" : "tool_calls";
+                    finish_reason = tool_calls.empty() ? "stop" : "tool_calls";
                 } else {
                     engine_final_content = ctx.engine.chat_continue();
                 }
@@ -2478,27 +2537,36 @@ int main(int argc, char ** argv) {
     // → web_search).  Operators can fully replace it via -s.
     static constexpr char kBuiltinSystem[] =
         "You are a helpful, concise assistant.\n"
-        "Answer directly for greetings, chitchat, math, and anything you "
-        "already know — do NOT call a tool for those.\n"
-        "Use a tool only when the request truly needs one:\n"
+        "\n"
+        "## RULE 1 (most important): EXECUTE OR ANSWER, NEVER ANNOUNCE\n"
+        "If you decide a tool is needed, CALL IT in the same turn — emit\n"
+        "the actual tool_call now.  Sentences like \"I'll search…\",\n"
+        "\"Let me fetch…\", \"I'll look that up…\", \"Now I'll…\",\n"
+        "\"Right now I'll…\" are FORBIDDEN unless the tool_call follows in\n"
+        "this same turn.  If you cannot or will not call a tool, give the\n"
+        "user the final answer right now (or say plainly \"I don't have\n"
+        "live access; I can only tell you what I know up to my training\n"
+        "cutoff\").  Stating intent without execution is a critical\n"
+        "failure for this assistant.\n"
+        "\n"
+        "## When to use a tool\n"
+        "Answer directly for greetings, chitchat, math, and anything you\n"
+        "already know — do NOT call a tool for those.  Use a tool only\n"
+        "when the request truly needs one:\n"
         "  - up-to-date / 'today' / 'latest' info → web_search, THEN web_fetch\n"
         "  - the current date/time                → datetime\n"
         "  - reading / listing files              → fs_read_file / fs_list_dir / fs_glob / fs_grep\n"
         "\n"
-        "CRITICAL — every rule is mandatory:\n"
-        " 1. web_search returns titles + 1-2 sentence snippets. The snippets "
-        "    are NOT enough to summarise from. After every web_search you "
-        "    MUST immediately call web_fetch on the top 1-3 most relevant "
-        "    URLs and base your answer on the fetched body text.\n"
-        " 2. Two web_search calls in a row is wrong. Search ONCE, then fetch.\n"
-        " 3. NEVER announce a tool call without making it. Phrases like "
-        "    \"I will fetch...\", \"let me search...\", \"I'll get...\" are "
-        "    forbidden when followed by silence — either invoke the tool in "
-        "    the same turn, or write the final answer right away. Saying you "
-        "    are going to do something is NOT the same as doing it.\n"
-        " 4. If a fetch fails (HTTP 4xx/5xx), retry with the next URL from "
-        "    the search results. Do not fall back to summarising snippets.\n"
-        " 5. When you cite an article, cite the URL you actually fetched.";
+        "## Other mandatory rules\n"
+        " - web_search returns titles + 1-2 sentence snippets.  The\n"
+        "   snippets are NOT enough to summarise from.  After every\n"
+        "   web_search you MUST immediately call web_fetch on the top 1-3\n"
+        "   most relevant URLs and base your answer on the fetched body.\n"
+        " - Two web_search calls in a row is wrong.  Search ONCE, then\n"
+        "   fetch.\n"
+        " - If a fetch fails (HTTP 4xx/5xx), retry with the next URL from\n"
+        "   the search results.  Do not fall back to summarising snippets.\n"
+        " - When you cite an article, cite the URL you actually fetched.";
 
     std::string default_system = args.system_inline;
     if (default_system.empty() && !args.system_path.empty()) {

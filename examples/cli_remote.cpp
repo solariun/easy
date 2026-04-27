@@ -58,6 +58,44 @@
 
 namespace {
 
+// ---- TokenSpinner — '|/-\\' frames overwriting via \b ---------------------
+//
+// Ticks once per stream callback (token / reasoning / tool round-trip)
+// when nothing visible has been printed for the current turn.  As soon
+// as the first visible byte goes out, the spinner is erased and never
+// re-shown for that turn.  Auto-disabled outside a TTY.
+class TokenSpinner {
+   public:
+    explicit TokenSpinner(bool en)
+        : enabled_(en && ::isatty(fileno(stdout)) != 0) {}
+
+    void tick_silent() {
+        if (!enabled_ || ever_printed_) return;
+        static const char frames[] = { '|', '/', '-', '\\' };
+        if (active_) std::fputc('\b', stdout);
+        std::fputc(frames[frame_ % 4], stdout);
+        std::fflush(stdout);
+        active_ = true;
+        ++frame_;
+    }
+    void about_to_print() {
+        if (!enabled_) return;
+        if (active_) { std::fputs("\b \b", stdout); active_ = false; }
+        ever_printed_ = true;
+    }
+    void finish() {
+        if (active_) { std::fputs("\b \b", stdout); active_ = false; }
+        ever_printed_ = false;
+        frame_        = 0;
+    }
+
+   private:
+    bool enabled_      = false;
+    bool active_       = false;
+    bool ever_printed_ = false;
+    int  frame_        = 0;
+};
+
 // ---- ANSI helpers ---------------------------------------------------------
 struct Style {
     bool color = false;
@@ -289,7 +327,7 @@ struct Options {
     std::vector<std::string> stop_sequences;
     std::string              extra_body;       // JSON object literal
     int                      timeout           = 600;
-    bool        show_reasoning   = false;
+    bool        show_reasoning   = true;   // default ON; --no-reasoning to opt out
     bool        verbose          = false;
     bool        no_plan          = false;     // skip auto-registering Plan
     bool        tls_insecure     = false;     // skip peer cert verification
@@ -349,8 +387,14 @@ void usage(const char * argv0) {
 "\n"
 "  Behaviour:\n"
 "    -p, --prompt TEXT          one-shot prompt; without this you get a REPL\n"
-"    --show-reasoning           render delta.reasoning_content (dim) inline\n"
-"    --verbose                  log HTTP+SSE traffic to stderr\n"
+"                               (you can also pass the prompt as a positional\n"
+"                                arg, or pipe it via stdin)\n"
+"    --no-reasoning             hide delta.reasoning_content (default: shown\n"
+"                                inline in dim grey).  --hide-reasoning is\n"
+"                                an alias.  --show-reasoning is now a no-op\n"
+"                                (kept for backwards compat).\n"
+"    --verbose                  log HTTP+SSE traffic to stderr (timestamps +\n"
+"                                per-piece diagnostics)\n"
 "\n"
 "  Management subcommands (use one, no chat):\n"
 "    --list-tools               list LOCAL tools (registered in this CLI)\n"
@@ -411,7 +455,9 @@ bool parse_args(int argc, char ** argv, Options & o) {
             }
         }
         else if (a == "--no-plan")        o.no_plan = true;
-        else if (a == "--show-reasoning") o.show_reasoning = true;
+        else if (a == "--show-reasoning") o.show_reasoning = true;   // no-op now (kept for compat)
+        else if (a == "--no-reasoning"
+              || a == "--hide-reasoning") o.show_reasoning = false;
         else if (a == "--verbose" || a == "-v") o.verbose = true;
         else if (a == "--insecure-tls")   o.tls_insecure = true;
         else if (a == "--ca-cert")        o.tls_ca_path  = need(i, "--ca-cert");
@@ -424,6 +470,23 @@ bool parse_args(int argc, char ** argv, Options & o) {
         else if (a == "--metrics")        o.metrics     = true;
         else if (a == "--set-preset")     o.set_preset  = need(i, "--set-preset");
         else if (a == "-h" || a == "--help") { usage(argv[0]); std::exit(0); }
+        else if (!a.empty() && a[0] != '-' && o.prompt.empty()) {
+            // Positional argument is treated as the one-shot prompt, so
+            // `easyai-cli-remote --url ai.local "what date is today?"`
+            // works without the explicit -p / --prompt flag.  Multiple
+            // positionals get joined with a space.
+            o.prompt = a;
+            for (++i; i < argc; ++i) {
+                std::string extra = argv[i];
+                if (!extra.empty() && extra[0] != '-') {
+                    o.prompt += " ";
+                    o.prompt += extra;
+                } else {
+                    --i;
+                    break;
+                }
+            }
+        }
         else {
             std::fprintf(stderr, "unknown arg: %s\n", a.c_str());
             return false;
@@ -624,21 +687,80 @@ void render_plan(const easyai::Plan & p, const Style & st) {
     std::fflush(stdout);
 }
 
+// One spinner instance per process — captured by the closures below
+// so each stream tick advances the same animation.  We keep counters
+// for the verbose summary (--verbose).
+struct StreamStats {
+    int      content_pieces  = 0;
+    int      reason_pieces   = 0;
+    int      tool_calls      = 0;
+    int      tool_errors     = 0;
+    long     ms_to_first_tok = -1;
+    std::chrono::steady_clock::time_point started{};
+    void reset() {
+        content_pieces  = 0;
+        reason_pieces   = 0;
+        tool_calls      = 0;
+        tool_errors     = 0;
+        ms_to_first_tok = -1;
+        started         = std::chrono::steady_clock::now();
+    }
+    long elapsed_ms() const {
+        using namespace std::chrono;
+        return (long) duration_cast<milliseconds>(
+                   steady_clock::now() - started).count();
+    }
+};
+
+static TokenSpinner * g_spinner = nullptr;
+static StreamStats  * g_stats   = nullptr;
+
 void wire_callbacks(easyai::Client & cli, easyai::Plan & plan,
                     const Options & o, const Style & st) {
-    cli.on_token([](const std::string & piece) {
+    cli.on_token([&st, &o](const std::string & piece) {
+        if (g_stats) {
+            ++g_stats->content_pieces;
+            if (g_stats->ms_to_first_tok < 0)
+                g_stats->ms_to_first_tok = g_stats->elapsed_ms();
+        }
+        if (g_spinner) g_spinner->about_to_print();
         std::fputs(piece.c_str(), stdout);
         std::fflush(stdout);
+        if (o.verbose) {
+            std::fprintf(stderr, "%s[content %d, +%ldms]%s\n",
+                         st.dim(),
+                         g_stats ? g_stats->content_pieces : 0,
+                         g_stats ? g_stats->elapsed_ms() : 0,
+                         st.reset());
+        }
     });
-    if (o.show_reasoning) {
-        cli.on_reason([&st](const std::string & piece) {
+    cli.on_reason([&st, &o](const std::string & piece) {
+        if (g_stats) ++g_stats->reason_pieces;
+        if (o.show_reasoning) {
+            if (g_spinner) g_spinner->about_to_print();
             std::fprintf(stdout, "%s%s%s",
                          st.dim(), piece.c_str(), st.reset());
             std::fflush(stdout);
-        });
-    }
-    cli.on_tool([&st](const easyai::ToolCall & call,
-                       const easyai::ToolResult & result) {
+        } else if (g_spinner) {
+            // Hidden reasoning still ticks the spinner so the user
+            // sees activity during long thinking phases.
+            g_spinner->tick_silent();
+        }
+        if (o.verbose) {
+            std::fprintf(stderr, "%s[reason %d, +%ldms]%s\n",
+                         st.dim(),
+                         g_stats ? g_stats->reason_pieces : 0,
+                         g_stats ? g_stats->elapsed_ms() : 0,
+                         st.reset());
+        }
+    });
+    cli.on_tool([&st, &o](const easyai::ToolCall & call,
+                           const easyai::ToolResult & result) {
+        if (g_stats) {
+            ++g_stats->tool_calls;
+            if (result.is_error) ++g_stats->tool_errors;
+        }
+        if (g_spinner) g_spinner->about_to_print();
         const char * marker = result.is_error ? "✗" : "🔧";
         const char * color  = result.is_error ? st.red() : st.cyan();
         std::fprintf(stdout, "\n%s%s %s(%s)%s",
@@ -651,8 +773,23 @@ void wire_callbacks(easyai::Client & cli, easyai::Plan & plan,
         }
         std::fputs("\n", stdout);
         std::fflush(stdout);
+        if (o.verbose) {
+            std::fprintf(stderr,
+                "%s[tool %s%s name=%s args_bytes=%zu result_bytes=%zu +%ldms]%s\n",
+                st.dim(),
+                result.is_error ? "FAIL " : "ok ",
+                call.name.c_str(),
+                call.name.c_str(),
+                call.arguments_json.size(),
+                result.content.size(),
+                g_stats ? g_stats->elapsed_ms() : 0,
+                st.reset());
+        }
     });
-    plan.on_change([&st](const easyai::Plan & p) { render_plan(p, st); });
+    plan.on_change([&st](const easyai::Plan & p) {
+        if (g_spinner) g_spinner->about_to_print();
+        render_plan(p, st);
+    });
 }
 
 // ---- repl helpers ---------------------------------------------------------
@@ -663,7 +800,15 @@ bool is_special(const std::string & line, const std::string & cmd) {
 
 int run_one(easyai::Client & cli, const std::string & prompt,
             const Style & st) {
+    TokenSpinner spinner(/*en=*/true);
+    StreamStats  stats;  stats.reset();
+    g_spinner = &spinner;
+    g_stats   = &stats;
+
     std::string answer = cli.chat(prompt);
+    spinner.finish();
+    g_spinner = nullptr;
+    g_stats   = nullptr;
     std::fputc('\n', stdout);
     if (answer.empty() && !cli.last_error().empty()) {
         std::fprintf(stderr, "%serror:%s %s\n", st.red(), st.reset(),
@@ -746,6 +891,22 @@ int main(int argc, char ** argv) {
         && o.url.compare(0, 7, "http://")  != 0
         && o.url.compare(0, 8, "https://") != 0) {
         o.url = "http://" + o.url;
+    }
+
+    // Pipe / heredoc input — when stdin isn't a TTY and no prompt was
+    // given on the command line, read all of stdin as a one-shot
+    // prompt.  Lets you do:
+    //   echo "que dia eh hoje" | easyai-cli-remote --url ai.local
+    //   easyai-cli-remote --url ai.local <<EOF
+    //   ... long question ...
+    //   EOF
+    if (o.prompt.empty() && ::isatty(fileno(stdin)) == 0) {
+        std::string buf, line;
+        while (std::getline(std::cin, line)) {
+            if (!buf.empty()) buf += "\n";
+            buf += line;
+        }
+        if (!buf.empty()) o.prompt = std::move(buf);
     }
 
     // --list-tools is purely LOCAL — it prints the tools registered in

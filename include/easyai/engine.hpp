@@ -126,6 +126,10 @@ class Engine {
     bool load();              // loads gguf + builds context. returns true on success.
     bool is_loaded() const;
     void reset();             // wipes conversation history + KV cache.
+    void clear_kv();          // wipes ONLY the KV cache (history kept intact).
+                              // useful between retry attempts so the next
+                              // generate_one() re-renders the same history
+                              // with a fresh starting state.
 
     // ---------------- runtime sampler reconfig ------------------------------
     // The sampler is built at load() time. Use this to re-create it with new

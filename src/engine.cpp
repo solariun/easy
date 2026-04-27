@@ -1045,6 +1045,11 @@ void Engine::reset() {
     if (p_->sampler)   common_sampler_reset(p_->sampler);
 }
 
+void Engine::clear_kv() {
+    if (p_->ctx())   llama_memory_clear(llama_get_memory(p_->ctx()), true);
+    if (p_->sampler) common_sampler_reset(p_->sampler);
+}
+
 std::string Engine::generate() {
     if (!p_->loaded) { p_->last_error = "engine not loaded"; return {}; }
 
