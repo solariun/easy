@@ -57,9 +57,9 @@ Sibling repo path: `develop/easyai/easyai/` next to `develop/easyai/llama.cpp/`.
 ```
 easyai/
 ├── include/easyai/{engine,tool,builtin_tools,presets,plan,client,
-│                   ui,text,log,cli,easyai}.hpp                                # public API
+│                   ui,text,log,cli,backend,agent,easyai}.hpp                  # public API
 ├── src/{engine,tool,builtin_tools,presets,plan,client,
-│        ui,log,cli,cli_client}.cpp                                            # impl
+│        ui,log,cli,cli_client,backend,agent}.cpp                              # impl
 ├── examples/{cli,cli_remote,server,agent,chat,recipes}.cpp                    # binaries
 ├── webui/{index.html,bundle.js,bundle.css,loading.html,AI-brain.svg}          # llama-server fork
 ├── cmake/{xxd.cmake,easyaiConfig.cmake.in}                                    # build helpers + find_package
@@ -238,6 +238,56 @@ third-party agent can build the same CLI experience in a handful of lines.
 - `easyai::cli::validate_sandbox(path, &err)` — uniform "exists? is a
   dir?" check.
 
+**Backend abstraction** (`include/easyai/backend.hpp`,
+`src/backend.cpp` + `src/cli_client.cpp`)
+The local↔remote unification.  `easyai::Backend` is the abstract
+interface (`init/chat/reset/set_system/set_sampling/info/tool_list/
+tool_count/last_error`).  `easyai::LocalBackend` wraps `Engine` and
+ships in libeasyai; `easyai::RemoteBackend` wraps `Client` and ships
+in libeasyai-cli — so the engine-only library doesn't drag in the
+HTTP client unless the consumer actually links against it.  Each has
+a public `Config` struct (sandbox, allow_bash, preset, sampling
+overrides, KV cache controls for local, TLS knobs for remote).
+
+**Agent — Tier-1 façade** (`include/easyai/agent.hpp`,
+`src/agent.cpp` in libeasyai-cli)
+The "extremely easy for all skill levels" entry point.  Three-line
+hello world: `easyai::Agent a("model.gguf"); a.ask("…");`.  Remote
+variant via the static factory `easyai::Agent::remote(url, key?)`.
+Fluent setters (`system / sandbox / allow_bash / preset /
+remote_model / temperature / top_p / top_k / min_p / on_token`) all
+queue into the underlying Backend's Config; the Backend is built
+lazily on first `ask()`.  Escape hatch: `agent.backend()` returns the
+materialised `Backend &` for everything Agent doesn't surface
+directly.  Default toolset: datetime + web_search + web_fetch on;
+fs_* and bash off until the user opts in.
+
+**The four-tier API rule** (Gustavo's standard pattern, codified
+2026-04-27):
+
+  1. **Tier 1 — 3-line "hello world"** via `Agent` (or any future
+     façade) with sensible defaults.
+  2. **Tier 2 — fluent customisation** (`Toolbelt`, `Streaming`,
+     `Agent` setters) chainable on the same façade.
+  3. **Tier 3 — explicit composables** (`Engine`, `Client`,
+     `Backend`, `Tool::builder`).  Users who outgrow Tier 1/2 step
+     here without rewriting.
+  4. **Tier 4 — escape hatch** (`Agent::backend()`, raw llama.cpp
+     handles, raw HTTP).  Power users never hit a wall.
+
+  Higher tiers are ALWAYS implemented on top of lower tiers — never
+  parallel codepaths.  That's how Tier 1 stays trustworthy.
+
+**Deep — default assistant persona** (server.cpp's `kBuiltinSystem`)
+A fresh `easyai-server` boots up as **Deep**, an expert system
+engineer who answers from CHECKED FACTS.  Operating loop:
+`TIME → THINK → PLAN → EXECUTE → VERIFY`.  "Time first" is its own
+rule — `datetime` is the first tool call any time the answer touches
+"now", "today", a deadline, a release version, or a fact that could
+have changed since cutoff.  Operators who want a different persona
+pass `--system` or `-s` — Deep is the default, not hardcoded.
+Webui title default also flips to `"Deep"`.
+
 **Installer** (`scripts/install_easyai_server.sh`)
 - Linux/Debian only.  Backend auto-detect: `nvidia-smi` → CUDA;
   `rocminfo` → ROCm/HIP; `vulkaninfo` / AMD `lspci` → Vulkan; else CPU.
@@ -255,8 +305,22 @@ third-party agent can build the same CLI experience in a handful of lines.
 ## 5. Recent commits (most recent first)
 
 ```
-2026-04-27  — sandbox virtualisation + bash tool + library refactor session.
+2026-04-27 (afternoon) — Deep + lib-first refactor (phase 5/6).
 
+2dd5e79  Deep — name + persona for the default easyai-server assistant
+866abde  Phase 6 — easyai::Agent, the friendly Tier-1 front door (3-line hello)
+1280aac  Phase 5c — Backend abstraction (LocalBackend + RemoteBackend) in lib
+22ece56  Phase 5d — easyai::cli management subcommands (print_models, …)
+3b66832  Phase 5b — easyai::ui::Streaming wires the canonical agent UX
+344ff4b  Phase 5a — extract small reusable utilities into the lib
+                    (ThinkStripper, trim_for_log, render_plan, print_presets,
+                     print_tool_row, slurp_file w/ max_bytes, client_has_tool)
+8314eb6  Client::retry_on_incomplete now defaults ON in libeasyai-cli
+dec031f  client: fix json::type_error 302 in retry-on-incomplete nudge
+
+2026-04-27 (morning)  — sandbox virtualisation + bash tool + library refactor.
+
+8b60868  SESSION_NOTES update for the morning's work
 25bf165  Docs refresh: Toolbelt, bash tool, --sandbox/--allow-bash gating
 2572bc0  Static analysis pass: SSE buffer cap + grep regex DoS guard
 bc28474  easyai::cli — Toolbelt builder + log file helper + sandbox validator

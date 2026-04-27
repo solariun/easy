@@ -38,34 +38,40 @@ against, plus six ready-to-run binaries:
 
 ## At a glance
 
+The pitch in three lines:
+
 ```cpp
 #include "easyai/easyai.hpp"
 
 int main() {
-    easyai::Engine engine;
-    engine.model("models/qwen2.5-1.5b-instruct.gguf")
-          .gpu_layers(99)              // Metal on macOS, Vulkan elsewhere
-          .context(4096)
-          .system("You are a helpful agent.")
-          .add_tool(easyai::tools::datetime())
-          .add_tool(easyai::tools::web_search())
-          .add_tool(easyai::tools::web_fetch())
-          .add_tool(easyai::tools::fs_read_file("."))
-          .on_token([](const std::string & t){ std::cout << t << std::flush; })
-          .load();
-
-    engine.chat("What time is it in Tokyo right now?");
+    easyai::Agent a("models/qwen2.5-1.5b-instruct.gguf");
+    std::cout << a.ask("What time is it in Tokyo right now?") << "\n";
 }
 ```
 
-`Engine::chat()` runs the **full** tool-call/tool-result loop for you — up to
-8 hops by default (lift the cap with `engine.max_tool_hops(N)` for shell-driven
-flows, or just register `bash` and the helpers do it for you).
-
-If you want the canonical agent toolset wired in three lines instead of
-seven, use the Toolbelt builder:
+That's the whole thing.  Construct an `Agent`, ask, print.  Default
+toolset (datetime + web_search + web_fetch) is already wired in;
+fs_* and bash stay off until you opt in.  Remote endpoints work the
+same way:
 
 ```cpp
+auto a = easyai::Agent::remote("http://127.0.0.1:8080/v1");
+a.system("Be terse.")
+ .on_token([](auto p){ std::cout << p << std::flush; });
+a.ask("Summarise this commit.");
+```
+
+When you outgrow the 3-line shape, the same library exposes every
+layer below — Tier 2 fluent builders (`Toolbelt`, `Streaming`),
+Tier 3 explicit composables (`Engine`, `Client`, `Backend`,
+`Tool::builder`), Tier 4 raw escape hatches (`Agent::backend()`,
+llama.cpp handles).  Higher tiers are implemented on top of lower
+ones — no parallel codepaths — so Tier 1 stays trustworthy as the
+project evolves.
+
+```cpp
+// Tier 2 example: wire the canonical toolset onto an Engine in
+// three fluent lines instead of seven add_tool calls.
 easyai::Engine engine;
 engine.model("models/qwen2.5-1.5b-instruct.gguf").gpu_layers(99).context(4096);
 
@@ -77,6 +83,10 @@ easyai::cli::Toolbelt()
 engine.load();
 engine.chat("Find all .md files larger than 1 KB and summarise them.");
 ```
+
+`Engine::chat()` runs the **full** tool-call/tool-result loop for you — up to
+8 hops by default (lift the cap with `engine.max_tool_hops(N)` for shell-driven
+flows, or just register `bash` and the helpers do it for you).
 
 Tool definitions are 6 lines:
 
@@ -132,6 +142,18 @@ engine.add_tool(
   * `open_log_tee / close_log_tee` — open `/tmp/<prefix>-<pid>-<epoch>.log`
     with header, register as the global log sink.
   * `validate_sandbox(path, &err)` — uniform "exists? is a dir?" check.
+  * `client_has_tool(client, name)`, `print_models / print_local_tools /
+    print_remote_tools / print_health / print_props / print_metrics /
+    set_preset` — management subcommand helpers that drive an
+    `easyai-server` from a one-line dispatcher.
+* `easyai::Backend` (+ `LocalBackend`, `RemoteBackend`) — common
+  interface for "give me a model, local or remote, with the same
+  chat/reset/set_system shape".  Linking only `easyai::engine` gets
+  you LocalBackend; adding `easyai::cli` adds RemoteBackend without
+  duplicating the abstraction.
+* `easyai::Agent` — the friendly Tier-1 façade over Backend.  3-line
+  hello-world, fluent setters for system/sandbox/allow_bash/preset,
+  and `backend()` as the escape hatch back to Tier 3 power.
 
 ### Library (`libeasyai-cli`, link target `easyai::cli`)
 
@@ -215,6 +237,37 @@ doesn't already include a `system` message.
 
 This makes `easyai-server` look like a real OpenAI-compatible backend to any
 client that expects one.
+
+---
+
+## Meet Deep — the default assistant persona
+
+A fresh `easyai-server` boots up as **Deep** — an expert system
+engineer who answers from CHECKED FACTS, not impressions.  Built into
+the default system prompt so a small open-weights model behaves like
+an engineer instead of a chatbot from minute one.
+
+Deep's operating loop is: **TIME → THINK → PLAN → EXECUTE → VERIFY**.
+
+- **Time first.** Any question that touches "now", "today", a
+  deadline, a release version, or a fact that could have changed
+  since training cutoff → `datetime` is the first tool call.  Anchors
+  the rest of the turn to the real wall clock.
+- **Think.** State the goal, identify what's known vs. needs lookup,
+  what could go wrong.
+- **Plan.** Multi-step tasks call `plan(action='add', text=…)` first
+  so the user can see and intervene live.
+- **Execute.** Every registered tool is fair game.
+- **Verify.** Before claiming success — does the file exist? does
+  the test pass? does the URL really say that?  When in doubt, run
+  another tool instead of guessing.
+
+Old behaviour rules carry over: `RULE 1` (execute or answer, never
+just announce), `web_search → web_fetch` mandatory, citations stick
+to the URL actually fetched.
+
+Operators who want a different persona pass `--system "<text>"` or
+`-s persona.txt` — Deep is the default, not a hardcoded identity.
 
 ---
 
