@@ -58,42 +58,49 @@
 
 namespace {
 
-// ---- TokenSpinner — '|/-\\' frames overwriting via \b ---------------------
+// ---- TokenSpinner — '|/-\\' frames trailing the cursor --------------------
 //
-// Ticks once per stream callback (token / reasoning / tool round-trip)
-// when nothing visible has been printed for the current turn.  As soon
-// as the first visible byte goes out, the spinner is erased and never
-// re-shown for that turn.  Auto-disabled outside a TTY.
+// Always-visible variant: every call to after_print() leaves a fresh
+// spinner frame at the current cursor position.  about_to_print()
+// erases it before the next visible piece writes; tick_silent() does
+// both in place when nothing visible was emitted this round.  finish()
+// erases any trailing frame at end-of-turn.
+//
+// Auto-disabled when stdout isn't a TTY (clean output for $(easyai-cli …)).
 class TokenSpinner {
    public:
     explicit TokenSpinner(bool en)
         : enabled_(en && ::isatty(fileno(stdout)) != 0) {}
 
+    void about_to_print() {
+        if (!enabled_) return;
+        if (active_) { std::fputs("\b \b", stdout); active_ = false; }
+    }
+    void after_print() {
+        if (!enabled_) return;
+        write_frame_();
+    }
     void tick_silent() {
-        if (!enabled_ || ever_printed_) return;
+        if (!enabled_) return;
+        about_to_print();
+        write_frame_();
+    }
+    void finish() {
+        about_to_print();
+        frame_ = 0;
+    }
+
+   private:
+    void write_frame_() {
         static const char frames[] = { '|', '/', '-', '\\' };
-        if (active_) std::fputc('\b', stdout);
         std::fputc(frames[frame_ % 4], stdout);
         std::fflush(stdout);
         active_ = true;
         ++frame_;
     }
-    void about_to_print() {
-        if (!enabled_) return;
-        if (active_) { std::fputs("\b \b", stdout); active_ = false; }
-        ever_printed_ = true;
-    }
-    void finish() {
-        if (active_) { std::fputs("\b \b", stdout); active_ = false; }
-        ever_printed_ = false;
-        frame_        = 0;
-    }
-
-   private:
-    bool enabled_      = false;
-    bool active_       = false;
-    bool ever_printed_ = false;
-    int  frame_        = 0;
+    bool enabled_ = false;
+    bool active_  = false;
+    int  frame_   = 0;
 };
 
 // ---- ANSI helpers ---------------------------------------------------------
@@ -733,6 +740,7 @@ void wire_callbacks(easyai::Client & cli, easyai::Plan & plan,
         if (g_spinner) g_spinner->about_to_print();
         std::fputs(piece.c_str(), stdout);
         std::fflush(stdout);
+        if (g_spinner) g_spinner->after_print();
         if (o.verbose) {
             std::fprintf(stderr, "%s[content %d, +%ldms]%s\n",
                          st.dim(),
@@ -748,6 +756,7 @@ void wire_callbacks(easyai::Client & cli, easyai::Plan & plan,
             std::fprintf(stdout, "%s%s%s",
                          st.dim(), piece.c_str(), st.reset());
             std::fflush(stdout);
+            if (g_spinner) g_spinner->after_print();
         } else if (g_spinner) {
             // Hidden reasoning still ticks the spinner so the user
             // sees activity during long thinking phases.
@@ -780,6 +789,7 @@ void wire_callbacks(easyai::Client & cli, easyai::Plan & plan,
         }
         std::fputs("\n", stdout);
         std::fflush(stdout);
+        if (g_spinner) g_spinner->after_print();
         if (o.verbose) {
             std::fprintf(stderr,
                 "%s[tool %s%s name=%s args_bytes=%zu result_bytes=%zu +%ldms]%s\n",
@@ -796,6 +806,7 @@ void wire_callbacks(easyai::Client & cli, easyai::Plan & plan,
     plan.on_change([&st](const easyai::Plan & p) {
         if (g_spinner) g_spinner->about_to_print();
         render_plan(p, st);
+        if (g_spinner) g_spinner->after_print();
     });
 }
 
@@ -811,6 +822,12 @@ int run_one(easyai::Client & cli, const std::string & prompt,
     StreamStats  stats;  stats.reset();
     g_spinner = &spinner;
     g_stats   = &stats;
+
+    // Show the first spinner frame immediately so the user sees activity
+    // during the request's pre-roll (model loading prompt into KV,
+    // first-token latency).  Subsequent ticks come from the stream
+    // callbacks below.
+    spinner.after_print();
 
     std::string answer = cli.chat(prompt);
     spinner.finish();

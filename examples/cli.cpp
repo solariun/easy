@@ -107,58 +107,74 @@ void handle_sigint(int) {
 void install_sigint() { std::signal(SIGINT, handle_sigint); }
 
 // ============================================================================
-//  TokenSpinner — rotating "/-\|" character that fills the gap between
-//  request submit and the first VISIBLE token.  Useful for thinking
-//  models (long reasoning_content phase that we don't print by default)
-//  and for tool-call dispatches where the on_token callback runs but
-//  emits nothing.  Gets erased by `\b \b` the moment the first visible
-//  byte is about to print, then never re-shows for that turn.
+//  TokenSpinner — rotating `|/-\\` character that ALWAYS trails the
+//  cursor while a streamed response is in flight.
 //
-//  Disabled automatically when stdout isn't a TTY (so capturing the
-//  output via `result=$(easyai-cli ... -p '...')` stays clean).
+//  Pattern per token:
+//      1. caller calls about_to_print()  → erases spinner if active
+//      2. caller prints the visible content
+//      3. caller calls after_print()      → re-shows spinner one frame ahead
+//
+//  Pattern per "silent" token (reasoning hidden, etc):
+//      tick_silent()  → erases + reshows on the same column, advancing frame
+//
+//  Net effect: the user always sees an animated spinner directly after
+//  the most recently printed character, ticking forward with every
+//  delta.  When the turn ends, finish() erases the trailing frame.
+//
+//  Disabled when stdout isn't a TTY (clean output for `$(easyai-cli …)`).
 // ============================================================================
 class TokenSpinner {
    public:
     explicit TokenSpinner(bool en)
         : enabled_(en && ::isatty(fileno(stdout)) != 0) {}
 
-    // Call on every token piece you receive — even when the piece would
-    // be filtered out (think-block content, tool-call args, etc.).  We
-    // only render after a piece BUT WITHOUT VISIBLE OUTPUT.
-    void tick_silent() {
-        if (!enabled_ || ever_printed_) return;
-        static const char frames[] = { '|', '/', '-', '\\' };
-        if (active_) std::fputc('\b', stdout);
-        std::fputc(frames[frame_ % 4], stdout);
-        std::fflush(stdout);
-        active_ = true;
-        ++frame_;
-    }
-
-    // Call BEFORE printing visible content.  Erases the spinner and
-    // latches "we've started showing real text" so subsequent ticks
-    // are no-ops for this turn.
+    // Erase the trailing spinner so visible content can print cleanly.
+    // Called BEFORE writing each non-empty piece to stdout.
     void about_to_print() {
         if (!enabled_) return;
         if (active_) {
             std::fputs("\b \b", stdout);
             active_ = false;
         }
-        ever_printed_ = true;
     }
 
-    // End-of-turn cleanup so the next prompt starts on a clean line.
+    // Re-print the spinner one frame ahead of the cursor.  Called AFTER
+    // each non-empty piece has been written; gives the impression of an
+    // animated cursor ticking after every visible token.
+    void after_print() {
+        if (!enabled_) return;
+        write_frame_();
+    }
+
+    // Advance one frame in place when nothing visible was emitted this
+    // round (e.g. reasoning hidden, tool-call argument accumulator
+    // building up).  Equivalent to about_to_print() + after_print().
+    void tick_silent() {
+        if (!enabled_) return;
+        about_to_print();
+        write_frame_();
+    }
+
+    // End-of-turn cleanup: erases any trailing frame so the next prompt
+    // starts on a clean column.  Resets internal state.
     void finish() {
-        if (active_) { std::fputs("\b \b", stdout); active_ = false; }
-        ever_printed_ = false;
-        frame_        = 0;
+        about_to_print();
+        frame_ = 0;
     }
 
    private:
-    bool enabled_      = false;
-    bool active_       = false;
-    bool ever_printed_ = false;
-    int  frame_        = 0;
+    void write_frame_() {
+        static const char frames[] = { '|', '/', '-', '\\' };
+        std::fputc(frames[frame_ % 4], stdout);
+        std::fflush(stdout);
+        active_ = true;
+        ++frame_;
+    }
+
+    bool enabled_ = false;
+    bool active_  = false;
+    int  frame_   = 0;
 };
 
 }  // namespace
@@ -862,6 +878,7 @@ int main(int argc, char ** argv) {
                 } else {
                     spinner.about_to_print();
                     std::cout << visible << std::flush;
+                    spinner.after_print();
                 }
             });
         } catch (const std::exception & e) {
@@ -870,7 +887,11 @@ int main(int argc, char ** argv) {
             return 1;
         }
         std::string tail = strip.flush();
-        if (!tail.empty()) { spinner.about_to_print(); std::cout << tail; }
+        if (!tail.empty()) {
+            spinner.about_to_print();
+            std::cout << tail;
+            spinner.after_print();
+        }
         spinner.finish();
         std::cout << std::endl;
         return 0;
@@ -937,10 +958,15 @@ int main(int argc, char ** argv) {
                 } else {
                     spinner.about_to_print();
                     std::cout << visible << std::flush;
+                    spinner.after_print();
                 }
             });
             std::string tail = strip.flush();
-            if (!tail.empty()) { spinner.about_to_print(); std::cout << tail; }
+            if (!tail.empty()) {
+                spinner.about_to_print();
+                std::cout << tail;
+                spinner.after_print();
+            }
             spinner.finish();
         } catch (const std::exception & e) {
             spinner.finish();
