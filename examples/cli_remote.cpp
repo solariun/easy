@@ -771,7 +771,14 @@ void register_tools(easyai::Client & cli,
     if (wants("fs_write_file")) cli.add_tool(easyai::tools::fs_write_file(root));
 
     // bash — same root as fs_*; opt-in via --allow-bash or --tools bash.
-    if (wants("bash"))          cli.add_tool(easyai::tools::bash(root));
+    if (wants("bash")) {
+        cli.add_tool(easyai::tools::bash(root));
+        // Bash flows naturally span many hops (compile → run → fix →
+        // re-run → grep logs → …); the default 8-hop cap chokes them.
+        // Bump to effectively-unlimited.  Other safety nets (per-tool
+        // timeouts, output caps, retry_on_incomplete) still apply.
+        cli.max_tool_hops(99999);
+    }
 
     // Inline system-info tools — defined above in `namespace systools`.
     // They demonstrate how to add your own custom Tool with a couple of

@@ -393,6 +393,7 @@ class LocalBackend final : public Backend {
             if (cfg_.allow_bash) {
                 const std::string root = cfg_.sandbox.empty() ? "." : cfg_.sandbox;
                 engine_.add_tool(easyai::tools::bash(root));
+                engine_.max_tool_hops(99999);  // see notes in cli_remote/cli.cpp
             }
         }
         engine_.on_tool([](const easyai::ToolCall & c, const easyai::ToolResult & r){
@@ -584,6 +585,9 @@ class RemoteBackend final : public Backend {
             if (cfg_.allow_bash) {
                 const std::string root = cfg_.sandbox.empty() ? "." : cfg_.sandbox;
                 client_->add_tool(easyai::tools::bash(root));
+                // Bash flows often need many turns; lift the agentic-loop
+                // safety cap to effectively-unlimited.
+                client_->max_tool_hops(99999);
             }
         }
     }

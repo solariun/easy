@@ -73,6 +73,12 @@ class Engine {
     Engine & parallel_tool_calls (bool enable);    // default false
     Engine & verbose       (bool on);              // default false
 
+    // Agentic-loop safety cap: how many tool round-trips chat() will run
+    // before bailing out.  Default 8 — fine for small research flows.
+    // Bash flows often need many more (compile → run → fix → re-run);
+    // when --allow-bash is in play, callers bump this to ~99999.
+    Engine & max_tool_hops (int n);
+
     // ---------------- KV cache & model overrides ----------------------------
     // KV cache data type — accepts ggml_type names: "f32", "f16", "bf16",
     // "q8_0", "q4_0", "q4_1", "q5_0", "q5_1", "iq4_nl". Lower precision

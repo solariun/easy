@@ -94,6 +94,13 @@ public:
     // budget was exhausted.
     bool last_turn_was_incomplete() const;
 
+    // Agentic-loop safety cap: how many tool round-trips before chat()
+    // bails out with "max tool hops exceeded".  Default 8 — fine for
+    // small research flows.  Bash-driven flows often need many more
+    // because a single shell session naturally spans many turns;
+    // when --allow-bash is in play, callers bump this to ~99999.
+    Client & max_tool_hops (int n);
+
     // ----- TLS (only meaningful for https:// endpoints) --------------------
     // tls_insecure(true) skips peer certificate verification — useful for
     // local dev with self-signed certs, NEVER for production.  ca_cert_path

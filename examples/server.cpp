@@ -2690,7 +2690,9 @@ int main(int argc, char ** argv) {
         if (args.allow_bash) {
             // bash inherits --sandbox as cwd if given; otherwise the
             // server's own cwd (which is whatever systemd / the launcher
-            // chose).
+            // chose).  Also bump the agentic loop cap — bash flows
+            // span far more hops than the default 8.
+            ctx->engine.max_tool_hops(99999);
             const std::string root = args.sandbox.empty() ? "." : args.sandbox;
             ctx->default_tools.push_back(easyai::tools::bash(root));
         }

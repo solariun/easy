@@ -570,6 +570,7 @@ struct Engine::Impl {
     bool         enable_thinking = true;   // sent to chat templates that use it
     common_chat_tool_choice tool_choice = COMMON_CHAT_TOOL_CHOICE_AUTO;
     bool         parallel_tool_calls    = false;
+    int          max_tool_hops          = 8;     // default agentic safety cap
 
     TokenCallback    on_token;
     ToolCallback     on_tool;
@@ -828,6 +829,7 @@ Engine & Engine::tool_choice_auto()             { p_->tool_choice = COMMON_CHAT_
 Engine & Engine::tool_choice_required()         { p_->tool_choice = COMMON_CHAT_TOOL_CHOICE_REQUIRED; return *this; }
 Engine & Engine::tool_choice_none()             { p_->tool_choice = COMMON_CHAT_TOOL_CHOICE_NONE;     return *this; }
 Engine & Engine::parallel_tool_calls(bool e)    { p_->parallel_tool_calls = e; return *this; }
+Engine & Engine::max_tool_hops      (int  n)    { if (n > 0) p_->max_tool_hops = n; return *this; }
 Engine & Engine::verbose(bool v)                { p_->verbose = v; return *this; }
 
 // ---------------------------------------------------------------------------
@@ -1112,7 +1114,7 @@ std::string Engine::chat(const std::string & user_message) {
 std::string Engine::chat_continue() {
     if (!p_->loaded) { p_->last_error = "engine not loaded"; return {}; }
 
-    constexpr int kMaxToolHops      = 8;
+    const int kMaxToolHops          = p_->max_tool_hops;
     constexpr int kMaxThoughtRetries = 2;   // budget for "thought-only" retries
     int thought_retries = 0;
     std::string final_text;

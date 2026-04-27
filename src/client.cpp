@@ -193,6 +193,7 @@ struct Client::Impl {
     int         max_reasoning_chars = 0;    // 0 = unlimited; >0 aborts SSE on overflow
     bool        retry_on_incomplete = false;
     bool        last_was_incomplete = false; // mirror of last turn's timings.incomplete
+    int         max_tool_hops       = 8;     // agentic loop safety cap; bumped by bash
 
     // Diagnostic log file (tee).  Borrowed; caller owns fclose.
     std::FILE * log_fp = nullptr;
@@ -624,13 +625,16 @@ struct Client::Impl {
     // -----------------------------------------------------------------
     // Agentic multi-hop loop.  Mirrors Engine::chat_continue limits.
     // -----------------------------------------------------------------
-    static constexpr int kMaxHops = 8;
+    // Agentic-loop safety cap: how many tool round-trips we allow before
+    // bailing out.  Configurable via Client::max_tool_hops (default 8).
+    // For bash-enabled flows the caller bumps this much higher because
+    // a single shell command can naturally span many turns.
 
     std::string run_chat_loop() {
         last_was_incomplete   = false;
         bool retried_for_incomplete = false;
 
-        for (int hop = 0; hop < kMaxHops; ++hop) {
+        for (int hop = 0; hop < max_tool_hops; ++hop) {
             AssistantTurn turn;
             if (!stream_chat(turn)) return {};
 
@@ -706,7 +710,7 @@ struct Client::Impl {
             }
             // Loop continues — request next turn with tool results in history.
         }
-        last_error = "max tool hops (" + std::to_string(kMaxHops) + ") exceeded";
+        last_error = "max tool hops (" + std::to_string(max_tool_hops) + ") exceeded";
         return {};
     }
 
@@ -773,6 +777,7 @@ Client & Client::tls_insecure    (bool v)          { p_->tls_insecure    = v;   
 Client & Client::ca_cert_path    (std::string p)   { p_->tls_ca_path     = std::move(p); return *this; }
 Client & Client::max_reasoning_chars(int n)        { p_->max_reasoning_chars = n; return *this; }
 Client & Client::retry_on_incomplete(bool v)       { p_->retry_on_incomplete = v; return *this; }
+Client & Client::max_tool_hops      (int n)         { if (n > 0) p_->max_tool_hops = n; return *this; }
 bool     Client::last_turn_was_incomplete() const   { return p_->last_was_incomplete; }
 
 Client & Client::model              (std::string id)     { p_->model_id          = std::move(id);     return *this; }
