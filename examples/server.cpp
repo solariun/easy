@@ -2372,7 +2372,17 @@ static bool require_auth(const ServerCtx & ctx, const httplib::Request & req,
         "  -s, --system-file <path>     Server-default system prompt from file\n"
         "      --system <text>          Inline system prompt\n"
         "      --no-tools               Don't expose the built-in toolbelt\n"
-        "      --sandbox <dir>          Root for fs_* tools (default '.')\n"
+        "      --sandbox <dir>          Enable fs_* tools (read_file,\n"
+        "                                list_dir, glob, grep, write_file),\n"
+        "                                ALL scoped to <dir>. Without\n"
+        "                                --sandbox these tools are NOT\n"
+        "                                registered or exposed in the webui.\n"
+        "      --allow-bash             Register the `bash` tool (run shell\n"
+        "                                commands). cwd = --sandbox dir if\n"
+        "                                given, otherwise the server's cwd.\n"
+        "                                NOT a hardened sandbox — the\n"
+        "                                command runs with the server's\n"
+        "                                user privileges.\n"
         "\nModel tuning (apply on top of --preset):\n"
         "      --preset <name>          Ambient preset (default 'balanced')\n"
         "      --temperature <f>        Override temperature (0.0-2.0)\n"
@@ -2443,7 +2453,8 @@ struct ServerArgs {
     int         ngl        = -1;
     int         n_threads  = 0;
     bool        load_tools = true;
-    std::string sandbox    = ".";
+    std::string sandbox;            // empty = fs_* tools NOT registered
+    bool        allow_bash = false; // explicit opt-in for the `bash` tool
     std::string preset     = "balanced";
     size_t      max_body   = 8u * 1024u * 1024u;
 
@@ -2508,6 +2519,7 @@ static ServerArgs parse_args(int argc, char ** argv) {
         else if (s == "-t" || s == "--threads")      a.n_threads      = std::atoi(need(i, "-t"));
         else if (s == "--no-tools")                  a.load_tools     = false;
         else if (s == "--sandbox")                   a.sandbox        = need(i, "--sandbox");
+        else if (s == "--allow-bash")                a.allow_bash     = true;
         else if (s == "--preset")                    a.preset         = need(i, "--preset");
         else if (s == "--max-body")                  a.max_body       = (size_t) std::atoll(need(i, "--max-body"));
         else if (s == "--batch")                     a.n_batch        = std::atoi(need(i, "--batch"));
@@ -2657,14 +2669,31 @@ int main(int argc, char ** argv) {
     }
 
     // Default toolbelt — opt-out via --no-tools.
+    //
+    // fs_* and bash are SHIPPED OFF by default: --sandbox <dir> turns on
+    // the filesystem set (scoped to <dir>), and --allow-bash turns on the
+    // shell tool. Without these flags the model — and the webui's "tools"
+    // listing — never sees them, so we don't accidentally expose write
+    // access or shell to a fresh `easyai-server` install.
     if (args.load_tools) {
         ctx->default_tools.push_back(easyai::tools::datetime());
         ctx->default_tools.push_back(easyai::tools::web_fetch());
         ctx->default_tools.push_back(easyai::tools::web_search());
-        ctx->default_tools.push_back(easyai::tools::fs_list_dir (args.sandbox));
-        ctx->default_tools.push_back(easyai::tools::fs_read_file(args.sandbox));
-        ctx->default_tools.push_back(easyai::tools::fs_glob     (args.sandbox));
-        ctx->default_tools.push_back(easyai::tools::fs_grep     (args.sandbox));
+
+        if (!args.sandbox.empty()) {
+            ctx->default_tools.push_back(easyai::tools::fs_list_dir  (args.sandbox));
+            ctx->default_tools.push_back(easyai::tools::fs_read_file (args.sandbox));
+            ctx->default_tools.push_back(easyai::tools::fs_glob      (args.sandbox));
+            ctx->default_tools.push_back(easyai::tools::fs_grep      (args.sandbox));
+            ctx->default_tools.push_back(easyai::tools::fs_write_file(args.sandbox));
+        }
+        if (args.allow_bash) {
+            // bash inherits --sandbox as cwd if given; otherwise the
+            // server's own cwd (which is whatever systemd / the launcher
+            // chose).
+            const std::string root = args.sandbox.empty() ? "." : args.sandbox;
+            ctx->default_tools.push_back(easyai::tools::bash(root));
+        }
     }
 
     // -------- production knobs / auth --------------------------------------

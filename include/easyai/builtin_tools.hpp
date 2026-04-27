@@ -28,4 +28,20 @@ Tool fs_list_dir  (std::string root = ".");
 Tool fs_glob      (std::string root = ".");
 Tool fs_grep      (std::string root = ".");
 
+// ---------- shell -------------------------------------------------------
+// Run a shell command via /bin/sh -c. Working directory is set to `root`.
+//
+// IMPORTANT: this is NOT a hardened sandbox. The child runs with the
+// caller's full uid/gid, can read/write any file the caller can, can
+// hit the network, can spawn long-lived processes, etc. The only
+// safety nets are:
+//   - cwd is fixed to `root` (so the model's relative paths land there);
+//   - merged stdout/stderr is captured and capped at 32 KB;
+//   - a hard timeout (default 30s, capped at 300s) sends SIGTERM then
+//     SIGKILL.
+// Caller is responsible for deciding whether bash is appropriate for
+// their threat model — we surface it only when the user opts in
+// (e.g. --allow-bash in cli-remote).
+Tool bash         (std::string root = ".");
+
 }  // namespace easyai::tools

@@ -50,6 +50,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <map>
@@ -479,6 +480,7 @@ struct Options {
     std::string system_prompt;
     std::string system_file;
     std::string sandbox;
+    bool        allow_bash      = false;       // opt-in: register `bash` tool
     std::set<std::string> tools_enabled;       // empty = all defaults
     std::string prompt;                        // -p one-shot
     // Sampling / penalty knobs — -1 / -2 / empty == server default.
@@ -546,7 +548,7 @@ void usage(const char * argv0) {
 "    --tools LIST               comma list, valid names:\n"
 "                                 datetime, plan, web_search, web_fetch,\n"
 "                                 fs_read_file, fs_list_dir, fs_glob,\n"
-"                                 fs_grep, fs_write_file,\n"
+"                                 fs_grep, fs_write_file, bash,\n"
 "                                 system_meminfo, system_loadavg,\n"
 "                                 system_cpu_usage, system_swaps\n"
 "                               default: datetime,plan,web_search,web_fetch,\n"
@@ -556,6 +558,12 @@ void usage(const char * argv0) {
 "                                 fs_glob, fs_grep AND fs_write_file,\n"
 "                                 ALL scoped to DIR.  Without --sandbox\n"
 "                                 the model has no file access.\n"
+"    --allow-bash               register the `bash` tool (run shell\n"
+"                                 commands).  WARNING: NOT a hardened\n"
+"                                 sandbox — the command runs with your\n"
+"                                 user privileges (network, full FS, etc).\n"
+"                                 cwd is set to --sandbox DIR if given,\n"
+"                                 otherwise the current working dir.\n"
 "    --no-plan                  don't auto-register the planning tool\n"
 "\n"
 "  Behaviour:\n"
@@ -631,6 +639,7 @@ bool parse_args(int argc, char ** argv, Options & o) {
         else if (a == "--system")         o.system_prompt = need(i, "--system");
         else if (a == "--system-file")    o.system_file   = need(i, "--system-file");
         else if (a == "--sandbox")        o.sandbox       = need(i, "--sandbox");
+        else if (a == "--allow-bash")     o.allow_bash    = true;
         else if (a == "--temperature")    o.temperature       = std::stof(need(i, "--temperature"));
         else if (a == "--top-p")          o.top_p             = std::stof(need(i, "--top-p"));
         else if (a == "--top-k")          o.top_k             = std::stoi(need(i, "--top-k"));
@@ -736,6 +745,8 @@ void register_tools(easyai::Client & cli,
             if (!o.sandbox.empty()) {
                 for (const auto & d : kSandboxFsTools) if (d == name) return true;
             }
+            // bash is opt-in by --allow-bash (NOT auto-enabled by --sandbox).
+            if (o.allow_bash && name == "bash") return true;
             return false;
         }
         return o.tools_enabled.count(name) != 0;
@@ -753,6 +764,9 @@ void register_tools(easyai::Client & cli,
     if (wants("fs_glob"))       cli.add_tool(easyai::tools::fs_glob(root));
     if (wants("fs_grep"))       cli.add_tool(easyai::tools::fs_grep(root));
     if (wants("fs_write_file")) cli.add_tool(easyai::tools::fs_write_file(root));
+
+    // bash — same root as fs_*; opt-in via --allow-bash or --tools bash.
+    if (wants("bash"))          cli.add_tool(easyai::tools::bash(root));
 
     // Inline system-info tools — defined above in `namespace systools`.
     // They demonstrate how to add your own custom Tool with a couple of
@@ -1083,8 +1097,14 @@ bool client_has_tool(const easyai::Client & cli, const std::string & name) {
 }
 
 int run_one(easyai::Client & cli, const std::string & prompt,
-            const Style & st) {
-    if (prompt_wants_file_write(prompt) && !client_has_tool(cli, "fs_write_file")) {
+            const Options & o, const Style & st) {
+    // Tip targets newcomers who've forgotten --sandbox.  If the user
+    // already passed --sandbox we stay quiet — they know about it; the
+    // missing tool would be from an explicit --tools filter, where the
+    // tip's "pass --sandbox" advice is wrong anyway.
+    if (o.sandbox.empty()
+        && prompt_wants_file_write(prompt)
+        && !client_has_tool(cli, "fs_write_file")) {
         std::fprintf(stderr,
             "%s[easyai-cli-remote] tip:%s your prompt looks like it wants "
             "the model to write a file, but fs_write_file is NOT registered. "
@@ -1144,7 +1164,8 @@ int run_one(easyai::Client & cli, const std::string & prompt,
     return 0;
 }
 
-int run_repl(easyai::Client & cli, easyai::Plan & plan, const Style & st) {
+int run_repl(easyai::Client & cli, easyai::Plan & plan,
+             const Options & o, const Style & st) {
     std::fprintf(stderr,
         "%seasyai-cli-remote%s — interactive.  /exit to quit, /help for commands.\n",
         st.bold(), st.reset());
@@ -1185,7 +1206,7 @@ int run_repl(easyai::Client & cli, easyai::Plan & plan, const Style & st) {
             continue;
         }
 
-        run_one(cli, line, st);
+        run_one(cli, line, o, st);
     }
     return 0;
 }
@@ -1196,6 +1217,27 @@ int main(int argc, char ** argv) {
     Options o;
     if (!parse_args(argc, argv, o)) { usage(argv[0]); return 2; }
     Style st = detect_style();
+
+    // Validate --sandbox up front: an existing directory the user
+    // can read is the contract.  Failing here is much friendlier than
+    // letting the model discover later that every fs_* call hits
+    // "No such file or directory".
+    if (!o.sandbox.empty()) {
+        std::error_code ec;
+        auto stat = std::filesystem::status(o.sandbox, ec);
+        if (ec || !std::filesystem::exists(stat)) {
+            std::fprintf(stderr,
+                "%serror:%s --sandbox %s does not exist.\n",
+                st.red(), st.reset(), o.sandbox.c_str());
+            return 2;
+        }
+        if (!std::filesystem::is_directory(stat)) {
+            std::fprintf(stderr,
+                "%serror:%s --sandbox %s is not a directory.\n",
+                st.red(), st.reset(), o.sandbox.c_str());
+            return 2;
+        }
+    }
 
     // Auto-prepend http:// when --url omits a scheme — convenience for
     // local dev so `--url ai.local:8080` Just Works.  https endpoints
@@ -1326,8 +1368,8 @@ int main(int argc, char ** argv) {
         rc = run_management(cli, o, st);
     } else {
         wire_callbacks(cli, plan, o, st);
-        if (!o.prompt.empty()) rc = run_one(cli, o.prompt, st);
-        else                   rc = run_repl(cli, plan, st);
+        if (!o.prompt.empty()) rc = run_one(cli, o.prompt, o, st);
+        else                   rc = run_repl(cli, plan, o, st);
     }
     close_log_fp();
     return rc;

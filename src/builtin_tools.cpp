@@ -2,6 +2,7 @@
 #include "easyai/tool.hpp"
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -16,6 +17,12 @@
 #include <sstream>
 #include <string>
 #include <vector>
+
+#include <fcntl.h>
+#include <poll.h>
+#include <signal.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 #if defined(EASYAI_HAVE_CURL)
 #include <curl/curl.h>
@@ -275,7 +282,11 @@ static bool http_get(const std::string & url,
     curl_easy_setopt(c, CURLOPT_URL, url.c_str());
     curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(c, CURLOPT_MAXREDIRS, 5L);
-#ifdef CURLOPT_PROTOCOLS_STR
+    // CURLOPT_PROTOCOLS / _REDIR_PROTOCOLS deprecated in libcurl 7.85.0 in
+    // favour of the *_STR variants. The new ones are enums (not macros), so
+    // an `#ifdef CURLOPT_PROTOCOLS_STR` test silently falls through; gate on
+    // the version macro instead.
+#if defined(LIBCURL_VERSION_NUM) && LIBCURL_VERSION_NUM >= 0x075500
     curl_easy_setopt(c, CURLOPT_PROTOCOLS_STR,         "http,https");
     curl_easy_setopt(c, CURLOPT_REDIR_PROTOCOLS_STR,   "http,https");
 #else
@@ -331,7 +342,11 @@ static bool http_post_form(const std::string & url,
     curl_easy_setopt(c, CURLOPT_URL,             url.c_str());
     curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION,  1L);
     curl_easy_setopt(c, CURLOPT_MAXREDIRS,       5L);
-#ifdef CURLOPT_PROTOCOLS_STR
+    // CURLOPT_PROTOCOLS / _REDIR_PROTOCOLS deprecated in libcurl 7.85.0 in
+    // favour of the *_STR variants. The new ones are enums (not macros), so
+    // an `#ifdef CURLOPT_PROTOCOLS_STR` test silently falls through; gate on
+    // the version macro instead.
+#if defined(LIBCURL_VERSION_NUM) && LIBCURL_VERSION_NUM >= 0x075500
     curl_easy_setopt(c, CURLOPT_PROTOCOLS_STR,         "http,https");
     curl_easy_setopt(c, CURLOPT_REDIR_PROTOCOLS_STR,   "http,https");
 #else
@@ -964,6 +979,153 @@ Tool fs_grep(std::string root) {
         done:
             if (n == 0) return ToolResult::ok("No matches.");
             return ToolResult::ok(clip(o.str(), 32 * 1024));
+        })
+        .build();
+}
+
+// ============================================================================
+// shell — run /bin/sh -c with merged stdout/stderr, cwd pinned to sandbox.
+// ============================================================================
+//
+// NOT a hardened sandbox.  The child has the caller's full privileges.
+// Capping is purely cooperative:
+//   - chdir(root) before exec
+//   - 32 KB output cap (the rest is silently dropped, with a marker)
+//   - SIGTERM at deadline, SIGKILL 2s later
+//
+// We deliberately use /bin/sh -c so the model can pipe, redirect, &&,
+// quote, etc — i.e. behave like a normal shell user.
+Tool bash(std::string root) {
+    auto sb = std::make_shared<Sandbox>(std::move(root));
+    return Tool::builder("bash")
+        .describe(
+            "Run a shell command via `/bin/sh -c`. Output is stdout and stderr "
+            "merged; the working directory is `/` (the sandbox base). "
+            "Use this for grep | xargs, find, git, package managers, anything "
+            "you'd type in a terminal. "
+            "WARNING: this is NOT a hardened sandbox — the command runs with the "
+            "caller's user privileges and can read/write files, hit the network, "
+            "spawn processes, etc. Prefer the dedicated tools (read_file, "
+            "write_file, glob, grep) for simple file ops; reach for bash only "
+            "when you actually need shell features."
+        )
+        .param("command", "string",
+               "Shell command line. Quoted, piped, redirected etc. as you would "
+               "type it in a terminal. Example: `ls -la | head -20`.", true)
+        .param("timeout_sec", "integer",
+               "Max seconds to run before SIGTERM/SIGKILL. Default 30, max 300.",
+               false)
+        .handle([sb](const ToolCall & c) {
+            std::string cmd;
+            long long timeout_sec = 30;
+            if (!args::get_string(c.arguments_json, "command", cmd) || cmd.empty())
+                return ToolResult::error("missing arg: command");
+            args::get_int(c.arguments_json, "timeout_sec", timeout_sec);
+            if (timeout_sec < 1)   timeout_sec = 1;
+            if (timeout_sec > 300) timeout_sec = 300;
+
+            int pipefd[2];
+            if (::pipe(pipefd) < 0)
+                return ToolResult::error(std::string("pipe() failed: ") + std::strerror(errno));
+
+            const std::string cwd = sb->root.string();
+            pid_t pid = ::fork();
+            if (pid < 0) {
+                ::close(pipefd[0]); ::close(pipefd[1]);
+                return ToolResult::error(std::string("fork() failed: ") + std::strerror(errno));
+            }
+            if (pid == 0) {
+                // child
+                ::close(pipefd[0]);
+                ::dup2(pipefd[1], 1);
+                ::dup2(pipefd[1], 2);
+                ::close(pipefd[1]);
+                if (!cwd.empty() && ::chdir(cwd.c_str()) != 0) {
+                    std::fprintf(stderr, "chdir(%s) failed: %s\n",
+                                 cwd.c_str(), std::strerror(errno));
+                    ::_exit(126);
+                }
+                ::execl("/bin/sh", "sh", "-c", cmd.c_str(), (char *) nullptr);
+                ::_exit(127);
+            }
+            // parent
+            ::close(pipefd[1]);
+            ::fcntl(pipefd[0], F_SETFL, O_NONBLOCK);
+
+            constexpr size_t kCap = 32 * 1024;
+            std::string out;
+            out.reserve(4096);
+
+            auto deadline = std::chrono::steady_clock::now()
+                          + std::chrono::seconds(timeout_sec);
+            bool sent_term = false;
+            bool killed_for_timeout = false;
+            int  status = 0;
+            bool reaped = false;
+
+            auto drain_pipe = [&]() {
+                char buf[4096];
+                ssize_t n;
+                while ((n = ::read(pipefd[0], buf, sizeof(buf))) > 0) {
+                    if (out.size() < kCap) {
+                        size_t take = std::min((size_t) n, kCap - out.size());
+                        out.append(buf, take);
+                    }
+                }
+            };
+
+            for (;;) {
+                auto now = std::chrono::steady_clock::now();
+                if (now >= deadline) {
+                    if (!sent_term) {
+                        ::kill(pid, SIGTERM);
+                        sent_term          = true;
+                        killed_for_timeout = true;   // we initiated it
+                        deadline           = now + std::chrono::seconds(2); // grace
+                    } else {
+                        ::kill(pid, SIGKILL);
+                        break;
+                    }
+                }
+                int wait_ms = (int) std::chrono::duration_cast<std::chrono::milliseconds>(
+                                  deadline - now).count();
+                if (wait_ms < 0)   wait_ms = 0;
+                if (wait_ms > 200) wait_ms = 200;
+
+                struct pollfd pfd { pipefd[0], POLLIN, 0 };
+                int rc = ::poll(&pfd, 1, wait_ms);
+                if (rc < 0 && errno == EINTR) continue;
+                if (rc > 0 && (pfd.revents & (POLLIN | POLLHUP))) {
+                    drain_pipe();
+                }
+
+                pid_t r = ::waitpid(pid, &status, WNOHANG);
+                if (r == pid) {
+                    drain_pipe();
+                    reaped = true;
+                    break;
+                }
+            }
+
+            if (!reaped) {
+                drain_pipe();
+                ::waitpid(pid, &status, 0);
+            }
+            ::close(pipefd[0]);
+
+            std::ostringstream oss;
+            if (killed_for_timeout) {
+                oss << "exit=-1  [killed: timeout after " << timeout_sec << "s]\n";
+            } else if (WIFEXITED(status)) {
+                oss << "exit=" << WEXITSTATUS(status) << "\n";
+            } else if (WIFSIGNALED(status)) {
+                oss << "exit=signal:" << WTERMSIG(status) << "\n";
+            } else {
+                oss << "exit=?\n";
+            }
+            std::string body = std::move(out);
+            if (body.size() >= kCap) body += "\n[truncated at 32 KB]\n";
+            return ToolResult::ok(oss.str() + body);
         })
         .build();
 }
