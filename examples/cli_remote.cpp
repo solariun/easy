@@ -722,10 +722,39 @@ void register_tools(easyai::Client & cli,
 
     if (o.verbose) {
         std::fprintf(stderr,
-            "%s[easyai-cli-remote]%s registered %zu tool(s):",
+            "%s[easyai-cli-remote]%s registered %zu tool(s):\n",
             st.dim(), st.reset(), cli.tools().size());
-        for (const auto & t : cli.tools()) std::fprintf(stderr, " %s", t.name.c_str());
-        std::fputc('\n', stderr);
+        for (const auto & t : cli.tools()) {
+            // Squash the JSON schema down to a single line for the log.
+            std::string schema = t.parameters_json;
+            for (char & c : schema) if (c == '\n' || c == '\r') c = ' ';
+            // Collapse runs of spaces to one, just for readability.
+            std::string compact;
+            compact.reserve(schema.size());
+            bool prev_space = false;
+            for (char c : schema) {
+                if (c == ' ') {
+                    if (!prev_space) compact.push_back(' ');
+                    prev_space = true;
+                } else {
+                    compact.push_back(c);
+                    prev_space = false;
+                }
+            }
+            // Trim long descriptions in the log so the line stays
+            // scannable; the model still sees the full text.
+            std::string desc = t.description;
+            for (char & c : desc) if (c == '\n' || c == '\r') c = ' ';
+            if (desc.size() > 120) desc = desc.substr(0, 120) + "…";
+            std::fprintf(stderr,
+                "%s  - %s%s%s  desc=\"%s\"\n",
+                st.dim(),
+                st.bold(), t.name.c_str(), st.reset(),
+                desc.c_str());
+            std::fprintf(stderr,
+                "%s    schema=%s%s\n",
+                st.dim(), compact.c_str(), st.reset());
+        }
     }
 }
 
@@ -953,15 +982,24 @@ void wire_callbacks(easyai::Client & cli, easyai::Plan & plan,
         write_through_spinner(ss.str());
         if (o.verbose) {
             std::fprintf(stderr,
-                "%s[tool %s%s name=%s args_bytes=%zu result_bytes=%zu +%ldms]%s\n",
+                "%s[tool %s name=%s args_bytes=%zu result_bytes=%zu +%ldms]%s\n",
                 st.dim(),
-                result.is_error ? "FAIL " : "ok ",
-                call.name.c_str(),
+                result.is_error ? "FAIL" : "ok",
                 call.name.c_str(),
                 call.arguments_json.size(),
                 result.content.size(),
                 g_stats ? g_stats->elapsed_ms() : 0,
                 st.reset());
+            std::string args_prev = call.arguments_json;
+            if (args_prev.size() > 240) args_prev = args_prev.substr(0, 240) + "…";
+            for (char & c : args_prev) if (c == '\n' || c == '\r') c = ' ';
+            std::fprintf(stderr, "%s         args=%s%s\n",
+                         st.dim(), args_prev.c_str(), st.reset());
+            std::string res_prev = result.content;
+            if (res_prev.size() > 240) res_prev = res_prev.substr(0, 240) + "…";
+            for (char & c : res_prev) if (c == '\n' || c == '\r') c = ' ';
+            std::fprintf(stderr, "%s         result=%s%s\n",
+                         st.dim(), res_prev.c_str(), st.reset());
         }
     });
     plan.on_change([&st](const easyai::Plan & p) {

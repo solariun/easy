@@ -443,6 +443,12 @@ struct Client::Impl {
                 "[easyai-cli] POST %s%s  (body=%zu bytes, tools=%zu, hist=%zu)\n",
                 endpoint.c_str(), path.c_str(), body.size(),
                 tools.size(), history_json.size());
+            if (!tools.empty()) {
+                std::fprintf(stderr, "[easyai-cli]   tools[]:");
+                for (const auto & t : tools)
+                    std::fprintf(stderr, " %s", t.name.c_str());
+                std::fputc('\n', stderr);
+            }
         }
 
         auto headers = headers_with_auth("text/event-stream");
@@ -558,6 +564,35 @@ struct Client::Impl {
         for (int hop = 0; hop < kMaxHops; ++hop) {
             AssistantTurn turn;
             if (!stream_chat(turn)) return {};
+
+            if (verbose) {
+                std::fprintf(stderr,
+                    "[easyai-cli] hop %d done: content=%zu reasoning=%zu "
+                    "tool_calls=%zu finish=%s incomplete=%s\n",
+                    hop,
+                    turn.content.size(),
+                    turn.reasoning.size(),
+                    turn.tool_calls.size(),
+                    turn.finish_reason.c_str(),
+                    turn.incomplete ? "yes" : "no");
+                for (const auto & p : turn.tool_calls) {
+                    std::string args = p.arguments;
+                    if (args.size() > 160) args = args.substr(0, 160) + "…";
+                    for (char & c : args) if (c == '\n' || c == '\r') c = ' ';
+                    std::fprintf(stderr,
+                        "[easyai-cli]   tool_call name=%s id=%s args=%s\n",
+                        p.name.c_str(),
+                        p.id.empty() ? "(none)" : p.id.c_str(),
+                        args.c_str());
+                }
+                if (turn.tool_calls.empty() && turn.incomplete) {
+                    std::string tail = turn.content;
+                    if (tail.size() > 160) tail = "…" + tail.substr(tail.size() - 160);
+                    for (char & c : tail) if (c == '\n' || c == '\r') c = ' ';
+                    std::fprintf(stderr,
+                        "[easyai-cli]   content tail: %s\n", tail.c_str());
+                }
+            }
 
             // Opt-in retry on incomplete turns.  Discards the bad
             // assistant entry from history (so the conversation handed
