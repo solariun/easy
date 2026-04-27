@@ -9,16 +9,22 @@ easyai turns [llama.cpp](https://github.com/ggml-org/llama.cpp) into an
 it C++ functions; it gives the model the ability to call them.  That's
 the whole pitch.
 
-It also ships four ready-to-run binaries built on top of the same
-library:
+It ships **two libraries** you can `find_package(easyai)` and link
+against, plus six ready-to-run binaries:
 
-| Binary           | What it gives you                                                                                                                                  |
-|------------------|----------------------------------------------------------------------------------------------------------------------------------------------------|
-| `easyai-cli`     | Drop-in `llama-cli` replacement: local **or** remote OpenAI-compatible endpoint, one-shot scripting (`-p`), tools, presets, optional `<think>` strip. |
-| `easyai-server`  | Drop-in `llama-server` replacement: OpenAI-compat HTTP **with full SSE streaming**, embedded SvelteKit webui, Bearer auth, Prometheus `/metrics`, KV-cache controls, flash-attn, mlock. |
-| `easyai-agent`   | A demo agent showing every built-in tool plus an inline custom tool.                                                                                |
-| `easyai-recipes` | Tutorial agent paired with `manual.md` — implements `today_is` and `weather` (HTTP-calling) from scratch.                                          |
-| `easyai-chat`    | A bare-bones REPL with no tools — useful as a sanity check.                                                                                          |
+| Library             | Purpose                                                                                                                                       |
+|---------------------|-----------------------------------------------------------------------------------------------------------------------------------------------|
+| `libeasyai`         | Local llama.cpp engine — `easyai::Engine`, `easyai::Tool`, built-in tools, presets, `easyai::Plan`.  Linked via `easyai::engine`.            |
+| `libeasyai-cli`     | OpenAI-protocol client — `easyai::Client` mirrors `Engine` but the model runs on a remote `/v1/chat/completions` endpoint while tools execute locally.  Linked via `easyai::cli`. |
+
+| Binary               | What it gives you                                                                                                                                  |
+|----------------------|----------------------------------------------------------------------------------------------------------------------------------------------------|
+| `easyai-cli`         | Drop-in `llama-cli` replacement: local **or** remote OpenAI-compatible endpoint, one-shot scripting (`-p`), tools, presets, optional `<think>` strip. |
+| `easyai-cli-remote`  | Pure agentic CLI built on `libeasyai-cli` — no local model required.  REPL or `-p`, full sampling control (`--temperature`, `--top-p`, `--top-k`, `--min-p`, `--repeat-penalty`, `--frequency-penalty`, `--presence-penalty`, `--seed`, `--max-tokens`, `--stop`), plan tool, server-management subcommands (`--list-models`, `--list-tools`, `--health`, `--props`, `--metrics`, `--set-preset`). |
+| `easyai-server`      | Drop-in `llama-server` replacement: OpenAI-compat HTTP **with full SSE streaming**, embedded SvelteKit webui, Bearer auth, Prometheus `/metrics`, KV-cache controls, flash-attn, mlock. |
+| `easyai-agent`       | A demo agent showing every built-in tool plus an inline custom tool.                                                                                |
+| `easyai-recipes`     | Tutorial agent paired with `manual.md` — implements `today_is` and `weather` (HTTP-calling) from scratch.                                          |
+| `easyai-chat`        | A bare-bones REPL with no tools — useful as a sanity check.                                                                                          |
 
 > **Status** — used in production on a Linux Vulkan box (Radeon 680M)
 > as a self-hosted ChatGPT-style assistant.  Apple Silicon (Metal),
@@ -69,12 +75,15 @@ engine.add_tool(
 
 ## What's in the box
 
-### Library (`libeasyai`)
+### Library (`libeasyai`, link target `easyai::engine`)
 
 * `easyai::Engine` — high-level wrapper around llama.cpp's model + context +
   sampler + chat templates. Fluent setters, RAII-owned native resources.
 * `easyai::Tool` — name + description + JSON-schema params + handler. Builder
   API generates the schema for you.
+* `easyai::Plan` — agent-friendly checklist with one multi-action tool
+  (add / start / done / list).  Pluggable into `Engine` or `Client`; fires a
+  callback on every mutation so you can render live.
 * `easyai::tools::*` — built-in tools:
   * `datetime` (no deps)
   * `web_fetch` (libcurl, HTML→text)
@@ -85,6 +94,20 @@ engine.add_tool(
   (`deterministic / precise / balanced / creative / wild`) plus a tiny parser
   that turns chat lines like `"creative 0.9"` or `"/temp 0.5"` into sampling
   overrides.
+
+### Library (`libeasyai-cli`, link target `easyai::cli`)
+
+* `easyai::Client` — same fluent API shape as `Engine`, but the model runs on
+  a remote `/v1/chat/completions` endpoint and **tools execute locally**.
+  Configures HTTP transport (`endpoint`, `api_key`, `timeout_seconds`,
+  `verbose`) plus the full sampling/penalty surface (`temperature`, `top_p`,
+  `top_k`, `min_p`, `repeat_penalty`, `frequency_penalty`, `presence_penalty`,
+  `seed`, `max_tokens`, `stop(vector)`, `extra_body_json`).  Streaming
+  callbacks (`on_token`, `on_reason`, `on_tool`) and an agentic multi-hop
+  loop mirror `Engine::chat_continue` semantics.
+* Direct-endpoint helpers — `list_models`, `list_remote_tools`, `health`,
+  `metrics`, `props`, `set_preset` — let downstream apps script and
+  introspect an `easyai-server` without ever touching curl.
 
 ### Binaries
 
@@ -183,6 +206,63 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 For Claude Code (or any tool that takes an OpenAI-compatible base URL), set
 `http://127.0.0.1:8080/v1` as the base. Any tools the client declares will
 be forwarded; any tools it doesn't declare will use the server's toolbelt.
+
+### Selective builds — only what you need
+
+Every target is independent.  Configure once, then build whichever
+subset matters for your situation:
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release           # configure once
+
+# Just the engine library (libeasyai.so + headers):
+cmake --build build -j --target easyai
+
+# Just the OpenAI-protocol client library (libeasyai-cli.so):
+cmake --build build -j --target easyai_cli
+
+# Just the agentic remote CLI (links libeasyai-cli):
+cmake --build build -j --target easyai-cli-remote
+
+# Just the server:
+cmake --build build -j --target easyai-server
+
+# Drop the examples entirely (lib-only consumers):
+cmake -S . -B build -DEASYAI_BUILD_EXAMPLES=OFF
+cmake --build build -j
+
+# Drop the embedded webui from easyai-server (smaller binary):
+cmake -S . -B build -DEASYAI_BUILD_WEBUI=OFF
+cmake --build build -j
+
+# Drop libcurl-using tools (web_fetch / web_search):
+cmake -S . -B build -DEASYAI_WITH_CURL=OFF
+cmake --build build -j
+
+# Clean rebuild from scratch:
+rm -rf build
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+
+# Just delete object files but keep configuration:
+cmake --build build --target clean
+```
+
+After `cmake --install build --prefix /usr/local`, downstream projects
+can `find_package(easyai 0.1 REQUIRED)`:
+
+```cmake
+# Your CMakeLists.txt:
+find_package(easyai 0.1 REQUIRED)
+add_executable(myapp main.cpp)
+target_link_libraries(myapp PRIVATE
+    easyai::engine    # libeasyai.so — local llama.cpp wrapper
+    easyai::cli       # libeasyai-cli.so — OpenAI-protocol client
+)
+```
+
+Both targets export their public include directory and `cxx_std_17`
+feature, so consumers don't need any extra include flags.
 
 ### Build for your hardware
 

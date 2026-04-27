@@ -248,6 +248,20 @@ add_executable(hello hello.cpp)
 target_link_libraries(hello PRIVATE easyai)
 ```
 
+If your project lives outside this tree and you've installed easyai
+(`cmake --install build --prefix /usr/local`), use `find_package`
+instead:
+
+```cmake
+find_package(easyai 0.1 REQUIRED)
+add_executable(hello hello.cpp)
+target_link_libraries(hello PRIVATE easyai::engine)
+```
+
+`easyai::engine` is the link target for `libeasyai.so` (local llama.cpp
+wrapper).  For the OpenAI-protocol client described in 3.9, swap to
+`easyai::cli` (or link both side by side).
+
 ### 3.2 Adding a tool
 
 The 6-line shape:
@@ -807,6 +821,108 @@ if (turn.finish_reason == "tool_calls") {
     std::cout << turn.content;
 }
 ```
+
+### 3.10 Talking to a remote endpoint with `easyai::Client`
+
+`libeasyai-cli` is the network-side counterpart of `libeasyai`.  Same
+fluent API, same `Tool` registration model, same agentic loop — the
+model runs on a remote `/v1/chat/completions` endpoint while your
+tools execute locally.
+
+```cpp
+// remote.cpp
+#include "easyai/client.hpp"
+#include "easyai/builtin_tools.hpp"
+#include "easyai/plan.hpp"
+
+#include <cstdio>
+#include <cstdlib>
+#include <iostream>
+
+int main() {
+    easyai::Client cli;
+    cli.endpoint("http://ai.local:8080")
+       .api_key(std::getenv("EASYAI_API_KEY") ? std::getenv("EASYAI_API_KEY") : "")
+       .model("EasyAi")
+       .system("You are a planning agent. Be concise.")
+       .temperature(0.2f)
+       .top_p(0.95f)
+       .seed(42);
+
+    cli.add_tool(easyai::tools::datetime());
+    cli.add_tool(easyai::tools::web_search());
+    cli.add_tool(easyai::tools::web_fetch());
+
+    easyai::Plan plan;
+    plan.on_change([](const easyai::Plan & p){
+        std::cout << "\n[plan]\n";
+        p.render(std::cout);
+    });
+    cli.add_tool(plan.tool());
+
+    cli.on_token ([](const std::string & p){ std::cout << p << std::flush; });
+    cli.on_reason([](const std::string & p){ std::cerr << p << std::flush; });
+    cli.on_tool  ([](const easyai::ToolCall & call, const easyai::ToolResult & r){
+        std::fprintf(stderr, "%s %s(%s)\n",
+                     r.is_error ? "✗" : "🔧",
+                     call.name.c_str(),
+                     call.arguments_json.c_str());
+    });
+
+    std::string answer = cli.chat("Resumo dos 3 papers mais citados sobre Mamba este ano.");
+    if (answer.empty() && !cli.last_error().empty()) {
+        std::fprintf(stderr, "error: %s\n", cli.last_error().c_str());
+        return 1;
+    }
+    std::cout << "\n";
+    return 0;
+}
+```
+
+CMake — find_package style (after `cmake --install`):
+
+```cmake
+find_package(easyai 0.1 REQUIRED)
+add_executable(remote remote.cpp)
+target_link_libraries(remote PRIVATE easyai::cli)
+```
+
+`easyai::cli` transitively pulls `easyai::engine` so `Tool` / `Plan` /
+the `easyai::tools::*` factories are available without extra link
+flags.
+
+**Sampling and penalty knobs** are all there as fluent setters:
+`temperature`, `top_p`, `top_k`, `min_p`, `repeat_penalty`,
+`frequency_penalty`, `presence_penalty`, `seed`, `max_tokens`,
+`stop(vector)`, `extra_body_json` (free-form JSON merged last so it can
+override anything the typed setters wrote, useful for non-standard
+server extensions like `{"reasoning_effort":"high"}`).
+
+**Server management** without touching curl:
+
+```cpp
+std::vector<easyai::RemoteModel> models;
+cli.list_models(models);
+
+std::vector<easyai::RemoteTool> remote_tools;
+cli.list_remote_tools(remote_tools);     // GET /v1/tools
+
+if (!cli.health()) std::fprintf(stderr, "down: %s\n", cli.last_error().c_str());
+
+std::string props_json;
+cli.props(props_json);                    // GET /props (raw JSON)
+
+std::string prom_text;
+cli.metrics(prom_text);                   // GET /metrics (Prometheus)
+
+cli.set_preset("creative");               // POST /v1/preset
+```
+
+The `easyai-cli-remote` binary (`examples/cli_remote.cpp`) is a
+ready-to-run reference for all of the above — REPL or one-shot, every
+sampling knob exposed as a flag, six management subcommands
+(`--list-models`, `--list-tools`, `--health`, `--props`, `--metrics`,
+`--set-preset NAME`).
 
 ---
 

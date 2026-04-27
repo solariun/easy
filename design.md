@@ -6,6 +6,30 @@ internal pieces fit together. It assumes you've at least skimmed the
 
 ---
 
+## 0. Dependency inventory
+
+Everything easyai pulls in, why, and where it lives:
+
+| Dependency             | Required for                              | Source                                                                  | Linkage                                                  |
+|------------------------|-------------------------------------------|-------------------------------------------------------------------------|----------------------------------------------------------|
+| **llama.cpp `llama`**  | inference, model load, KV cache           | sibling checkout (`../llama.cpp/`)                                      | `libeasyai.so` `PRIVATE` link (BUILD_INTERFACE wrapped) |
+| **llama.cpp `common`** | chat templates, tool-call parsing, sampler | sibling checkout (`../llama.cpp/common/`)                              | `libeasyai.so` `PRIVATE` link                            |
+| **ggml + backends**    | tensor ops (CPU / Metal / Vulkan / CUDA / HIP) | transitively via `llama`                                            | resolved at runtime through `libllama.so`                |
+| **cpp-httplib**        | server transport, **client transport**    | vendored by llama.cpp (`../llama.cpp/vendor/cpp-httplib/httplib.h`)     | static lib, linked into `easyai-server` and `libeasyai-cli` |
+| **nlohmann::json**     | request/response JSON, tool args/results  | vendored by llama.cpp (`../llama.cpp/vendor/nlohmann/json.hpp`)         | header-only; included only where needed                  |
+| **libcurl** (optional) | `web_fetch`, `web_search` (DuckDuckGo)    | system package (`libcurl-dev`)                                          | `libeasyai.so` `PRIVATE` when `EASYAI_WITH_CURL=ON`      |
+| **OpenSSL** (optional) | future HTTPS for `easyai::Client`         | system package (`libssl-dev`)                                           | not yet linked — see [`include/easyai/client.hpp`](include/easyai/client.hpp) |
+| **glslc / Vulkan SDK** | shader compilation when `GGML_VULKAN=ON`  | system package                                                          | build-time only, baked into `libggml-vulkan.so`         |
+| **systemd-coredump**   | crash capture for the production server   | system package, declared by `scripts/install_easyai_server.sh`          | runtime, optional                                        |
+
+**No header-leak guarantee** for the public ABI: `easyai/engine.hpp` only
+forward-declares `common_chat_params`, `easyai/client.hpp` is
+self-contained (no transitive llama.cpp / cpp-httplib / nlohmann include),
+`easyai/tool.hpp` and `easyai/plan.hpp` use only standard library. Consumers
+can link `libeasyai-cli` without touching llama.cpp at all.
+
+---
+
 ## 1. Goals & non-goals
 
 ### Goals
@@ -236,6 +260,66 @@ ships `easyai::args::get_string / get_int / get_double / get_bool` —
 deliberately single-level scanners that don't pull a JSON dependency into
 your handler code. For nested args, include `nlohmann/json.hpp` yourself
 (it's vendored by llama.cpp).
+
+---
+
+## 5b. The OpenAI-protocol client (`libeasyai-cli`)
+
+`easyai::Client` is the network counterpart of `Engine`.  Same fluent
+API, same `Tool` registration model, same agentic loop semantics — the
+difference is that `chat()` POSTs to `/v1/chat/completions` and streams
+the reply back over SSE instead of running llama.cpp locally.
+
+```
+                       libeasyai-cli                     remote server
+   ┌────────────────────────────────────────────┐      ┌──────────────┐
+   │  Client::chat("…")                          │      │  llama.cpp /  │
+   │    POST /v1/chat/completions  (stream:true) │ ───▶ │  another      │
+   │    body: { messages, tools, sampling… }     │      │  OpenAI-     │
+   │                                             │      │  compat API  │
+   │    SSE chunks  ◀─────────────────────────── │ ◀──  │              │
+   │    parse delta.{content,reasoning,tool_calls}│      └──────────────┘
+   │                                             │
+   │    finish_reason == "tool_calls"?           │
+   │      yes → dispatch handler() in-process,   │
+   │            append tool message,             │
+   │            POST again.                      │
+   │      no  → return turn.content              │
+   └────────────────────────────────────────────┘
+```
+
+Why a separate library:
+
+* **Different deployment surface.**  `libeasyai` requires a model file,
+  ggml, and the active GPU backend at link time.  `libeasyai-cli` only
+  needs cpp-httplib + nlohmann::json + the `Tool`/`ToolCall`/`ToolResult`
+  POD types it inherits from `libeasyai`.  Apps that just want to drive
+  a remote endpoint don't pay the llama.cpp install cost.
+* **Same authoring experience.**  A handler written for `Engine::add_tool`
+  works unchanged with `Client::add_tool`.  This lets you prototype a
+  tool against a tiny local model and then point the same code at the
+  production cluster by swapping `Engine` → `Client`.
+* **Server-management SDK.**  `Client` exposes one method per
+  easyai-server endpoint (`list_models`, `list_remote_tools`, `health`,
+  `metrics`, `props`, `set_preset`).  That makes the library enough to
+  script and recreate a server's state from scratch.
+
+The agentic loop in `Impl::run_chat_loop` mirrors
+`Engine::chat_continue`: bounded at 8 hops, pushes the assistant
+message into history *before* dispatching, captures tool failures as
+`ERROR: …` content so the model can react to them, and returns
+`turn.content` only when the model emits a non-tool `finish_reason`.
+
+History is stored as raw OpenAI-shape JSON strings (one per message)
+inside `Impl::history_json`, so no nlohmann::json type ever leaks
+through the public ABI — `messages_array()` rebuilds the array on each
+request.
+
+The wire protocol is OpenAI's incremental-tool-call shape: tool calls
+arrive across multiple deltas keyed by `index`, and `arguments` is a
+*string concatenation* across deltas.  `PendingToolCall` accumulates
+these in a `std::map<int, PendingToolCall>` so out-of-order arrivals
+self-merge.
 
 ---
 

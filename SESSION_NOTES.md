@@ -5,17 +5,23 @@
 
 ## 1. Project at a glance
 
-`easyai` is a C++17 wrapper around `llama.cpp` that ships:
+`easyai` is a C++17 framework around `llama.cpp` that ships **two
+libraries** (`find_package(easyai)` exports `easyai::engine` and
+`easyai::cli`) plus six binaries:
 
-| Binary           | Role                                                                                         |
-|------------------|----------------------------------------------------------------------------------------------|
-| `libeasyai`      | High-level Engine API + built-in tools (datetime, web_search via DuckDuckGo, web_fetch, fs_*)|
-| `easyai-cli`     | Drop-in `llama-cli` replacement, **also** speaks OpenAI-compat HTTP via `--url`              |
-| `easyai-server`  | Drop-in `llama-server` replacement: embeds llama-server's SvelteKit webui, no MCP            |
-| `easyai-agent`   | Demo agent showing every built-in tool                                                       |
-| `easyai-chat`    | Bare REPL                                                                                    |
+| Artifact              | Type    | Role                                                                                                                                    |
+|-----------------------|---------|-----------------------------------------------------------------------------------------------------------------------------------------|
+| `libeasyai`           | library | local llama.cpp engine — `Engine`, `Tool`, `Plan`, built-in tools (datetime, web_search/fetch, fs_*), presets.  Linked via `easyai::engine`.    |
+| `libeasyai-cli`       | library | OpenAI-protocol client — `Client` mirrors `Engine`'s fluent API but the model runs remote and tools execute locally.  Linked via `easyai::cli`. |
+| `easyai-cli`          | binary  | Drop-in `llama-cli` replacement, also speaks OpenAI-compat HTTP via `--url`                                                            |
+| `easyai-cli-remote`   | binary  | Pure agentic CLI on top of `libeasyai-cli` — no local model.  REPL or `-p`, full sampling control, plan tool, server-management subcommands. |
+| `easyai-server`       | binary  | Drop-in `llama-server` replacement: embeds llama-server's SvelteKit webui, no MCP                                                      |
+| `easyai-agent`        | binary  | Demo agent showing every built-in tool                                                                                                  |
+| `easyai-chat`         | binary  | Bare REPL                                                                                                                               |
+| `easyai-recipes`      | binary  | Tutorial agent paired with manual.md ch. 3.8                                                                                            |
 
-GitHub: **https://github.com/solariun/easy** (branch `main`).
+GitHub: **https://github.com/solariun/easy** (branch `main`, tag `v0.1.0`
+is the first formal release).
 Sibling repo path: `develop/easyai/easyai/` next to `develop/easyai/llama.cpp/`.
 
 ## 2. User context (important — read this)
@@ -50,18 +56,28 @@ Sibling repo path: `develop/easyai/easyai/` next to `develop/easyai/llama.cpp/`.
 
 ```
 easyai/
-├── include/easyai/{engine,tool,builtin_tools,presets,easyai}.hpp   # public API
-├── src/{engine,tool,builtin_tools,presets}.cpp                     # impl
-├── examples/{cli,server,agent,chat}.cpp                            # binaries
-├── webui/{index.html,bundle.js,bundle.css,loading.html}            # llama-server fork
-├── cmake/xxd.cmake                                                 # binary embed helper
-├── scripts/install_easyai_server.sh                                # Linux installer
+├── include/easyai/{engine,tool,builtin_tools,presets,plan,client,easyai}.hpp  # public API
+├── src/{engine,tool,builtin_tools,presets,plan,client}.cpp                    # impl
+├── examples/{cli,cli_remote,server,agent,chat,recipes}.cpp                    # binaries
+├── webui/{index.html,bundle.js,bundle.css,loading.html,AI-brain.svg}          # llama-server fork
+├── cmake/{xxd.cmake,easyaiConfig.cmake.in}                                    # build helpers + find_package
+├── scripts/install_easyai_server.sh                                           # Linux installer
 ├── README.md  design.md  manual.md  SESSION_NOTES.md (this file)
 └── CMakeLists.txt
 ```
 
 Build: `cmake -S . -B build && cmake --build build -j` (Metal auto on macOS;
 `-DGGML_VULKAN=ON` / `-DGGML_CUDA=ON` / `-DGGML_HIP=ON` for other GPUs).
+Selective targets: `cmake --build build --target easyai|easyai_cli|easyai-server|easyai-cli-remote|...`.
+
+Install: `cmake --install build --prefix /usr/local` lays out
+`<prefix>/lib/libeasyai{,-cli}.so.0.1.0`,
+`<prefix>/include/easyai/*.hpp`, and
+`<prefix>/lib/cmake/easyai/easyaiConfig.cmake` so downstream projects
+do `find_package(easyai 0.1 REQUIRED)` + `target_link_libraries(myapp
+PRIVATE easyai::engine easyai::cli)`.  The hand-rolled config dodges
+install(EXPORT)'s issue with the `EXCLUDE_FROM_ALL` llama.cpp subdir
+by creating IMPORTED targets at find_package time.
 
 ## 4. Architecture
 
@@ -76,9 +92,41 @@ Build: `cmake -S . -B build && cmake --build build -j` (Metal auto on macOS;
 - Public `chat_params_for_current_state(bool)` returns the rendered
   `common_chat_params` so the HTTP layer can do incremental parsing.
 - `perf_data()` wraps `llama_perf_context()` for tokens/s timings.
-- Recovery layer in `parse_assistant`: if PEG parse fails, manually
-  extracts `<tool_call>{...}</tool_call>` from raw output — handles Qwen2.5's
-  doubled-brace `{{ ... }}` malformed JSON pattern.
+- Three-layer recovery in `parse_assistant` for malformed tool_calls:
+  (1) Qwen-style doubled-brace JSON, (2) Hermes-XML `<function=NAME>/
+  <parameter=K>V`, (3) markdown indicator `*🔧 NAME(args)*` (when the
+  model abandons the structured format mid-conversation).  Wrench-emoji
+  byte sequence (F0 9F 94 A7) is the gate so prose doesn't trip recovery.
+- `extract_think_block` splits `<think>...</think>` out of raw content
+  when the official parser threw, so the streaming layer's last-resort
+  fallback never re-emits reasoning that was already streamed as
+  `delta.reasoning_content`.
+
+**Client** (`src/client.cpp`, libeasyai-cli)
+- pImpl with raw OpenAI-shape JSON history strings — no nlohmann::json
+  in the public ABI.
+- HTTP/SSE via cpp-httplib; URL parser supports `http(s)://host[:port][/base]`.
+  HTTPS reports a clear "not in this build" error (no OpenSSL link yet).
+- Streaming SSE parser handles `\n\n` / `\r\n\r\n` terminators, ignores
+  comments and our server's UI-only `easyai.tool_call`/`tool_result`
+  custom events.
+- Tool-call deltas accumulated by `index` into `PendingToolCall`
+  (string-built `arguments` across deltas — exactly how OpenAI streams
+  them).  Multi-hop loop bounded at 8, mirrors `Engine::chat_continue`.
+- Full sampling/penalty surface: `temperature`, `top_p`, `top_k`, `min_p`,
+  `repeat_penalty`, `frequency_penalty`, `presence_penalty`, `seed`,
+  `max_tokens`, `stop(vector)`, `extra_body_json` (free-form JSON merged
+  last so it overrides anything the typed setters wrote).
+- Direct-endpoint helpers (`list_models`, `list_remote_tools`, `health`,
+  `metrics`, `props`, `set_preset`) round out the SDK so downstream apps
+  can manage an easyai-server without touching curl.
+
+**Plan** (`src/plan.cpp`, `include/easyai/plan.hpp`)
+- In-memory checklist of `{id, text, status}` items + `ChangeCallback`.
+- `Plan::tool()` returns a single `Tool` with `action=add|start|done|list`
+  schema — wires into `Engine::add_tool` or `Client::add_tool` the same way.
+- `render_string()` produces a GitHub-style markdown checklist
+  (`- [ ] / [~] / [x]`).
 
 **Server** (`examples/server.cpp`)
 - cpp-httplib + nlohmann::json (vendored by llama.cpp).
@@ -152,20 +200,25 @@ two layers:
 ## 5. Recent commits (most recent first)
 
 ```
-(uncommitted as of 2026-04-26 ~12:00 UTC; staged for review:)
-  Engine: thought-only retry path in chat_continue + on_hop_reset callback
-  Engine: verbose hop dump (raw size + tail + msg field sizes)
-  Server: try/catch around compute_diffs in on_token (strict monotonic guard)
-  Server: disable custom __easyai-thinking panel (kept dormant via flag)
-  Server: shrink bundle's native Reasoning panel + open-during-stream / collapse-on-finish
-  Lib: args::get_*_or + args::has helpers (defaults for tool authors)
-  Examples: new examples/recipes.cpp (today_is + weather, wired into CMake)
-  Installer: systemd-coredump dep, LimitCORE=infinity, --enable-verbose flag,
-             coredumpctl hint in post-install summary
-  Docs: README framework framing + status, design.md drops streaming-out-of-scope
-        and adds on_hop_reset / thought-only retry, manual.md ch.3.8 recipe book
-        in for-dummies style
+v0.1.0 (tag) — first formal release, 2026-04-26.
 
+dc74102  easyai-cli-remote phase 3 + full sampling control on Client
+8e6c4e4  libeasyai-cli phase 2: full Client implementation (HTTP/SSE + agentic)
+5bf32c0  Lib-ise easyai + scaffold libeasyai-cli (phase 1 of 3)
+8a1ca33  Webui: live ctx during stream, override favicon, tools badge, lock UX
+46903e3  Engine: recover tool_calls from markdown markers when model abandons XML
+d7f638e  Webui ctx counter: cumulative session usage + near-limit input lock
+b2f77ff  Webui: move AI-brain.svg src/->webui/, reopen think panel, diag console
+870be9b  Webui: fix SyntaxError that killed tone-badge IIFE + bundle SSE noise
+c2eb22c  Webui: chip always visible, tone badge unstuck, smaller response body
+9b31a38  Stop reasoning + Hermes tool_call XML bleeding into chat body
+e9297fe  Brand to EasyAi + embed brain SVG favicon + harden bar/tone visibility
+f8d83d1  Stack-overflow audit chapter in design.md
+3dec718  Fix SIGSEGV stack-overflow from std::regex in strip_html + silent SSE
+7976dbe  Webui follow-ups + Bug B fallback now reaches SSE stream
+731d441  Webui: blue brain panel, hide bundle Reasoning, live metrics + pulsing pill
+2ff181e  Framework polish: args defaults, recipes example, docs, installer
+5f7fa7d  Bug B fix + streaming UI normalisation
 186c20a  Update SESSION_NOTES.md with reasoning-format fix and Bug A/B status.
 709684b  THE missing piece: set reasoning_format on common_chat_templates_inputs
 3a94bd3  Fix Jinja crash: push user msg before chat_params render in streaming
@@ -236,6 +289,13 @@ c6a09d6  Single combined bar above the textarea (tone + ctx + last)
   on last good state and wait for next token to settle.
 
 ## 6. Known issues / pending validation
+
+- **HTTPS for `easyai::Client`** — not wired yet.  Needs cpp-httplib's
+  `CPPHTTPLIB_OPENSSL_SUPPORT` define + linking OpenSSL into the
+  `easyai_cli` target + a `make_http()` branch returning an SSLClient
+  base pointer (httplib's SSLClient inherits from `httplib::Client`).
+  Until this lands the `Client` returns a clear error on `https://`
+  endpoints.  Workaround: terminate TLS at a reverse proxy.
 
 - **(A) Webui thinking-panel rendering** — ✅ **FIX VALIDATED**.
   Commit `709684b` made the per-message reasoning panel light up
