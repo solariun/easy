@@ -10,3 +10,6 @@
 #include "builtin_tools.hpp"
 #include "presets.hpp"
 #include "plan.hpp"
+#include "ui.hpp"
+#include "text.hpp"
+#include "log.hpp"

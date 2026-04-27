@@ -106,81 +106,6 @@ void handle_sigint(int) {
 }
 void install_sigint() { std::signal(SIGINT, handle_sigint); }
 
-// ============================================================================
-//  TokenSpinner — rotating `|/-\\` character that ALWAYS trails the
-//  cursor while a streamed response is in flight.
-//
-//  Pattern per token:
-//      1. caller calls about_to_print()  → erases spinner if active
-//      2. caller prints the visible content
-//      3. caller calls after_print()      → re-shows spinner one frame ahead
-//
-//  Pattern per "silent" token (reasoning hidden, etc):
-//      tick_silent()  → erases + reshows on the same column, advancing frame
-//
-//  Net effect: the user always sees an animated spinner directly after
-//  the most recently printed character, ticking forward with every
-//  delta.  When the turn ends, finish() erases the trailing frame.
-//
-//  Disabled when stdout isn't a TTY (clean output for `$(easyai-cli …)`).
-// ============================================================================
-class TokenSpinner {
-   public:
-    explicit TokenSpinner(bool en)
-        : enabled_(en && ::isatty(fileno(stdout)) != 0) {}
-
-    void about_to_print() {
-        if (!enabled_) return;
-        if (active_) {
-            std::fputs("\b \b", stdout);
-            active_ = false;
-        }
-    }
-    void after_print() {
-        if (!enabled_) return;
-        maybe_advance_();
-        write_frame_();
-    }
-    void tick_silent() {
-        if (!enabled_) return;
-        about_to_print();
-        maybe_advance_();
-        write_frame_();
-    }
-    void finish() {
-        about_to_print();
-        frame_ = 0;
-    }
-
-   private:
-    // Frame advancement is throttled (~10 Hz) so a model emitting 50
-    // tokens/second doesn't burn CPU on fputc + fflush per delta.  The
-    // glyph stays at the cursor either way (write_frame_ runs every
-    // call), it just rotates more calmly.
-    static constexpr int kFrameAdvanceMs = 100;
-
-    void maybe_advance_() {
-        const auto now = std::chrono::steady_clock::now();
-        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                            now - last_advance_).count();
-        if (ms >= kFrameAdvanceMs) {
-            ++frame_;
-            last_advance_ = now;
-        }
-    }
-    void write_frame_() {
-        static const char frames[] = { '|', '/', '-', '\\' };
-        std::fputc(frames[frame_ % 4], stdout);
-        std::fflush(stdout);
-        active_ = true;
-    }
-
-    bool enabled_ = false;
-    bool active_  = false;
-    int  frame_   = 0;
-    std::chrono::steady_clock::time_point last_advance_{};
-};
-
 }  // namespace
 
 // ============================================================================
@@ -900,7 +825,8 @@ int main(int argc, char ** argv) {
 
         ThinkStripper strip;
         strip.enabled = args.no_think;
-        TokenSpinner  spinner(/*enabled=*/true);
+        easyai::ui::Spinner spinner(/*enabled=*/true);
+        spinner.start_heartbeat();
 
         // Honour an inline preset prefix in the prompt too.
         std::string text = args.prompt;
@@ -914,25 +840,19 @@ int main(int argc, char ** argv) {
         try {
             backend->chat(text, [&](const std::string & p){
                 std::string visible = strip.filter(p);
-                if (visible.empty()) {
-                    spinner.tick_silent();
-                } else {
-                    spinner.about_to_print();
-                    std::cout << visible << std::flush;
-                    spinner.after_print();
-                }
+                if (!visible.empty()) spinner.write(visible);
+                // empty visible (hidden think) — heartbeat keeps the
+                // glyph alive on its own.
             });
         } catch (const std::exception & e) {
+            spinner.stop_heartbeat();
             spinner.finish();
             std::fprintf(stderr, "\n[easyai-cli] error: %s\n", e.what());
             return 1;
         }
         std::string tail = strip.flush();
-        if (!tail.empty()) {
-            spinner.about_to_print();
-            std::cout << tail;
-            spinner.after_print();
-        }
+        if (!tail.empty()) spinner.write(tail);
+        spinner.stop_heartbeat();
         spinner.finish();
         std::cout << std::endl;
         return 0;
@@ -947,7 +867,7 @@ int main(int argc, char ** argv) {
 
     ThinkStripper strip;
     strip.enabled = args.no_think;
-    TokenSpinner  spinner(/*enabled=*/true);
+    easyai::ui::Spinner spinner(/*enabled=*/true);
 
     std::string line;
     while (true) {
@@ -991,25 +911,18 @@ int main(int argc, char ** argv) {
         // -------- normal generation ---------------------------------------
         g_interrupt.store(false);
         std::cout << "\033[33m";
+        spinner.start_heartbeat();
         try {
             backend->chat(line, [&](const std::string & p){
                 std::string visible = strip.filter(p);
-                if (visible.empty()) {
-                    spinner.tick_silent();
-                } else {
-                    spinner.about_to_print();
-                    std::cout << visible << std::flush;
-                    spinner.after_print();
-                }
+                if (!visible.empty()) spinner.write(visible);
             });
             std::string tail = strip.flush();
-            if (!tail.empty()) {
-                spinner.about_to_print();
-                std::cout << tail;
-                spinner.after_print();
-            }
+            if (!tail.empty()) spinner.write(tail);
+            spinner.stop_heartbeat();
             spinner.finish();
         } catch (const std::exception & e) {
+            spinner.stop_heartbeat();
             spinner.finish();
             std::fprintf(stderr, "\n[easyai-cli] error: %s\n", e.what());
         }

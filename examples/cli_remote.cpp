@@ -38,14 +38,14 @@
 
 #include "easyai/builtin_tools.hpp"
 #include "easyai/client.hpp"
+#include "easyai/log.hpp"
 #include "easyai/plan.hpp"
+#include "easyai/text.hpp"
 #include "easyai/tool.hpp"
+#include "easyai/ui.hpp"
 
 #include <algorithm>
-#include <atomic>
 #include <chrono>
-#include <condition_variable>
-#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -54,234 +54,34 @@
 #include <fstream>
 #include <iostream>
 #include <map>
-#include <mutex>
 #include <set>
 #include <sstream>
 #include <string>
 #include <sys/types.h>
-#include <thread>
-#include <unistd.h>      // isatty, getpid
+#include <unistd.h>      // getpid
 #include <vector>
 
 namespace {
 
-// ---- diagnostic log file (RAW transaction tee) ----------------------------
-//
-// When --verbose is on (and unless --log-file overrides it) cli-remote
-// writes every diagnostic line AND every byte that crosses the wire
-// (request body, raw SSE chunks, tool dispatch summaries — that part
-// is done inside libeasyai-cli through Client::log_file) into a file.
-// The path is printed at startup so the operator can paste it back
-// here for offline analysis or grep through it locally.
-//
-// Why borrow a FILE* instead of a path?  We want both this CLI and the
-// library writing to the SAME stream so timestamps interleave naturally.
-// One open, one close, one set of OS buffers.
-static std::FILE * g_log_fp = nullptr;
+using easyai::ui::Style;
+using easyai::ui::Spinner;
+using easyai::ui::StreamStats;
 
-void vlog(const char * fmt, ...) {
-    va_list ap1, ap2;
-    va_start(ap1, fmt);
-    va_copy(ap2, ap1);
-    std::vfprintf(stderr, fmt, ap1);
-    va_end(ap1);
-    if (g_log_fp) {
-        std::vfprintf(g_log_fp, fmt, ap2);
-        std::fflush(g_log_fp);
-    }
-    va_end(ap2);
+// Shorthand: easyai::log::write tees stderr + the optional --log-file FILE.
+// vlog(...) is just the historical name we kept for in-file readability.
+inline void vlog(const char * fmt, ...) __attribute__((format(printf, 1, 2)));
+inline void vlog(const char * fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    // libstdc++ has no public va_list overload of write(); just expand
+    // through a small buffer.  Logging volume is low (per-hop summaries),
+    // so this is fine.
+    char buf[4096];
+    std::vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    easyai::log::write("%s", buf);
 }
 
-// ---- TokenSpinner — '|/-\\' frames trailing the cursor --------------------
-//
-// Always-visible variant: every write leaves a spinner glyph at the
-// cursor position.  Frame advancement is THROTTLED to ~10 Hz when
-// driven by tokens (kFrameAdvanceMs) so a chatty model emitting 50
-// tokens/sec doesn't burn CPU.  A background HEARTBEAT thread also
-// refreshes the glyph every kHeartbeatMs of dead air — that gives
-// the user a "still working" pulse during select/poll-style idle
-// (waiting for first byte, model deliberating quietly with hidden
-// reasoning, long tool round-trips, etc.) without depending on
-// tokens to drive the animation.
-//
-// Concurrency contract: any caller that writes to stdout MUST do so
-// through a WriteScope, which holds the spinner mutex around the
-// erase/write/redraw cycle.  Otherwise the heartbeat thread can paint
-// a frame in the middle of the user's output and produce visual
-// garble.
-//
-// Auto-disabled when stdout isn't a TTY (clean output for $(easyai-cli …)).
-class TokenSpinner {
-   public:
-    explicit TokenSpinner(bool en)
-        : enabled_(en && ::isatty(fileno(stdout)) != 0) {}
-    ~TokenSpinner() { stop_heartbeat(); }
-
-    TokenSpinner(const TokenSpinner &)             = delete;
-    TokenSpinner & operator=(const TokenSpinner &) = delete;
-
-    // RAII bracket for any stdout write coming from a callback.  On
-    // construction: lock the spinner mutex and erase the active glyph.
-    // On destruction: flush, advance the frame (subject to throttle)
-    // and draw a fresh glyph.  Lock is held throughout — heartbeat
-    // can't intrude.
-    class WriteScope {
-       public:
-        explicit WriteScope(TokenSpinner & s) : s_(s.enabled_ ? &s : nullptr) {
-            if (!s_) return;
-            s_->mu_.lock();
-            if (s_->active_) {
-                std::fputs("\b \b", stdout);
-                s_->active_ = false;
-            }
-        }
-        ~WriteScope() {
-            if (!s_) return;
-            std::fflush(stdout);
-            s_->maybe_advance_locked_();
-            s_->draw_locked_();
-            s_->mu_.unlock();
-        }
-        WriteScope(const WriteScope &)             = delete;
-        WriteScope & operator=(const WriteScope &) = delete;
-       private:
-        TokenSpinner * s_;
-    };
-
-    WriteScope scoped() { return WriteScope(*this); }
-
-    // Draw the very first frame (typically right after starting a
-    // request, before any token has arrived).
-    void initial_draw() {
-        if (!enabled_) return;
-        std::lock_guard<std::mutex> lg(mu_);
-        if (!active_) draw_locked_();
-    }
-
-    // Wipe the spinner glyph at end-of-turn.
-    void finish() {
-        if (!enabled_) return;
-        std::lock_guard<std::mutex> lg(mu_);
-        if (active_) {
-            std::fputs("\b \b", stdout);
-            std::fflush(stdout);
-            active_ = false;
-        }
-        frame_ = 0;
-    }
-
-    // Heartbeat — refreshes the glyph every interval_ms of idle so the
-    // animation never freezes during long dead-air windows (waiting
-    // for first SSE byte, hidden reasoning with --no-reasoning, slow
-    // tool round-trips).
-    void start_heartbeat(int interval_ms = kHeartbeatMs) {
-        if (!enabled_) return;
-        if (hb_running_.exchange(true)) return;
-        interval_ms_ = interval_ms;
-        hb_thread_   = std::thread(&TokenSpinner::heartbeat_loop_, this);
-    }
-    void stop_heartbeat() {
-        if (!hb_running_.exchange(false)) return;
-        hb_cv_.notify_all();
-        if (hb_thread_.joinable()) hb_thread_.join();
-    }
-
-   private:
-    static constexpr int kFrameAdvanceMs = 100;     // 10 Hz throttle floor
-    static constexpr int kHeartbeatMs    = 250;     // 4 Hz idle pulse
-
-    void maybe_advance_locked_() {
-        const auto now = std::chrono::steady_clock::now();
-        const auto ms  = std::chrono::duration_cast<std::chrono::milliseconds>(
-                            now - last_advance_).count();
-        if (ms >= kFrameAdvanceMs) {
-            ++frame_;
-            last_advance_ = now;
-        }
-    }
-    void draw_locked_() {
-        static const char frames[] = { '|', '/', '-', '\\' };
-        std::fputc(frames[frame_ % 4], stdout);
-        std::fflush(stdout);
-        active_ = true;
-    }
-
-    void heartbeat_loop_() {
-        while (hb_running_) {
-            {
-                std::unique_lock<std::mutex> wait_lk(hb_wait_mu_);
-                hb_cv_.wait_for(wait_lk,
-                                std::chrono::milliseconds(interval_ms_),
-                                [this]{ return !hb_running_; });
-            }
-            if (!hb_running_) break;
-            std::lock_guard<std::mutex> lg(mu_);
-            if (!active_) continue;            // nothing drawn yet
-            std::fputs("\b \b", stdout);
-            ++frame_;
-            last_advance_ = std::chrono::steady_clock::now();
-            draw_locked_();
-        }
-    }
-
-    bool enabled_ = false;
-    bool active_  = false;
-    int  frame_   = 0;
-    std::chrono::steady_clock::time_point last_advance_{};
-
-    std::mutex              mu_;               // stdout + state
-    std::atomic<bool>       hb_running_{false};
-    int                     interval_ms_ = kHeartbeatMs;
-    std::thread             hb_thread_;
-    std::mutex              hb_wait_mu_;
-    std::condition_variable hb_cv_;
-};
-
-// Insert a newline before <think> and after </think> so the markers
-// don't get visually joined to surrounding stream content (when the
-// model leaks them through despite the chat template stripping).
-// Best-effort whole-piece scan — if a tag splits across SSE chunks
-// the join glitch survives, but llama.cpp tokenizes both as single
-// tokens so the split case is rare.
-std::string punctuate_think_tags(const std::string & in) {
-    std::string out;
-    out.reserve(in.size() + 4);
-    for (size_t i = 0; i < in.size(); ) {
-        if (in.compare(i, 7, "<think>") == 0) {
-            if (!out.empty() && out.back() != '\n') out.push_back('\n');
-            out.append("<think>");
-            if (i + 7 < in.size() && in[i + 7] != '\n') out.push_back('\n');
-            i += 7;
-        } else if (in.compare(i, 8, "</think>") == 0) {
-            if (!out.empty() && out.back() != '\n') out.push_back('\n');
-            out.append("</think>");
-            if (i + 8 < in.size() && in[i + 8] != '\n') out.push_back('\n');
-            i += 8;
-        } else {
-            out.push_back(in[i++]);
-        }
-    }
-    return out;
-}
-
-// ---- ANSI helpers ---------------------------------------------------------
-struct Style {
-    bool color = false;
-    const char * reset () const { return color ? "\033[0m"  : ""; }
-    const char * dim   () const { return color ? "\033[2m"  : ""; }
-    const char * bold  () const { return color ? "\033[1m"  : ""; }
-    const char * cyan  () const { return color ? "\033[36m" : ""; }
-    const char * yellow() const { return color ? "\033[33m" : ""; }
-    const char * red   () const { return color ? "\033[31m" : ""; }
-    const char * green () const { return color ? "\033[32m" : ""; }
-};
-
-Style detect_style() {
-    Style s;
-    s.color = ::isatty(STDOUT_FILENO) != 0
-              && std::getenv("NO_COLOR") == nullptr;
-    return s;
-}
 
 // ===========================================================================
 // Inline system-info tools — demonstrate how to wire your own custom
@@ -304,13 +104,7 @@ Style detect_style() {
 namespace systools {
 
 // ---- /proc parsing helpers ------------------------------------------------
-bool slurp_file(const std::string & path, std::string & out) {
-    std::ifstream f(path);
-    if (!f) return false;
-    std::stringstream ss; ss << f.rdbuf();
-    out = ss.str();
-    return true;
-}
+using easyai::text::slurp_file;
 
 // Parse "key: NUM unit\n" lines into a kB-valued map (kB is the unit
 // /proc/meminfo always uses, despite the "kB" suffix).
@@ -950,44 +744,17 @@ void render_plan(const easyai::Plan & p, const Style & st) {
     std::fflush(stdout);
 }
 
-// One spinner instance per process — captured by the closures below
-// so each stream tick advances the same animation.  We keep counters
-// for the verbose summary (--verbose).
-struct StreamStats {
-    int      content_pieces  = 0;
-    int      reason_pieces   = 0;
-    int      tool_calls      = 0;
-    int      tool_errors     = 0;
-    long     ms_to_first_tok = -1;
-    std::chrono::steady_clock::time_point started{};
-    void reset() {
-        content_pieces  = 0;
-        reason_pieces   = 0;
-        tool_calls      = 0;
-        tool_errors     = 0;
-        ms_to_first_tok = -1;
-        started         = std::chrono::steady_clock::now();
-    }
-    long elapsed_ms() const {
-        using namespace std::chrono;
-        return (long) duration_cast<milliseconds>(
-                   steady_clock::now() - started).count();
-    }
-};
+// Per-process spinner + stats handles, captured by the streaming
+// callbacks so they can update progress without each on_token closure
+// taking an explicit Spinner&/StreamStats& parameter.  The lifetime is
+// managed by run_one()/run_repl() which set/clear these around each
+// turn.
+static Spinner     * g_spinner = nullptr;
+static StreamStats * g_stats   = nullptr;
 
-static TokenSpinner * g_spinner = nullptr;
-static StreamStats  * g_stats   = nullptr;
-
-// Push `text` to stdout, going through the spinner WriteScope when one
-// is active so the heartbeat thread can't paint over the output.
-void write_through_spinner(const std::string & text) {
-    if (g_spinner) {
-        auto _g = g_spinner->scoped();
-        std::fputs(text.c_str(), stdout);
-    } else {
-        std::fputs(text.c_str(), stdout);
-        std::fflush(stdout);
-    }
+inline void write_through_spinner(const std::string & text) {
+    if (g_spinner) g_spinner->write(text);
+    else { std::fputs(text.c_str(), stdout); std::fflush(stdout); }
 }
 
 void wire_callbacks(easyai::Client & cli, easyai::Plan & plan,
@@ -1004,7 +771,7 @@ void wire_callbacks(easyai::Client & cli, easyai::Plan & plan,
             if (g_stats->ms_to_first_tok < 0)
                 g_stats->ms_to_first_tok = g_stats->elapsed_ms();
         }
-        std::string piece = punctuate_think_tags(piece_in);
+        std::string piece = easyai::text::punctuate_think_tags(piece_in);
         if (*last_kind == StreamKind::REASON) piece.insert(0, "\n");
         *last_kind = StreamKind::CONTENT;
         write_through_spinner(piece);
@@ -1016,7 +783,7 @@ void wire_callbacks(easyai::Client & cli, easyai::Plan & plan,
             buf.reserve(piece_in.size() + 16);
             if (*last_kind == StreamKind::CONTENT) buf += "\n";
             buf += st.dim();
-            buf += punctuate_think_tags(piece_in);
+            buf += easyai::text::punctuate_think_tags(piece_in);
             buf += st.reset();
             write_through_spinner(buf);
         }
@@ -1078,30 +845,7 @@ bool is_special(const std::string & line, const std::string & cmd) {
         || (line.size() > cmd.size() && line.rfind(cmd + " ", 0) == 0);
 }
 
-// Best-effort detection of "user wants to write a file" in their
-// prompt — used to surface a helpful tip when fs_write_file is NOT
-// registered (the most common cause of "the model researched a lot
-// then gave up without producing the deliverable").  Pure NL match,
-// case-insensitive.  False positives are cheap (a one-line stderr
-// hint); false negatives mean the user discovers the missing tool
-// the hard way.
-bool prompt_wants_file_write(const std::string & prompt) {
-    std::string lo;
-    lo.reserve(prompt.size());
-    for (char c : prompt) lo.push_back(std::tolower((unsigned char) c));
-    static const char * needles[] = {
-        "write to ",   "write it ", "write a file", "write the file",
-        "save to ",    "save it ",  "save as ",     "save a file",
-        "create a file","create the file",
-        "into a file", "to a file",
-        ".md",         ".txt",      ".json",        ".csv",
-        ".html",       ".log",
-    };
-    for (const char * n : needles) {
-        if (lo.find(n) != std::string::npos) return true;
-    }
-    return false;
-}
+using easyai::text::prompt_wants_file_write;
 
 bool client_has_tool(const easyai::Client & cli, const std::string & name) {
     for (const auto & t : cli.tools()) if (t.name == name) return true;
@@ -1132,7 +876,7 @@ int run_one(easyai::Client & cli, const std::string & prompt,
             st.bold(),  st.reset());
     }
 
-    TokenSpinner spinner(/*en=*/true);
+    Spinner spinner(/*enabled=*/true);
     StreamStats  stats;  stats.reset();
     g_spinner = &spinner;
     g_stats   = &stats;
@@ -1233,7 +977,7 @@ int run_repl(easyai::Client & cli, easyai::Plan & plan,
 int main(int argc, char ** argv) {
     Options o;
     if (!parse_args(argc, argv, o)) { usage(argv[0]); return 2; }
-    Style st = detect_style();
+    Style st = easyai::ui::detect_style();
 
     // Validate --sandbox up front: an existing directory the user
     // can read is the contract.  Failing here is much friendlier than
@@ -1306,6 +1050,7 @@ int main(int argc, char ** argv) {
     // policy and is easy to find from another shell.  Closed at the end
     // of main; libeasyai-cli ALSO writes here through Client::log_file.
     std::string resolved_log_path;
+    std::FILE * log_fp = nullptr;
     if (o.verbose) {
         if (!o.log_file_path.empty()) {
             resolved_log_path = o.log_file_path;
@@ -1316,12 +1061,16 @@ int main(int argc, char ** argv) {
                           (long) std::time(nullptr));
             resolved_log_path = buf;
         }
-        g_log_fp = std::fopen(resolved_log_path.c_str(), "w");
-        if (!g_log_fp) {
+        log_fp = std::fopen(resolved_log_path.c_str(), "w");
+        if (!log_fp) {
             std::fprintf(stderr,
                 "%swarning:%s could not open log file %s — continuing without raw log.\n",
                 st.yellow(), st.reset(), resolved_log_path.c_str());
         } else {
+            // Both this CLI's vlog() (via easyai::log) and libeasyai-cli
+            // (via cli.log_file) tee through the SAME FILE* so timestamps
+            // interleave naturally.
+            easyai::log::set_file(log_fp);
             std::fprintf(stderr,
                 "%s[easyai-cli-remote]%s raw transaction log: %s%s%s\n",
                 st.dim(), st.reset(),
@@ -1331,20 +1080,20 @@ int main(int argc, char ** argv) {
             char ts[32] = {0};
             std::strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%S",
                           std::localtime(&t));
-            std::fprintf(g_log_fp,
+            std::fprintf(log_fp,
                 "easyai-cli-remote raw transaction log\n"
                 "started: %s   pid: %d\n"
                 "argv:",
                 ts, (int) ::getpid());
             for (int k = 0; k < argc; ++k)
-                std::fprintf(g_log_fp, " %s", argv[k]);
-            std::fputc('\n', g_log_fp);
-            std::fflush(g_log_fp);
+                std::fprintf(log_fp, " %s", argv[k]);
+            std::fputc('\n', log_fp);
+            std::fflush(log_fp);
         }
     }
 
     easyai::Client cli;
-    if (g_log_fp) cli.log_file(g_log_fp);
+    if (log_fp) cli.log_file(log_fp);
     if (!o.url.empty()) cli.endpoint(o.url);
     cli.model(o.model).timeout_seconds(o.timeout);
     if (!o.api_key.empty())            cli.api_key(o.api_key);
@@ -1373,10 +1122,11 @@ int main(int argc, char ** argv) {
     register_tools(cli, plan, o, st);
 
     auto close_log_fp = [&]() {
-        if (g_log_fp) {
-            std::fputs("\n========== END OF LOG ==========\n", g_log_fp);
-            std::fclose(g_log_fp);
-            g_log_fp = nullptr;
+        if (log_fp) {
+            std::fputs("\n========== END OF LOG ==========\n", log_fp);
+            std::fclose(log_fp);
+            log_fp = nullptr;
+            easyai::log::set_file(nullptr);
         }
     };
 

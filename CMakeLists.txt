@@ -62,6 +62,8 @@ set(EASYAI_SOURCES
     src/builtin_tools.cpp
     src/presets.cpp
     src/plan.cpp
+    src/ui.cpp
+    src/log.cpp
 )
 
 add_library(easyai ${EASYAI_SOURCES})
