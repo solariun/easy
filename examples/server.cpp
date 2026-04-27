@@ -2015,7 +2015,45 @@ static void handle_chat_stream(ServerCtx & ctx,
                     //                in the fallback below so the user sees
                     //                *something* and the journal explains
                     //                why.
+                    // Detect "announcement only" content: model emitted a
+                    // short message saying it WILL call a tool but didn't.
+                    // Triggers on phrases like "I'll …", "Let me …", "Now
+                    // I'll …", or any short content ending in ":".  Only
+                    // fires alongside tool_calls.empty() so a real reply
+                    // that happens to contain "I'll" doesn't get retried.
+                    auto looks_like_announcement = [](const std::string & s) {
+                        if (s.empty()) return false;
+                        // Trim trailing whitespace
+                        size_t e = s.size();
+                        while (e > 0 && std::isspace((unsigned char) s[e - 1])) --e;
+                        if (e == 0) return false;
+                        // Sentence-final colon → almost always an announcement.
+                        if (s[e - 1] == ':') return true;
+                        // Lowercase scan for known intent phrases.
+                        std::string lc;
+                        lc.reserve(e);
+                        for (size_t i = 0; i < e; ++i)
+                            lc += (char) std::tolower((unsigned char) s[i]);
+                        static const char * kPhrases[] = {
+                            "i'll ",
+                            "i will ",
+                            "let me ",
+                            "let's ",
+                            "now i'll",
+                            "now let me",
+                            "i'm going to",
+                            "i am going to",
+                            "i'm about to",
+                            "i'm gonna",
+                        };
+                        for (auto p : kPhrases) {
+                            if (lc.find(p) != std::string::npos) return true;
+                        }
+                        return false;
+                    };
+
                     constexpr int kMaxThoughtRetries = 2;
+                    constexpr size_t kMaxAnnouncementChars = 600;  // real answers are usually longer
                     int  retries        = 0;
                     bool nudge_in_hist  = false;  // whether we owe a pop_last
                     easyai::Engine::GeneratedTurn turn;
@@ -2025,13 +2063,20 @@ static void handle_chat_stream(ServerCtx & ctx,
                             turn.tool_calls.empty()
                             && turn.content.empty()
                             && !turn.reasoning.empty();
-                        if (thought_only && retries < kMaxThoughtRetries) {
+                        const bool announcement_only =
+                            turn.tool_calls.empty()
+                            && !turn.content.empty()
+                            && turn.content.size() < kMaxAnnouncementChars
+                            && looks_like_announcement(turn.content);
+                        if ((thought_only || announcement_only) && retries < kMaxThoughtRetries) {
                             ++retries;
                             // The engine already pushed an assistant entry
                             // for this thought-only turn — drop it before
                             // the next attempt so history stays clean.
                             ctx.engine.pop_last(1);
 
+                            const char * kind = thought_only
+                                ? "thought-only" : "announcement-only";
                             if (retries == 2 && !nudge_in_hist) {
                                 ctx.engine.push_message("user",
                                     "TOOL_CALL_REMINDER: your previous reply "
@@ -2043,14 +2088,14 @@ static void handle_chat_stream(ServerCtx & ctx,
                                     "are going to do.");
                                 nudge_in_hist = true;
                                 std::fprintf(stderr,
-                                    "[easyai-server] client_tools thought-only "
+                                    "[easyai-server] client_tools %s "
                                     "(retry %d/%d): KV reset + nudge injected\n",
-                                    retries, kMaxThoughtRetries);
+                                    kind, retries, kMaxThoughtRetries);
                             } else {
                                 std::fprintf(stderr,
-                                    "[easyai-server] client_tools thought-only "
+                                    "[easyai-server] client_tools %s "
                                     "(retry %d/%d): KV reset, plain re-run\n",
-                                    retries, kMaxThoughtRetries);
+                                    kind, retries, kMaxThoughtRetries);
                             }
                             ctx.engine.clear_kv();
                             // Drop the streaming layer's accumulated parse
@@ -2082,6 +2127,7 @@ static void handle_chat_stream(ServerCtx & ctx,
                     }
                     if (turn.tool_calls.empty() && turn.content.empty()
                             && !turn.reasoning.empty()) {
+                        // thought-only after retries exhausted
                         std::fprintf(stderr,
                             "[easyai-server] client_tools thought-only "
                             "exhausted retries: promoting reasoning to "
@@ -2101,6 +2147,35 @@ static void handle_chat_stream(ServerCtx & ctx,
                         emit_data(safe_dump(env));
                         any_content_emitted = true;
                         turn.content = std::move(body);
+                    } else if (turn.tool_calls.empty() && !turn.content.empty()
+                                && turn.content.size() < kMaxAnnouncementChars
+                                && looks_like_announcement(turn.content)
+                                && nudge_in_hist) {
+                        // announcement-only after retries exhausted: the
+                        // existing content is the announcement itself.
+                        // Append a server-side hint so the user knows
+                        // the announcement wasn't followed by an action,
+                        // and what to try next.
+                        std::fprintf(stderr,
+                            "[easyai-server] client_tools announcement-only "
+                            "exhausted retries: appending diagnostic note.\n");
+                        std::string suffix =
+                            "\n\n_(server note: the model announced it would "
+                            "call a tool but didn't emit the call even after "
+                          + std::to_string(kMaxThoughtRetries)
+                          + " retries.  Try rephrasing more specifically — "
+                            "e.g. \"use fs_write_file to save X to Y\" — or "
+                            "ask it to answer directly without tools.)_";
+                        ordered_json env;
+                        env["choices"] = json::array({{
+                            {"index", 0},
+                            {"delta", {{"content", suffix}}},
+                            {"finish_reason", nullptr},
+                        }});
+                        emit_data(safe_dump(env));
+                        // any_content_emitted was already true (the
+                        // announcement itself was streamed); just append.
+                        turn.content += suffix;
                     }
                     tool_calls    = std::move(turn.tool_calls);
                     tool_call_ids = std::move(turn.tool_call_ids);
