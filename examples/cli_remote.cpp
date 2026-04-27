@@ -42,13 +42,16 @@
 #include "easyai/tool.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <mutex>
 #include <set>
 #include <sstream>
 #include <string>
@@ -60,64 +63,175 @@ namespace {
 
 // ---- TokenSpinner — '|/-\\' frames trailing the cursor --------------------
 //
-// Always-visible variant: every after_print() leaves a spinner glyph
-// at the cursor position.  Frame advancement is THROTTLED to ~10 Hz
-// (kFrameAdvanceMs) so a chatty model emitting 50 tokens/sec doesn't
-// burn CPU on fputc+flush every couple of milliseconds.  When the
-// throttle hasn't elapsed we still re-print the same frame after the
-// content so the cursor never goes "naked" — visually the spinner
-// just rotates a bit slower than the text scrolls.
+// Always-visible variant: every write leaves a spinner glyph at the
+// cursor position.  Frame advancement is THROTTLED to ~10 Hz when
+// driven by tokens (kFrameAdvanceMs) so a chatty model emitting 50
+// tokens/sec doesn't burn CPU.  A background HEARTBEAT thread also
+// refreshes the glyph every kHeartbeatMs of dead air — that gives
+// the user a "still working" pulse during select/poll-style idle
+// (waiting for first byte, model deliberating quietly with hidden
+// reasoning, long tool round-trips, etc.) without depending on
+// tokens to drive the animation.
+//
+// Concurrency contract: any caller that writes to stdout MUST do so
+// through a WriteScope, which holds the spinner mutex around the
+// erase/write/redraw cycle.  Otherwise the heartbeat thread can paint
+// a frame in the middle of the user's output and produce visual
+// garble.
 //
 // Auto-disabled when stdout isn't a TTY (clean output for $(easyai-cli …)).
 class TokenSpinner {
    public:
     explicit TokenSpinner(bool en)
         : enabled_(en && ::isatty(fileno(stdout)) != 0) {}
+    ~TokenSpinner() { stop_heartbeat(); }
 
-    void about_to_print() {
+    TokenSpinner(const TokenSpinner &)             = delete;
+    TokenSpinner & operator=(const TokenSpinner &) = delete;
+
+    // RAII bracket for any stdout write coming from a callback.  On
+    // construction: lock the spinner mutex and erase the active glyph.
+    // On destruction: flush, advance the frame (subject to throttle)
+    // and draw a fresh glyph.  Lock is held throughout — heartbeat
+    // can't intrude.
+    class WriteScope {
+       public:
+        explicit WriteScope(TokenSpinner & s) : s_(s.enabled_ ? &s : nullptr) {
+            if (!s_) return;
+            s_->mu_.lock();
+            if (s_->active_) {
+                std::fputs("\b \b", stdout);
+                s_->active_ = false;
+            }
+        }
+        ~WriteScope() {
+            if (!s_) return;
+            std::fflush(stdout);
+            s_->maybe_advance_locked_();
+            s_->draw_locked_();
+            s_->mu_.unlock();
+        }
+        WriteScope(const WriteScope &)             = delete;
+        WriteScope & operator=(const WriteScope &) = delete;
+       private:
+        TokenSpinner * s_;
+    };
+
+    WriteScope scoped() { return WriteScope(*this); }
+
+    // Draw the very first frame (typically right after starting a
+    // request, before any token has arrived).
+    void initial_draw() {
         if (!enabled_) return;
-        if (active_) { std::fputs("\b \b", stdout); active_ = false; }
+        std::lock_guard<std::mutex> lg(mu_);
+        if (!active_) draw_locked_();
     }
-    void after_print() {
-        if (!enabled_) return;
-        maybe_advance_();
-        write_frame_();
-    }
-    void tick_silent() {
-        if (!enabled_) return;
-        about_to_print();
-        maybe_advance_();
-        write_frame_();
-    }
+
+    // Wipe the spinner glyph at end-of-turn.
     void finish() {
-        about_to_print();
+        if (!enabled_) return;
+        std::lock_guard<std::mutex> lg(mu_);
+        if (active_) {
+            std::fputs("\b \b", stdout);
+            std::fflush(stdout);
+            active_ = false;
+        }
         frame_ = 0;
     }
 
-   private:
-    static constexpr int kFrameAdvanceMs = 100;     // ~10 Hz cap
+    // Heartbeat — refreshes the glyph every interval_ms of idle so the
+    // animation never freezes during long dead-air windows (waiting
+    // for first SSE byte, hidden reasoning with --no-reasoning, slow
+    // tool round-trips).
+    void start_heartbeat(int interval_ms = kHeartbeatMs) {
+        if (!enabled_) return;
+        if (hb_running_.exchange(true)) return;
+        interval_ms_ = interval_ms;
+        hb_thread_   = std::thread(&TokenSpinner::heartbeat_loop_, this);
+    }
+    void stop_heartbeat() {
+        if (!hb_running_.exchange(false)) return;
+        hb_cv_.notify_all();
+        if (hb_thread_.joinable()) hb_thread_.join();
+    }
 
-    void maybe_advance_() {
+   private:
+    static constexpr int kFrameAdvanceMs = 100;     // 10 Hz throttle floor
+    static constexpr int kHeartbeatMs    = 250;     // 4 Hz idle pulse
+
+    void maybe_advance_locked_() {
         const auto now = std::chrono::steady_clock::now();
-        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        const auto ms  = std::chrono::duration_cast<std::chrono::milliseconds>(
                             now - last_advance_).count();
         if (ms >= kFrameAdvanceMs) {
             ++frame_;
             last_advance_ = now;
         }
     }
-    void write_frame_() {
+    void draw_locked_() {
         static const char frames[] = { '|', '/', '-', '\\' };
         std::fputc(frames[frame_ % 4], stdout);
         std::fflush(stdout);
         active_ = true;
     }
 
+    void heartbeat_loop_() {
+        while (hb_running_) {
+            {
+                std::unique_lock<std::mutex> wait_lk(hb_wait_mu_);
+                hb_cv_.wait_for(wait_lk,
+                                std::chrono::milliseconds(interval_ms_),
+                                [this]{ return !hb_running_; });
+            }
+            if (!hb_running_) break;
+            std::lock_guard<std::mutex> lg(mu_);
+            if (!active_) continue;            // nothing drawn yet
+            std::fputs("\b \b", stdout);
+            ++frame_;
+            last_advance_ = std::chrono::steady_clock::now();
+            draw_locked_();
+        }
+    }
+
     bool enabled_ = false;
     bool active_  = false;
     int  frame_   = 0;
     std::chrono::steady_clock::time_point last_advance_{};
+
+    std::mutex              mu_;               // stdout + state
+    std::atomic<bool>       hb_running_{false};
+    int                     interval_ms_ = kHeartbeatMs;
+    std::thread             hb_thread_;
+    std::mutex              hb_wait_mu_;
+    std::condition_variable hb_cv_;
 };
+
+// Insert a newline before <think> and after </think> so the markers
+// don't get visually joined to surrounding stream content (when the
+// model leaks them through despite the chat template stripping).
+// Best-effort whole-piece scan — if a tag splits across SSE chunks
+// the join glitch survives, but llama.cpp tokenizes both as single
+// tokens so the split case is rare.
+std::string punctuate_think_tags(const std::string & in) {
+    std::string out;
+    out.reserve(in.size() + 4);
+    for (size_t i = 0; i < in.size(); ) {
+        if (in.compare(i, 7, "<think>") == 0) {
+            if (!out.empty() && out.back() != '\n') out.push_back('\n');
+            out.append("<think>");
+            if (i + 7 < in.size() && in[i + 7] != '\n') out.push_back('\n');
+            i += 7;
+        } else if (in.compare(i, 8, "</think>") == 0) {
+            if (!out.empty() && out.back() != '\n') out.push_back('\n');
+            out.append("</think>");
+            if (i + 8 < in.size() && in[i + 8] != '\n') out.push_back('\n');
+            i += 8;
+        } else {
+            out.push_back(in[i++]);
+        }
+    }
+    return out;
+}
 
 // ---- ANSI helpers ---------------------------------------------------------
 struct Style {
@@ -407,7 +521,10 @@ void usage(const char * argv0) {
 "                               default: datetime,plan,web_search,web_fetch,\n"
 "                                 system_meminfo,system_loadavg,\n"
 "                                 system_cpu_usage,system_swaps\n"
-"    --sandbox DIR              enable fs_* tools, scoped to DIR\n"
+"    --sandbox DIR              enable fs_list_dir, fs_read_file,\n"
+"                                 fs_glob, fs_grep AND fs_write_file,\n"
+"                                 ALL scoped to DIR.  Without --sandbox\n"
+"                                 the model has no file access.\n"
 "    --no-plan                  don't auto-register the planning tool\n"
 "\n"
 "  Behaviour:\n"
@@ -558,6 +675,15 @@ const std::vector<std::string> kDefaultTools = {
     "system_meminfo", "system_loadavg", "system_cpu_usage", "system_swaps",
 };
 
+// fs_* tools that are auto-enabled by --sandbox DIR (when --tools is
+// empty).  Passing --sandbox is the explicit "give the model file
+// access scoped here" gesture; without --tools the docs promise
+// "enable fs_* tools" — this set is what that means.  fs_write_file
+// is included: --sandbox is the user's explicit write authorisation.
+const std::vector<std::string> kSandboxFsTools = {
+    "fs_list_dir", "fs_read_file", "fs_glob", "fs_grep", "fs_write_file",
+};
+
 void register_tools(easyai::Client & cli,
                     easyai::Plan & plan,
                     const Options & o,
@@ -565,6 +691,9 @@ void register_tools(easyai::Client & cli,
     auto wants = [&](const std::string & name) {
         if (o.tools_enabled.empty()) {
             for (const auto & d : kDefaultTools) if (d == name) return true;
+            if (!o.sandbox.empty()) {
+                for (const auto & d : kSandboxFsTools) if (d == name) return true;
+            }
             return false;
         }
         return o.tools_enabled.count(name) != 0;
@@ -755,18 +884,27 @@ struct StreamStats {
 static TokenSpinner * g_spinner = nullptr;
 static StreamStats  * g_stats   = nullptr;
 
+// Push `text` to stdout, going through the spinner WriteScope when one
+// is active so the heartbeat thread can't paint over the output.
+void write_through_spinner(const std::string & text) {
+    if (g_spinner) {
+        auto _g = g_spinner->scoped();
+        std::fputs(text.c_str(), stdout);
+    } else {
+        std::fputs(text.c_str(), stdout);
+        std::fflush(stdout);
+    }
+}
+
 void wire_callbacks(easyai::Client & cli, easyai::Plan & plan,
                     const Options & o, const Style & st) {
-    cli.on_token([&st, &o](const std::string & piece) {
+    cli.on_token([&st, &o](const std::string & piece_in) {
         if (g_stats) {
             ++g_stats->content_pieces;
             if (g_stats->ms_to_first_tok < 0)
                 g_stats->ms_to_first_tok = g_stats->elapsed_ms();
         }
-        if (g_spinner) g_spinner->about_to_print();
-        std::fputs(piece.c_str(), stdout);
-        std::fflush(stdout);
-        if (g_spinner) g_spinner->after_print();
+        write_through_spinner(punctuate_think_tags(piece_in));
         if (o.verbose) {
             std::fprintf(stderr, "%s[content %d, +%ldms]%s\n",
                          st.dim(),
@@ -775,19 +913,18 @@ void wire_callbacks(easyai::Client & cli, easyai::Plan & plan,
                          st.reset());
         }
     });
-    cli.on_reason([&st, &o](const std::string & piece) {
+    cli.on_reason([&st, &o](const std::string & piece_in) {
         if (g_stats) ++g_stats->reason_pieces;
         if (o.show_reasoning) {
-            if (g_spinner) g_spinner->about_to_print();
-            std::fprintf(stdout, "%s%s%s",
-                         st.dim(), piece.c_str(), st.reset());
-            std::fflush(stdout);
-            if (g_spinner) g_spinner->after_print();
-        } else if (g_spinner) {
-            // Hidden reasoning still ticks the spinner so the user
-            // sees activity during long thinking phases.
-            g_spinner->tick_silent();
+            std::string buf;
+            buf.reserve(piece_in.size() + 16);
+            buf += st.dim();
+            buf += punctuate_think_tags(piece_in);
+            buf += st.reset();
+            write_through_spinner(buf);
         }
+        // When show_reasoning is off the heartbeat keeps the spinner
+        // ticking on its own — no explicit refresh needed here.
         if (o.verbose) {
             std::fprintf(stderr, "%s[reason %d, +%ldms]%s\n",
                          st.dim(),
@@ -802,20 +939,18 @@ void wire_callbacks(easyai::Client & cli, easyai::Plan & plan,
             ++g_stats->tool_calls;
             if (result.is_error) ++g_stats->tool_errors;
         }
-        if (g_spinner) g_spinner->about_to_print();
         const char * marker = result.is_error ? "✗" : "🔧";
         const char * color  = result.is_error ? st.red() : st.cyan();
-        std::fprintf(stdout, "\n%s%s %s(%s)%s",
-                     color, marker, call.name.c_str(),
-                     trim_for_log(call.arguments_json, 80).c_str(),
-                     st.reset());
+        std::ostringstream ss;
+        ss << "\n" << color << marker << " " << call.name
+           << "(" << trim_for_log(call.arguments_json, 80) << ")"
+           << st.reset();
         if (result.is_error) {
-            std::fprintf(stdout, " %s%s%s",
-                         st.red(), trim_for_log(result.content, 100).c_str(), st.reset());
+            ss << " " << st.red()
+               << trim_for_log(result.content, 100) << st.reset();
         }
-        std::fputs("\n", stdout);
-        std::fflush(stdout);
-        if (g_spinner) g_spinner->after_print();
+        ss << "\n";
+        write_through_spinner(ss.str());
         if (o.verbose) {
             std::fprintf(stderr,
                 "%s[tool %s%s name=%s args_bytes=%zu result_bytes=%zu +%ldms]%s\n",
@@ -830,9 +965,11 @@ void wire_callbacks(easyai::Client & cli, easyai::Plan & plan,
         }
     });
     plan.on_change([&st](const easyai::Plan & p) {
-        if (g_spinner) g_spinner->about_to_print();
-        render_plan(p, st);
-        if (g_spinner) g_spinner->after_print();
+        std::ostringstream ss;
+        ss << "\n" << st.yellow() << "── plan ──" << st.reset() << "\n";
+        p.render(ss);
+        ss << "\n";
+        write_through_spinner(ss.str());
     });
 }
 
@@ -842,8 +979,51 @@ bool is_special(const std::string & line, const std::string & cmd) {
         || (line.size() > cmd.size() && line.rfind(cmd + " ", 0) == 0);
 }
 
+// Best-effort detection of "user wants to write a file" in their
+// prompt — used to surface a helpful tip when fs_write_file is NOT
+// registered (the most common cause of "the model researched a lot
+// then gave up without producing the deliverable").  Pure NL match,
+// case-insensitive.  False positives are cheap (a one-line stderr
+// hint); false negatives mean the user discovers the missing tool
+// the hard way.
+bool prompt_wants_file_write(const std::string & prompt) {
+    std::string lo;
+    lo.reserve(prompt.size());
+    for (char c : prompt) lo.push_back(std::tolower((unsigned char) c));
+    static const char * needles[] = {
+        "write to ",   "write it ", "write a file", "write the file",
+        "save to ",    "save it ",  "save as ",     "save a file",
+        "create a file","create the file",
+        "into a file", "to a file",
+        ".md",         ".txt",      ".json",        ".csv",
+        ".html",       ".log",
+    };
+    for (const char * n : needles) {
+        if (lo.find(n) != std::string::npos) return true;
+    }
+    return false;
+}
+
+bool client_has_tool(const easyai::Client & cli, const std::string & name) {
+    for (const auto & t : cli.tools()) if (t.name == name) return true;
+    return false;
+}
+
 int run_one(easyai::Client & cli, const std::string & prompt,
             const Style & st) {
+    if (prompt_wants_file_write(prompt) && !client_has_tool(cli, "fs_write_file")) {
+        std::fprintf(stderr,
+            "%s[easyai-cli-remote] tip:%s your prompt looks like it wants "
+            "the model to write a file, but fs_write_file is NOT registered. "
+            "Pass %s--sandbox DIR%s to give the model file read+write access "
+            "scoped to DIR (or %s--tools fs_write_file%s explicitly). "
+            "Without it the model will research, then stall when it tries "
+            "to save and finds no write tool.\n",
+            st.yellow(), st.reset(),
+            st.bold(),  st.reset(),
+            st.bold(),  st.reset());
+    }
+
     TokenSpinner spinner(/*en=*/true);
     StreamStats  stats;  stats.reset();
     g_spinner = &spinner;
@@ -851,11 +1031,16 @@ int run_one(easyai::Client & cli, const std::string & prompt,
 
     // Show the first spinner frame immediately so the user sees activity
     // during the request's pre-roll (model loading prompt into KV,
-    // first-token latency).  Subsequent ticks come from the stream
-    // callbacks below.
-    spinner.after_print();
+    // first-token latency).  The heartbeat thread keeps the glyph
+    // animating during dead air (no SSE chunks yet, hidden reasoning,
+    // long tool round-trips); token/tool/plan callbacks drive the
+    // animation faster when data IS flowing.
+    spinner.initial_draw();
+    spinner.start_heartbeat();
 
     std::string answer = cli.chat(prompt);
+
+    spinner.stop_heartbeat();
     spinner.finish();
     g_spinner = nullptr;
     g_stats   = nullptr;
