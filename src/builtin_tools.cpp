@@ -727,6 +727,17 @@ struct Sandbox {
         out = (root / rel).lexically_normal();
         return true;
     }
+    // Render a real on-disk path back into the model's "/"-rooted view.
+    // The sandbox base is hidden; the model only ever sees /file.md,
+    // /subdir/file.md, etc.  This is the inverse of resolve() for display.
+    std::string virtual_path(const fs::path & real) const {
+        std::error_code ec;
+        fs::path rel = fs::relative(real, root, ec);
+        if (ec || rel.empty() || rel == ".") return "/";
+        std::string s = rel.generic_string();
+        if (s.front() != '/') s.insert(0, "/");
+        return s;
+    }
 };
 
 }  // namespace
@@ -734,8 +745,9 @@ struct Sandbox {
 Tool fs_read_file(std::string root) {
     auto sb = std::make_shared<Sandbox>(std::move(root));
     return Tool::builder("read_file")
-        .describe("Read a UTF-8 text file from disk and return its contents.")
-        .param("path",   "string",  "Path to the file (relative or absolute, inside the sandbox)", true)
+        .describe("Read a UTF-8 text file from disk and return its contents. "
+                  "The filesystem you see is rooted at `/`; use paths like `/report.md` or `/docs/spec.md`.")
+        .param("path",   "string",  "Path to the file, e.g. `/report.md` or `/docs/spec.md`.", true)
         .param("offset", "integer", "Skip this many bytes from the start", false)
         .param("limit",  "integer", "Maximum bytes to return (default 64KB)", false)
         .handle([sb](const ToolCall & c) {
@@ -751,7 +763,7 @@ Tool fs_read_file(std::string root) {
             fs::path p; std::string err;
             if (!sb->resolve(path, p, err)) return ToolResult::error(err);
             std::ifstream f(p, std::ios::binary);
-            if (!f) return ToolResult::error("cannot open: " + p.string());
+            if (!f) return ToolResult::error("cannot open: " + sb->virtual_path(p));
             f.seekg(offset);
             std::string buf((size_t) limit, '\0');
             f.read(buf.data(), limit);
@@ -764,8 +776,9 @@ Tool fs_read_file(std::string root) {
 Tool fs_write_file(std::string root) {
     auto sb = std::make_shared<Sandbox>(std::move(root));
     return Tool::builder("write_file")
-        .describe("Write text to a file (overwrites). Creates parent directories.")
-        .param("path",    "string",  "Destination path (inside the sandbox)", true)
+        .describe("Write text to a file (overwrites). Creates parent directories. "
+                  "The filesystem you see is rooted at `/`; use paths like `/report.md` or `/docs/notes.md`.")
+        .param("path",    "string",  "Destination path, e.g. `/report.md` or `/docs/notes.md`.", true)
         .param("content", "string",  "UTF-8 text content to write", true)
         .param("append",  "boolean", "If true, append instead of overwriting", false)
         .handle([sb](const ToolCall & c) {
@@ -782,10 +795,10 @@ Tool fs_write_file(std::string root) {
             std::error_code ec;
             fs::create_directories(p.parent_path(), ec);
             std::ofstream f(p, std::ios::binary | (append ? std::ios::app : std::ios::trunc));
-            if (!f) return ToolResult::error("cannot open for write: " + p.string());
+            if (!f) return ToolResult::error("cannot open for write: " + sb->virtual_path(p));
             f.write(content.data(), content.size());
             return ToolResult::ok("wrote " + std::to_string(content.size())
-                                  + " bytes to " + p.string());
+                                  + " bytes to " + sb->virtual_path(p));
         })
         .build();
 }
@@ -793,8 +806,9 @@ Tool fs_write_file(std::string root) {
 Tool fs_list_dir(std::string root) {
     auto sb = std::make_shared<Sandbox>(std::move(root));
     return Tool::builder("list_dir")
-        .describe("List the entries (files and directories) inside a directory.")
-        .param("path", "string", "Directory path (inside the sandbox)", true)
+        .describe("List the entries (files and directories) inside a directory. "
+                  "The filesystem you see is rooted at `/`; use `/` for the top, `/subdir` for nested paths.")
+        .param("path", "string", "Directory path, e.g. `/` or `/subdir`.", true)
         .handle([sb](const ToolCall & c) {
             std::string path;
             if (!args::get_string(c.arguments_json, "path", path))
@@ -803,7 +817,7 @@ Tool fs_list_dir(std::string root) {
             fs::path p; std::string err;
             if (!sb->resolve(path, p, err)) return ToolResult::error(err);
             if (!fs::is_directory(p))
-                return ToolResult::error("not a directory: " + p.string());
+                return ToolResult::error("not a directory: " + sb->virtual_path(p));
 
             std::ostringstream o;
             for (auto & e : fs::directory_iterator(p)) {
@@ -824,9 +838,10 @@ Tool fs_glob(std::string root) {
     auto sb = std::make_shared<Sandbox>(std::move(root));
     return Tool::builder("glob")
         .describe("Find files whose names match a wildcard pattern (e.g. '*.cpp', "
-                  "'src/**/*.h'). Recursive by default.")
+                  "'src/**/*.h'). Recursive by default. "
+                  "The filesystem you see is rooted at `/`; results are returned as `/`-rooted paths.")
         .param("pattern", "string", "Wildcard pattern (* matches any chars except /; ** matches across dirs)", true)
-        .param("path",    "string", "Optional starting directory inside the sandbox (default = root)", false)
+        .param("path",    "string", "Optional starting directory, e.g. `/src` (default = `/`).", false)
         .handle([sb](const ToolCall & c) {
             std::string pattern, sub;
             if (!args::get_string(c.arguments_json, "pattern", pattern))
@@ -871,7 +886,7 @@ Tool fs_glob(std::string root) {
                 try { m = std::regex_match(rel, rx); }
                 catch (const std::regex_error &) { /* unsupported; skip entry */ }
                 if (m) {
-                    o << rel << "\n";
+                    o << sb->virtual_path(e.path()) << "\n";
                     if (++n >= 500) { o << "...[stopped at 500 matches]\n"; break; }
                 }
             }
@@ -884,9 +899,10 @@ Tool fs_glob(std::string root) {
 Tool fs_grep(std::string root) {
     auto sb = std::make_shared<Sandbox>(std::move(root));
     return Tool::builder("grep")
-        .describe("Search file contents for a regular expression. Returns matching lines with file:line prefixes.")
+        .describe("Search file contents for a regular expression. Returns matching lines with file:line prefixes. "
+                  "The filesystem you see is rooted at `/`; result paths come back as `/`-rooted.")
         .param("pattern",       "string",  "Regular expression to search for", true)
-        .param("path",          "string",  "Optional starting directory (default = sandbox root)", false)
+        .param("path",          "string",  "Optional starting directory, e.g. `/src` (default = `/`).", false)
         .param("file_glob",     "string",  "Optional filename glob to limit search (e.g. '*.cpp')", false)
         .param("max_matches",   "integer", "Stop after this many matches (default 100)", false)
         .param("case_insensitive", "boolean", "Case-insensitive match (default false)", false)
@@ -936,11 +952,11 @@ Tool fs_grep(std::string root) {
                 std::ifstream f(e.path());
                 if (!f) continue;
                 std::string line; int lineno = 0;
-                std::string rel = fs::relative(e.path(), sb->root).generic_string();
+                std::string vpath = sb->virtual_path(e.path());
                 while (std::getline(f, line)) {
                     ++lineno;
                     if (std::regex_search(line, rx)) {
-                        o << rel << ":" << lineno << ": " << clip(line, 240) << "\n";
+                        o << vpath << ":" << lineno << ": " << clip(line, 240) << "\n";
                         if (++n >= max_matches) goto done;
                     }
                 }
