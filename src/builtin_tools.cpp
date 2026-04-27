@@ -970,6 +970,13 @@ Tool fs_grep(std::string root) {
                 std::string vpath = sb->virtual_path(e.path());
                 while (std::getline(f, line)) {
                     ++lineno;
+                    // libstdc++'s regex engine is recursive; running a
+                    // user-supplied pattern against a multi-megabyte
+                    // single line (binary blob, minified JS, base64
+                    // dump) is a DoS vector via catastrophic
+                    // backtracking. 64 KiB is plenty for source code
+                    // and short of the failure regime.
+                    if (line.size() > 64 * 1024) continue;
                     if (std::regex_search(line, rx)) {
                         o << vpath << ":" << lineno << ": " << clip(line, 240) << "\n";
                         if (++n >= max_matches) goto done;

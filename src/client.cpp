@@ -117,8 +117,18 @@ struct SseEvent {
 
 class SseBuffer {
 public:
-    void feed(const char * bytes, size_t n) {
+    // Hard ceiling on the SSE pending buffer.  In a healthy stream the
+    // buffer drains completely between events; if a malformed/truncated
+    // stream skips its terminators, buf_ would otherwise grow without
+    // bound and OOM the client.  16 MiB is roughly 4–8x the largest
+    // single tool result we ship today (32 KB bash output → 4 MB
+    // web_fetch → 16 MB ceiling has plenty of headroom).
+    static constexpr size_t kMaxPending = 16 * 1024 * 1024;
+
+    bool feed(const char * bytes, size_t n) {
+        if (buf_.size() + n > kMaxPending) return false;
         buf_.append(bytes, n);
+        return true;
     }
     bool next(SseEvent & out) {
         // SSE event terminator is a blank line — accept either \n\n
@@ -375,7 +385,11 @@ struct Client::Impl {
                 std::fwrite(data, 1, len, log_fp);
                 std::fflush(log_fp);
             }
-            sse.feed(data, len);
+            if (!sse.feed(data, len)) {
+                last_error = "SSE pending buffer exceeded 16 MiB — "
+                             "abandoning stream (malformed server response?)";
+                return false;
+            }
             SseEvent ev;
             while (sse.next(ev)) {
                 if (ev.data.empty() || ev.data == "[DONE]") continue;
