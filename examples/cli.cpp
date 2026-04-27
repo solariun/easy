@@ -301,25 +301,10 @@ class LocalBackend final : public Backend {
         if (cfg_.repeat_penalty > 0) engine_.repeat_penalty(cfg_.repeat_penalty);
 
         if (cfg_.load_tools) {
-            engine_.add_tool(easyai::tools::datetime())
-                   .add_tool(easyai::tools::web_fetch())
-                   .add_tool(easyai::tools::web_search());
-            // fs_* and bash are SHIPPED OFF by default — same gating as
-            // easyai-cli-remote and easyai-server. --sandbox <dir>
-            // enables file tools (scoped to <dir>); --allow-bash adds
-            // the shell tool.
-            if (!cfg_.sandbox.empty()) {
-                engine_.add_tool(easyai::tools::fs_list_dir  (cfg_.sandbox))
-                       .add_tool(easyai::tools::fs_read_file (cfg_.sandbox))
-                       .add_tool(easyai::tools::fs_glob      (cfg_.sandbox))
-                       .add_tool(easyai::tools::fs_grep      (cfg_.sandbox))
-                       .add_tool(easyai::tools::fs_write_file(cfg_.sandbox));
-            }
-            if (cfg_.allow_bash) {
-                const std::string root = cfg_.sandbox.empty() ? "." : cfg_.sandbox;
-                engine_.add_tool(easyai::tools::bash(root));
-                engine_.max_tool_hops(99999);  // see notes in cli_remote/cli.cpp
-            }
+            easyai::cli::Toolbelt()
+                .sandbox   (cfg_.sandbox)
+                .allow_bash(cfg_.allow_bash)
+                .apply     (engine_);
         }
         engine_.on_tool([](const easyai::ToolCall & c, const easyai::ToolResult & r){
             std::fprintf(stderr,
@@ -494,26 +479,10 @@ class RemoteBackend final : public Backend {
         // behaved like a vanilla OpenAI streamer); flip on with
         // --with-tools to turn easyai-cli into a remote agentic CLI.
         if (cfg_.with_tools) {
-            client_->add_tool(easyai::tools::datetime());
-#if defined(EASYAI_HAVE_CURL)
-            client_->add_tool(easyai::tools::web_search());
-            client_->add_tool(easyai::tools::web_fetch());
-#endif
-            // fs_* and bash gated identically to local mode.
-            if (!cfg_.sandbox.empty()) {
-                client_->add_tool(easyai::tools::fs_read_file (cfg_.sandbox));
-                client_->add_tool(easyai::tools::fs_list_dir  (cfg_.sandbox));
-                client_->add_tool(easyai::tools::fs_glob      (cfg_.sandbox));
-                client_->add_tool(easyai::tools::fs_grep      (cfg_.sandbox));
-                client_->add_tool(easyai::tools::fs_write_file(cfg_.sandbox));
-            }
-            if (cfg_.allow_bash) {
-                const std::string root = cfg_.sandbox.empty() ? "." : cfg_.sandbox;
-                client_->add_tool(easyai::tools::bash(root));
-                // Bash flows often need many turns; lift the agentic-loop
-                // safety cap to effectively-unlimited.
-                client_->max_tool_hops(99999);
-            }
+            easyai::cli::Toolbelt()
+                .sandbox   (cfg_.sandbox)
+                .allow_bash(cfg_.allow_bash)
+                .apply     (*client_);
         }
     }
     void push_sampling_() {

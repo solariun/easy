@@ -13,3 +13,4 @@
 #include "ui.hpp"
 #include "text.hpp"
 #include "log.hpp"
+#include "cli.hpp"

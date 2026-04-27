@@ -37,6 +37,7 @@
 // Auto-disabled when stdout is not a TTY.
 
 #include "easyai/builtin_tools.hpp"
+#include "easyai/cli.hpp"
 #include "easyai/client.hpp"
 #include "easyai/log.hpp"
 #include "easyai/plan.hpp"
@@ -979,25 +980,12 @@ int main(int argc, char ** argv) {
     if (!parse_args(argc, argv, o)) { usage(argv[0]); return 2; }
     Style st = easyai::ui::detect_style();
 
-    // Validate --sandbox up front: an existing directory the user
-    // can read is the contract.  Failing here is much friendlier than
-    // letting the model discover later that every fs_* call hits
-    // "No such file or directory".
-    if (!o.sandbox.empty()) {
-        std::error_code ec;
-        auto stat = std::filesystem::status(o.sandbox, ec);
-        if (ec || !std::filesystem::exists(stat)) {
-            std::fprintf(stderr,
-                "%serror:%s --sandbox %s does not exist.\n",
-                st.red(), st.reset(), o.sandbox.c_str());
-            return 2;
-        }
-        if (!std::filesystem::is_directory(stat)) {
-            std::fprintf(stderr,
-                "%serror:%s --sandbox %s is not a directory.\n",
-                st.red(), st.reset(), o.sandbox.c_str());
-            return 2;
-        }
+    // Validate --sandbox up front so the user gets a clear error
+    // BEFORE the agent loop starts hitting "No such file or directory".
+    if (std::string err; !easyai::cli::validate_sandbox(o.sandbox, err)) {
+        std::fprintf(stderr, "%serror:%s %s\n",
+                     st.red(), st.reset(), err.c_str());
+        return 2;
     }
 
     // Auto-prepend http:// when --url omits a scheme — convenience for
@@ -1046,49 +1034,25 @@ int main(int argc, char ** argv) {
     if (!o.log_file_path.empty()) o.verbose = true;
 
     // Open the diagnostic log file when --verbose (or --log-file) is on.
-    // Auto-generated path lives under /tmp so it survives reboots' cleanup
-    // policy and is easy to find from another shell.  Closed at the end
-    // of main; libeasyai-cli ALSO writes here through Client::log_file.
+    // open_log_tee handles auto-path (/tmp/easyai-cli-remote-<pid>-<epoch>.log),
+    // header (timestamp + pid + argv), and registers the FILE* as the
+    // sink for easyai::log so vlog() tees here.  libeasyai-cli also
+    // writes raw SSE here via cli.log_file(log_fp) below.
     std::string resolved_log_path;
     std::FILE * log_fp = nullptr;
     if (o.verbose) {
-        if (!o.log_file_path.empty()) {
-            resolved_log_path = o.log_file_path;
-        } else {
-            char buf[64];
-            std::snprintf(buf, sizeof(buf), "/tmp/easyai-cli-%d-%ld.log",
-                          (int) ::getpid(),
-                          (long) std::time(nullptr));
-            resolved_log_path = buf;
-        }
-        log_fp = std::fopen(resolved_log_path.c_str(), "w");
+        log_fp = easyai::cli::open_log_tee(
+            o.log_file_path, "easyai-cli-remote",
+            argc, argv, &resolved_log_path);
         if (!log_fp) {
             std::fprintf(stderr,
                 "%swarning:%s could not open log file %s — continuing without raw log.\n",
                 st.yellow(), st.reset(), resolved_log_path.c_str());
         } else {
-            // Both this CLI's vlog() (via easyai::log) and libeasyai-cli
-            // (via cli.log_file) tee through the SAME FILE* so timestamps
-            // interleave naturally.
-            easyai::log::set_file(log_fp);
             std::fprintf(stderr,
                 "%s[easyai-cli-remote]%s raw transaction log: %s%s%s\n",
                 st.dim(), st.reset(),
                 st.bold(), resolved_log_path.c_str(), st.reset());
-            // Header line so a fresh log file isn't ambiguous.
-            const auto t = std::time(nullptr);
-            char ts[32] = {0};
-            std::strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%S",
-                          std::localtime(&t));
-            std::fprintf(log_fp,
-                "easyai-cli-remote raw transaction log\n"
-                "started: %s   pid: %d\n"
-                "argv:",
-                ts, (int) ::getpid());
-            for (int k = 0; k < argc; ++k)
-                std::fprintf(log_fp, " %s", argv[k]);
-            std::fputc('\n', log_fp);
-            std::fflush(log_fp);
         }
     }
 
@@ -1122,12 +1086,8 @@ int main(int argc, char ** argv) {
     register_tools(cli, plan, o, st);
 
     auto close_log_fp = [&]() {
-        if (log_fp) {
-            std::fputs("\n========== END OF LOG ==========\n", log_fp);
-            std::fclose(log_fp);
-            log_fp = nullptr;
-            easyai::log::set_file(nullptr);
-        }
+        easyai::cli::close_log_tee(log_fp);
+        log_fp = nullptr;
     };
 
     int rc;

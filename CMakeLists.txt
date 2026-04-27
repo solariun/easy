@@ -64,6 +64,7 @@ set(EASYAI_SOURCES
     src/plan.cpp
     src/ui.cpp
     src/log.cpp
+    src/cli.cpp
 )
 
 add_library(easyai ${EASYAI_SOURCES})
@@ -115,6 +116,7 @@ endif()
 # that easyai-server already relies on.
 set(EASYAI_CLI_SOURCES
     src/client.cpp
+    src/cli_client.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../llama.cpp/vendor/cpp-httplib/httplib.cpp
 )
 

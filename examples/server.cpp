@@ -2676,26 +2676,11 @@ int main(int argc, char ** argv) {
     // listing — never sees them, so we don't accidentally expose write
     // access or shell to a fresh `easyai-server` install.
     if (args.load_tools) {
-        ctx->default_tools.push_back(easyai::tools::datetime());
-        ctx->default_tools.push_back(easyai::tools::web_fetch());
-        ctx->default_tools.push_back(easyai::tools::web_search());
-
-        if (!args.sandbox.empty()) {
-            ctx->default_tools.push_back(easyai::tools::fs_list_dir  (args.sandbox));
-            ctx->default_tools.push_back(easyai::tools::fs_read_file (args.sandbox));
-            ctx->default_tools.push_back(easyai::tools::fs_glob      (args.sandbox));
-            ctx->default_tools.push_back(easyai::tools::fs_grep      (args.sandbox));
-            ctx->default_tools.push_back(easyai::tools::fs_write_file(args.sandbox));
-        }
-        if (args.allow_bash) {
-            // bash inherits --sandbox as cwd if given; otherwise the
-            // server's own cwd (which is whatever systemd / the launcher
-            // chose).  Also bump the agentic loop cap — bash flows
-            // span far more hops than the default 8.
-            ctx->engine.max_tool_hops(99999);
-            const std::string root = args.sandbox.empty() ? "." : args.sandbox;
-            ctx->default_tools.push_back(easyai::tools::bash(root));
-        }
+        auto tb = easyai::cli::Toolbelt()
+                      .sandbox   (args.sandbox)
+                      .allow_bash(args.allow_bash);
+        for (auto & t : tb.tools()) ctx->default_tools.push_back(std::move(t));
+        if (tb.bash_on()) ctx->engine.max_tool_hops(99999);
     }
 
     // -------- production knobs / auth --------------------------------------
