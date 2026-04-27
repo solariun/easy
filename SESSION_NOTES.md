@@ -56,8 +56,10 @@ Sibling repo path: `develop/easyai/easyai/` next to `develop/easyai/llama.cpp/`.
 
 ```
 easyai/
-├── include/easyai/{engine,tool,builtin_tools,presets,plan,client,easyai}.hpp  # public API
-├── src/{engine,tool,builtin_tools,presets,plan,client}.cpp                    # impl
+├── include/easyai/{engine,tool,builtin_tools,presets,plan,client,
+│                   ui,text,log,cli,easyai}.hpp                                # public API
+├── src/{engine,tool,builtin_tools,presets,plan,client,
+│        ui,log,cli,cli_client}.cpp                                            # impl
 ├── examples/{cli,cli_remote,server,agent,chat,recipes}.cpp                    # binaries
 ├── webui/{index.html,bundle.js,bundle.css,loading.html,AI-brain.svg}          # llama-server fork
 ├── cmake/{xxd.cmake,easyaiConfig.cmake.in}                                    # build helpers + find_package
@@ -83,8 +85,9 @@ by creating IMPORTED targets at find_package time.
 
 **Engine** (`src/engine.cpp`)
 - pImpl with `common_init_from_params` from llama.cpp's common library.
-- `chat()` runs the agentic tool-call loop (max 8 hops); `generate_one()` is
-  single-pass for forwarding tool_calls to clients.
+- `chat()` runs the agentic tool-call loop (default cap 8 hops, configurable
+  via `Engine::max_tool_hops(int)` — bumped to 99999 when bash registers);
+  `generate_one()` is single-pass for forwarding tool_calls to clients.
 - Has setters for every tunable: `temperature/top_p/top_k/min_p/repeat_penalty/
   max_tokens/seed/batch/threads/threads_batch/cache_type_k/cache_type_v/
   no_kv_offload/kv_unified/add_kv_override/flash_attn/use_mlock/use_mmap/
@@ -112,7 +115,15 @@ by creating IMPORTED targets at find_package time.
   custom events.
 - Tool-call deltas accumulated by `index` into `PendingToolCall`
   (string-built `arguments` across deltas — exactly how OpenAI streams
-  them).  Multi-hop loop bounded at 8, mirrors `Engine::chat_continue`.
+  them).  Multi-hop loop default-bounded at 8 (`Client::max_tool_hops(int)`
+  to lift), mirrors `Engine::chat_continue`.
+- SSE pending buffer capped at 16 MiB; on overflow the client aborts
+  with `last_error` set.  Stops a malformed/runaway stream from OOMing
+  the process.
+- Auto-retry-with-nudge on `timings.incomplete=true`: discards the
+  bad assistant turn, appends a corrective user message
+  ("don't announce, execute"), re-issues once.  Default ON in
+  cli-remote; opt-out with `--no-retry-on-incomplete`.
 - Full sampling/penalty surface: `temperature`, `top_p`, `top_k`, `min_p`,
   `repeat_penalty`, `frequency_penalty`, `presence_penalty`, `seed`,
   `max_tokens`, `stop(vector)`, `extra_body_json` (free-form JSON merged
@@ -196,6 +207,37 @@ two layers:
    - Input form gets `margin-bottom: 44px !important` injected so the
      metrics bar fits below it without overlap.
 
+**CLI utilities** (`src/{ui,text,log,cli,cli_client}.cpp` + matching headers)
+Lifted out of the example binaries during the 2026-04-27 refactor so a
+third-party agent can build the same CLI experience in a handful of lines.
+- `easyai::ui::Style` + `detect_style()` — ANSI colour helpers; auto-disabled
+  on non-TTY stdout and when `NO_COLOR` is set.
+- `easyai::ui::Spinner` — `'|/-\\'` glyph that follows the cursor; throttled
+  frame advance (~10 Hz) plus a heartbeat thread that keeps the animation
+  alive during dead air (slow tool calls, hidden reasoning).  Exposes a
+  RAII `WriteScope` AND a one-call `write(text)` for the common path.
+- `easyai::ui::StreamStats` — counters + timing that on_token/on_reason/
+  on_tool callbacks update; lets the verbose summary show
+  "[hop N: content=… reason=… tools=… +Tms]".
+- `easyai::text::*` — `slurp_file`, `punctuate_think_tags` (newlines around
+  `<think>`/`</think>` tags so they don't visually glue to the stream),
+  `prompt_wants_file_write` heuristic for the missing-fs_write_file tip.
+- `easyai::log::set_file(FILE*) / write(fmt, …)` — single-sink tee to
+  stderr + an optional `--log-file` FILE.  cli-remote's vlog is now a
+  4-line wrapper around this; libeasyai-cli ALSO writes raw SSE bytes
+  to the SAME FILE via `Client::log_file(fp)` so timestamps interleave.
+- `easyai::cli::Toolbelt` — fluent builder.  `.sandbox(dir).allow_bash()
+  .with_plan(plan).apply(engine_or_client)`.  apply() bumps
+  `max_tool_hops` to 99999 when bash is enabled.  Engine variant lives
+  in libeasyai (`src/cli.cpp`); Client variant in libeasyai-cli
+  (`src/cli_client.cpp`) so the engine-only library doesn't drag in
+  the HTTP client.
+- `easyai::cli::open_log_tee / close_log_tee` — opens
+  `/tmp/<prefix>-<pid>-<epoch>.log` with a header listing argv,
+  registers it as the global log sink.
+- `easyai::cli::validate_sandbox(path, &err)` — uniform "exists? is a
+  dir?" check.
+
 **Installer** (`scripts/install_easyai_server.sh`)
 - Linux/Debian only.  Backend auto-detect: `nvidia-smi` → CUDA;
   `rocminfo` → ROCm/HIP; `vulkaninfo` / AMD `lspci` → Vulkan; else CPU.
@@ -213,6 +255,23 @@ two layers:
 ## 5. Recent commits (most recent first)
 
 ```
+2026-04-27  — sandbox virtualisation + bash tool + library refactor session.
+
+25bf165  Docs refresh: Toolbelt, bash tool, --sandbox/--allow-bash gating
+2572bc0  Static analysis pass: SSE buffer cap + grep regex DoS guard
+bc28474  easyai::cli — Toolbelt builder + log file helper + sandbox validator
+2fa381a  Extract CLI utilities into the public lib (easyai::ui / text / log)
+21590b9  max_tool_hops: configurable; --allow-bash bumps to 99999
+b8eda29  easyai-cli: same fs_*/bash gating as cli-remote and server
+8e957af  Auto-retry-with-nudge for incomplete turns; default ON in cli-remote
+0a93741  bash tool + tighten fs_*/bash gating in server and cli-remote
+430f9b0  fs tools: virtual /-rooted view; sandbox base hidden from the model
+56d44c3  Sandbox::resolve: total containment via path-component filtering
+443468a  cli-remote: drop per-piece [content N, +Tms] / [reason N, +Tms] traces
+fb8becb  cli-remote: newline on reasoning↔content transition
+afe7a57  Server: incomplete-detection two-tier threshold (80 B / 350 B post-tool)
+e3cf422  libeasyai-cli + cli-remote: RAW transaction log file for offline analysis
+
 v0.1.0 (tag) — first formal release, 2026-04-26.
 
 dc74102  easyai-cli-remote phase 3 + full sampling control on Client
@@ -255,6 +314,56 @@ c6a09d6  Single combined bar above the textarea (tone + ctx + last)
 `git log --oneline | head -30` for the rest.
 
 ### Recent rabbit-hole notes
+
+- **Sandbox containment refactored to total-anchor (2026-04-27)**: the
+  original `Sandbox::resolve` rejected any path whose canonical form
+  escaped the root.  Models would research, then emit `write_file
+  path: "/2026-04-27_news.md"` and the rejection killed the whole
+  deliverable.  Two iterations:
+  1. `56d44c3` — iterate the input's path components, drop empty
+     fragments, separators (`/`, `\`), and pure-dot components
+     (`.`, `..`, `...`, …), join survivors onto sandbox root.
+     Trade-off: a malicious symlink already inside the sandbox
+     could now follow itself out, since we no longer call
+     `weakly_canonical`.  Acceptable — the sandbox is user-owned
+     and we don't expose symlink creation to the model.
+  2. `430f9b0` — in addition, render the sandbox path as `/`-rooted
+     in tool descriptions and result/error messages.  The model
+     thinks the world starts at `/`, never sees the real prefix.
+     Stops the model from inventing `/home/user/`, `root/`, etc as
+     phantom subdirs (those choices were prompted by ambiguous
+     descriptions saying "default = root").
+
+- **Auto-retry with corrective nudge for incomplete turns
+  (2026-04-27, `8e957af`)**: the previous `--retry-on-incomplete`
+  did a blind retry on the same prompt, which usually reproduced
+  the same "Let me fetch a few more sources." stop-without-tool_call
+  bailout.  Now the retry appends a synthetic user message:
+  *"Your previous reply only announced an action without emitting
+  any tool_call. Do NOT say 'let me…' / 'I'll…' unless the tool_call
+  follows in the SAME turn. Either call the next tool you actually
+  need, or give the user the final answer."*  Default ON in
+  cli-remote; one retry max (no spirals).  Reproduces across
+  multiple models including Gemini, so it's an infra-level fix.
+
+- **bash tool design choices (2026-04-27, `0a93741`)**: `/bin/sh -c`
+  for full shell features (pipes, redirects, &&); cwd pinned to
+  --sandbox; output capped at 32 KB; SIGTERM at deadline, SIGKILL
+  +2 s grace; per-command timeout default 30 s, max 300 s.  Honest
+  in its own description: NOT a hardened sandbox — it's a normal
+  shell process with the caller's user privileges.  Opt-in only via
+  `--allow-bash`.  Bumps `max_tool_hops` to 99999 because bash flows
+  span many turns (compile → run → fix → re-run).
+
+- **Static analysis findings (2026-04-27, `2572bc0`)**: SSE pending
+  buffer was unbounded — a malformed stream that never emits a
+  terminator would OOM the client.  Capped at 16 MiB with a clean
+  abort.  Separately, `fs_grep` ran user regexes against
+  multi-megabyte single lines (binary blobs, minified JS) — libstdc++'s
+  recursive regex blows up on `(a+)+` style patterns.  Skip lines
+  >64 KiB.  Audit also cleared format-string vulns (no
+  `printf(user_string)`), URL allowlist (http/https only), HTTP body
+  caps (2/4 MB), JSON parse exception handling.
 
 - **Why thinking was rendering inline as message body** (root cause found
   in `709684b`): `Engine::Impl::render()` left `common_chat_templates_inputs::
