@@ -693,7 +693,7 @@ struct Client::Impl {
             // fine with it.
             if (turn.incomplete && retry_on_incomplete && !retried_for_incomplete) {
                 retried_for_incomplete = true;
-                nlohmann::json nudge;
+                ordered_json nudge;
                 nudge["role"]    = "user";
                 nudge["content"] =
                     "Your previous reply only announced an action without "
@@ -703,7 +703,12 @@ struct Client::Impl {
                     "either call the next tool you actually need to make "
                     "progress, or give the user the final answer. Pick "
                     "one and execute it now.";
-                history_json.push_back(nudge);
+                // history_json is std::vector<std::string> (raw JSON); we
+                // serialise here.  Earlier this pushed `nudge` directly,
+                // which threw json::type_error 302 at runtime when the
+                // implicit nlohmann json→string conversion ran on an
+                // object-typed value.
+                history_json.push_back(nudge.dump());
                 if (verbose) {
                     std::fprintf(stderr,
                         "[easyai-cli] retry_on_incomplete: discarding bad turn "
