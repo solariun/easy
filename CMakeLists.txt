@@ -248,6 +248,25 @@ if (EASYAI_INSTALL)
         ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
+    # The example binaries are installed too when EASYAI_BUILD_EXAMPLES
+    # is on (default).  This is what makes `cmake --install` give you a
+    # ready-to-run easyai-server / easyai-cli / easyai-cli-remote on the
+    # PATH instead of leaving them under build/.  Skip this block when
+    # consumers only want the libs.
+    if (EASYAI_BUILD_EXAMPLES)
+        set(_easyai_install_bins
+            easyai-cli
+            easyai-cli-remote
+            easyai-server
+            easyai-chat
+            easyai-agent)
+        if (CURL_FOUND)
+            list(APPEND _easyai_install_bins easyai-recipes)
+        endif()
+        install(TARGETS ${_easyai_install_bins}
+            RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+    endif()
+
     install(DIRECTORY include/easyai
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
         FILES_MATCHING PATTERN "*.hpp")
