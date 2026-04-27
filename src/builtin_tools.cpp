@@ -685,26 +685,46 @@ struct Sandbox {
     // happily satisfied by "/srv/userMALICIOUS/secrets" (same prefix,
     // different directory tree).  We require canonical to either equal
     // root or have root + path-separator as its prefix.
-    bool resolve(const std::string & in, fs::path & out, std::string & err) const {
-        fs::path p = in;
-        if (!p.is_absolute()) p = root / p;
-        std::error_code ec;
-        fs::path canon = fs::weakly_canonical(p, ec);
-        if (canon.empty()) canon = p.lexically_normal();
-
-        const std::string rs = root.string();
-        const std::string cs = canon.string();
-        const bool inside =
-            cs == rs ||
-            (cs.size() > rs.size()
-             && cs.compare(0, rs.size(), rs) == 0
-             && (cs[rs.size()] == fs::path::preferred_separator
-                 || cs[rs.size()] == '/'));
-        if (!inside) {
-            err = "path escapes sandbox root: " + cs;
-            return false;
+    // Always succeeds.  We never reject — instead we ALWAYS anchor
+    // the resulting path inside the sandbox by:
+    //   1. iterating the input's path components,
+    //   2. dropping any "..", ".", and absolute markers ("/", "\"),
+    //   3. joining the survivors onto the sandbox root.
+    //
+    // This means:
+    //   "/news.md"          → <sandbox>/news.md
+    //   "../etc/passwd"     → <sandbox>/etc/passwd        (contained)
+    //   "a/../b/news.md"    → <sandbox>/a/b/news.md       (contained)
+    //   "C:\\foo\\bar"      → <sandbox>/C:/foo/bar        (Windows-y but
+    //                                                       still inside)
+    //
+    // Trade-off vs the previous canonical-resolution + containment
+    // check: a malicious symlink already inside the sandbox could
+    // be followed out of it, since we no longer call weakly_canonical.
+    // Acceptable because the sandbox is user-owned (they pick the dir
+    // with --sandbox); we don't expose symlink creation to the model.
+    // In return: the model can NEVER produce a path that "escapes" —
+    // any input becomes a real file path under the sandbox.
+    //
+    // The `err` out-param is kept for API stability (callers still
+    // check the return value) but is never written; this method
+    // always returns true.
+    bool resolve(const std::string & in, fs::path & out, std::string & /*err*/) const {
+        auto is_only_dots = [](const std::string & s) {
+            if (s.empty()) return false;
+            for (char c : s) if (c != '.') return false;
+            return true;
+        };
+        fs::path raw = in;
+        fs::path rel;
+        for (const auto & part : raw) {
+            const std::string s = part.string();
+            if (s.empty())                  continue;
+            if (s == "/" || s == "\\")      continue;
+            if (is_only_dots(s))            continue;   // ".", "..", "...", "....", …
+            rel /= part;
         }
-        out = canon;
+        out = (root / rel).lexically_normal();
         return true;
     }
 };
