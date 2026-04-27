@@ -327,7 +327,8 @@ class LocalBackend final : public Backend {
     struct Config {
         std::string model_path;
         std::string system_prompt;
-        std::string sandbox = ".";
+        std::string sandbox;            // empty = fs_* tools NOT registered
+        bool        allow_bash = false; // explicit opt-in for the `bash` tool
         int  n_ctx     = 4096;
         int  n_batch   = 0;        // 0 = follow ctx
         int  ngl       = -1;
@@ -377,11 +378,22 @@ class LocalBackend final : public Backend {
         if (cfg_.load_tools) {
             engine_.add_tool(easyai::tools::datetime())
                    .add_tool(easyai::tools::web_fetch())
-                   .add_tool(easyai::tools::web_search())
-                   .add_tool(easyai::tools::fs_list_dir (cfg_.sandbox))
-                   .add_tool(easyai::tools::fs_read_file(cfg_.sandbox))
-                   .add_tool(easyai::tools::fs_glob     (cfg_.sandbox))
-                   .add_tool(easyai::tools::fs_grep     (cfg_.sandbox));
+                   .add_tool(easyai::tools::web_search());
+            // fs_* and bash are SHIPPED OFF by default — same gating as
+            // easyai-cli-remote and easyai-server. --sandbox <dir>
+            // enables file tools (scoped to <dir>); --allow-bash adds
+            // the shell tool.
+            if (!cfg_.sandbox.empty()) {
+                engine_.add_tool(easyai::tools::fs_list_dir  (cfg_.sandbox))
+                       .add_tool(easyai::tools::fs_read_file (cfg_.sandbox))
+                       .add_tool(easyai::tools::fs_glob      (cfg_.sandbox))
+                       .add_tool(easyai::tools::fs_grep      (cfg_.sandbox))
+                       .add_tool(easyai::tools::fs_write_file(cfg_.sandbox));
+            }
+            if (cfg_.allow_bash) {
+                const std::string root = cfg_.sandbox.empty() ? "." : cfg_.sandbox;
+                engine_.add_tool(easyai::tools::bash(root));
+            }
         }
         engine_.on_tool([](const easyai::ToolCall & c, const easyai::ToolResult & r){
             std::fprintf(stderr,
@@ -462,7 +474,8 @@ class RemoteBackend final : public Backend {
         std::string api_key;        // optional Bearer token
         std::string model = "easyai";
         std::string system_prompt;
-        std::string sandbox = ".";  // root for fs_* tools when --with-tools is on
+        std::string sandbox;        // empty = fs_* tools NOT registered (even with --with-tools)
+        bool        allow_bash = false;  // explicit opt-in for the `bash` tool
         easyai::Preset preset{};
         long timeout_seconds = 300;
         int      max_tokens  = -1;
@@ -560,11 +573,18 @@ class RemoteBackend final : public Backend {
             client_->add_tool(easyai::tools::web_search());
             client_->add_tool(easyai::tools::web_fetch());
 #endif
-            client_->add_tool(easyai::tools::fs_read_file (cfg_.sandbox));
-            client_->add_tool(easyai::tools::fs_list_dir  (cfg_.sandbox));
-            client_->add_tool(easyai::tools::fs_glob      (cfg_.sandbox));
-            client_->add_tool(easyai::tools::fs_grep      (cfg_.sandbox));
-            client_->add_tool(easyai::tools::fs_write_file(cfg_.sandbox));
+            // fs_* and bash gated identically to local mode.
+            if (!cfg_.sandbox.empty()) {
+                client_->add_tool(easyai::tools::fs_read_file (cfg_.sandbox));
+                client_->add_tool(easyai::tools::fs_list_dir  (cfg_.sandbox));
+                client_->add_tool(easyai::tools::fs_glob      (cfg_.sandbox));
+                client_->add_tool(easyai::tools::fs_grep      (cfg_.sandbox));
+                client_->add_tool(easyai::tools::fs_write_file(cfg_.sandbox));
+            }
+            if (cfg_.allow_bash) {
+                const std::string root = cfg_.sandbox.empty() ? "." : cfg_.sandbox;
+                client_->add_tool(easyai::tools::bash(root));
+            }
         }
     }
     void push_sampling_() {
@@ -623,7 +643,8 @@ struct CliArgs {
     int  n_ctx = 4096, ngl = -1, n_threads = 0;
     int  n_batch = 0;              // 0 = follow ctx
     bool load_tools = true;
-    std::string sandbox = ".";
+    std::string sandbox;        // empty = fs_* tools NOT registered
+    bool allow_bash = false;    // explicit opt-in for `bash`
 
     // KV cache controls
     std::string cache_type_k;      // empty = library default (f16)
@@ -674,7 +695,16 @@ struct CliArgs {
         "      --ngl <n>                 GPU layers (-1=auto, 0=CPU)\n"
         "  -t, --threads <n>             CPU threads\n"
         "      --no-tools                Don't register the built-in toolbelt\n"
-        "      --sandbox <dir>           Root for fs_* tools (default '.')\n"
+        "      --sandbox <dir>           Enable fs_* tools (read_file,\n"
+        "                                 list_dir, glob, grep, write_file),\n"
+        "                                 ALL scoped to <dir>. Without\n"
+        "                                 --sandbox these tools are NOT\n"
+        "                                 registered.\n"
+        "      --allow-bash              Register the `bash` tool (run shell\n"
+        "                                 commands). cwd = --sandbox dir if\n"
+        "                                 given, otherwise CWD. NOT a\n"
+        "                                 hardened sandbox — the command\n"
+        "                                 runs with your user privileges.\n"
         "\nKV cache (local mode, all optional):\n"
         " -ctk, --cache-type-k <type>    K-cache dtype (f32|f16|bf16|q8_0|q4_0|q4_1|q5_0|q5_1|iq4_nl)\n"
         " -ctv, --cache-type-v <type>    V-cache dtype (same options) — quantising V saves a lot of VRAM\n"
@@ -724,6 +754,7 @@ static CliArgs parse(int argc, char ** argv) {
         else if (s == "-t" || s == "--threads")       a.n_threads     = std::atoi(need(i, "-t"));
         else if (s == "--no-tools")                   a.load_tools    = false;
         else if (s == "--sandbox")                    a.sandbox       = need(i, "--sandbox");
+        else if (s == "--allow-bash")                 a.allow_bash    = true;
         // KV controls (local mode)
         else if (s == "-ctk" || s == "--cache-type-k") a.cache_type_k = need(i, "-ctk");
         else if (s == "-ctv" || s == "--cache-type-v") a.cache_type_v = need(i, "-ctv");
@@ -821,6 +852,7 @@ int main(int argc, char ** argv) {
         rc.model         = args.remote_model;
         rc.system_prompt = system_prompt;
         rc.sandbox       = args.sandbox;
+        rc.allow_bash    = args.allow_bash;
         rc.preset        = preset;
         rc.max_tokens    = args.max_tokens;
         rc.seed          = args.seed;
@@ -833,6 +865,7 @@ int main(int argc, char ** argv) {
         lc.model_path     = args.model_path;
         lc.system_prompt  = system_prompt;
         lc.sandbox        = args.sandbox;
+        lc.allow_bash     = args.allow_bash;
         lc.n_ctx          = args.n_ctx;
         lc.n_batch        = args.n_batch;
         lc.ngl            = args.ngl;
