@@ -11,4 +11,9 @@ void Toolbelt::apply(Client & client) const {
     if (allow_bash_) client.max_tool_hops(99999);
 }
 
+bool client_has_tool(const Client & client, const std::string & name) {
+    for (const auto & t : client.tools()) if (t.name == name) return true;
+    return false;
+}
+
 }  // namespace easyai::cli

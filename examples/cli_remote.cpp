@@ -619,34 +619,9 @@ void register_tools(easyai::Client & cli,
 }
 
 // Trim a string to N chars with ellipsis suffix for log lines.
-std::string trim_for_log(std::string s, size_t max_chars) {
-    if (s.size() <= max_chars) return s;
-    s.resize(max_chars);
-    s += "…";
-    // Strip newlines so the log line stays single-line.
-    for (char & c : s) if (c == '\n' || c == '\r') c = ' ';
-    return s;
-}
+using easyai::text::trim_for_log;
 
-// ---- management subcommand handlers ---------------------------------------
-// Pretty-print a tool catalog with name + multi-line description.
-void print_tool_row(const std::string & name,
-                    const std::string & description,
-                    const Style & st) {
-    std::printf("%s%s%s\n", st.bold(), name.c_str(), st.reset());
-    // Indent each line of the description by two spaces and dim it.
-    const std::string & d = description;
-    size_t i = 0;
-    while (i < d.size()) {
-        size_t nl = d.find('\n', i);
-        std::string line = (nl == std::string::npos)
-                               ? d.substr(i)
-                               : d.substr(i, nl - i);
-        std::printf("  %s%s%s\n", st.dim(), line.c_str(), st.reset());
-        if (nl == std::string::npos) break;
-        i = nl + 1;
-    }
-}
+using easyai::ui::print_tool_row;
 
 int run_management(easyai::Client & cli, const Options & o, const Style & st) {
     if (o.list_models) {
@@ -736,14 +711,7 @@ int run_management(easyai::Client & cli, const Options & o, const Style & st) {
 }
 
 // ---- callback wiring ------------------------------------------------------
-void render_plan(const easyai::Plan & p, const Style & st) {
-    std::fprintf(stdout, "\n%s── plan ──%s\n", st.yellow(), st.reset());
-    std::ostringstream ss;
-    p.render(ss);
-    std::fputs(ss.str().c_str(), stdout);
-    std::fputs("\n", stdout);
-    std::fflush(stdout);
-}
+using easyai::ui::render_plan;
 
 // Per-process spinner + stats handles, captured by the streaming
 // callbacks so they can update progress without each on_token closure
@@ -848,10 +816,7 @@ bool is_special(const std::string & line, const std::string & cmd) {
 
 using easyai::text::prompt_wants_file_write;
 
-bool client_has_tool(const easyai::Client & cli, const std::string & name) {
-    for (const auto & t : cli.tools()) if (t.name == name) return true;
-    return false;
-}
+using easyai::cli::client_has_tool;
 
 int run_one(easyai::Client & cli, const std::string & prompt,
             const Options & o, const Style & st) {

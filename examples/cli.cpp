@@ -59,23 +59,6 @@
 // ============================================================================
 namespace {
 
-// Read a small text file fully. Capped to 1 MiB so a stray --system-file at
-// /dev/random / a multi-GB log can't eat the heap.
-std::string read_text_file(const std::string & path,
-                           size_t max_bytes = 1u << 20) {
-    std::ifstream f(path, std::ios::binary);
-    if (!f) return {};
-    f.seekg(0, std::ios::end);
-    auto sz = f.tellg();
-    if (sz <= 0) return {};
-    if ((size_t) sz > max_bytes) sz = (std::streamoff) max_bytes;
-    f.seekg(0, std::ios::beg);
-    std::string out((size_t) sz, '\0');
-    f.read(out.data(), sz);
-    out.resize((size_t) f.gcount());
-    return out;
-}
-
 // Pretty-print all built-in presets.
 void print_presets() {
     std::fprintf(stderr, "\nAvailable presets:\n");
@@ -108,122 +91,6 @@ void install_sigint() { std::signal(SIGINT, handle_sigint); }
 
 }  // namespace
 
-// ============================================================================
-//  ThinkStripper — streaming filter for <think>…</think> / <thinking>…</thinking>
-//
-//  The model emits tokens piece-by-piece, so a tag may be split across pieces
-//  ("<thi" + "nk>" + "..."). We maintain a small text buffer between calls and
-//  only emit bytes once we know they belong to the visible region.
-//
-//  Algorithm (per call to filter(piece)):
-//    1. Append piece to buffer.
-//    2. While we can advance, alternate between two states:
-//         - OUTSIDE think: scan for the next <think>/<thinking>.
-//             • Found  → emit everything before it; jump past tag; → INSIDE
-//             • Not    → emit everything except a small trailing "safe" margin
-//                        (long enough to be a partial open tag), keep margin
-//                        in buffer; return.
-//         - INSIDE think: scan for the next </think>/</thinking>.
-//             • Found  → drop everything up to & including it; → OUTSIDE
-//             • Not    → drop everything except a trailing margin (length of
-//                        the longest possible close tag), keep margin; return.
-//    3. flush() at end of stream emits whatever remained outside think mode.
-//
-//  Buffer growth is bounded — when no tag is found we always either emit or
-//  truncate, so memory stays O(margin).
-// ============================================================================
-class ThinkStripper {
-   public:
-    bool enabled = false;
-
-    // Emit visible text for a streamed piece. Returns the bytes the caller
-    // should print to the user.
-    std::string filter(const std::string & piece) {
-        if (!enabled) return piece;
-        buffer_ += piece;
-        std::string out;
-
-        for (;;) {
-            if (in_think_) {
-                size_t end = find_close(buffer_);
-                if (end == std::string::npos) {
-                    // Keep at most the longest possible close tag length so a
-                    // partial close on the next call can still match.
-                    if (buffer_.size() > kCloseMargin) {
-                        buffer_.erase(0, buffer_.size() - kCloseMargin);
-                    }
-                    return out;
-                }
-                size_t close = buffer_.find('>', end);
-                if (close == std::string::npos) return out;  // malformed
-                buffer_.erase(0, close + 1);
-                in_think_ = false;
-            } else {
-                size_t start = find_open(buffer_);
-                if (start == std::string::npos) {
-                    // Emit everything except a small safe margin where a
-                    // partial open tag could begin.
-                    size_t safe = buffer_.size() > kOpenMargin
-                                      ? buffer_.size() - kOpenMargin : 0;
-                    if (safe > 0) {
-                        out += buffer_.substr(0, safe);
-                        buffer_.erase(0, safe);
-                    }
-                    return out;
-                }
-                out += buffer_.substr(0, start);
-                size_t close = buffer_.find('>', start);
-                if (close == std::string::npos) {
-                    // The opening '<' is there but '>' hasn't streamed yet —
-                    // park what we have, wait for the rest.
-                    buffer_.erase(0, start);
-                    return out;
-                }
-                buffer_.erase(0, close + 1);
-                in_think_ = true;
-            }
-        }
-    }
-
-    // Emit any trailing bytes accumulated in the buffer at end of stream.
-    std::string flush() {
-        std::string out;
-        if (!enabled || !in_think_) {
-            out = std::move(buffer_);
-        }
-        buffer_.clear();
-        in_think_ = false;
-        return out;
-    }
-
-    void reset() {
-        buffer_.clear();
-        in_think_ = false;
-    }
-
-   private:
-    // Margins must be >= length of the longest tag we recognise.
-    static constexpr size_t kOpenMargin  = 10;  // "<thinking" is 9
-    static constexpr size_t kCloseMargin = 12;  // "</thinking>" is 11
-
-    std::string buffer_;
-    bool        in_think_ = false;
-
-    static size_t find_open(const std::string & s) {
-        size_t a = s.find("<think>");
-        size_t b = s.find("<thinking>");
-        if (a == std::string::npos) return b;
-        if (b == std::string::npos) return a;
-        return std::min(a, b);
-    }
-    static size_t find_close(const std::string & s) {
-        size_t a = s.find("</think>");
-        size_t b = s.find("</thinking>");
-        if (a == std::string::npos) return b;
-        if (b == std::string::npos) return a;
-        return std::min(a, b);
-    }
-};
 
 // ============================================================================
 //  Backend interface — the abstraction over local engine vs. remote HTTP.
@@ -714,7 +581,7 @@ int main(int argc, char ** argv) {
 
     std::string system_prompt = args.system_inline;
     if (system_prompt.empty() && !args.system_path.empty()) {
-        system_prompt = read_text_file(args.system_path);
+        easyai::text::slurp_file(args.system_path, system_prompt);
         if (system_prompt.empty()) {
             std::fprintf(stderr, "[easyai-cli] WARNING: failed to read system file '%s'\n",
                          args.system_path.c_str());
@@ -792,7 +659,7 @@ int main(int argc, char ** argv) {
         // Banners → stderr so stdout is clean for piping.
         std::fprintf(stderr, "[easyai-cli] %s\n", backend->info().c_str());
 
-        ThinkStripper strip;
+        easyai::text::ThinkStripper strip;
         strip.enabled = args.no_think;
         easyai::ui::Spinner spinner(/*enabled=*/true);
         spinner.start_heartbeat();
@@ -834,7 +701,7 @@ int main(int argc, char ** argv) {
         backend->info().c_str(), preset.name.c_str(),
         args.no_think ? "  [no-think]" : "");
 
-    ThinkStripper strip;
+    easyai::text::ThinkStripper strip;
     strip.enabled = args.no_think;
     easyai::ui::Spinner spinner(/*enabled=*/true);
 

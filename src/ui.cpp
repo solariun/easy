@@ -1,7 +1,11 @@
 #include "easyai/ui.hpp"
 
+#include "easyai/plan.hpp"
+#include "easyai/presets.hpp"
+
 #include <cstdio>
 #include <cstdlib>
+#include <sstream>
 #include <unistd.h>
 
 namespace easyai::ui {
@@ -112,6 +116,42 @@ void Spinner::heartbeat_loop_() {
         ++frame_;
         last_advance_ = std::chrono::steady_clock::now();
         draw_locked_();
+    }
+}
+
+// ---------------------------------------------------------------- pretty-print
+void print_presets(const Style & st, std::FILE * out) {
+    for (const auto & p : easyai::all_presets()) {
+        std::fprintf(out, "  %s%s%s  %s%s%s\n",
+                     st.bold(),  p.name.c_str(),        st.reset(),
+                     st.dim(),   p.description.c_str(), st.reset());
+    }
+}
+
+void render_plan(const Plan & plan, const Style & st, std::FILE * out) {
+    std::fprintf(out, "\n%s── plan ──%s\n", st.yellow(), st.reset());
+    std::ostringstream ss;
+    plan.render(ss);
+    std::fputs(ss.str().c_str(), out);
+    std::fputc('\n', out);
+    std::fflush(out);
+}
+
+void print_tool_row(const std::string & name,
+                    const std::string & description,
+                    const Style & st,
+                    std::FILE * out) {
+    std::fprintf(out, "%s%s%s\n", st.bold(), name.c_str(), st.reset());
+    std::size_t i = 0;
+    while (i < description.size()) {
+        std::size_t nl = description.find('\n', i);
+        std::string line = (nl == std::string::npos)
+                               ? description.substr(i)
+                               : description.substr(i, nl - i);
+        std::fprintf(out, "  %s%s%s\n",
+                     st.dim(), line.c_str(), st.reset());
+        if (nl == std::string::npos) break;
+        i = nl + 1;
     }
 }
 

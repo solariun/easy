@@ -94,6 +94,14 @@ std::FILE * open_log_tee(const std::string & path,
 // clears the easyai::log sink.  Safe to call on nullptr.
 void close_log_tee(std::FILE * fp);
 
+// ---------- Client introspection helpers -----------------------------------
+
+// Returns true if the Client has a tool with the given name registered
+// (matches Tool::name).  Inline so consumers don't take the
+// libeasyai-cli link dep just for this lookup.
+bool client_has_tool(const Client & client, const std::string & name);
+
+
 // ---------- Sandbox dir validation -----------------------------------------
 //
 // Returns true if `path` is empty (caller didn't pass --sandbox) or

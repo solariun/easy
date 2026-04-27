@@ -117,6 +117,30 @@ private:
 };
 
 
+// ---------- pretty-printers (small, dependency-free helpers) ---------------
+//
+// Forward-declarations so consumers don't have to pull plan.hpp /
+// presets.hpp transitively just for the ui header.
+}  // namespace easyai::ui
+namespace easyai { class Plan; }
+namespace easyai::ui {
+
+// Print all built-in presets (one per line: name + summary) to `out`.
+// Uses dim style for the summary suffix.
+void print_presets(const Style & st, std::FILE * out = stdout);
+
+// Print a plan's GitHub-style markdown checklist below a "── plan ──"
+// banner.  Used by REPLs to show progress when a Plan callback fires.
+void render_plan(const Plan & plan, const Style & st, std::FILE * out = stdout);
+
+// Pretty-print one tool's name + multi-line description in the
+// "name: <bold>\n  desc-line\n  desc-line" shape used by --list-tools.
+void print_tool_row(const std::string & name,
+                    const std::string & description,
+                    const Style & st,
+                    std::FILE * out = stdout);
+
+
 // ---------- streaming stats -------------------------------------------------
 //
 // Counters + timers that track an SSE turn from start to finish.  Free
