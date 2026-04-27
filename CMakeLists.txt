@@ -10,6 +10,19 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# RPATH for installed binaries.  Without this, `cmake --install` strips
+# the build-time RPATH and leaves the installed easyai-* binaries
+# unable to locate libeasyai{,-cli}.{so,dylib} unless they happen to
+# be on the system loader path.  We point the binary at its sibling
+# lib dir relative to its own location, so a `--prefix /opt/easyai`
+# (or any prefix) Just Works without LD_LIBRARY_PATH gymnastics.
+if (APPLE)
+    set(CMAKE_INSTALL_RPATH "@loader_path/../lib")
+else()
+    set(CMAKE_INSTALL_RPATH "\$ORIGIN/../lib")
+endif()
+set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
+
 option(EASYAI_BUILD_EXAMPLES "Build easyai example agents"             ON)
 option(EASYAI_WITH_CURL      "Build web_fetch / web_search"            ON)
 option(EASYAI_BUILD_WEBUI    "Embed the llama-server-style webui"      ON)
@@ -270,6 +283,32 @@ if (EASYAI_INSTALL)
     install(DIRECTORY include/easyai
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
         FILES_MATCHING PATTERN "*.hpp")
+
+    # llama.cpp's libraries — built under build/bin/ via EXCLUDE_FROM_ALL
+    # add_subdirectory, so its own install rules don't run.  We ship
+    # them into <prefix>/lib alongside libeasyai{,-cli} so the
+    # installed binaries (which carry RUNPATH=$ORIGIN/../lib or
+    # @loader_path/../lib) load them transparently — no need for
+    # LD_LIBRARY_PATH or an explicit "find_package(llama)" downstream.
+    install(CODE "
+        file(GLOB _easyai_runtime_libs
+            \"\${CMAKE_BINARY_DIR}/bin/libggml*.so*\"
+            \"\${CMAKE_BINARY_DIR}/bin/libggml*.dylib\"
+            \"\${CMAKE_BINARY_DIR}/bin/libllama*.so*\"
+            \"\${CMAKE_BINARY_DIR}/bin/libllama*.dylib\")
+        if (NOT _easyai_runtime_libs)
+            file(GLOB _easyai_runtime_libs
+                \"${CMAKE_BINARY_DIR}/bin/libggml*.so*\"
+                \"${CMAKE_BINARY_DIR}/bin/libggml*.dylib\"
+                \"${CMAKE_BINARY_DIR}/bin/libllama*.so*\"
+                \"${CMAKE_BINARY_DIR}/bin/libllama*.dylib\")
+        endif()
+        foreach(_lib IN LISTS _easyai_runtime_libs)
+            file(INSTALL DESTINATION
+                \"\${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_LIBDIR}\"
+                TYPE SHARED_LIBRARY FILES \"\${_lib}\")
+        endforeach()
+    ")
 
     configure_package_config_file(
         ${CMAKE_CURRENT_SOURCE_DIR}/cmake/easyaiConfig.cmake.in
