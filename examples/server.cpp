@@ -58,6 +58,7 @@
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
+#include <ctime>
 #include <fstream>
 #include <memory>
 #include <mutex>
@@ -1345,6 +1346,8 @@ struct ServerCtx {
     std::mutex                 engine_mu;       // protects every engine_* call
     std::vector<easyai::Tool>  default_tools;   // copied into engine per request
     std::string                default_system;
+    bool                       inject_datetime    = true;        // server-side authoritative date/time injection
+    std::string                knowledge_cutoff   = "2024-10";   // model training-data cutoff hint
     easyai::Preset             default_preset;  // current "ambient" preset
     std::string                model_id;        // basename of model file
     std::string                api_key;         // empty = auth disabled
@@ -1483,6 +1486,44 @@ static bool parse_chat_request(const httplib::Request & req,
 // Apply request-level overrides + replace history. Caller already holds
 // engine_mu and has called reset_engine_defaults().
 // ---------------------------------------------------------------------------
+// Build an authoritative preamble that's appended to the SERVER's
+// default system prompt on every request.  Per user request: pass the
+// model the current date/time + timezone, and tell it about its
+// knowledge cutoff so it knows when to defer to tools instead of
+// hallucinating post-cutoff facts.
+//
+// We rebuild this per request so the timestamp is always fresh.
+static std::string build_authoritative_preamble(const ServerCtx & ctx) {
+    auto now    = std::chrono::system_clock::now();
+    auto tt     = std::chrono::system_clock::to_time_t(now);
+    std::tm lt{};
+#if defined(_WIN32)
+    localtime_s(&lt, &tt);
+#else
+    localtime_r(&tt, &lt);
+#endif
+    char ts[64]; char tz[32];
+    std::strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S %z", &lt);
+    std::strftime(tz, sizeof(tz), "%Z",                    &lt);
+
+    std::ostringstream out;
+    out << "\n\n# AUTHORITATIVE DATE/TIME (do not ignore, do not second-guess)\n"
+        << "Current date and time: " << ts << " (" << tz << ").\n"
+        << "Trust this over any training-data intuition about \"today\".\n"
+        << "If the user mentions \"today\", \"now\", \"this year\" etc., use the\n"
+        << "value above.  When unsure, call the `datetime` tool first.\n"
+        << "\n# KNOWLEDGE CUTOFF\n"
+        << "Your training data ends around " << ctx.knowledge_cutoff << ".\n"
+        << "For ANY claim about events, people, products, prices, releases,\n"
+        << "leaders, scores, weather, or facts after that cutoff you MUST\n"
+        << "either:\n"
+        << "  1. Call a tool (web_search, web_fetch, datetime, …) to verify, OR\n"
+        << "  2. Explicitly state that you are not certain.\n"
+        << "Never present a post-cutoff fact as known.  Hallucination is\n"
+        << "considered a critical failure for this assistant.\n";
+    return out.str();
+}
+
 static void prepare_engine_for_request(ServerCtx & ctx, const ChatRequest & req) {
     if (req.client_tools) {
         ctx.engine.clear_tools();
@@ -1496,6 +1537,14 @@ static void prepare_engine_for_request(ServerCtx & ctx, const ChatRequest & req)
             if (name.empty()) continue;
             ctx.engine.add_tool(make_stub_tool(name, description, params_json));
         }
+    }
+    // Re-apply the system prompt every request so the authoritative
+    // date/time injection (if enabled) is FRESH each turn — not cached
+    // from when the engine was first loaded.
+    if (ctx.inject_datetime) {
+        ctx.engine.system(ctx.default_system + build_authoritative_preamble(ctx));
+    } else {
+        ctx.engine.system(ctx.default_system);
     }
     ctx.engine.set_sampling(
         req.temp_override  >= 0 ? (float) req.temp_override  : -1.0f,
@@ -2178,6 +2227,15 @@ static bool require_auth(const ServerCtx & ctx, const httplib::Request & req,
         "       --metrics               Expose Prometheus /metrics endpoint\n"
         "       --reasoning <on|off>    Enable model thinking (default on)\n"
         "       --no-think              Strip <think>...</think> from replies\n"
+        "       --inject-datetime <on|off>\n"
+        "                               Append authoritative date/time + TZ + a\n"
+        "                               knowledge-cutoff hint to the system prompt\n"
+        "                               on EVERY request (default on).  Tells the\n"
+        "                               model to trust the server's clock and to\n"
+        "                               verify post-cutoff facts via tools.\n"
+        "       --knowledge-cutoff <YYYY-MM>\n"
+        "                               Model training-data cutoff hint used by\n"
+        "                               --inject-datetime.  Default '2024-10'.\n"
         "  -v,  --verbose               Engine logs raw model output + parser\n"
         "                                 actions to stderr — useful for debugging\n"
         "                                 'why did it stop?' moments\n"
@@ -2209,6 +2267,12 @@ struct ServerArgs {
     std::string sandbox    = ".";
     std::string preset     = "balanced";
     size_t      max_body   = 8u * 1024u * 1024u;
+
+    // Authoritative date/time injection — see build_authoritative_preamble
+    // in this file.  ON by default because most users want the model to
+    // trust the wall clock instead of guessing about "today".
+    bool        inject_datetime  = true;
+    std::string knowledge_cutoff = "2024-10";
 
     // sampling overrides (apply on top of preset)
     float       temperature    = -1.0f;
@@ -2297,6 +2361,11 @@ static ServerArgs parse_args(int argc, char ** argv) {
             a.reasoning = (v == "on" || v == "1" || v == "true" || v == "yes");
         }
         else if (s == "--no-think")                  a.no_think       = true;
+        else if (s == "--inject-datetime") {
+            std::string v = need(i, "--inject-datetime");
+            a.inject_datetime = (v == "on" || v == "1" || v == "true" || v == "yes");
+        }
+        else if (s == "--knowledge-cutoff")          a.knowledge_cutoff = need(i, "--knowledge-cutoff");
         else if (s == "-v" || s == "--verbose")      a.verbose        = true;
         else if (s == "--webui-title")               a.webui_title    = need(i, "--webui-title");
         else if (s == "--webui-icon")                a.webui_icon     = need(i, "--webui-icon");
@@ -2361,7 +2430,9 @@ int main(int argc, char ** argv) {
     // -------- build the context (heap-allocated so HTTP lambdas can capture
     // a stable reference; lifetime tied to main()'s scope via unique_ptr).
     auto ctx = std::make_unique<ServerCtx>();
-    ctx->default_system = default_system;
+    ctx->default_system   = default_system;
+    ctx->inject_datetime  = args.inject_datetime;
+    ctx->knowledge_cutoff = args.knowledge_cutoff;
     {
         // Compute model_id = basename(path) without extension.
         std::string p = args.model_path;
