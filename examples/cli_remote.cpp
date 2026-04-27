@@ -45,9 +45,11 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <fstream>
 #include <iostream>
 #include <map>
@@ -55,11 +57,39 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <sys/types.h>
 #include <thread>
-#include <unistd.h>      // isatty
+#include <unistd.h>      // isatty, getpid
 #include <vector>
 
 namespace {
+
+// ---- diagnostic log file (RAW transaction tee) ----------------------------
+//
+// When --verbose is on (and unless --log-file overrides it) cli-remote
+// writes every diagnostic line AND every byte that crosses the wire
+// (request body, raw SSE chunks, tool dispatch summaries — that part
+// is done inside libeasyai-cli through Client::log_file) into a file.
+// The path is printed at startup so the operator can paste it back
+// here for offline analysis or grep through it locally.
+//
+// Why borrow a FILE* instead of a path?  We want both this CLI and the
+// library writing to the SAME stream so timestamps interleave naturally.
+// One open, one close, one set of OS buffers.
+static std::FILE * g_log_fp = nullptr;
+
+void vlog(const char * fmt, ...) {
+    va_list ap1, ap2;
+    va_start(ap1, fmt);
+    va_copy(ap2, ap1);
+    std::vfprintf(stderr, fmt, ap1);
+    va_end(ap1);
+    if (g_log_fp) {
+        std::vfprintf(g_log_fp, fmt, ap2);
+        std::fflush(g_log_fp);
+    }
+    va_end(ap2);
+}
 
 // ---- TokenSpinner — '|/-\\' frames trailing the cursor --------------------
 //
@@ -466,6 +496,7 @@ struct Options {
     int                      timeout           = 600;
     bool        show_reasoning   = true;   // default ON; --no-reasoning to opt out
     bool        verbose          = false;
+    std::string log_file_path;             // explicit --log-file override
     int         max_reasoning    = 0;      // 0 = unlimited (disable runaway abort)
     bool        retry_on_incomplete = false;
     bool        no_plan          = false;     // skip auto-registering Plan
@@ -549,7 +580,17 @@ void usage(const char * argv0) {
 "                                turns transparently and a placeholder is\n"
 "                                rendered after the response.\n"
 "    --verbose                  log HTTP+SSE traffic to stderr (timestamps +\n"
-"                                per-piece diagnostics)\n"
+"                                per-piece diagnostics).  When set,\n"
+"                                ALSO writes the same diagnostics PLUS\n"
+"                                the raw HTTP transaction (request body,\n"
+"                                every SSE chunk byte-for-byte, every\n"
+"                                tool dispatch input/output) into a log\n"
+"                                file at /tmp/easyai-cli-{pid}-{epoch}.log.\n"
+"                                The path is printed at startup.  Override\n"
+"                                with --log-file PATH.\n"
+"    --log-file PATH            write the raw transaction log here instead\n"
+"                                of the auto-generated /tmp path.  Implies\n"
+"                                --verbose if --verbose wasn't passed.\n"
 "\n"
 "  Management subcommands (use one, no chat):\n"
 "    --list-tools               list LOCAL tools (registered in this CLI)\n"
@@ -616,6 +657,7 @@ bool parse_args(int argc, char ** argv, Options & o) {
         else if (a == "--max-reasoning")     o.max_reasoning      = std::stoi(need(i, "--max-reasoning"));
         else if (a == "--retry-on-incomplete") o.retry_on_incomplete = true;
         else if (a == "--verbose" || a == "-v") o.verbose = true;
+        else if (a == "--log-file")       o.log_file_path     = need(i, "--log-file");
         else if (a == "--insecure-tls")   o.tls_insecure = true;
         else if (a == "--ca-cert")        o.tls_ca_path  = need(i, "--ca-cert");
         else if (a == "-p" || a == "--prompt") o.prompt = need(i, "--prompt");
@@ -721,9 +763,8 @@ void register_tools(easyai::Client & cli,
     if (wants("system_swaps"))     cli.add_tool(systools::make_system_swaps());
 
     if (o.verbose) {
-        std::fprintf(stderr,
-            "%s[easyai-cli-remote]%s registered %zu tool(s):\n",
-            st.dim(), st.reset(), cli.tools().size());
+        vlog("%s[easyai-cli-remote]%s registered %zu tool(s):\n",
+             st.dim(), st.reset(), cli.tools().size());
         for (const auto & t : cli.tools()) {
             // Squash the JSON schema down to a single line for the log.
             std::string schema = t.parameters_json;
@@ -746,14 +787,12 @@ void register_tools(easyai::Client & cli,
             std::string desc = t.description;
             for (char & c : desc) if (c == '\n' || c == '\r') c = ' ';
             if (desc.size() > 120) desc = desc.substr(0, 120) + "…";
-            std::fprintf(stderr,
-                "%s  - %s%s%s  desc=\"%s\"\n",
-                st.dim(),
-                st.bold(), t.name.c_str(), st.reset(),
-                desc.c_str());
-            std::fprintf(stderr,
-                "%s    schema=%s%s\n",
-                st.dim(), compact.c_str(), st.reset());
+            vlog("%s  - %s%s%s  desc=\"%s\"\n",
+                 st.dim(),
+                 st.bold(), t.name.c_str(), st.reset(),
+                 desc.c_str());
+            vlog("%s    schema=%s%s\n",
+                 st.dim(), compact.c_str(), st.reset());
         }
     }
 }
@@ -935,11 +974,11 @@ void wire_callbacks(easyai::Client & cli, easyai::Plan & plan,
         }
         write_through_spinner(punctuate_think_tags(piece_in));
         if (o.verbose) {
-            std::fprintf(stderr, "%s[content %d, +%ldms]%s\n",
-                         st.dim(),
-                         g_stats ? g_stats->content_pieces : 0,
-                         g_stats ? g_stats->elapsed_ms() : 0,
-                         st.reset());
+            vlog("%s[content %d, +%ldms]%s\n",
+                 st.dim(),
+                 g_stats ? g_stats->content_pieces : 0,
+                 g_stats ? g_stats->elapsed_ms() : 0,
+                 st.reset());
         }
     });
     cli.on_reason([&st, &o](const std::string & piece_in) {
@@ -955,11 +994,11 @@ void wire_callbacks(easyai::Client & cli, easyai::Plan & plan,
         // When show_reasoning is off the heartbeat keeps the spinner
         // ticking on its own — no explicit refresh needed here.
         if (o.verbose) {
-            std::fprintf(stderr, "%s[reason %d, +%ldms]%s\n",
-                         st.dim(),
-                         g_stats ? g_stats->reason_pieces : 0,
-                         g_stats ? g_stats->elapsed_ms() : 0,
-                         st.reset());
+            vlog("%s[reason %d, +%ldms]%s\n",
+                 st.dim(),
+                 g_stats ? g_stats->reason_pieces : 0,
+                 g_stats ? g_stats->elapsed_ms() : 0,
+                 st.reset());
         }
     });
     cli.on_tool([&st, &o](const easyai::ToolCall & call,
@@ -981,25 +1020,24 @@ void wire_callbacks(easyai::Client & cli, easyai::Plan & plan,
         ss << "\n";
         write_through_spinner(ss.str());
         if (o.verbose) {
-            std::fprintf(stderr,
-                "%s[tool %s name=%s args_bytes=%zu result_bytes=%zu +%ldms]%s\n",
-                st.dim(),
-                result.is_error ? "FAIL" : "ok",
-                call.name.c_str(),
-                call.arguments_json.size(),
-                result.content.size(),
-                g_stats ? g_stats->elapsed_ms() : 0,
-                st.reset());
+            vlog("%s[tool %s name=%s args_bytes=%zu result_bytes=%zu +%ldms]%s\n",
+                 st.dim(),
+                 result.is_error ? "FAIL" : "ok",
+                 call.name.c_str(),
+                 call.arguments_json.size(),
+                 result.content.size(),
+                 g_stats ? g_stats->elapsed_ms() : 0,
+                 st.reset());
             std::string args_prev = call.arguments_json;
             if (args_prev.size() > 240) args_prev = args_prev.substr(0, 240) + "…";
             for (char & c : args_prev) if (c == '\n' || c == '\r') c = ' ';
-            std::fprintf(stderr, "%s         args=%s%s\n",
-                         st.dim(), args_prev.c_str(), st.reset());
+            vlog("%s         args=%s%s\n",
+                 st.dim(), args_prev.c_str(), st.reset());
             std::string res_prev = result.content;
             if (res_prev.size() > 240) res_prev = res_prev.substr(0, 240) + "…";
             for (char & c : res_prev) if (c == '\n' || c == '\r') c = ' ';
-            std::fprintf(stderr, "%s         result=%s%s\n",
-                         st.dim(), res_prev.c_str(), st.reset());
+            vlog("%s         result=%s%s\n",
+                 st.dim(), res_prev.c_str(), st.reset());
         }
     });
     plan.on_change([&st](const easyai::Plan & p) {
@@ -1202,7 +1240,55 @@ int main(int argc, char ** argv) {
         return 2;
     }
 
+    // --log-file implies --verbose so the user gets the full diagnostic
+    // stream (otherwise the file would only carry the wire-level RAW data
+    // and miss CLI-side context).
+    if (!o.log_file_path.empty()) o.verbose = true;
+
+    // Open the diagnostic log file when --verbose (or --log-file) is on.
+    // Auto-generated path lives under /tmp so it survives reboots' cleanup
+    // policy and is easy to find from another shell.  Closed at the end
+    // of main; libeasyai-cli ALSO writes here through Client::log_file.
+    std::string resolved_log_path;
+    if (o.verbose) {
+        if (!o.log_file_path.empty()) {
+            resolved_log_path = o.log_file_path;
+        } else {
+            char buf[64];
+            std::snprintf(buf, sizeof(buf), "/tmp/easyai-cli-%d-%ld.log",
+                          (int) ::getpid(),
+                          (long) std::time(nullptr));
+            resolved_log_path = buf;
+        }
+        g_log_fp = std::fopen(resolved_log_path.c_str(), "w");
+        if (!g_log_fp) {
+            std::fprintf(stderr,
+                "%swarning:%s could not open log file %s — continuing without raw log.\n",
+                st.yellow(), st.reset(), resolved_log_path.c_str());
+        } else {
+            std::fprintf(stderr,
+                "%s[easyai-cli-remote]%s raw transaction log: %s%s%s\n",
+                st.dim(), st.reset(),
+                st.bold(), resolved_log_path.c_str(), st.reset());
+            // Header line so a fresh log file isn't ambiguous.
+            const auto t = std::time(nullptr);
+            char ts[32] = {0};
+            std::strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%S",
+                          std::localtime(&t));
+            std::fprintf(g_log_fp,
+                "easyai-cli-remote raw transaction log\n"
+                "started: %s   pid: %d\n"
+                "argv:",
+                ts, (int) ::getpid());
+            for (int k = 0; k < argc; ++k)
+                std::fprintf(g_log_fp, " %s", argv[k]);
+            std::fputc('\n', g_log_fp);
+            std::fflush(g_log_fp);
+        }
+    }
+
     easyai::Client cli;
+    if (g_log_fp) cli.log_file(g_log_fp);
     if (!o.url.empty()) cli.endpoint(o.url);
     cli.model(o.model).timeout_seconds(o.timeout);
     if (!o.api_key.empty())            cli.api_key(o.api_key);
@@ -1230,10 +1316,22 @@ int main(int argc, char ** argv) {
     easyai::Plan plan;
     register_tools(cli, plan, o, st);
 
-    if (any_management(o)) return run_management(cli, o, st);
+    auto close_log_fp = [&]() {
+        if (g_log_fp) {
+            std::fputs("\n========== END OF LOG ==========\n", g_log_fp);
+            std::fclose(g_log_fp);
+            g_log_fp = nullptr;
+        }
+    };
 
-    wire_callbacks(cli, plan, o, st);
-
-    if (!o.prompt.empty()) return run_one(cli, o.prompt, st);
-    return run_repl(cli, plan, st);
+    int rc;
+    if (any_management(o)) {
+        rc = run_management(cli, o, st);
+    } else {
+        wire_callbacks(cli, plan, o, st);
+        if (!o.prompt.empty()) rc = run_one(cli, o.prompt, st);
+        else                   rc = run_repl(cli, plan, st);
+    }
+    close_log_fp();
+    return rc;
 }

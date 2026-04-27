@@ -24,6 +24,7 @@
 
 #include "easyai/tool.hpp"
 
+#include <cstdio>
 #include <functional>
 #include <memory>
 #include <string>
@@ -59,6 +60,15 @@ public:
     Client & api_key         (std::string key);             // Bearer
     Client & timeout_seconds (int  s);                      // connect+read; default 600
     Client & verbose         (bool v);                      // log SSE lines to stderr
+
+    // Tee EVERY HTTP transaction (request body + raw SSE chunks + tool
+    // dispatch summaries) into the given FILE*.  The Client does NOT
+    // take ownership — caller is responsible for fclose().  Pass nullptr
+    // to disable.  Useful for offline analysis of "model produced no
+    // tool_call" cases: the file contains exactly what crossed the wire
+    // so you can grep for delta.tool_calls fragments, finish_reason,
+    // timings.incomplete, etc.
+    Client & log_file        (std::FILE * fp);
 
     // Hard cap on accumulated reasoning_content bytes for ONE turn.
     // When the running model's reasoning exceeds this threshold, the SSE

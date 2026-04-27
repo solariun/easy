@@ -26,6 +26,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <ctime>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -192,6 +193,9 @@ struct Client::Impl {
     int         max_reasoning_chars = 0;    // 0 = unlimited; >0 aborts SSE on overflow
     bool        retry_on_incomplete = false;
     bool        last_was_incomplete = false; // mirror of last turn's timings.incomplete
+
+    // Diagnostic log file (tee).  Borrowed; caller owns fclose.
+    std::FILE * log_fp = nullptr;
 
     // Request shape.  -1 / -1.0f / empty == "leave server default in place".
     std::string              model_id;
@@ -362,6 +366,14 @@ struct Client::Impl {
         bool reasoning_aborted = false;
 
         auto on_chunk = [&](const char * data, size_t len) -> bool {
+            // Tee raw SSE bytes verbatim into the log file when one is
+            // attached.  Lets the operator see exactly what crossed the
+            // wire (including custom easyai.* events, server timings,
+            // and any tool_call deltas the parser might have skipped).
+            if (log_fp) {
+                std::fwrite(data, 1, len, log_fp);
+                std::fflush(log_fp);
+            }
             sse.feed(data, len);
             SseEvent ev;
             while (sse.next(ev)) {
@@ -451,6 +463,27 @@ struct Client::Impl {
             }
         }
 
+        if (log_fp) {
+            // Header + full request body (NOT pretty-printed — we want
+            // the exact bytes that hit the wire) so the log can be
+            // replayed against any /v1/chat/completions endpoint.
+            const auto now = std::chrono::system_clock::now();
+            const auto t   = std::chrono::system_clock::to_time_t(now);
+            char ts[32] = {0};
+            std::strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%S",
+                          std::localtime(&t));
+            std::fprintf(log_fp,
+                "\n========== REQUEST %s ==========\n"
+                "POST %s%s\n"
+                "tools=%zu hist=%zu body_bytes=%zu\n"
+                "----- BODY -----\n%s\n"
+                "----- SSE STREAM (raw) -----\n",
+                ts, endpoint.c_str(), path.c_str(),
+                tools.size(), history_json.size(), body.size(),
+                body.c_str());
+            std::fflush(log_fp);
+        }
+
         auto headers = headers_with_auth("text/event-stream");
         auto res = cli->Post(path, headers, body, "application/json",
                              [&](const char * d, size_t l) {
@@ -486,6 +519,27 @@ struct Client::Impl {
         }
         // Promote tool-call map → vector in stable index order.
         for (auto & kv : tc_by_index) out.tool_calls.push_back(std::move(kv.second));
+
+        if (log_fp) {
+            std::fprintf(log_fp,
+                "\n----- PARSED TURN -----\n"
+                "http_status=%d content_bytes=%zu reasoning_bytes=%zu "
+                "tool_calls=%zu finish_reason=%s incomplete=%s\n",
+                res ? res->status : -1,
+                out.content.size(), out.reasoning.size(),
+                out.tool_calls.size(),
+                out.finish_reason.c_str(),
+                out.incomplete ? "yes" : "no");
+            for (const auto & p : out.tool_calls) {
+                std::fprintf(log_fp,
+                    "tool_call: name=%s id=%s args=%s\n",
+                    p.name.c_str(),
+                    p.id.empty() ? "(none)" : p.id.c_str(),
+                    p.arguments.c_str());
+            }
+            std::fputs("==========\n", log_fp);
+            std::fflush(log_fp);
+        }
         return true;
     }
 
@@ -549,6 +603,21 @@ struct Client::Impl {
             }
         }
         if (on_tool) on_tool(call, result);
+        if (log_fp) {
+            std::fprintf(log_fp,
+                "\n----- TOOL DISPATCH -----\n"
+                "name=%s id=%s is_error=%s\n"
+                "args=%s\n"
+                "result_bytes=%zu\n"
+                "result=%s\n"
+                "==========\n",
+                call.name.c_str(), call.id.c_str(),
+                result.is_error ? "yes" : "no",
+                call.arguments_json.c_str(),
+                result.content.size(),
+                result.content.c_str());
+            std::fflush(log_fp);
+        }
         return tool_msg_json(call.id, call.name, result.content, result.is_error);
     }
 
@@ -685,6 +754,7 @@ Client & Client::endpoint        (std::string url) { p_->endpoint        = std::
 Client & Client::api_key         (std::string key) { p_->api_key         = std::move(key); return *this; }
 Client & Client::timeout_seconds (int  s)          { p_->timeout_seconds = s;   return *this; }
 Client & Client::verbose         (bool v)          { p_->verbose         = v;   return *this; }
+Client & Client::log_file        (std::FILE * fp)  { p_->log_fp          = fp;  return *this; }
 Client & Client::tls_insecure    (bool v)          { p_->tls_insecure    = v;   return *this; }
 Client & Client::ca_cert_path    (std::string p)   { p_->tls_ca_path     = std::move(p); return *this; }
 Client & Client::max_reasoning_chars(int n)        { p_->max_reasoning_chars = n; return *this; }
