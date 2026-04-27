@@ -338,15 +338,53 @@ and use `Tool::make(name, description, schema_json, handler)`.
 Always pass a root directory:
 
 ```cpp
-engine.add_tool(easyai::tools::fs_read_file("./workspace"));
-engine.add_tool(easyai::tools::fs_glob     ("./workspace"));
-engine.add_tool(easyai::tools::fs_grep     ("./workspace"));
+engine.add_tool(easyai::tools::fs_read_file ("./workspace"));
+engine.add_tool(easyai::tools::fs_write_file("./workspace"));
+engine.add_tool(easyai::tools::fs_list_dir  ("./workspace"));
+engine.add_tool(easyai::tools::fs_glob      ("./workspace"));
+engine.add_tool(easyai::tools::fs_grep      ("./workspace"));
 ```
 
-Paths sent by the model are resolved (relative or absolute) and rejected if
-they escape the root via `..` or symlinks. The check uses
-`std::filesystem::weakly_canonical` and a string-prefix comparison — safe
-against path-traversal in current macOS/Linux/Win semantics.
+Paths sent by the model are anchored to the root by **iterating path
+components and dropping any `..`, `.`, or absolute markers** before
+joining onto the root.  Total containment by construction — there is
+no path the model can construct that escapes.
+
+The model sees a virtual `/`-rooted filesystem (`/report.md`,
+`/docs/spec.md`); the real sandbox path is hidden from descriptions
+and result messages.
+
+### 3.3.1 Toolbelt — register the canonical agent toolset in 3 lines
+
+Instead of hand-rolling the standard tool registration:
+
+```cpp
+easyai::cli::Toolbelt()
+    .sandbox   ("./workspace")    // enables all fs_* tools, scoped here
+    .allow_bash()                  // adds bash, bumps max_tool_hops to 99999
+    .with_plan (plan)              // adds the plan tool
+    .apply     (engine);           // or .apply(client) for the remote variant
+```
+
+The Toolbelt always includes `datetime` + `web_search` + `web_fetch`;
+fs_* and bash are gated behind `.sandbox()` and `.allow_bash()` so a
+fresh agent installation can't accidentally expose write or shell.
+
+### 3.3.2 Bash tool — when you need a real shell
+
+```cpp
+engine.add_tool(easyai::tools::bash("./workspace"));
+engine.max_tool_hops(99999);   // bash flows span many turns
+```
+
+`bash` is a `/bin/sh -c` runner. Output (stdout + stderr) is captured
+and capped at 32 KiB; per-command timeout defaults to 30 s, max 300 s
+(SIGTERM, then SIGKILL +2 s grace). The cwd is pinned to the root.
+
+This is **NOT** a hardened sandbox — the command runs with your user
+privileges. It's appropriate for local single-user agents; for
+anything multi-tenant or production, run easyai-server inside a
+container / firejail / unprivileged user.
 
 ### 3.4 Streaming token output
 

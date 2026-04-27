@@ -59,7 +59,26 @@ int main() {
 ```
 
 `Engine::chat()` runs the **full** tool-call/tool-result loop for you — up to
-8 hops by default. Tool definitions are 6 lines:
+8 hops by default (lift the cap with `engine.max_tool_hops(N)` for shell-driven
+flows, or just register `bash` and the helpers do it for you).
+
+If you want the canonical agent toolset wired in three lines instead of
+seven, use the Toolbelt builder:
+
+```cpp
+easyai::Engine engine;
+engine.model("models/qwen2.5-1.5b-instruct.gguf").gpu_layers(99).context(4096);
+
+easyai::cli::Toolbelt()
+    .sandbox   ("/srv/data")    // enables fs_read_file/list_dir/glob/grep/write
+    .allow_bash()                // enables bash + bumps max_tool_hops to 99999
+    .apply     (engine);
+
+engine.load();
+engine.chat("Find all .md files larger than 1 KB and summarise them.");
+```
+
+Tool definitions are 6 lines:
 
 ```cpp
 engine.add_tool(
@@ -89,11 +108,30 @@ engine.add_tool(
   * `web_fetch` (libcurl, HTML→text)
   * `web_search` (DuckDuckGo HTML, no API key, no external service)
   * `fs_read_file`, `fs_write_file`, `fs_list_dir`, `fs_glob`, `fs_grep`
-    (sandboxed to a root directory you provide)
+    — sandboxed to a root directory you provide; the model sees a virtual
+    `/`-rooted filesystem (real sandbox path is hidden).
+  * `bash` — shell command runner. `/bin/sh -c`, cwd pinned to the
+    sandbox root, stdout/stderr merged + capped, configurable timeout.
+    Honest about what it is: NOT a hardened sandbox — runs with your
+    user privileges. Opt-in.
 * `easyai::presets` — named sampling profiles
   (`deterministic / precise / balanced / creative / wild`) plus a tiny parser
   that turns chat lines like `"creative 0.9"` or `"/temp 0.5"` into sampling
   overrides.
+* `easyai::ui` — terminal UI helpers (`Style`, `Spinner`, `StreamStats`).
+  Auto-detect TTY, honour `NO_COLOR`, heartbeat-driven spinner so the
+  glyph keeps animating during long tool calls.
+* `easyai::text` — small string helpers (`punctuate_think_tags`,
+  `slurp_file`, `prompt_wants_file_write` heuristic).
+* `easyai::log` — `set_file(FILE*)` + `write(fmt, ...)`: tee diagnostic
+  output to stderr **and** an optional log file.
+* `easyai::cli` — CLI infrastructure:
+  * `Toolbelt` — fluent builder that registers the canonical agent
+    toolset on an `Engine` or `Client` and bumps `max_tool_hops` to
+    99999 when bash is enabled.
+  * `open_log_tee / close_log_tee` — open `/tmp/<prefix>-<pid>-<epoch>.log`
+    with header, register as the global log sink.
+  * `validate_sandbox(path, &err)` — uniform "exists? is a dir?" check.
 
 ### Library (`libeasyai-cli`, link target `easyai::cli`)
 
@@ -111,10 +149,23 @@ engine.add_tool(
 
 ### Binaries
 
+#### Tool gating across all three CLIs
+
+All three example CLIs (`easyai-cli`, `easyai-cli-remote`, `easyai-server`)
+follow the same gating model. Default is **safe**: no filesystem access,
+no shell.
+
+| Flag             | What it enables                                                         |
+|------------------|-------------------------------------------------------------------------|
+| (no flag)        | `datetime`, `web_search`, `web_fetch` only.                             |
+| `--sandbox <dir>`| `fs_read_file / fs_write_file / fs_list_dir / fs_glob / fs_grep`, ALL scoped to `<dir>`. The model sees a virtual `/`-rooted filesystem; real path is hidden. |
+| `--allow-bash`   | `bash` (run `/bin/sh -c`). cwd = `--sandbox <dir>` if given, otherwise the binary's CWD. NOT a hardened sandbox — runs with your user privileges. Also bumps the agentic-loop `max_tool_hops` to 99999 (bash flows naturally span many turns). |
+
 #### `easyai-cli`
 
 ```
 easyai-cli -m model.gguf [-s system.txt] [--ngl 99] [--no-tools]
+            [--sandbox DIR] [--allow-bash]
 ```
 
 Drop-in REPL.  Type any line to talk; type any of these to control the engine:
@@ -137,6 +188,7 @@ prompt (in the CLI's case, just the system prompt for that REPL session).
 
 ```
 easyai-server -m model.gguf [-s system.txt] [--port 8080] [--ngl 99]
+              [--sandbox DIR] [--allow-bash]
 ```
 
 OpenAI-compatible HTTP server. Endpoints:

@@ -277,3 +277,70 @@ individual tool's `clip()` budget (typically 8-16 KiB).
 
 *Last reviewed against commit immediately before the security-fixes
 commit.  Re-run when adding a new tool or a new HTTP boundary.*
+
+---
+
+## 15. SECOND PASS — late-2026 additions
+
+### 15.1 SSE pending-buffer growth (MEDIUM, FIXED)
+
+**File:** `src/client.cpp` — `SseBuffer::feed`.
+
+**Issue:** `buf_.append(bytes, n)` had no upper bound.  A malformed
+or malicious SSE response that never emits an event terminator
+(`\n\n` / `\r\n\r\n`) would push the buffer to OOM.
+
+**Fix:** capped the pending buffer at 16 MiB (`kMaxPending`).  On
+overflow, `feed` returns false; the content_receiver propagates the
+abort, the request fails cleanly with `last_error` set to
+`"SSE pending buffer exceeded 16 MiB — abandoning stream..."`.
+
+### 15.2 Regex-DoS in fs_grep (MEDIUM, FIXED)
+
+**File:** `src/builtin_tools.cpp` — `fs_grep` line iteration.
+
+**Issue:** libstdc++'s `std::regex` is recursive and is famously
+vulnerable to catastrophic backtracking on patterns like
+`(a+)+$`.  A user-supplied pattern run against a multi-megabyte
+single line (binary blob, minified JS, base64 dump) hangs the
+tool dispatch thread for minutes.
+
+**Fix:** skip lines longer than 64 KiB before feeding them to
+`std::regex_search`.  Bounds worst-case regex work without
+touching the typical source-tree case.
+
+### 15.3 Bash command runner (NEW SURFACE — by design)
+
+**File:** `src/builtin_tools.cpp` — `bash` factory.
+
+The `bash` tool is **explicitly NOT a hardened sandbox**.  It runs
+`/bin/sh -c <user_supplied_string>` with the caller's full privileges,
+inside `cwd` set to the configured root directory.  Mitigations are
+cooperative, not isolating:
+
+- 32 KiB output cap (silently truncates with marker)
+- Per-command timeout (default 30 s, max 300 s; SIGTERM then SIGKILL
+  +2 s grace)
+- Server side: requires `--allow-bash` opt-in to register at all
+  (default off, never appears in webui's tool list)
+- CLI side: `--allow-bash` opt-in in cli/cli-remote
+- Hop-cap bump: when bash is enabled, agentic loop runs up to 99999
+  hops (other safety nets — per-tool timeouts, output caps,
+  retry_on_incomplete — still apply)
+
+For threat models requiring isolation, run `easyai-server --allow-bash`
+inside a container / firejail / unprivileged user with disabled
+network egress; the tool's contract assumes the OS provides
+isolation, not the framework.
+
+### 15.4 Audit-cleared items (NO ACTION)
+
+- format strings — every `*printf(stderr, ...)` reviewed; all use
+  literal format strings, no user-string-as-format.
+- snprintf buffers — stack buffers (8, 32, 60, 64) reviewed against
+  worst-case content; all have ≥4× headroom.
+- HTTP body caps — web_fetch 2 MB GET, web_search 4 MB POST
+  (`HttpSink::max_bytes`).
+- JSON parse exceptions — every `nlohmann::json::parse(user_data)`
+  is wrapped in try/catch.
+
