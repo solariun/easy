@@ -129,8 +129,6 @@ class TokenSpinner {
     explicit TokenSpinner(bool en)
         : enabled_(en && ::isatty(fileno(stdout)) != 0) {}
 
-    // Erase the trailing spinner so visible content can print cleanly.
-    // Called BEFORE writing each non-empty piece to stdout.
     void about_to_print() {
         if (!enabled_) return;
         if (active_) {
@@ -138,43 +136,49 @@ class TokenSpinner {
             active_ = false;
         }
     }
-
-    // Re-print the spinner one frame ahead of the cursor.  Called AFTER
-    // each non-empty piece has been written; gives the impression of an
-    // animated cursor ticking after every visible token.
     void after_print() {
         if (!enabled_) return;
+        maybe_advance_();
         write_frame_();
     }
-
-    // Advance one frame in place when nothing visible was emitted this
-    // round (e.g. reasoning hidden, tool-call argument accumulator
-    // building up).  Equivalent to about_to_print() + after_print().
     void tick_silent() {
         if (!enabled_) return;
         about_to_print();
+        maybe_advance_();
         write_frame_();
     }
-
-    // End-of-turn cleanup: erases any trailing frame so the next prompt
-    // starts on a clean column.  Resets internal state.
     void finish() {
         about_to_print();
         frame_ = 0;
     }
 
    private:
+    // Frame advancement is throttled (~10 Hz) so a model emitting 50
+    // tokens/second doesn't burn CPU on fputc + fflush per delta.  The
+    // glyph stays at the cursor either way (write_frame_ runs every
+    // call), it just rotates more calmly.
+    static constexpr int kFrameAdvanceMs = 100;
+
+    void maybe_advance_() {
+        const auto now = std::chrono::steady_clock::now();
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            now - last_advance_).count();
+        if (ms >= kFrameAdvanceMs) {
+            ++frame_;
+            last_advance_ = now;
+        }
+    }
     void write_frame_() {
         static const char frames[] = { '|', '/', '-', '\\' };
         std::fputc(frames[frame_ % 4], stdout);
         std::fflush(stdout);
         active_ = true;
-        ++frame_;
     }
 
     bool enabled_ = false;
     bool active_  = false;
     int  frame_   = 0;
+    std::chrono::steady_clock::time_point last_advance_{};
 };
 
 }  // namespace

@@ -60,11 +60,13 @@ namespace {
 
 // ---- TokenSpinner — '|/-\\' frames trailing the cursor --------------------
 //
-// Always-visible variant: every call to after_print() leaves a fresh
-// spinner frame at the current cursor position.  about_to_print()
-// erases it before the next visible piece writes; tick_silent() does
-// both in place when nothing visible was emitted this round.  finish()
-// erases any trailing frame at end-of-turn.
+// Always-visible variant: every after_print() leaves a spinner glyph
+// at the cursor position.  Frame advancement is THROTTLED to ~10 Hz
+// (kFrameAdvanceMs) so a chatty model emitting 50 tokens/sec doesn't
+// burn CPU on fputc+flush every couple of milliseconds.  When the
+// throttle hasn't elapsed we still re-print the same frame after the
+// content so the cursor never goes "naked" — visually the spinner
+// just rotates a bit slower than the text scrolls.
 //
 // Auto-disabled when stdout isn't a TTY (clean output for $(easyai-cli …)).
 class TokenSpinner {
@@ -78,11 +80,13 @@ class TokenSpinner {
     }
     void after_print() {
         if (!enabled_) return;
+        maybe_advance_();
         write_frame_();
     }
     void tick_silent() {
         if (!enabled_) return;
         about_to_print();
+        maybe_advance_();
         write_frame_();
     }
     void finish() {
@@ -91,16 +95,28 @@ class TokenSpinner {
     }
 
    private:
+    static constexpr int kFrameAdvanceMs = 100;     // ~10 Hz cap
+
+    void maybe_advance_() {
+        const auto now = std::chrono::steady_clock::now();
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            now - last_advance_).count();
+        if (ms >= kFrameAdvanceMs) {
+            ++frame_;
+            last_advance_ = now;
+        }
+    }
     void write_frame_() {
         static const char frames[] = { '|', '/', '-', '\\' };
         std::fputc(frames[frame_ % 4], stdout);
         std::fflush(stdout);
         active_ = true;
-        ++frame_;
     }
+
     bool enabled_ = false;
     bool active_  = false;
     int  frame_   = 0;
+    std::chrono::steady_clock::time_point last_advance_{};
 };
 
 // ---- ANSI helpers ---------------------------------------------------------
