@@ -2110,35 +2110,42 @@ static void handle_chat_stream(ServerCtx & ctx,
             const double predicted_ms = std::max(0.0, perf_after.predicted_ms - perf_before.predicted_ms);
 
             // INCOMPLETE-RESPONSE SIGNAL — single transport-level fact
-            // shared between webui and libeasyai-cli.
+            // shared between webui and libeasyai-cli.  Two thresholds,
+            // because "tiny" depends on whether we're mid-task or not:
             //
             //   incomplete := tool_calls.empty()
-            //              && content_bytes_emitted < kIncompleteThreshold
+            //              && ( content_bytes < kAnnounceFloor
+            //                || (last_is_tool && content_bytes < kPostToolFloor) )
             //
-            // When the model produced no tool_call AND only a tiny
-            // amount of visible content (typically just an
-            // announcement like "Now let me create the file:"), this
-            // turn is materially incomplete: the user got nothing
-            // useful out of it.  Both surfaces (webui + cli-remote)
-            // read this single boolean off `timings.incomplete` and
-            // render their own placeholder.
+            //  - kAnnounceFloor (80 B) catches the FIRST-turn pattern
+            //    "Let me search…" / "I'll write the file now" — tiny
+            //    reply, no tool_call, the user got nothing useful.
             //
-            // We deliberately do NOT do retries / nudges / promote-
-            // reasoning here — that's policy, and lives in libeasyai-
-            // cli (Client::retry_on_incomplete) where the agent can
-            // decide.  The server just states the fact.
+            //  - kPostToolFloor (350 B) catches the MID-LOOP pattern
+            //    where the model has already received tool results
+            //    and is expected to either dispatch the next tool or
+            //    synthesise a real deliverable, but instead emits a
+            //    medium-size narration like "I've gathered substantial
+            //    content from AP and BBC.  Let me fetch one more
+            //    source before compiling the report." (152 bytes).
+            //    The 80-byte floor missed those — this raised floor,
+            //    gated on last_is_tool, catches them without ever
+            //    flagging a normal short answer (chitchat turn with
+            //    no tools registered → last_is_tool=false → 80 B
+            //    floor only).
             //
-            // Threshold is intentionally low: 80 bytes is enough to
-            // catch every "Let me search…" / "Now I'll write…" /
-            // "Sure, fetching…" pattern across languages without
-            // relying on natural-language regex.  A real one-liner
-            // answer ("23 °C") fits well under 80 bytes too — but
-            // that's typically a chitchat turn with NO tools sent
-            // anyway, so the user-visible signal is clean.
-            constexpr size_t kIncompleteThreshold = 80;
+            // Both are pure byte counts — NO natural-language regex,
+            // no announcement pattern matching.  When this fires the
+            // server just sets timings.incomplete=true; webui and
+            // libeasyai-cli decide policy (Client::retry_on_incomplete
+            // or render-placeholder).
+            constexpr size_t kAnnounceFloor = 80;
+            constexpr size_t kPostToolFloor = 350;
             const bool incomplete =
                 tool_calls.empty()
-                && content_bytes_emitted < kIncompleteThreshold;
+                && (content_bytes_emitted < kAnnounceFloor
+                    || (req_state->last_is_tool
+                        && content_bytes_emitted < kPostToolFloor));
             if (incomplete) {
                 std::fprintf(stderr,
                     "[easyai-server] WARN incomplete response (content_bytes=%zu, "
