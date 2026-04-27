@@ -34,6 +34,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <unistd.h>     // isatty
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
@@ -104,6 +105,61 @@ void handle_sigint(int) {
     g_interrupt.store(true);
 }
 void install_sigint() { std::signal(SIGINT, handle_sigint); }
+
+// ============================================================================
+//  TokenSpinner — rotating "/-\|" character that fills the gap between
+//  request submit and the first VISIBLE token.  Useful for thinking
+//  models (long reasoning_content phase that we don't print by default)
+//  and for tool-call dispatches where the on_token callback runs but
+//  emits nothing.  Gets erased by `\b \b` the moment the first visible
+//  byte is about to print, then never re-shows for that turn.
+//
+//  Disabled automatically when stdout isn't a TTY (so capturing the
+//  output via `result=$(easyai-cli ... -p '...')` stays clean).
+// ============================================================================
+class TokenSpinner {
+   public:
+    explicit TokenSpinner(bool en)
+        : enabled_(en && ::isatty(fileno(stdout)) != 0) {}
+
+    // Call on every token piece you receive — even when the piece would
+    // be filtered out (think-block content, tool-call args, etc.).  We
+    // only render after a piece BUT WITHOUT VISIBLE OUTPUT.
+    void tick_silent() {
+        if (!enabled_ || ever_printed_) return;
+        static const char frames[] = { '|', '/', '-', '\\' };
+        if (active_) std::fputc('\b', stdout);
+        std::fputc(frames[frame_ % 4], stdout);
+        std::fflush(stdout);
+        active_ = true;
+        ++frame_;
+    }
+
+    // Call BEFORE printing visible content.  Erases the spinner and
+    // latches "we've started showing real text" so subsequent ticks
+    // are no-ops for this turn.
+    void about_to_print() {
+        if (!enabled_) return;
+        if (active_) {
+            std::fputs("\b \b", stdout);
+            active_ = false;
+        }
+        ever_printed_ = true;
+    }
+
+    // End-of-turn cleanup so the next prompt starts on a clean line.
+    void finish() {
+        if (active_) { std::fputs("\b \b", stdout); active_ = false; }
+        ever_printed_ = false;
+        frame_        = 0;
+    }
+
+   private:
+    bool enabled_      = false;
+    bool active_       = false;
+    bool ever_printed_ = false;
+    int  frame_        = 0;
+};
 
 }  // namespace
 
@@ -729,6 +785,13 @@ int main(int argc, char ** argv) {
     // ----- build backend ---------------------------------------------------
     std::unique_ptr<Backend> backend;
     if (!args.url.empty()) {
+        // Convenience: auto-prepend http:// when the user gives us a
+        // bare host[:port] like "ai.local:8080".  HTTPS still needs
+        // the explicit `https://` prefix.
+        if (args.url.compare(0, 7, "http://")  != 0
+            && args.url.compare(0, 8, "https://") != 0) {
+            args.url = "http://" + args.url;
+        }
         // Remote backend transport now lives in libeasyai-cli (no
         // libcurl dependency); --url works regardless of EASYAI_HAVE_CURL.
         // libcurl is still optional for the LOCAL backend's web tools.
@@ -780,6 +843,7 @@ int main(int argc, char ** argv) {
 
         ThinkStripper strip;
         strip.enabled = args.no_think;
+        TokenSpinner  spinner(/*enabled=*/true);
 
         // Honour an inline preset prefix in the prompt too.
         std::string text = args.prompt;
@@ -793,14 +857,21 @@ int main(int argc, char ** argv) {
         try {
             backend->chat(text, [&](const std::string & p){
                 std::string visible = strip.filter(p);
-                if (!visible.empty()) std::cout << visible << std::flush;
+                if (visible.empty()) {
+                    spinner.tick_silent();
+                } else {
+                    spinner.about_to_print();
+                    std::cout << visible << std::flush;
+                }
             });
         } catch (const std::exception & e) {
+            spinner.finish();
             std::fprintf(stderr, "\n[easyai-cli] error: %s\n", e.what());
             return 1;
         }
         std::string tail = strip.flush();
-        if (!tail.empty()) std::cout << tail;
+        if (!tail.empty()) { spinner.about_to_print(); std::cout << tail; }
+        spinner.finish();
         std::cout << std::endl;
         return 0;
     }
@@ -814,6 +885,7 @@ int main(int argc, char ** argv) {
 
     ThinkStripper strip;
     strip.enabled = args.no_think;
+    TokenSpinner  spinner(/*enabled=*/true);
 
     std::string line;
     while (true) {
@@ -860,11 +932,18 @@ int main(int argc, char ** argv) {
         try {
             backend->chat(line, [&](const std::string & p){
                 std::string visible = strip.filter(p);
-                if (!visible.empty()) std::cout << visible << std::flush;
+                if (visible.empty()) {
+                    spinner.tick_silent();
+                } else {
+                    spinner.about_to_print();
+                    std::cout << visible << std::flush;
+                }
             });
             std::string tail = strip.flush();
-            if (!tail.empty()) std::cout << tail;
+            if (!tail.empty()) { spinner.about_to_print(); std::cout << tail; }
+            spinner.finish();
         } catch (const std::exception & e) {
+            spinner.finish();
             std::fprintf(stderr, "\n[easyai-cli] error: %s\n", e.what());
         }
         std::cout << "\033[0m" << std::endl;

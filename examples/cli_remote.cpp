@@ -726,7 +726,24 @@ int main(int argc, char ** argv) {
     if (!parse_args(argc, argv, o)) { usage(argv[0]); return 2; }
     Style st = detect_style();
 
-    if (o.url.empty()) {
+    // Auto-prepend http:// when --url omits a scheme — convenience for
+    // local dev so `--url ai.local:8080` Just Works.  https endpoints
+    // still need the explicit `https://` prefix.
+    if (!o.url.empty()
+        && o.url.compare(0, 7, "http://")  != 0
+        && o.url.compare(0, 8, "https://") != 0) {
+        o.url = "http://" + o.url;
+    }
+
+    // --list-tools is purely LOCAL — it prints the tools registered in
+    // this CLI process, no network needed.  When that's the ONLY thing
+    // requested, skip the --url requirement so `--list-tools` works on
+    // its own without an endpoint argument.
+    const bool only_local_listing =
+        o.list_tools
+        && !o.list_models && !o.list_remote_tools && !o.health
+        && !o.props && !o.metrics && o.set_preset.empty();
+    if (!only_local_listing && o.url.empty()) {
         std::fprintf(stderr, "%serror:%s --url (or EASYAI_URL) is required\n",
                      st.red(), st.reset());
         usage(argv[0]);
@@ -734,7 +751,8 @@ int main(int argc, char ** argv) {
     }
 
     easyai::Client cli;
-    cli.endpoint(o.url).model(o.model).timeout_seconds(o.timeout);
+    if (!o.url.empty()) cli.endpoint(o.url);
+    cli.model(o.model).timeout_seconds(o.timeout);
     if (!o.api_key.empty())            cli.api_key(o.api_key);
     if (!o.system_prompt.empty())      cli.system(o.system_prompt);
     if (o.temperature       >= 0.0f)   cli.temperature(o.temperature);
