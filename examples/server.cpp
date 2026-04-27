@@ -1349,6 +1349,7 @@ struct ServerCtx {
     std::string                default_system;
     bool                       inject_datetime    = true;        // server-side authoritative date/time injection
     std::string                knowledge_cutoff   = "2024-10";   // model training-data cutoff hint
+    bool                       verbose            = false;       // mirror of args.verbose for HTTP-layer logs
     easyai::Preset             default_preset;  // current "ambient" preset
     std::string                model_id;        // basename of model file
     std::string                api_key;         // empty = auth disabled
@@ -2248,6 +2249,18 @@ static void route_chat_completions(ServerCtx & ctx, const httplib::Request & req
 
     ctx.n_requests.fetch_add(1, std::memory_order_relaxed);
 
+    if (ctx.verbose) {
+        std::fprintf(stderr,
+            "[easyai-server] POST /v1/chat/completions  client_tools=%s "
+            "stream=%s tools=%zu hist=%zu last_user_bytes=%zu inject_override=%s\n",
+            state->client_tools ? "yes" : "no",
+            state->stream       ? "yes" : "no",
+            state->client_tools ? state->tools_blob.size() : ctx.default_tools.size(),
+            state->hist.size(),
+            state->last_user.size(),
+            state->inject_override.empty() ? "(default)" : state->inject_override.c_str());
+    }
+
     if (state->stream) {
         // Streaming path: lock + engine work happen inside the chunked
         // content provider lambda (which runs after this function returns).
@@ -2640,6 +2653,7 @@ int main(int argc, char ** argv) {
     ctx->default_system   = default_system;
     ctx->inject_datetime  = args.inject_datetime;
     ctx->knowledge_cutoff = args.knowledge_cutoff;
+    ctx->verbose          = args.verbose;
     {
         // Compute model_id = basename(path) without extension.
         std::string p = args.model_path;
@@ -4065,11 +4079,21 @@ int main(int argc, char ** argv) {
     std::fprintf(stderr,
         "[easyai-server] %s loaded\n"
         "                backend=%s  ctx=%d  tools=%zu  preset=%s\n"
-        "                listening on http://%s:%d  (webui at /)\n",
+        "                listening on http://%s:%d  (webui at /)\n"
+        "                inject_datetime=%s  cutoff=%s  verbose=%s\n",
         ctx->model_id.c_str(), ctx->engine.backend_summary().c_str(),
         ctx->engine.n_ctx(), ctx->default_tools.size(),
         ctx->default_preset.name.c_str(),
-        args.host.c_str(), args.port);
+        args.host.c_str(), args.port,
+        ctx->inject_datetime ? "ON" : "OFF",
+        ctx->knowledge_cutoff.c_str(),
+        args.verbose ? "ON" : "OFF");
+    if (args.verbose) {
+        std::fprintf(stderr,
+            "[easyai-server] VERBOSE: per-request POST line + per-hop "
+            "generate_one/chat_continue dumps + thought-only retry "
+            "trace will appear in this stream.\n");
+    }
 
     // -------- http server -------------------------------------------------
     httplib::Server svr;
