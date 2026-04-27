@@ -187,6 +187,8 @@ struct Client::Impl {
     std::string api_key;
     int         timeout_seconds = 600;
     bool        verbose         = false;
+    bool        tls_insecure    = false;   // skip peer cert verification
+    std::string tls_ca_path;                // PEM bundle for custom CAs
 
     // Request shape.  -1 / -1.0f / empty == "leave server default in place".
     std::string              model_id;
@@ -226,17 +228,31 @@ struct Client::Impl {
             last_error = "invalid endpoint URL: " + endpoint;
             return nullptr;
         }
-        if (u.scheme == "https") {
-#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
-            // SSLClient is a separate type; bridging it through a unique_ptr
-            // to the base would need pointer juggling.  For now, refuse
-            // HTTPS at this layer — easyai builds its cpp-httplib without
-            // OpenSSL and most deployments terminate TLS at a reverse proxy.
+        // Build the authority-only URL httplib's URL constructor wants.
+        // (It dispatches internally to ClientImpl for http:// or to
+        // SSLClient for https:// when CPPHTTPLIB_OPENSSL_SUPPORT is on.)
+        std::string auth = u.scheme + "://" + u.host + ":"
+                         + std::to_string(u.port);
+        auto cli = std::make_unique<httplib::Client>(auth);
+        if (!cli->is_valid()) {
+#ifndef CPPHTTPLIB_OPENSSL_SUPPORT
+            if (u.scheme == "https") {
+                last_error = "HTTPS endpoint requires OpenSSL — install "
+                             "libssl-dev and rebuild libeasyai-cli";
+                return nullptr;
+            }
 #endif
-            last_error = "HTTPS endpoints are not supported in this build";
+            last_error = "transport setup failed for endpoint " + endpoint;
             return nullptr;
         }
-        auto cli = std::make_unique<httplib::Client>(u.host, u.port);
+        if (u.scheme == "https") {
+            if (tls_insecure) {
+                cli->enable_server_certificate_verification(false);
+            }
+            if (!tls_ca_path.empty()) {
+                cli->set_ca_cert_path(tls_ca_path.c_str());
+            }
+        }
         cli->set_read_timeout (timeout_seconds, 0);
         cli->set_write_timeout(timeout_seconds, 0);
         cli->set_keep_alive(true);
@@ -576,6 +592,8 @@ Client & Client::endpoint        (std::string url) { p_->endpoint        = std::
 Client & Client::api_key         (std::string key) { p_->api_key         = std::move(key); return *this; }
 Client & Client::timeout_seconds (int  s)          { p_->timeout_seconds = s;   return *this; }
 Client & Client::verbose         (bool v)          { p_->verbose         = v;   return *this; }
+Client & Client::tls_insecure    (bool v)          { p_->tls_insecure    = v;   return *this; }
+Client & Client::ca_cert_path    (std::string p)   { p_->tls_ca_path     = std::move(p); return *this; }
 
 Client & Client::model              (std::string id)     { p_->model_id          = std::move(id);     return *this; }
 Client & Client::system             (std::string prompt) { p_->system_prompt     = std::move(prompt); return *this; }

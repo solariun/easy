@@ -60,6 +60,15 @@ public:
     Client & timeout_seconds (int  s);                      // connect+read; default 600
     Client & verbose         (bool v);                      // log SSE lines to stderr
 
+    // ----- TLS (only meaningful for https:// endpoints) --------------------
+    // tls_insecure(true) skips peer certificate verification — useful for
+    // local dev with self-signed certs, NEVER for production.  ca_cert_path
+    // points at a custom CA bundle (PEM) when the system store doesn't have
+    // the issuer (corp CAs, internal microservices, etc.).  Both are no-ops
+    // on http:// endpoints and on builds without OpenSSL support.
+    Client & tls_insecure    (bool v);
+    Client & ca_cert_path    (std::string path);
+
     // ----- request shape (fluent) ------------------------------------------
     // Every sampling/penalty knob below maps directly to the matching
     // OpenAI / llama-server / easyai-server field; -1.0f / -1 / "" are

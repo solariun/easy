@@ -42,14 +42,17 @@
 #include "easyai/tool.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <set>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <unistd.h>      // isatty
 #include <vector>
 
@@ -74,6 +77,195 @@ Style detect_style() {
     return s;
 }
 
+// ===========================================================================
+// Inline system-info tools — demonstrate how to wire your own custom
+// Tool right inside the CLI.  All four are Linux-specific (read /proc),
+// they return a clear "Linux only" error on macOS / *BSD.  Hooking
+// these into the model gives it observability over the host running
+// the agent: "is this box paging?", "is one core saturated?", etc.
+//
+// Cookbook for adding your own:
+//   1. Build an easyai::Tool with Tool::builder("name").describe(...)
+//      .param(...).handle([](const ToolCall &){ ... }).build()
+//   2. Pass it to cli.add_tool().  That's it.
+//
+// The model sees `name` + `description` + `parameters` (auto-generated
+// from .param() calls) and decides when to call it.  Your handler runs
+// in this process when the model invokes it; whatever you return as
+// ToolResult::ok(text) becomes the tool message the model sees next.
+// ===========================================================================
+
+namespace systools {
+
+// ---- /proc parsing helpers ------------------------------------------------
+bool slurp_file(const std::string & path, std::string & out) {
+    std::ifstream f(path);
+    if (!f) return false;
+    std::stringstream ss; ss << f.rdbuf();
+    out = ss.str();
+    return true;
+}
+
+// Parse "key: NUM unit\n" lines into a kB-valued map (kB is the unit
+// /proc/meminfo always uses, despite the "kB" suffix).
+std::map<std::string, long long> parse_proc_meminfo(const std::string & text) {
+    std::map<std::string, long long> kv;
+    std::stringstream ss(text);
+    std::string line;
+    while (std::getline(ss, line)) {
+        auto colon = line.find(':');
+        if (colon == std::string::npos) continue;
+        std::string key  = line.substr(0, colon);
+        std::string rest = line.substr(colon + 1);
+        try { kv[key] = std::stoll(rest); }
+        catch (...) { /* skip malformed line */ }
+    }
+    return kv;
+}
+
+// Per-cpu cumulative ticks from a single /proc/stat line.
+struct CpuTicks {
+    std::string  label;     // "cpu", "cpu0", "cpu1", …
+    long long    user      = 0;
+    long long    nice      = 0;
+    long long    system    = 0;
+    long long    idle      = 0;
+    long long    iowait    = 0;
+    long long    irq       = 0;
+    long long    softirq   = 0;
+    long long    steal     = 0;
+    long long    total() const { return user + nice + system + idle + iowait + irq + softirq + steal; }
+    long long    busy()  const { return total() - idle - iowait; }
+};
+
+std::vector<CpuTicks> parse_proc_stat(const std::string & text) {
+    std::vector<CpuTicks> out;
+    std::stringstream ss(text);
+    std::string line;
+    while (std::getline(ss, line)) {
+        if (line.size() < 3 || line.compare(0, 3, "cpu") != 0) continue;
+        CpuTicks t;
+        std::stringstream ls(line);
+        ls >> t.label
+           >> t.user >> t.nice >> t.system >> t.idle
+           >> t.iowait >> t.irq >> t.softirq >> t.steal;
+        out.push_back(t);
+    }
+    return out;
+}
+
+// ---- Tool factories -------------------------------------------------------
+easyai::Tool make_system_meminfo() {
+    return easyai::Tool::builder("system_meminfo")
+        .describe("Return total / available / free / buffers / cached memory and "
+                  "swap totals from /proc/meminfo, in MiB.  Linux only.  No args.")
+        .handle([](const easyai::ToolCall &) -> easyai::ToolResult {
+            std::string raw;
+            if (!slurp_file("/proc/meminfo", raw))
+                return easyai::ToolResult::error("/proc/meminfo unreadable (Linux only)");
+            auto kv = parse_proc_meminfo(raw);
+            auto get = [&](const char * k) -> long long {
+                auto it = kv.find(k); return it == kv.end() ? 0 : it->second;
+            };
+            std::ostringstream out;
+            out << "Memory (MiB):\n"
+                << "  Total:     " << get("MemTotal")     / 1024 << "\n"
+                << "  Available: " << get("MemAvailable") / 1024 << "\n"
+                << "  Free:      " << get("MemFree")      / 1024 << "\n"
+                << "  Buffers:   " << get("Buffers")      / 1024 << "\n"
+                << "  Cached:    " << get("Cached")       / 1024 << "\n"
+                << "  Used (total - available): "
+                <<     (get("MemTotal") - get("MemAvailable")) / 1024 << "\n"
+                << "Swap (MiB):\n"
+                << "  Total: " << get("SwapTotal") / 1024 << "\n"
+                << "  Free:  " << get("SwapFree")  / 1024 << "\n"
+                << "  Used:  " << (get("SwapTotal") - get("SwapFree")) / 1024 << "\n";
+            return easyai::ToolResult::ok(out.str());
+        }).build();
+}
+
+easyai::Tool make_system_loadavg() {
+    return easyai::Tool::builder("system_loadavg")
+        .describe("Return the 1, 5 and 15 minute load averages plus the "
+                  "running/total process counter from /proc/loadavg.  Linux only.")
+        .handle([](const easyai::ToolCall &) -> easyai::ToolResult {
+            std::string raw;
+            if (!slurp_file("/proc/loadavg", raw))
+                return easyai::ToolResult::error("/proc/loadavg unreadable (Linux only)");
+            float l1 = 0, l5 = 0, l15 = 0;
+            char  procs[64] = {0};
+            int   last_pid  = 0;
+            std::sscanf(raw.c_str(), "%f %f %f %63s %d",
+                        &l1, &l5, &l15, procs, &last_pid);
+            std::ostringstream out;
+            out << "Load average:\n"
+                << "  1m:  " << l1  << "\n"
+                << "  5m:  " << l5  << "\n"
+                << "  15m: " << l15 << "\n"
+                << "  running/total: " << procs << "\n"
+                << "  last pid:      " << last_pid << "\n";
+            return easyai::ToolResult::ok(out.str());
+        }).build();
+}
+
+easyai::Tool make_system_cpu_usage() {
+    return easyai::Tool::builder("system_cpu_usage")
+        .describe("Sample /proc/stat twice with a configurable gap and report "
+                  "per-CPU busy% (1.0 = 100% saturated).  Useful when the "
+                  "user asks 'how loaded is the box right now'.  Linux only.")
+        .param("sample_ms", "integer",
+               "Window between samples in milliseconds.  Default 200, max 2000.",
+               false)
+        .handle([](const easyai::ToolCall & call) -> easyai::ToolResult {
+            long long sample = easyai::args::get_int_or(
+                call.arguments_json, "sample_ms", 200);
+            if (sample < 50)   sample = 50;
+            if (sample > 2000) sample = 2000;
+
+            std::string a;
+            if (!slurp_file("/proc/stat", a))
+                return easyai::ToolResult::error("/proc/stat unreadable (Linux only)");
+            std::this_thread::sleep_for(std::chrono::milliseconds(sample));
+            std::string b;
+            if (!slurp_file("/proc/stat", b))
+                return easyai::ToolResult::error("/proc/stat unreadable on second sample");
+
+            auto va = parse_proc_stat(a);
+            auto vb = parse_proc_stat(b);
+            // Index by label so we don't rely on order.
+            std::map<std::string, CpuTicks> by_label;
+            for (const auto & c : va) by_label[c.label] = c;
+
+            std::ostringstream out;
+            out << "CPU usage over " << sample << " ms:\n";
+            for (const auto & y : vb) {
+                auto it = by_label.find(y.label);
+                if (it == by_label.end()) continue;
+                long long dt   = y.total() - it->second.total();
+                long long dbsy = y.busy()  - it->second.busy();
+                if (dt <= 0) continue;
+                double pct = double(dbsy) / double(dt);
+                out << "  " << y.label << ": "
+                    << int(pct * 100.0 + 0.5) << "%\n";
+            }
+            return easyai::ToolResult::ok(out.str());
+        }).build();
+}
+
+easyai::Tool make_system_swaps() {
+    return easyai::Tool::builder("system_swaps")
+        .describe("List configured swap devices/files with size and used "
+                  "amount, from /proc/swaps.  Linux only.")
+        .handle([](const easyai::ToolCall &) -> easyai::ToolResult {
+            std::string raw;
+            if (!slurp_file("/proc/swaps", raw))
+                return easyai::ToolResult::error("/proc/swaps unreadable (Linux only)");
+            return easyai::ToolResult::ok(raw);
+        }).build();
+}
+
+}  // namespace systools
+
 // ---- options + parsing ----------------------------------------------------
 struct Options {
     std::string url;
@@ -97,16 +289,19 @@ struct Options {
     std::vector<std::string> stop_sequences;
     std::string              extra_body;       // JSON object literal
     int                      timeout           = 600;
-    bool        show_reasoning = false;
-    bool        verbose        = false;
-    bool        no_plan        = false;        // skip auto-registering Plan
+    bool        show_reasoning   = false;
+    bool        verbose          = false;
+    bool        no_plan          = false;     // skip auto-registering Plan
+    bool        tls_insecure     = false;     // skip peer cert verification
+    std::string tls_ca_path;                  // PEM bundle for custom CAs
 
     // Management subcommands (mutually exclusive with prompt mode).
-    bool        list_models = false;
-    bool        list_tools  = false;
-    bool        health      = false;
-    bool        props       = false;
-    bool        metrics     = false;
+    bool        list_models       = false;
+    bool        list_tools        = false;    // local tools (registered in this process)
+    bool        list_remote_tools = false;    // server tools (GET /v1/tools)
+    bool        health            = false;
+    bool        props             = false;
+    bool        metrics           = false;
     std::string set_preset;
 };
 
@@ -119,6 +314,8 @@ void usage(const char * argv0) {
 "    --api-key KEY              Bearer auth (EASYAI_API_KEY)\n"
 "    --model NAME               request body 'model' field (EASYAI_MODEL)\n"
 "    --timeout SECONDS          read+write timeout (default 600)\n"
+"    --insecure-tls             skip peer cert check (https only — DEV ONLY)\n"
+"    --ca-cert PATH             trust this CA bundle (PEM) for https://\n"
 "\n"
 "  Conversation shape:\n"
 "    --system TEXT              system prompt as inline string\n"
@@ -138,10 +335,15 @@ void usage(const char * argv0) {
 "    --extra-json '{...}'       free-form JSON merged into the request body\n"
 "\n"
 "  Tools:\n"
-"    --tools LIST               comma list: datetime,plan,web_search,\n"
-"                                  web_fetch,fs_read_file,fs_list_dir,\n"
-"                                  fs_glob,fs_grep,fs_write_file\n"
-"                               default: datetime,plan,web_search,web_fetch\n"
+"    --tools LIST               comma list, valid names:\n"
+"                                 datetime, plan, web_search, web_fetch,\n"
+"                                 fs_read_file, fs_list_dir, fs_glob,\n"
+"                                 fs_grep, fs_write_file,\n"
+"                                 system_meminfo, system_loadavg,\n"
+"                                 system_cpu_usage, system_swaps\n"
+"                               default: datetime,plan,web_search,web_fetch,\n"
+"                                 system_meminfo,system_loadavg,\n"
+"                                 system_cpu_usage,system_swaps\n"
 "    --sandbox DIR              enable fs_* tools, scoped to DIR\n"
 "    --no-plan                  don't auto-register the planning tool\n"
 "\n"
@@ -151,8 +353,13 @@ void usage(const char * argv0) {
 "    --verbose                  log HTTP+SSE traffic to stderr\n"
 "\n"
 "  Management subcommands (use one, no chat):\n"
+"    --list-tools               list LOCAL tools (registered in this CLI)\n"
+"                               with their full descriptions — useful to\n"
+"                               see exactly what the model will be told\n"
+"    --list-remote-tools        GET /v1/tools — list server-side tools\n"
+"                               (easyai-server extension, may not exist on\n"
+"                               other OpenAI-compat servers)\n"
 "    --list-models              GET /v1/models\n"
-"    --list-tools               GET /v1/tools (easyai-server extension)\n"
 "    --health                   GET /health\n"
 "    --props                    GET /props\n"
 "    --metrics                  GET /metrics (Prometheus text)\n"
@@ -206,9 +413,12 @@ bool parse_args(int argc, char ** argv, Options & o) {
         else if (a == "--no-plan")        o.no_plan = true;
         else if (a == "--show-reasoning") o.show_reasoning = true;
         else if (a == "--verbose" || a == "-v") o.verbose = true;
+        else if (a == "--insecure-tls")   o.tls_insecure = true;
+        else if (a == "--ca-cert")        o.tls_ca_path  = need(i, "--ca-cert");
         else if (a == "-p" || a == "--prompt") o.prompt = need(i, "--prompt");
-        else if (a == "--list-models")    o.list_models = true;
-        else if (a == "--list-tools")     o.list_tools  = true;
+        else if (a == "--list-models")    o.list_models       = true;
+        else if (a == "--list-tools")     o.list_tools        = true;
+        else if (a == "--list-remote-tools") o.list_remote_tools = true;
         else if (a == "--health")         o.health      = true;
         else if (a == "--props")          o.props       = true;
         else if (a == "--metrics")        o.metrics     = true;
@@ -233,14 +443,16 @@ bool parse_args(int argc, char ** argv, Options & o) {
 }
 
 bool any_management(const Options & o) {
-    return o.list_models || o.list_tools || o.health
-        || o.props || o.metrics || !o.set_preset.empty();
+    return o.list_models || o.list_tools || o.list_remote_tools
+        || o.health      || o.props      || o.metrics
+        || !o.set_preset.empty();
 }
 
 // ---- tool registration ----------------------------------------------------
 // Default catalog when --tools isn't given.
 const std::vector<std::string> kDefaultTools = {
     "datetime", "plan", "web_search", "web_fetch",
+    "system_meminfo", "system_loadavg", "system_cpu_usage", "system_swaps",
 };
 
 void register_tools(easyai::Client & cli,
@@ -268,6 +480,14 @@ void register_tools(easyai::Client & cli,
     if (wants("fs_grep"))       cli.add_tool(easyai::tools::fs_grep(root));
     if (wants("fs_write_file")) cli.add_tool(easyai::tools::fs_write_file(root));
 
+    // Inline system-info tools — defined above in `namespace systools`.
+    // They demonstrate how to add your own custom Tool with a couple of
+    // lines using Tool::builder().
+    if (wants("system_meminfo"))   cli.add_tool(systools::make_system_meminfo());
+    if (wants("system_loadavg"))   cli.add_tool(systools::make_system_loadavg());
+    if (wants("system_cpu_usage")) cli.add_tool(systools::make_system_cpu_usage());
+    if (wants("system_swaps"))     cli.add_tool(systools::make_system_swaps());
+
     if (o.verbose) {
         std::fprintf(stderr,
             "%s[easyai-cli-remote]%s registered %zu tool(s):",
@@ -288,6 +508,25 @@ std::string trim_for_log(std::string s, size_t max_chars) {
 }
 
 // ---- management subcommand handlers ---------------------------------------
+// Pretty-print a tool catalog with name + multi-line description.
+void print_tool_row(const std::string & name,
+                    const std::string & description,
+                    const Style & st) {
+    std::printf("%s%s%s\n", st.bold(), name.c_str(), st.reset());
+    // Indent each line of the description by two spaces and dim it.
+    const std::string & d = description;
+    size_t i = 0;
+    while (i < d.size()) {
+        size_t nl = d.find('\n', i);
+        std::string line = (nl == std::string::npos)
+                               ? d.substr(i)
+                               : d.substr(i, nl - i);
+        std::printf("  %s%s%s\n", st.dim(), line.c_str(), st.reset());
+        if (nl == std::string::npos) break;
+        i = nl + 1;
+    }
+}
+
 int run_management(easyai::Client & cli, const Options & o, const Style & st) {
     if (o.list_models) {
         std::vector<easyai::RemoteModel> ms;
@@ -303,16 +542,34 @@ int run_management(easyai::Client & cli, const Options & o, const Style & st) {
         return 0;
     }
     if (o.list_tools) {
+        // LOCAL tools — these are what cli-remote sends to the model in
+        // the request body's `tools[]`.  Most useful for users since
+        // it answers "what can the model actually do right now".
+        if (cli.tools().empty()) {
+            std::fprintf(stderr,
+                "%sno tools registered.%s  Use --tools and/or --sandbox to "
+                "enable some.\n", st.dim(), st.reset());
+            return 0;
+        }
+        std::printf("%slocal tools (%zu):%s\n",
+                    st.bold(), cli.tools().size(), st.reset());
+        for (const auto & t : cli.tools()) {
+            print_tool_row(t.name, t.description, st);
+        }
+        return 0;
+    }
+    if (o.list_remote_tools) {
+        // Server-side catalog via /v1/tools (easyai-server extension).
         std::vector<easyai::RemoteTool> ts;
         if (!cli.list_remote_tools(ts)) {
             std::fprintf(stderr, "%serror:%s %s\n", st.red(), st.reset(),
                          cli.last_error().c_str());
             return 1;
         }
+        std::printf("%sremote tools (%zu):%s\n",
+                    st.bold(), ts.size(), st.reset());
         for (const auto & t : ts) {
-            std::printf("%s%s%s\n  %s%s%s\n",
-                        st.bold(), t.name.c_str(), st.reset(),
-                        st.dim(),  t.description.c_str(), st.reset());
+            print_tool_row(t.name, t.description, st);
         }
         return 0;
     }
@@ -492,13 +749,17 @@ int main(int argc, char ** argv) {
     if (!o.stop_sequences.empty())     cli.stop(o.stop_sequences);
     if (!o.extra_body.empty())         cli.extra_body_json(o.extra_body);
     if (o.verbose)                     cli.verbose(true);
+    if (o.tls_insecure)                cli.tls_insecure(true);
+    if (!o.tls_ca_path.empty())        cli.ca_cert_path(o.tls_ca_path);
 
-    // Management subcommands take precedence over chat — they don't
-    // need tools registered, so handle them first.
-    if (any_management(o)) return run_management(cli, o, st);
-
+    // Plan + tools registered up-front so --list-tools (which prints the
+    // LOCAL catalog this CLI sends to the model) can show them and the
+    // chat path / REPL also has them ready.
     easyai::Plan plan;
     register_tools(cli, plan, o, st);
+
+    if (any_management(o)) return run_management(cli, o, st);
+
     wire_callbacks(cli, plan, o, st);
 
     if (!o.prompt.empty()) return run_one(cli, o.prompt, st);

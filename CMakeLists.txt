@@ -90,8 +90,17 @@ endif()
 # the on-disk artifact to `libeasyai-cli.so` / `libeasyai-cli.a`.  Public
 # alias `easyai::cli` keeps downstream link-lines clean.
 # ============================================================================
+# NOTE: we compile cpp-httplib's httplib.cpp DIRECTLY into easyai_cli
+# instead of linking the vendored cpp-httplib static target.  Reason:
+# llama.cpp's cpp-httplib build doesn't define CPPHTTPLIB_OPENSSL_SUPPORT,
+# so the static lib has no SSLClient symbols — if we just defined the
+# macro on our side and tried to instantiate SSLClient, the linker
+# would fail.  Re-compiling the .cpp here lets us add the macro and
+# link OpenSSL ourselves, without touching the upstream vendor build
+# that easyai-server already relies on.
 set(EASYAI_CLI_SOURCES
     src/client.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../llama.cpp/vendor/cpp-httplib/httplib.cpp
 )
 
 add_library(easyai_cli ${EASYAI_CLI_SOURCES})
@@ -106,10 +115,20 @@ target_include_directories(easyai_cli
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
             ${CMAKE_CURRENT_SOURCE_DIR}/../llama.cpp/vendor             # nlohmann/json.hpp
             ${CMAKE_CURRENT_SOURCE_DIR}/../llama.cpp/vendor/cpp-httplib) # httplib.h
-target_link_libraries(easyai_cli
-    PUBLIC  easyai             # reuse the Tool/ToolCall/ToolResult types
-    PRIVATE cpp-httplib)        # transport
+target_link_libraries(easyai_cli PUBLIC easyai)   # reuse Tool/ToolCall/ToolResult
 target_compile_features(easyai_cli PUBLIC cxx_std_17)
+
+# OpenSSL -> HTTPS support inside libeasyai-cli.  Optional: when libssl
+# isn't available we skip the define and Client returns a clear
+# "HTTPS not in this build" error at request time.
+find_package(OpenSSL QUIET)
+if (OpenSSL_FOUND)
+    target_compile_definitions(easyai_cli PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT=1)
+    target_link_libraries(easyai_cli PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+    message(STATUS "easyai-cli: OpenSSL found — HTTPS endpoints enabled")
+else()
+    message(STATUS "easyai-cli: OpenSSL NOT found — HTTPS endpoints will be rejected at runtime")
+endif()
 
 # ============================================================================
 # examples (binaries)
