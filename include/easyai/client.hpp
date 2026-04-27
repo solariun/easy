@@ -60,6 +60,16 @@ public:
     Client & timeout_seconds (int  s);                      // connect+read; default 600
     Client & verbose         (bool v);                      // log SSE lines to stderr
 
+    // Hard cap on accumulated reasoning_content bytes for ONE turn.
+    // When the running model's reasoning exceeds this threshold, the SSE
+    // stream is aborted (cpp-httplib content_receiver returns false); the
+    // current chat() call returns whatever text was streamed so far and
+    // sets last_error to a descriptive "reasoning runaway" message.
+    // Pass 0 to disable (default).  Useful with chatty thinking models
+    // that occasionally fall into a long deliberation loop on niche
+    // questions and you want a hard timeout in tokens, not seconds.
+    Client & max_reasoning_chars (int n);
+
     // ----- TLS (only meaningful for https:// endpoints) --------------------
     // tls_insecure(true) skips peer certificate verification — useful for
     // local dev with self-signed certs, NEVER for production.  ca_cert_path

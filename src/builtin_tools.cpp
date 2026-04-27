@@ -9,6 +9,9 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <list>
+#include <mutex>
+#include <unordered_map>
 #include <regex>
 #include <sstream>
 #include <string>
@@ -401,17 +404,98 @@ Tool datetime() {
 
 // ============================================================================
 // web_fetch
+// ----------------------------------------------------------------------------
+// Process-wide LRU cache for fetched bodies.  The model often re-asks for
+// the same URL within a single conversation (it digests results, then
+// circles back).  Caching avoids:
+//  - re-hitting the source (politeness + DDG rate-limit avoidance)
+//  - waste of latency / tokens on the model side
+//
+// Cache key:  "<url>?as_html=<bool>"
+// Capacity:   16 entries (well within RAM for ~16 KiB clipped bodies)
+// TTL:        5 minutes (long enough to survive a multi-hop research,
+//                        short enough to keep "live" pages fresh)
 // ============================================================================
+#if defined(EASYAI_HAVE_CURL)
+namespace {
+
+struct WebFetchCache {
+    struct Entry {
+        std::string                                 body;     // already stripped + clipped
+        std::chrono::steady_clock::time_point       inserted;
+        bool                                        as_html;
+    };
+    static constexpr size_t kCapacity = 16;
+    static constexpr int    kTtlMs    = 5 * 60 * 1000;  // 5 min
+
+    std::mutex                                  mu;
+    std::list<std::pair<std::string, Entry>>    items;             // MRU at front
+    std::unordered_map<std::string,
+        std::list<std::pair<std::string, Entry>>::iterator> index;
+
+    bool get(const std::string & key, std::string & out_body) {
+        std::lock_guard<std::mutex> lock(mu);
+        auto it = index.find(key);
+        if (it == index.end()) return false;
+        const auto age_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - it->second->second.inserted).count();
+        if (age_ms > kTtlMs) {
+            items.erase(it->second);
+            index.erase(it);
+            return false;
+        }
+        // promote to MRU
+        items.splice(items.begin(), items, it->second);
+        out_body = it->second->second.body;
+        return true;
+    }
+    void put(const std::string & key, std::string body, bool as_html) {
+        std::lock_guard<std::mutex> lock(mu);
+        auto existing = index.find(key);
+        if (existing != index.end()) {
+            items.erase(existing->second);
+            index.erase(existing);
+        }
+        items.emplace_front(key, Entry{
+            std::move(body), std::chrono::steady_clock::now(), as_html});
+        index[key] = items.begin();
+        while (items.size() > kCapacity) {
+            index.erase(items.back().first);
+            items.pop_back();
+        }
+    }
+};
+
+WebFetchCache & web_fetch_cache() {
+    static WebFetchCache c;
+    return c;
+}
+
+}  // namespace
+#endif
+
 Tool web_fetch() {
     return Tool::builder("web_fetch")
-        .describe("Fetch a URL and return its text content (HTML stripped, "
-                  "trimmed to ~16 KB). This is the ONLY way to read a web "
-                  "page's actual content — web_search returns titles and "
-                  "short snippets, not the page body. Always call this after "
-                  "web_search when the user wants the contents of an article, "
-                  "documentation page, or news story.")
+        .describe("Fetch a URL and return its text content (HTML stripped + "
+                  "trimmed).  This is the ONLY way to read a web page's "
+                  "actual content — web_search returns titles and short "
+                  "snippets, not the page body.  Always call this after "
+                  "web_search when the user wants the contents of an "
+                  "article, documentation page, or news story.\n"
+                  "\n"
+                  "Pagination: fetched bodies are clipped to the first "
+                  "8 KB by default.  When a body is truncated the response "
+                  "ends with `[truncated: N more bytes; pass start=N to "
+                  "continue]` — call web_fetch again with the same URL plus "
+                  "`start=N` to read the next slice.\n"
+                  "\n"
+                  "Repeated fetches of the same URL within 5 minutes are "
+                  "served from an in-process cache; you do NOT need to "
+                  "re-fetch the same URL within one conversation.")
         .param("url",     "string", "Fully-qualified http(s) URL to fetch", true)
         .param("as_html", "boolean","If true, return raw HTML instead of stripped text", false)
+        .param("start",   "integer","Byte offset into the (already stripped) body, "
+                                    "for pagination.  Default 0 = beginning.", false)
         .handle([](const ToolCall & c) {
 #if !defined(EASYAI_HAVE_CURL)
             (void) c;
@@ -422,12 +506,43 @@ Tool web_fetch() {
                 return ToolResult::error("missing required arg: url");
             }
             args::get_bool(c.arguments_json, "as_html", as_html);
+            long long start = std::max<long long>(0,
+                args::get_int_or(c.arguments_json, "start", 0));
 
-            std::string body, err;
-            if (!http_get(url, {}, body, err)) {
-                return ToolResult::error("fetch failed: " + err);
+            // Cache key: url + as_html flag.  start is applied AFTER cache
+            // hit so we don't multiply storage by every offset.
+            const std::string key = url + (as_html ? "|html" : "|text");
+            std::string processed;
+            if (!web_fetch_cache().get(key, processed)) {
+                std::string body, err;
+                if (!http_get(url, {}, body, err)) {
+                    return ToolResult::error("fetch failed: " + err);
+                }
+                processed = as_html ? body : strip_html(body);
+                web_fetch_cache().put(key, processed, as_html);
             }
-            return ToolResult::ok(clip(as_html ? body : strip_html(body), 16 * 1024));
+
+            // Apply pagination + 8 KiB window.
+            constexpr size_t kWindow = 8 * 1024;
+            if ((size_t) start >= processed.size()) {
+                std::ostringstream oss;
+                oss << "[start=" << start << " is past end of body (size="
+                    << processed.size() << "); nothing to return]";
+                return ToolResult::ok(oss.str());
+            }
+            std::string slice = processed.substr(start, kWindow);
+            const size_t remaining =
+                processed.size() - start - slice.size();
+            if (remaining > 0) {
+                std::ostringstream oss;
+                oss << slice
+                    << "\n\n[truncated: " << remaining
+                    << " more bytes; pass start="
+                    << (start + slice.size())
+                    << " to continue]";
+                return ToolResult::ok(oss.str());
+            }
+            return ToolResult::ok(slice);
 #endif
         })
         .build();

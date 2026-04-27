@@ -189,6 +189,7 @@ struct Client::Impl {
     bool        verbose         = false;
     bool        tls_insecure    = false;   // skip peer cert verification
     std::string tls_ca_path;                // PEM bundle for custom CAs
+    int         max_reasoning_chars = 0;    // 0 = unlimited; >0 aborts SSE on overflow
 
     // Request shape.  -1 / -1.0f / empty == "leave server default in place".
     std::string              model_id;
@@ -355,6 +356,7 @@ struct Client::Impl {
         SseBuffer sse;
         std::map<int, PendingToolCall> tc_by_index;
         bool received_anything = false;
+        bool reasoning_aborted = false;
 
         auto on_chunk = [&](const char * data, size_t len) -> bool {
             sse.feed(data, len);
@@ -382,6 +384,13 @@ struct Client::Impl {
                     const auto & s = delta["reasoning_content"].get_ref<const std::string &>();
                     out.reasoning += s;
                     if (on_reason) on_reason(s);
+                    if (max_reasoning_chars > 0
+                            && (int) out.reasoning.size() > max_reasoning_chars) {
+                        // Hard cap on runaway thinking — return false from
+                        // the content_receiver to abort the SSE read.
+                        reasoning_aborted = true;
+                        return false;
+                    }
                 }
                 if (delta.contains("content") && delta["content"].is_string()) {
                     const auto & s = delta["content"].get_ref<const std::string &>();
@@ -430,6 +439,20 @@ struct Client::Impl {
                                  return on_chunk(d, l);
                              });
 
+        if (reasoning_aborted) {
+            // We deliberately closed the stream when reasoning_content
+            // exceeded the configured cap.  Treat as a soft success:
+            // the caller gets whatever was streamed (typically empty
+            // visible content + a long reasoning), the loop terminates,
+            // and last_error is set so the operator sees what happened.
+            last_error = "reasoning runaway: aborted after "
+                       + std::to_string(out.reasoning.size())
+                       + " chars (cap=" + std::to_string(max_reasoning_chars)
+                       + ").  The model didn't converge to an answer in "
+                         "this thinking budget.";
+            out.finish_reason = "stop";
+            return true;
+        }
         if (!res) {
             last_error = "HTTP request failed: "
                        + httplib::to_string(res.error());
@@ -594,6 +617,7 @@ Client & Client::timeout_seconds (int  s)          { p_->timeout_seconds = s;   
 Client & Client::verbose         (bool v)          { p_->verbose         = v;   return *this; }
 Client & Client::tls_insecure    (bool v)          { p_->tls_insecure    = v;   return *this; }
 Client & Client::ca_cert_path    (std::string p)   { p_->tls_ca_path     = std::move(p); return *this; }
+Client & Client::max_reasoning_chars(int n)        { p_->max_reasoning_chars = n; return *this; }
 
 Client & Client::model              (std::string id)     { p_->model_id          = std::move(id);     return *this; }
 Client & Client::system             (std::string prompt) { p_->system_prompt     = std::move(prompt); return *this; }

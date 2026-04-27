@@ -329,6 +329,7 @@ struct Options {
     int                      timeout           = 600;
     bool        show_reasoning   = true;   // default ON; --no-reasoning to opt out
     bool        verbose          = false;
+    int         max_reasoning    = 0;      // 0 = unlimited (disable runaway abort)
     bool        no_plan          = false;     // skip auto-registering Plan
     bool        tls_insecure     = false;     // skip peer cert verification
     std::string tls_ca_path;                  // PEM bundle for custom CAs
@@ -393,6 +394,11 @@ void usage(const char * argv0) {
 "                                inline in dim grey).  --hide-reasoning is\n"
 "                                an alias.  --show-reasoning is now a no-op\n"
 "                                (kept for backwards compat).\n"
+"    --max-reasoning N          abort the SSE stream when this turn's\n"
+"                                accumulated reasoning_content exceeds N\n"
+"                                chars.  Useful for chatty thinking models\n"
+"                                that fall into long deliberation loops on\n"
+"                                niche questions.  0 = unlimited (default).\n"
 "    --verbose                  log HTTP+SSE traffic to stderr (timestamps +\n"
 "                                per-piece diagnostics)\n"
 "\n"
@@ -458,6 +464,7 @@ bool parse_args(int argc, char ** argv, Options & o) {
         else if (a == "--show-reasoning") o.show_reasoning = true;   // no-op now (kept for compat)
         else if (a == "--no-reasoning"
               || a == "--hide-reasoning") o.show_reasoning = false;
+        else if (a == "--max-reasoning") o.max_reasoning   = std::stoi(need(i, "--max-reasoning"));
         else if (a == "--verbose" || a == "-v") o.verbose = true;
         else if (a == "--insecure-tls")   o.tls_insecure = true;
         else if (a == "--ca-cert")        o.tls_ca_path  = need(i, "--ca-cert");
@@ -943,6 +950,7 @@ int main(int argc, char ** argv) {
     if (o.verbose)                     cli.verbose(true);
     if (o.tls_insecure)                cli.tls_insecure(true);
     if (!o.tls_ca_path.empty())        cli.ca_cert_path(o.tls_ca_path);
+    if (o.max_reasoning   > 0)         cli.max_reasoning_chars(o.max_reasoning);
 
     // Plan + tools registered up-front so --list-tools (which prints the
     // LOCAL catalog this CLI sends to the model) can show them and the
