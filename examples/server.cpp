@@ -3491,38 +3491,8 @@ int main(int argc, char ** argv) {
                 //
                 // Re-runs every 250 ms (setInterval below).  Hydration may
                 // rip our hosts out; the parentElement guards put them back.
-                "const detachFixed=(host)=>{"
-                  "host.style.position='';"
-                  "host.style.top='';"
-                  "host.style.left='';"
-                  "host.style.right='';"
-                  "host.style.bottom='';"
-                  "host.style.transform='';"
-                  "host.style.zIndex='';"
-                  "host.style.pointerEvents='';"
-                "};"
-                // Find the bundle's prompt-form badge anchor:
-                //   <div style="container-type: inline-size">
-                //     <!-- tone + tools go here, as siblings BEFORE the row -->
-                //     <div class="flex min-w-0 flex-wrap items-center gap-1
-                //                 min-w-0 overflow-hidden">… model badge …</div>
-                //   </div>
-                // We don't touch the existing flex row — we attach our hosts
-                // as siblings inside the same container, immediately to the
-                // LEFT (in DOM order, before) the bundle's row, so they
-                // appear at the start of the form's bottom strip.
-                "const findBadgeAnchor=(form)=>{"
-                  "const cont=form.querySelector('[style*=\"container-type\"]');"
-                  "if(!cont)return null;"
-                  "const row=cont.querySelector('.flex-wrap.items-center')"
-                    "||cont.querySelector('[class~=\"flex-wrap\"][class~=\"items-center\"]')"
-                    "||cont.querySelector('.flex-wrap');"
-                  "return {cont,row};"
-                "};"
-                // Pull background / foreground / radius / padding / font from
-                // an actual bundle badge so our hosts adopt the bundle palette.
-                // Sample = first descendant of the row whose computed
-                // background isn't transparent and isn't ours.
+                // Sample any non-transparent badge inside the row that isn't
+                // ours, so we copy the bundle's palette.
                 "const sampleBadge=(row)=>{"
                   "if(!row)return null;"
                   "const all=row.querySelectorAll('button,label,[role=button],[class*=rounded]');"
@@ -3555,67 +3525,44 @@ int main(int argc, char ** argv) {
                   "};"
                   "apply(toneHost);apply(toolsHost);"
                 "};"
+                // Mount tone + tools INSIDE the bundle's badge row, ahead of
+                // the model badge.  Inheriting the row's flex / gap / wrap
+                // means our items align like native bundle badges with no
+                // margin math of our own.  If the row isn't in the DOM yet
+                // we hide instead of falling back to viewport-fixed (which
+                // dropped them in random corners during hydration).
                 "const reposition=()=>{"
                   "if(!toneHost||!toolsHost)return;"
-                  "const ta=document.querySelector('textarea');"
-                  "const form=ta&&(ta.closest('form')||ta.parentElement);"
-                  "const formOk=form&&form.getBoundingClientRect().width>60;"
-                  "if(formOk){"
-                    "if(getComputedStyle(form).position==='static'){"
-                      "form.style.position='relative';"
-                    "}"
-                    "const a=findBadgeAnchor(form);"
-                    "const parent=(a&&a.cont)||form;"
-                    "const row=a&&a.row;"
-                    "adoptBundleStyles(row);"
-                    // Tone goes immediately BEFORE the bundle's flex-wrap row.
-                    "if(toneHost.parentElement!==parent||toneHost.dataset.eaiAttach!=='flow'){"
-                      "detachFixed(toneHost);"
-                      "toneHost.style.cssText="
-                        "'all:initial;display:inline-flex;align-items:center;"
-                        "margin:0 .25rem 0 0;vertical-align:middle;"
-                        "font:14px/1 -apple-system,system-ui,sans-serif;';"
-                      "toneHost.dataset.eaiAttach='flow';"
-                      "if(row){parent.insertBefore(toneHost,row);}"
-                      "else{parent.appendChild(toneHost);}"
-                    "}"
-                    // Tools sits between tone and the row.
-                    "if(toolsHost.parentElement!==parent||toolsHost.dataset.eaiAttach!=='flow'){"
-                      "detachFixed(toolsHost);"
-                      "toolsHost.style.cssText="
-                        "'all:initial;display:inline-flex;align-items:center;"
-                        "margin:0 .25rem 0 0;vertical-align:middle;"
-                        "font:14px/1 -apple-system,system-ui,sans-serif;';"
-                      "toolsHost.dataset.eaiAttach='flow';"
-                      "if(row){parent.insertBefore(toolsHost,row);}"
-                      "else{parent.appendChild(toolsHost);}"
-                    "}"
-                    // After both insertions, ensure DOM order is
-                    // [tone][tools][row] — fix it up in case Svelte
-                    // re-mounted the row in the wrong relative position.
-                    "if(row&&toolsHost.previousSibling!==toneHost){"
-                      "parent.insertBefore(toolsHost,row);"
-                      "parent.insertBefore(toneHost,toolsHost);"
-                    "}"
-                  "}else{"
-                    // Fallback while hydrating: viewport-anchored bottom strip.
-                    "if(toneHost.parentElement!==document.documentElement||toneHost.dataset.eaiAttach!=='fixed'){"
-                      "toneHost.style.cssText="
-                        "'all:initial;position:fixed;left:1rem;bottom:1rem;"
-                        "z-index:2147483646;pointer-events:none;"
-                        "font:14px/1 -apple-system,system-ui,sans-serif;';"
-                      "toneHost.dataset.eaiAttach='fixed';"
-                      "document.documentElement.appendChild(toneHost);"
-                    "}"
-                    "if(toolsHost.parentElement!==document.documentElement||toolsHost.dataset.eaiAttach!=='fixed'){"
-                      "toolsHost.style.cssText="
-                        "'all:initial;position:fixed;left:9rem;bottom:1rem;"
-                        "z-index:2147483646;pointer-events:none;"
-                        "font:14px/1 -apple-system,system-ui,sans-serif;';"
-                      "toolsHost.dataset.eaiAttach='fixed';"
-                      "document.documentElement.appendChild(toolsHost);"
-                    "}"
+                  "const row=document.querySelector("
+                    "'[class~=\"flex-wrap\"][class~=\"items-center\"][class~=\"gap-1\"]')"
+                    "||document.querySelector("
+                      "'[class~=\"flex-wrap\"][class~=\"items-center\"]');"
+                  "if(!row){"
+                    "toneHost.style.display='none';"
+                    "toolsHost.style.display='none';"
+                    "return;"
                   "}"
+                  "const baseStyle="
+                    "'all:initial;display:inline-flex;align-items:center;"
+                    "font:14px/1 -apple-system,system-ui,sans-serif;';"
+                  "const orderOk="
+                    "toneHost.parentElement===row&&"
+                    "toolsHost.parentElement===row&&"
+                    "row.firstChild===toneHost&&"
+                    "toneHost.nextSibling===toolsHost;"
+                  "if(!orderOk){"
+                    "toneHost.style.cssText=baseStyle;"
+                    "toolsHost.style.cssText=baseStyle;"
+                    // Insert tools first (right after row.firstChild's
+                    // current position), then tone before it — final order
+                    // is [tone][tools][...bundle's children].
+                    "row.insertBefore(toolsHost,row.firstChild);"
+                    "row.insertBefore(toneHost,toolsHost);"
+                  "}else{"
+                    "toneHost.style.display='';"
+                    "toolsHost.style.display='';"
+                  "}"
+                  "adoptBundleStyles(row);"
                 "};"
 
                 "if(document.documentElement){ensureTone();ensureTools();reposition();}"
