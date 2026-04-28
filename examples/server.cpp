@@ -1407,7 +1407,15 @@ struct ServerCtx {
 // Chat-completions request — parsed once, used by both sync and stream paths.
 // ---------------------------------------------------------------------------
 struct ChatRequest {
-    std::vector<std::pair<std::string, std::string>> hist;          // full history
+    // FULL-FIDELITY history.  Each entry preserves tool_calls (for
+    // assistant), tool_call_id + name (for tool messages), and
+    // reasoning_content (when persisted).  The chat template renders
+    // <tool_call>…</tool_call> markup off `tool_calls`, so dropping
+    // it flattens the conversation into "tool result with no preceding
+    // call" which Qwen3 / Hermes / DeepSeek templates do not handle
+    // well — that was the root cause of malformed multi-hop turns
+    // from external clients (cli-remote, OpenAI SDK, Claude-Code).
+    std::vector<easyai::Engine::HistoryMessage>       hist;
     std::string                                       last_user;    // peeled-off (only valid when !last_is_tool)
     bool                                              last_is_tool = false;  // tool-result-injection turn
     bool                                              client_tools = false;
@@ -1454,28 +1462,74 @@ static bool parse_chat_request(const httplib::Request & req,
     // a previous turn's tool_calls and is now feeding the results back so
     // the model can produce the next visible reply.
     //
-    // The full conversation (incl. assistant turns with tool_calls and the
-    // tool messages themselves) is passed through into out.hist and
-    // replayed verbatim into the engine via replace_history.  The
-    // (role, content) representation is intentionally lossy on
-    // tool_call_id and tool_name; modern chat templates handle the
-    // association via positional ordering, which is good enough in
-    // practice.  When the user-visible reply requires those fields
-    // (rare), upgrade to a richer history schema.
+    // FULL-FIDELITY parse — mirrors llama-server's
+    // common_chat_msgs_parse_oaicompat.  Assistant `tool_calls` and
+    // tool `tool_call_id` / `name` are preserved so the chat template
+    // can render <tool_call>…</tool_call> markup against the matching
+    // tool result.  This is the upstream-tested behaviour; without it,
+    // Qwen3 / Hermes / DeepSeek templates render an orphan tool result
+    // and the model produces malformed output.
     std::string last_role;
     for (const auto & m : body["messages"]) {
-        std::string role = m.value("role", "user");
-        std::string content;
-        if (m.contains("content") && m["content"].is_string()) {
-            content = m["content"].get<std::string>();
-        } else if (m.contains("content") && m["content"].is_array()) {
-            for (const auto & part : m["content"]) {
-                if (part.value("type", "") == "text") content += part.value("text", "");
+        easyai::Engine::HistoryMessage hm{};
+        hm.role = m.value("role", "user");
+
+        if (m.contains("content")) {
+            const auto & content = m["content"];
+            if (content.is_string()) {
+                hm.content = content.get<std::string>();
+            } else if (content.is_array()) {
+                for (const auto & part : content) {
+                    if (part.value("type", "") == "text") hm.content += part.value("text", "");
+                }
+            }
+            // content.is_null() → leave hm.content empty (assistant
+            // turn with tool_calls only).
+        }
+
+        if (hm.role == "assistant"
+                && m.contains("tool_calls")
+                && m["tool_calls"].is_array()) {
+            for (const auto & tc : m["tool_calls"]) {
+                easyai::Engine::ToolCallSpec spec{};
+                if (tc.contains("function") && tc["function"].is_object()) {
+                    const auto & fn = tc["function"];
+                    if (fn.contains("name") && fn["name"].is_string()) {
+                        spec.name = fn["name"].get<std::string>();
+                    }
+                    if (fn.contains("arguments")) {
+                        // OpenAI spec says arguments is a string, but
+                        // tolerant clients pass an object — accept both.
+                        if (fn["arguments"].is_string()) {
+                            spec.arguments_json = fn["arguments"].get<std::string>();
+                        } else {
+                            spec.arguments_json = fn["arguments"].dump();
+                        }
+                    }
+                }
+                if (tc.contains("id") && tc["id"].is_string()) {
+                    spec.id = tc["id"].get<std::string>();
+                }
+                if (!spec.name.empty()) hm.tool_calls.push_back(std::move(spec));
             }
         }
-        out.hist.emplace_back(role, content);
-        last_role = role;
-        if (role == "user") out.last_user = content;
+
+        if (hm.role == "tool") {
+            if (m.contains("tool_call_id") && m["tool_call_id"].is_string()) {
+                hm.tool_call_id = m["tool_call_id"].get<std::string>();
+            }
+            if (m.contains("name") && m["name"].is_string()) {
+                hm.tool_name = m["name"].get<std::string>();
+            }
+        }
+
+        if (m.contains("reasoning_content") && m["reasoning_content"].is_string()) {
+            hm.reasoning_content = m["reasoning_content"].get<std::string>();
+        }
+
+        last_role = hm.role;
+        if (hm.role == "user") out.last_user = hm.content;
+        out.hist.push_back(std::move(hm));
     }
     if (last_role != "user" && last_role != "tool") {
         res.status = 400;
@@ -1491,43 +1545,21 @@ static bool parse_chat_request(const httplib::Request & req,
                         !body["tools"].empty();
     if (out.client_tools) out.tools_blob = body["tools"];
 
-    // ENCODING AUDIT — detect the OpenAI-protocol round-trip lossiness
-    // we suspect is breaking multi-hop agentic flows from external
-    // clients (cli-remote, OpenAI SDK, Claude-Code).  parse_chat_request
-    // currently flattens every message to (role, content) only:
-    // assistant `tool_calls` and tool message `tool_call_id` / `name`
-    // are dropped before replace_history, so the chat template renders
-    // a tool message with no preceding tool_call markup → model sees
-    // an orphan tool result → produces malformed output → retry path
-    // kicks in.  Logging this here makes the issue visible per request.
-    {
-        size_t lost_tool_calls = 0;
-        size_t lost_tool_ids   = 0;
-        for (const auto & m : body["messages"]) {
-            if (m.value("role", "") == "assistant"
-                    && m.contains("tool_calls")
-                    && m["tool_calls"].is_array()
-                    && !m["tool_calls"].empty()) {
-                lost_tool_calls += m["tool_calls"].size();
-            }
-            if (m.value("role", "") == "tool"
-                    && (m.contains("tool_call_id") || m.contains("name"))) {
-                ++lost_tool_ids;
-            }
+    // Light per-request log of multi-hop carryover so the operator can
+    // confirm full-fidelity round-trip on long sessions.  No banner —
+    // this is the healthy case; we just record the counts.
+    if (auto * fp = easyai::log::file()) {
+        size_t carried_tool_calls = 0;
+        size_t carried_tool_msgs  = 0;
+        for (const auto & hm : out.hist) {
+            carried_tool_calls += hm.tool_calls.size();
+            if (hm.role == "tool") ++carried_tool_msgs;
         }
-        if (lost_tool_calls || lost_tool_ids) {
-            easyai::log::mark_problem(
-                "Server: OpenAI-protocol round-trip is LOSSY for this request\n"
-                "incoming history dropped: assistant tool_calls=%zu tool messages "
-                "with tool_call_id/name=%zu\n"
-                "parse_chat_request flattens to (role, content); engine's "
-                "replace_history takes (role, content) only — chat template will "
-                "render the tool message without its matching tool_call markup, "
-                "which is a likely root cause of malformed output on agentic "
-                "multi-hop turns.\n"
-                "fix path: extend Engine::push_message to accept tool_calls + "
-                "preserve them in parse_chat_request -> prepare_engine_for_request.",
-                lost_tool_calls, lost_tool_ids);
+        if (carried_tool_calls || carried_tool_msgs) {
+            std::fprintf(fp,
+                "history carryover: assistant tool_calls=%zu tool messages=%zu\n",
+                carried_tool_calls, carried_tool_msgs);
+            std::fflush(fp);
         }
     }
 
@@ -1544,7 +1576,7 @@ static bool parse_chat_request(const httplib::Request & req,
     out.preset_inline = easyai::parse_preset(out.last_user);
     if (!out.preset_inline.applied.empty()) {
         out.last_user = out.last_user.substr(out.preset_inline.consumed);
-        out.hist.back().second = out.last_user;
+        out.hist.back().content = out.last_user;
     }
 
     // Optional per-request override of the authoritative-datetime
@@ -1654,7 +1686,7 @@ static void prepare_engine_for_request(ServerCtx & ctx, const ChatRequest & req)
     // last is "user", peel it off so the chat loop can push it after
     // the chat-params render (see chat_continue's user-message
     // requirement for Qwen3-style templates).
-    std::vector<std::pair<std::string, std::string>> hist_minus_last;
+    std::vector<easyai::Engine::HistoryMessage> hist_minus_last;
     if (req.last_is_tool) {
         hist_minus_last = req.hist;          // include the tool message
     } else {
@@ -1674,11 +1706,11 @@ static void prepare_engine_for_request(ServerCtx & ctx, const ChatRequest & req)
         // (Most clients put it at index 0, but we walk backwards to be
         // safe — multi-system histories pick the most recent.)
         auto it = std::find_if(hist_minus_last.rbegin(), hist_minus_last.rend(),
-            [](const std::pair<std::string,std::string> & m) {
-                return m.first == "system";
+            [](const easyai::Engine::HistoryMessage & m) {
+                return m.role == "system";
             });
         if (it != hist_minus_last.rend()) {
-            it->second += preamble;
+            it->content += preamble;
             ctx.engine.system(ctx.default_system);
         } else {
             ctx.engine.system(ctx.default_system + preamble);

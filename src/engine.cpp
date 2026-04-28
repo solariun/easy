@@ -1492,6 +1492,42 @@ void Engine::replace_history(const std::vector<std::pair<std::string, std::strin
     }
 }
 
+// Full-fidelity overload — preserves tool_calls, tool_call_id, name,
+// reasoning_content so the chat template can render the proper
+// <tool_call> markup.  This is what llama-server feeds into the
+// template via common_chat_templates_inputs::messages, and matches
+// the parse done by common_chat_msgs_parse_oaicompat.
+void Engine::replace_history(const std::vector<HistoryMessage> & messages) {
+    clear_history();
+    bool has_system = false;
+    for (const auto & m : messages) if (m.role == "system") { has_system = true; break; }
+    if (!has_system && !p_->system_prompt.empty()) {
+        p_->history.push_back({ "system", p_->system_prompt, {}, {}, "", "", "" });
+    }
+    for (const auto & m : messages) {
+        common_chat_msg msg{};
+        msg.role              = m.role;
+        msg.content           = m.content;
+        msg.reasoning_content = m.reasoning_content;
+        msg.tool_name         = m.tool_name;
+        msg.tool_call_id      = m.tool_call_id;
+        msg.tool_calls.reserve(m.tool_calls.size());
+        for (const auto & tc : m.tool_calls) {
+            common_chat_tool_call out{};
+            out.name      = tc.name;
+            // Per OpenAI spec, `arguments` is a JSON string literal.
+            // Empty arguments → "{}" so the chat template's
+            // function|tojson invocation doesn't print bare empty.
+            out.arguments = tc.arguments_json.empty()
+                                ? std::string("{}")
+                                : tc.arguments_json;
+            out.id        = tc.id;
+            msg.tool_calls.push_back(std::move(out));
+        }
+        p_->history.push_back(std::move(msg));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // generate_one — single-pass generation. Renders prompt, decodes, parses, and
 // returns the structured message. Used by HTTP layer when client provides its

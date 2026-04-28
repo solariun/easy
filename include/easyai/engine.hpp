@@ -173,6 +173,31 @@ class Engine {
     // already contain one.
     void replace_history(const std::vector<std::pair<std::string, std::string>> & messages);
 
+    // Full-fidelity history replay.  Mirrors what llama-server does with
+    // common_chat_msgs_parse_oaicompat → common_chat_templates_inputs::messages:
+    // assistant turns keep their `tool_calls`, tool turns keep their
+    // `tool_call_id` + `name`, so the chat template (Qwen3, DeepSeek,
+    // Hermes, …) can render the proper <tool_call>…</tool_call> markup
+    // and the model sees a structurally-correct conversation.  The
+    // (role, content)-only overload above LOSES that structure and was
+    // the root cause of malformed multi-hop turns from external clients
+    // that send full agentic histories (cli-remote, OpenAI SDK,
+    // Claude-Code).
+    struct ToolCallSpec {
+        std::string name;             // function name
+        std::string arguments_json;   // raw JSON object literal (per OpenAI spec)
+        std::string id;               // call_X — empty allowed, gets generated
+    };
+    struct HistoryMessage {
+        std::string role;                 // "system" | "user" | "assistant" | "tool"
+        std::string content;              // visible body (may be empty if tool_calls non-empty)
+        std::string reasoning_content;    // assistant's <think> block, if persisted
+        std::string tool_name;            // role == "tool": which tool produced `content`
+        std::string tool_call_id;         // role == "tool": matches an assistant tool_calls[i].id
+        std::vector<ToolCallSpec> tool_calls;   // role == "assistant"
+    };
+    void replace_history(const std::vector<HistoryMessage> & messages);
+
     // Direct access for advanced HTTP scenarios.
     void clear_history();
 
