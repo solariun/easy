@@ -1193,18 +1193,58 @@ std::string Engine::chat_continue() {
             final_text = msg.content;
 
             // Auto-retry-with-nudge on "incomplete" turn — model finished
-            // without a tool_call AND emitted only a tiny visible reply.
-            // Typical pattern: "Let me search…" / "I'll do that now"
-            // narration that promises action but never delivers.  We pop
-            // the bad assistant turn, push a corrective synthetic user
-            // message, fire on_hop_reset so streaming consumers can drop
-            // their incremental-parse state, and continue the loop.
-            // Mirrors libeasyai-cli's Client::retry_on_incomplete so every
+            // without a tool_call AND emitted ONLY a tool-announce
+            // narration ("Let me search…", "I'll look that up…") that
+            // promises action but never delivers.  We pop the bad
+            // assistant turn, push a corrective synthetic user message,
+            // fire on_hop_reset so streaming consumers can drop their
+            // incremental-parse state, and continue the loop.  Mirrors
+            // libeasyai-cli's Client::retry_on_incomplete so every
             // consumer of the lib gets the same recovery for free.
+            //
+            // The signal is *announce intent*, not raw length — a short
+            // greeting reply ("Hi! How can I help?") is a perfectly valid
+            // turn and should NOT trip the retry.  We require:
+            //   - tools are configured (otherwise nothing to call)
+            //   - reply is short (otherwise it's not an announce)
+            //   - reply EITHER is empty OR matches an announce phrase
+            auto looks_like_announce = [](const std::string & s) -> bool {
+                if (s.empty()) return true;
+                std::string lc;
+                lc.reserve(s.size());
+                for (char c : s) lc.push_back((char) std::tolower((unsigned char) c));
+                static const char * patterns[] = {
+                    "let me ",
+                    "i'll ",
+                    "i will ",
+                    "i'm going to ",
+                    "i am going to ",
+                    "let's ",
+                    "one moment",
+                    "hold on",
+                    "give me a moment",
+                    "give me a sec",
+                    "searching ",
+                    "looking up",
+                    "looking that up",
+                    "checking the",
+                    "fetching ",
+                    "i'll check",
+                    "i'll look",
+                    "i'll search",
+                };
+                for (const char * p : patterns) {
+                    if (lc.find(p) != std::string::npos) return true;
+                }
+                return false;
+            };
+
             if (p_->retry_on_incomplete
                     && incomplete_retries < kMaxIncompleteRetries
                     && hop + 1 < kMaxToolHops
-                    && final_text.size() < kAnnounceFloor) {
+                    && !p_->tools.empty()
+                    && final_text.size() < kAnnounceFloor
+                    && looks_like_announce(final_text)) {
                 ++incomplete_retries;
                 if (p_->verbose) std::fprintf(stderr,
                     "[easyai] hop %d: incomplete turn (%zu B content, no tool_call) "

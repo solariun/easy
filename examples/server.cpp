@@ -3100,7 +3100,7 @@ int main(int argc, char ** argv) {
                   // Summary mirrors the bundle's CollapsibleContentBlock
                   // header layout: flex, full width, cursor-pointer, items-
                   // centered, justify-between, p-3.  Order on the left:
-                  // word "Thinking" → lucide brain icon → live state label
+                  // lucide brain icon → "Thinking" → live state label
                   // ("reasoning…" while streaming, "reasoning" when closed).
                   "p.innerHTML="
                     "'<summary class=\"flex w-full cursor-pointer "
@@ -3109,8 +3109,6 @@ int main(int argc, char ** argv) {
                       "color:#5b8dee\">"
                       "<span style=\"display:inline-flex;align-items:center;"
                         "gap:.5rem\">"
-                        "<span style=\"font-weight:600;font-size:.72rem;"
-                          "letter-spacing:.02em\">Thinking</span>"
                         "<svg xmlns=\"http://www.w3.org/2000/svg\" "
                           "width=\"16\" height=\"16\" viewBox=\"0 0 24 24\" "
                           "fill=\"none\" stroke=\"currentColor\" "
@@ -3127,6 +3125,8 @@ int main(int argc, char ** argv) {
                           "<path d=\"M6 18a4 4 0 0 1-1.967-.516\"></path>"
                           "<path d=\"M19.967 17.484A4 4 0 0 1 18 18\"></path>"
                         "</svg>"
+                        "<span style=\"font-weight:600;font-size:.72rem;"
+                          "letter-spacing:.02em\">Thinking</span>"
                         "<span class=\"sumlabel\" style=\"font-weight:600;"
                           "font-size:.72rem;opacity:.75\">reasoning…</span>"
                       "</span>"
@@ -3466,45 +3466,57 @@ int main(int argc, char ** argv) {
                         "stroke:var(--ea-icon, currentColor);stroke-width:2;fill:none;"
                         "stroke-linecap:round;stroke-linejoin:round;opacity:.75}"
                       ".count{color:var(--ea-fg, #8b949e);opacity:.7;font-size:.7rem}"
-                      // position:fixed (not absolute) so the popover floats
-                      // above the bundle's badge row, which is wrapped in
-                      // overflow:hidden and would clip an absolute child.
-                      // Coordinates are written in inline style on click
-                      // from the host's getBoundingClientRect.
-                      ".pop{position:fixed;display:none;pointer-events:auto;"
-                        "min-width:14rem;max-width:22rem;"
-                        "background:#0f1318;border:1px solid #2a313b;"
-                        "border-radius:.5rem;padding:.45rem .5rem;"
-                        "box-shadow:0 6px 24px rgba(0,0,0,.5);"
-                        "color:#c9d1d9;font-size:.72rem;"
-                        "max-height:60vh;overflow-y:auto;"
-                        "z-index:2147483646}"
-                      ".pop.open{display:block}"
-                      ".pop .row{padding:.32rem .35rem;border-radius:.3rem;"
-                        "cursor:default;display:flex;flex-direction:column;"
-                        "gap:.15rem;line-height:1.35}"
-                      ".pop .row+.row{border-top:1px solid #1f242b}"
-                      ".pop .row:hover{background:rgba(91,141,238,.08)}"
-                      ".pop .name{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;"
-                        "font-size:.72rem;color:#5b8dee;font-weight:600}"
-                      ".pop .desc{color:#8b949e;font-size:.68rem;"
-                        "white-space:pre-wrap;line-height:1.4}"
-                      ".pop .empty{color:#8b949e;padding:.4rem .35rem}"
                     "</style>"
-                    "<div style=\"position:relative;display:inline-block\">"
-                      "<label class=\"badge\" data-trigger=\"1\">"
-                        "<svg viewBox=\"0 0 24 24\">"
-                          // Wrench icon
-                          "<path d=\"M14.7 6.3a3.5 3.5 0 0 1 4.6 4.6l-2.8-2.8-1.8 1.8 2.8 2.8a3.5 3.5 0 0 1-4.6-4.6\"/>"
-                          "<path d=\"M5 19l8.5-8.5\"/>"
-                        "</svg>"
-                        "<span>tools</span>"
-                        "<span class=\"count\"></span>"
-                      "</label>"
-                      "<div class=\"pop\" role=\"dialog\" aria-label=\"available tools\"></div>"
-                    "</div>`;"
+                    "<label class=\"badge\" data-trigger=\"1\">"
+                      "<svg viewBox=\"0 0 24 24\">"
+                        // Wrench icon
+                        "<path d=\"M14.7 6.3a3.5 3.5 0 0 1 4.6 4.6l-2.8-2.8-1.8 1.8 2.8 2.8a3.5 3.5 0 0 1-4.6-4.6\"/>"
+                        "<path d=\"M5 19l8.5-8.5\"/>"
+                      "</svg>"
+                      "<span>tools</span>"
+                      "<span class=\"count\"></span>"
+                    "</label>`;"
+                  // Popover lives at document.body — NOT in shadow DOM —
+                  // because the bundle's `.chat-processing-info-detail`
+                  // ancestor uses `backdrop-blur-sm` which creates a fixed-
+                  // positioning containing block in modern browsers.  A
+                  // position:fixed child of that subtree gets clipped by
+                  // the bar's bounds; pinning to body sidesteps the issue.
+                  "let pop=document.getElementById('__easyaiToolsPop');"
+                  "if(pop)pop.remove();"
+                  "pop=document.createElement('div');"
+                  "pop.id='__easyaiToolsPop';"
+                  "pop.setAttribute('role','dialog');"
+                  "pop.setAttribute('aria-label','available tools');"
+                  "pop.style.cssText="
+                    "'position:fixed;display:none;pointer-events:auto;"
+                    "min-width:14rem;max-width:22rem;"
+                    "background:#0f1318;border:1px solid #2a313b;"
+                    "border-radius:.5rem;padding:.45rem .5rem;"
+                    "box-shadow:0 6px 24px rgba(0,0,0,.5);"
+                    "color:#c9d1d9;font-size:.72rem;"
+                    "font-family:-apple-system,system-ui,sans-serif;"
+                    "max-height:60vh;overflow-y:auto;"
+                    "z-index:2147483646;';"
+                  "if(!document.getElementById('__easyaiToolsPopStyle')){"
+                    "const ps=document.createElement('style');"
+                    "ps.id='__easyaiToolsPopStyle';"
+                    "ps.textContent="
+                      "'#__easyaiToolsPop .row{padding:.32rem .35rem;"
+                        "border-radius:.3rem;cursor:default;display:flex;"
+                        "flex-direction:column;gap:.15rem;line-height:1.35}"
+                      "#__easyaiToolsPop .row+.row{border-top:1px solid #1f242b}"
+                      "#__easyaiToolsPop .row:hover{background:rgba(91,141,238,.08)}"
+                      "#__easyaiToolsPop .name{font-family:ui-monospace,"
+                        "SFMono-Regular,Menlo,monospace;font-size:.72rem;"
+                        "color:#5b8dee;font-weight:600}"
+                      "#__easyaiToolsPop .desc{color:#8b949e;font-size:.68rem;"
+                        "white-space:pre-wrap;line-height:1.4}"
+                      "#__easyaiToolsPop .empty{color:#8b949e;padding:.4rem .35rem}';"
+                    "document.head.appendChild(ps);"
+                  "}"
+                  "document.body.appendChild(pop);"
                   "const badge=root.querySelector('.badge');"
-                  "const pop=root.querySelector('.pop');"
                   "const cnt=root.querySelector('.count');"
                   "const renderList=(tools)=>{"
                     "if(!tools||!tools.length){"
@@ -3531,9 +3543,10 @@ int main(int argc, char ** argv) {
                   "}).catch(()=>{renderList([]);});"
                   // Compute fixed-position coords from the host's bounding
                   // box so the popover sits above the badge regardless of
-                  // ancestor overflow:hidden / transform / etc.
+                  // ancestor overflow:hidden / transform / etc.  Anchor on
+                  // toolsHost (the badge wrapper) which is in normal flow.
                   "const placePop=()=>{"
-                    "const anchor=toolsHost||badge;"
+                    "const anchor=toolsHost;"
                     "if(!anchor)return;"
                     "const r=anchor.getBoundingClientRect();"
                     "const vw=window.innerWidth;"
@@ -3543,25 +3556,25 @@ int main(int argc, char ** argv) {
                   "};"
                   "badge.addEventListener('click',(e)=>{"
                     "e.preventDefault();e.stopPropagation();"
-                    "const willOpen=!pop.classList.contains('open');"
-                    "if(willOpen)placePop();"
-                    "pop.classList.toggle('open');"
+                    "const willOpen=pop.style.display!=='block';"
+                    "if(willOpen){placePop();pop.style.display='block';}"
+                    "else{pop.style.display='none';}"
                   "});"
                   "window.addEventListener('resize',()=>{"
-                    "if(pop.classList.contains('open'))placePop();"
+                    "if(pop.style.display==='block')placePop();"
                   "});"
                   "window.addEventListener('scroll',()=>{"
-                    "if(pop.classList.contains('open'))placePop();"
+                    "if(pop.style.display==='block')placePop();"
                   "},true);"
-                  // Close on outside click.  Also handle clicks outside the
-                  // popover itself, which is now positioned in the viewport
-                  // and so isn't a descendant of toolsHost any more for
-                  // hit-testing — explicit check for both.
+                  // Close on outside click.  Pop now lives at document.body
+                  // (escapes ancestor backdrop-filter containing block);
+                  // host (badge) and pop are siblings under the document so
+                  // we hit-test both before deciding to close.
                   "document.addEventListener('click',(e)=>{"
                     "if(!toolsHost)return;"
                     "const inHost=toolsHost.contains(e.target);"
                     "const inPop=pop.contains(e.target);"
-                    "if(!inHost&&!inPop)pop.classList.remove('open');"
+                    "if(!inHost&&!inPop)pop.style.display='none';"
                   "});"
                   "toolsRoot=root;"
                   "return root;"
