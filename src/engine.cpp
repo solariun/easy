@@ -1,5 +1,6 @@
 #include "easyai/engine.hpp"
 #include "easyai/tool.hpp"        // easyai::args::get_string for tool_call recovery
+#include "easyai/log.hpp"          // raw transaction log + problem markers
 
 #include "common.h"
 #include "sampling.h"
@@ -735,6 +736,14 @@ struct Engine::Impl {
             parser_threw = true;
             msg.role    = "assistant";
             msg.content = raw;
+            easyai::log::mark_problem(
+                "Engine::parse_assistant common_chat_parse threw (%s)\n"
+                "raw_bytes=%zu — falling back to recovery passes\n"
+                "raw tail (last %zu bytes):\n%.*s",
+                e.what(), raw.size(),
+                std::min<size_t>(400, raw.size()),
+                (int) std::min<size_t>(400, raw.size()),
+                raw.c_str() + raw.size() - std::min<size_t>(400, raw.size()));
         }
 
         // 2a) When the parser threw and dumped raw into content, we still
@@ -771,6 +780,11 @@ struct Engine::Impl {
                 if (verbose) std::fprintf(stderr,
                     "[easyai] recovered %zu tool call(s) from malformed output (%s)\n",
                     msg.tool_calls.size(), recovery_kind);
+                easyai::log::mark_problem(
+                    "Engine::parse_assistant recovered %zu tool call(s) "
+                    "from malformed %s output (PEG parser refused)\n"
+                    "raw_bytes=%zu",
+                    msg.tool_calls.size(), recovery_kind, raw.size());
             }
         }
 
@@ -792,6 +806,10 @@ struct Engine::Impl {
                 if (verbose) std::fprintf(stderr,
                     "[easyai] recovered %zu tool call(s) from markdown markers "
                     "(model abandoned <tool_call> syntax — agentic loop continues)\n",
+                    msg.tool_calls.size());
+                easyai::log::mark_problem(
+                    "Engine::parse_assistant recovered %zu tool call(s) "
+                    "from markdown wrench markers (model abandoned <tool_call> XML)",
                     msg.tool_calls.size());
             }
         }
@@ -971,8 +989,15 @@ Engine & Engine::on_hop_reset(HopResetCallback cb)  { p_->on_hop_reset = std::mo
 
 bool Engine::load() {
     if (p_->loaded) return true;
+    // Auto-open the raw transaction log on the first Engine::load() so
+    // every server / agent / CLI built on libeasyai inherits a /tmp
+    // log file natively — no per-binary wiring required.  No-op when
+    // a sink was already attached (e.g. the CLI binary called
+    // easyai::cli::open_log_tee earlier) or when EASYAI_NO_AUTO_LOG=1.
+    easyai::log::auto_open("easyai");
     if (p_->params.model.path.empty()) {
         p_->last_error = "model path not set; call .model(\"path/to/file.gguf\") first";
+        easyai::log::error("[easyai] Engine::load: %s", p_->last_error.c_str());
         return false;
     }
 
@@ -995,18 +1020,21 @@ bool Engine::load() {
     p_->init = common_init_from_params(p_->params);
     if (!p_->init || !p_->init->model() || !p_->init->context()) {
         p_->last_error = "failed to load model: " + p_->params.model.path;
+        easyai::log::error("[easyai] Engine::load: %s", p_->last_error.c_str());
         return false;
     }
 
     p_->sampler = common_sampler_init(p_->init->model(), p_->params.sampling);
     if (!p_->sampler) {
         p_->last_error = "failed to initialize sampler";
+        easyai::log::error("[easyai] Engine::load: %s", p_->last_error.c_str());
         return false;
     }
 
     p_->templates = common_chat_templates_init(p_->init->model(), /*override=*/"");
     if (!p_->templates) {
         p_->last_error = "model has no usable chat template";
+        easyai::log::error("[easyai] Engine::load: %s", p_->last_error.c_str());
         return false;
     }
 
@@ -1117,8 +1145,13 @@ std::string Engine::chat_continue() {
     if (!p_->loaded) { p_->last_error = "engine not loaded"; return {}; }
 
     const int kMaxToolHops          = p_->max_tool_hops;
-    constexpr int kMaxThoughtRetries     = 2;   // thought-only retries
-    constexpr int kMaxIncompleteRetries  = 1;   // announce-without-action retries
+    // Bumped from 2/1 → 10/10 in 2026-04-28: malformed / "announce only"
+    // turns hit production agents far more often than the original budget
+    // (Qwen3 fine-tunes especially) and a 10x retry ceiling absorbs the
+    // long tail without losing the "no infinite spiral" guarantee.  Set in
+    // the lib so every server / CLI / agent inherits the same recovery.
+    constexpr int kMaxThoughtRetries     = 10;  // thought-only retries
+    constexpr int kMaxIncompleteRetries  = 10;  // announce-without-action retries
     constexpr size_t kAnnounceFloor      = 80;  // bytes — sub-tweet replies
     int thought_retries    = 0;
     int incomplete_retries = 0;
@@ -1161,6 +1194,17 @@ std::string Engine::chat_continue() {
             if (p_->verbose) std::fprintf(stderr,
                 "[easyai] hop %d: thought-only turn — clearing KV and retrying (%d/%d)\n",
                 hop, thought_retries, kMaxThoughtRetries);
+            // Mark the bad turn in the raw transaction log so an
+            // operator can grep for `PROBLEMATIC` and find every
+            // thought-only retry plus the raw tail that triggered it.
+            const size_t tail = std::min<size_t>(400, raw.size());
+            easyai::log::mark_problem(
+                "Engine::chat_continue thought-only turn (retry %d/%d)\n"
+                "hop=%d raw_bytes=%zu reasoning_bytes=%zu content_bytes=%zu tool_calls=0\n"
+                "raw tail (last %zu bytes):\n%.*s",
+                thought_retries, kMaxThoughtRetries,
+                hop, raw.size(), msg.reasoning_content.size(), msg.content.size(),
+                tail, (int) tail, raw.c_str() + raw.size() - tail);
             llama_memory_clear(llama_get_memory(p_->ctx()), true);
             if (p_->on_hop_reset) p_->on_hop_reset();
             continue;
@@ -1174,6 +1218,10 @@ std::string Engine::chat_continue() {
             msg.content = msg.reasoning_content;
             if (p_->verbose) std::fprintf(stderr,
                 "[easyai] hop %d: retry budget exhausted — promoting reasoning to content\n", hop);
+            easyai::log::mark_problem(
+                "Engine::chat_continue thought-only retry budget exhausted\n"
+                "hop=%d budget=%d — promoting reasoning_content (%zu bytes) into content\n",
+                hop, kMaxThoughtRetries, msg.reasoning_content.size());
             // Also push the synthesized text through on_token so the
             // streaming HTTP layer (which builds its SSE diffs from the
             // token stream, not from history) emits a content delta.
@@ -1251,6 +1299,14 @@ std::string Engine::chat_continue() {
                     "— discarding, nudging, retrying (%d/%d)\n",
                     hop, final_text.size(),
                     incomplete_retries, kMaxIncompleteRetries);
+                easyai::log::mark_problem(
+                    "Engine::chat_continue announce-without-action (retry %d/%d)\n"
+                    "hop=%d content_bytes=%zu reasoning_bytes=%zu tool_calls=0\n"
+                    "content: %.*s",
+                    incomplete_retries, kMaxIncompleteRetries,
+                    hop, final_text.size(), msg.reasoning_content.size(),
+                    (int) std::min<size_t>(400, final_text.size()),
+                    final_text.c_str());
                 if (!p_->history.empty()) p_->history.pop_back();
                 p_->history.push_back({
                     "user",
@@ -1275,14 +1331,20 @@ std::string Engine::chat_continue() {
             // upstream), but if even that came up empty, the user's
             // bubble will be blank — surface it loudly so the operator
             // can correlate against journalctl.
-            if (final_text.empty() && p_->verbose) {
-                std::fprintf(stderr,
+            if (final_text.empty()) {
+                if (p_->verbose) std::fprintf(stderr,
                     "[easyai] hop %d: WARN final content is EMPTY after %d hop(s); "
                     "reasoning=%zu tool_calls=%zu — model gave up without an "
                     "answer.  Common causes: tool error chain (rate limits, "
                     "network); over-prescriptive system prompt; model "
                     "exhausted on a niche question.\n",
                     hop, hop + 1,
+                    msg.reasoning_content.size(),
+                    msg.tool_calls.size());
+                easyai::log::mark_problem(
+                    "Engine::chat_continue empty final content\n"
+                    "hop=%d reasoning_bytes=%zu tool_calls=%zu",
+                    hop,
                     msg.reasoning_content.size(),
                     msg.tool_calls.size());
             }
@@ -1297,13 +1359,28 @@ std::string Engine::chat_continue() {
 
             if (!tool) {
                 result = ToolResult::error("unknown tool: " + tc.name);
+                easyai::log::error(
+                    "[easyai] Engine: model called unknown tool '%s' (id=%s) "
+                    "args=%.*s",
+                    tc.name.c_str(),
+                    tc.id.empty() ? "(none)" : tc.id.c_str(),
+                    (int) std::min<size_t>(400, tc.arguments.size()),
+                    tc.arguments.c_str());
             } else {
                 try {
                     result = tool->handler(call);
                 } catch (const std::exception & e) {
                     result = ToolResult::error(std::string("tool threw: ") + e.what());
+                    easyai::log::error(
+                        "[easyai] Engine: tool '%s' (id=%s) threw: %s",
+                        tc.name.c_str(),
+                        tc.id.empty() ? "(none)" : tc.id.c_str(), e.what());
                 } catch (...) {
                     result = ToolResult::error("tool threw unknown exception");
+                    easyai::log::error(
+                        "[easyai] Engine: tool '%s' (id=%s) threw unknown exception",
+                        tc.name.c_str(),
+                        tc.id.empty() ? "(none)" : tc.id.c_str());
                 }
             }
 

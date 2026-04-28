@@ -19,6 +19,7 @@
 // in the request body the server forwards real delta.tool_calls, so
 // the custom events are pure UI noise from our side.
 #include "easyai/client.hpp"
+#include "easyai/log.hpp"
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>
@@ -211,6 +212,12 @@ struct Client::Impl {
     bool        retry_on_incomplete = true;
     bool        last_was_incomplete = false; // mirror of last turn's timings.incomplete
     int         max_tool_hops       = 8;     // agentic loop safety cap; bumped by bash
+    // Per-chat budget for the announce-without-action / malformed-turn
+    // recovery loop.  Bumped from 1 → 10 in 2026-04-28 so a flaky model
+    // gets the same chances as the local Engine path before we surface
+    // an empty bubble.  No infinite spirals — once the budget is spent
+    // the bad turn is handed back to the caller.
+    int         max_incomplete_retries = 10;
 
     // Diagnostic log file (tee).  Borrowed; caller owns fclose.
     std::FILE * log_fp = nullptr;
@@ -652,12 +659,19 @@ struct Client::Impl {
     // a single shell command can naturally span many turns.
 
     std::string run_chat_loop() {
-        last_was_incomplete   = false;
-        bool retried_for_incomplete = false;
+        last_was_incomplete         = false;
+        int incomplete_retries      = 0;
 
         for (int hop = 0; hop < max_tool_hops; ++hop) {
             AssistantTurn turn;
-            if (!stream_chat(turn)) return {};
+            if (!stream_chat(turn)) {
+                if (!last_error.empty()) {
+                    easyai::log::error(
+                        "[easyai-cli] Client::run_chat_loop hop %d: stream_chat failed: %s",
+                        hop, last_error.c_str());
+                }
+                return {};
+            }
 
             if (verbose) {
                 std::fprintf(stderr,
@@ -698,8 +712,25 @@ struct Client::Impl {
             // The nudge stays in history after the retry. That's the
             // honest record of what we sent, and downstream turns are
             // fine with it.
-            if (turn.incomplete && retry_on_incomplete && !retried_for_incomplete) {
-                retried_for_incomplete = true;
+            if (turn.incomplete && retry_on_incomplete
+                                 && incomplete_retries < max_incomplete_retries) {
+                ++incomplete_retries;
+                // Mark the bad transaction in the raw log so an
+                // operator can grep `PROBLEMATIC` and find every retry.
+                {
+                    std::string tail = turn.content;
+                    if (tail.size() > 400)
+                        tail = "…" + tail.substr(tail.size() - 400);
+                    easyai::log::mark_problem(
+                        "Client::run_chat_loop announce-without-action "
+                        "(retry %d/%d) hop=%d content_bytes=%zu reasoning_bytes=%zu "
+                        "tool_calls=%zu finish=%s\ncontent: %s",
+                        incomplete_retries, max_incomplete_retries,
+                        hop, turn.content.size(), turn.reasoning.size(),
+                        turn.tool_calls.size(),
+                        turn.finish_reason.c_str(),
+                        tail.c_str());
+                }
                 ordered_json nudge;
                 nudge["role"]    = "user";
                 nudge["content"] =
@@ -719,14 +750,30 @@ struct Client::Impl {
                 if (verbose) {
                     std::fprintf(stderr,
                         "[easyai-cli] retry_on_incomplete: discarding bad turn "
-                        "(content=%zu, tool_calls=%zu), nudging, and re-issuing\n",
-                        turn.content.size(), turn.tool_calls.size());
+                        "(content=%zu, tool_calls=%zu), nudging, and re-issuing "
+                        "(%d/%d)\n",
+                        turn.content.size(), turn.tool_calls.size(),
+                        incomplete_retries, max_incomplete_retries);
                 }
                 continue;
             }
 
             history_json.push_back(assistant_msg_json(turn));
             last_was_incomplete = turn.incomplete;
+
+            // If we land here with `turn.incomplete` set, the retry budget
+            // was exhausted (or retry_on_incomplete was off).  Mark it
+            // loudly in the raw log so the operator can correlate the
+            // empty-bubble with the wire-level transcript.
+            if (turn.incomplete) {
+                easyai::log::mark_problem(
+                    "Client::run_chat_loop incomplete turn surfaced to caller "
+                    "(retries=%d/%d, retry_on_incomplete=%s) hop=%d "
+                    "content_bytes=%zu reasoning_bytes=%zu",
+                    incomplete_retries, max_incomplete_retries,
+                    retry_on_incomplete ? "on" : "off",
+                    hop, turn.content.size(), turn.reasoning.size());
+            }
 
             if (turn.finish_reason != "tool_calls" || turn.tool_calls.empty()) {
                 return turn.content;
@@ -737,6 +784,7 @@ struct Client::Impl {
             // Loop continues — request next turn with tool results in history.
         }
         last_error = "max tool hops (" + std::to_string(max_tool_hops) + ") exceeded";
+        easyai::log::error("[easyai-cli] %s", last_error.c_str());
         return {};
     }
 
@@ -789,7 +837,17 @@ struct Client::Impl {
 // ---------------------------------------------------------------------------
 // Public surface
 // ---------------------------------------------------------------------------
-Client::Client() : p_(std::make_unique<Impl>()) {}
+Client::Client() : p_(std::make_unique<Impl>()) {
+    // Auto-open a /tmp raw transaction log on first Client construction
+    // so every consumer of libeasyai-cli (cli-remote, RemoteBackend,
+    // Agent, third-party apps) inherits the log natively.  No-op when
+    // a sink was already attached (CLI binary opened one earlier) or
+    // when EASYAI_NO_AUTO_LOG=1.  We adopt the global sink as our
+    // per-client log_fp so the existing wire-tee path (request body +
+    // raw SSE chunks + tool dispatch summaries) lands in the same file.
+    easyai::log::auto_open("easyai-client");
+    if (!p_->log_fp) p_->log_fp = easyai::log::file();
+}
 Client::~Client() = default;
 Client::Client(Client &&) noexcept = default;
 Client & Client::operator=(Client &&) noexcept = default;
