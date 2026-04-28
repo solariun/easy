@@ -3868,6 +3868,31 @@ int main(int argc, char ** argv) {
                     "<span class=\"l\">'+initialLabel+'</span>';"
                   "return chip;"
                 "};"
+                // Sample the bundle's `.chat-processing-info-detail` bar
+                // (background, border, blur, radius, font) and project the
+                // same palette onto the chip so it reads as a sibling of
+                // the metrics bar rather than a custom overlay.  Cheap to
+                // call on every attach/update — getComputedStyle is fast
+                // and we set a handful of inline properties.
+                "const applyBarPalette=(chip)=>{"
+                  "if(!chip)return;"
+                  "const bar=document.querySelector('.chat-processing-info-detail');"
+                  "if(!bar)return;"
+                  "const cs=getComputedStyle(bar);"
+                  "const border="
+                    "(cs.borderTopWidth||'1px')+' '+"
+                    "(cs.borderTopStyle||'solid')+' '+"
+                    "(cs.borderTopColor||'transparent');"
+                  "chip.style.background=cs.backgroundColor;"
+                  "chip.style.color=cs.color;"
+                  "chip.style.border=border;"
+                  "chip.style.borderRadius=cs.borderRadius;"
+                  "chip.style.fontFamily=cs.fontFamily;"
+                  "chip.style.backdropFilter="
+                    "cs.backdropFilter||cs.webkitBackdropFilter||'';"
+                  "chip.style.webkitBackdropFilter="
+                    "cs.webkitBackdropFilter||cs.backdropFilter||'';"
+                "};"
                 // attachChip(msg): place the chip in the best available
                 // anchor.  During streaming the bundle has NOT yet rendered
                 // the copy/edit/fork/delete row, so findActionRow returns
@@ -3888,6 +3913,7 @@ int main(int argc, char ** argv) {
                       "row.appendChild(chip);"
                       "delete chip.dataset.fallback;"
                     "}"
+                    "applyBarPalette(chip);"
                     "return;"
                   "}"
                   // The bundle renders the action toolbar (copy/edit/etc)
@@ -3916,6 +3942,7 @@ int main(int argc, char ** argv) {
                     "msg.appendChild(chip);"
                   "}"
                   "msg[CHIP_MARK]=chip;"
+                  "applyBarPalette(chip);"
                 "};"
                 // Inline tool-log entries are emitted by the server as
                 // markdown italics ("\n*🔧 web_search*\n") so they end up
@@ -3979,6 +4006,7 @@ int main(int argc, char ** argv) {
                     "return;"
                   "}"
                   "chip.style.display='inline-flex';"
+                  "applyBarPalette(chip);"
                   "const dot=chip.querySelector('.d');"
                   "const lab=chip.querySelector('.l');"
                   "if(dot){"
