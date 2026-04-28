@@ -2903,27 +2903,31 @@ int main(int argc, char ** argv) {
               "})();</script>";
 
             // ----- hide the bundle's native Reasoning panel -----------------
-            // The bundle renders reasoning blocks via a custom Svelte
-            // component (CollapsibleContentBlock) with the wrapper class
-            // "my-2" — NOT as <details><summary>.  We already render our
-            // own blue brain-iconed custom panel above the message body,
-            // so the bundle's copy is just a duplicate — hide it.
+            // We render our own blue brain-iconed custom panel above the
+            // message body during streaming, so the bundle's copy would be
+            // a duplicate — hide it.  BUT: our panel is ephemeral DOM that
+            // gets wiped when the bundle re-mounts the message (e.g. on
+            // page reload from history).  In that case the bundle's panel
+            // is the ONLY remaining copy of the reasoning text, so hiding
+            // it would erase the user's reasoning history entirely.
             //
-            // Strategy: walk every element that has "my-2" in its class
-            // list, look at its trimmed innerText (label + body text),
-            // and hide the element when the text starts with "Reasoning"
-            // (covers both "Reasoning" closed and "Reasoning…" streaming
-            // labels, as well as the expanded body whose first line is
-            // still "Reasoning").  Tool-call panels share the same Svelte
-            // component but their label is the tool name, so they don't
-            // match and stay visible.
+            // Strategy: only hide when our `__easyai-thinking` panel is
+            // present in the same assistant message.  Otherwise leave the
+            // bundle's panel visible so past messages still show their
+            // reasoning.
             inj <<
               "<script>(()=>{"
-                "console.log('[easyai-inject] block3 hide-bundle-reasoning');"
+                "console.log('[easyai-inject] block3 hide-bundle-reasoning (custom-only)');"
                 "const isReasoning=(t)=>{"
                   "if(!t)return false;t=t.trim();"
                   "if(t.length>500)return false;"
                   "return /^Reasoning(?:\\.\\.\\.|\\u2026|\\b)/i.test(t);"
+                "};"
+                "const hasOurPanel=(el)=>{"
+                  "const msg=el.closest"
+                    "?el.closest('[aria-label=\"Assistant message with actions\"]')"
+                    ":null;"
+                  "return !!(msg&&msg.querySelector('.__easyai-thinking'));"
                 "};"
                 "const hide=()=>{"
                   // First sweep: anything with my-2 (the wrapper class
@@ -2932,6 +2936,7 @@ int main(int argc, char ** argv) {
                     "if(el.dataset.easyaiHidden)return;"
                     "const txt=(el.innerText||el.textContent||'').trim();"
                     "if(!isReasoning(txt))return;"
+                    "if(!hasOurPanel(el))return;"
                     "el.dataset.easyaiHidden='1';"
                     "el.style.setProperty('display','none','important');"
                   "});"
@@ -2942,6 +2947,7 @@ int main(int argc, char ** argv) {
                     "if(el.children.length)return;"
                     "const t=(el.innerText||el.textContent||'').trim();"
                     "if(!t||!/^Reasoning(\\.\\.\\.|\\u2026)?$/i.test(t))return;"
+                    "if(!hasOurPanel(el))return;"
                     "let p=el;"
                     "for(let i=0;i<8&&p;i++){"
                       "if(p.dataset&&p.dataset.easyaiHidden)return;"
@@ -3093,10 +3099,9 @@ int main(int argc, char ** argv) {
                     " line-height:1.5;';"
                   // Summary mirrors the bundle's CollapsibleContentBlock
                   // header layout: flex, full width, cursor-pointer, items-
-                  // centered, justify-between, p-3.  Lucide brain icon +
-                  // "reasoning" label on the left; right side is intentionally
-                  // empty (justify-between still aligns the inner group to
-                  // the start while leaving room for a future chevron).
+                  // centered, justify-between, p-3.  Order on the left:
+                  // word "Thinking" → lucide brain icon → live state label
+                  // ("reasoning…" while streaming, "reasoning" when closed).
                   "p.innerHTML="
                     "'<summary class=\"flex w-full cursor-pointer "
                       "items-center justify-between p-3\" "
@@ -3104,6 +3109,8 @@ int main(int argc, char ** argv) {
                       "color:#5b8dee\">"
                       "<span style=\"display:inline-flex;align-items:center;"
                         "gap:.5rem\">"
+                        "<span style=\"font-weight:600;font-size:.72rem;"
+                          "letter-spacing:.02em\">Thinking</span>"
                         "<svg xmlns=\"http://www.w3.org/2000/svg\" "
                           "width=\"16\" height=\"16\" viewBox=\"0 0 24 24\" "
                           "fill=\"none\" stroke=\"currentColor\" "
@@ -3121,7 +3128,7 @@ int main(int argc, char ** argv) {
                           "<path d=\"M19.967 17.484A4 4 0 0 1 18 18\"></path>"
                         "</svg>"
                         "<span class=\"sumlabel\" style=\"font-weight:600;"
-                          "font-size:.72rem\">reasoning…</span>"
+                          "font-size:.72rem;opacity:.75\">reasoning…</span>"
                       "</span>"
                     "</summary>'"
                     "+'<div class=\"t\" style=\"margin:0;"
@@ -3682,7 +3689,12 @@ int main(int argc, char ** argv) {
                 "const STATE_DOT={"
                   "thinking:'#b97df3',answering:'#1f6feb',"
                   "fetching:'#4fb0ff',error:'#f85149',"
-                  "complete:'#3fb950',idle:'#5b626a'"
+                  "complete:'#3fb950',idle:'#5b626a',"
+                  // 'answered' = past assistant message, no live SSE; the
+                  // chip renders an EMPTY circle (transparent fill +
+                  // subtle border) so it visually distinguishes "this is
+                  // history" from "this is the current turn".
+                  "answered:'transparent'"
                 "};"
                 "const findActionRow=(msg)=>{"
                   // The action toolbar is the parent whose DIRECT children
@@ -3729,7 +3741,7 @@ int main(int argc, char ** argv) {
                 // pulsing dot + metrics text are preserved verbatim, only
                 // the wrapper visuals change so the chip reads as a
                 // sibling of copy / edit / regenerate / branch / delete.
-                "const buildChip=()=>{"
+                "const buildChip=(initialState)=>{"
                   "const chip=document.createElement('span');"
                   "chip.style.cssText="
                     "'display:inline-flex;align-items:center;gap:.4rem;'+"
@@ -3740,10 +3752,20 @@ int main(int argc, char ** argv) {
                     "'font:.72rem -apple-system,system-ui,sans-serif;'+"
                     "'flex-shrink:0;white-space:nowrap;'+"
                     "'box-shadow:none;';"
+                  "const isAnswered=initialState==='answered';"
+                  // Past assistant messages render as an empty circle: no
+                  // background fill, just a 1px gray ring.  Active turns
+                  // render as a solid dot in the appropriate state colour.
+                  "const dotStyle=isAnswered"
+                    "?'width:.55rem;height:.55rem;border-radius:50%;'+"
+                      "'background:transparent;border:1px solid #5b626a;'+"
+                      "'flex-shrink:0;box-sizing:border-box'"
+                    ":'width:.5rem;height:.5rem;border-radius:50%;'+"
+                      "'background:#5b8dee;flex-shrink:0';"
+                  "const initialLabel=isAnswered?'answered':'starting…';"
                   "chip.innerHTML="
-                    "'<span class=\"d __easyaiDot\" style=\"width:.5rem;height:.5rem;"
-                      "border-radius:50%;background:#5b8dee;flex-shrink:0\"></span>"
-                    "<span class=\"l\">starting…</span>';"
+                    "'<span class=\"d __easyaiDot\" style=\"'+dotStyle+'\"></span>"
+                    "<span class=\"l\">'+initialLabel+'</span>';"
                   "return chip;"
                 "};"
                 // attachChip(msg): place the chip in the best available
@@ -3768,7 +3790,15 @@ int main(int argc, char ** argv) {
                     "}"
                     "return;"
                   "}"
-                  "chip=buildChip();"
+                  // The bundle renders the action toolbar (copy/edit/etc)
+                  // ONLY after a message finishes streaming.  When we see
+                  // a row at chip-creation time the message is already
+                  // past — render the chip in the passive 'answered'
+                  // state (empty circle + 'answered' label) so it doesn't
+                  // misleadingly say 'starting…'.  Active streams keep
+                  // the original 'starting…' default until the SSE handler
+                  // updates it.
+                  "chip=buildChip(row?'answered':null);"
                   "if(row){"
                     "chip.style.margin='0 0 0 .5rem';"
                     "row.appendChild(chip);"
