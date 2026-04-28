@@ -3064,14 +3064,17 @@ int main(int argc, char ** argv) {
                 "};"
 
                 // SSE → activity pill state machine.
-                // ---- per-message thinking panel (ENABLED) ------------------
-                // We render our own collapsible reasoning panel into each
-                // assistant bubble: blue-accented, brain-iconed, monospace
-                // gray body, max-height cap, click to expand.  The bundle's
-                // own native "Reasoning" panel is hidden via the observer
-                // a few blocks below to avoid duplication.  Toggle the
-                // flag below to fall back to the bundle's panel.
-                "window.__easyaiCustomThink=true;"
+                // ---- per-message thinking panel (DISABLED) -----------------
+                // We used to render our own collapsible reasoning panel; now
+                // we drive the bundle's native one (data-slot="collapsible-
+                // trigger" / "text-xs leading-relaxed ...") via DOM clicks.
+                // Open on the first reasoning_content delta of a phase,
+                // collapse on the first content delta after reasoning.  If
+                // the model alternates think → speak → think the controller
+                // re-opens / re-collapses around each transition.  Block 3
+                // (hide-bundle-reasoning) is gated on `hasOurPanel` so it
+                // becomes a no-op once the custom panel is gone.
+                "window.__easyaiCustomThink=false;"
                 "const THINK=new WeakMap();"      // msg → currently-open panel
                 "const findLastAssistantMsg=()=>{"
                   "const all=document.querySelectorAll("
@@ -3171,24 +3174,54 @@ int main(int argc, char ** argv) {
                   "THINK.set(msg,p);"
                   "return p;"
                 "};"
-                "function appendThinking(text){"
-                  "if(!window.__easyaiCustomThink)return;"
-                  "const msg=findLastAssistantMsg();"
-                  "if(!msg)return;"
-                  "const p=ensureThinkPanel(msg);"
-                  "const t=p.querySelector('.t');"
-                  "if(t){t.textContent+=text;t.scrollTop=t.scrollHeight;}"
+                // Find the bundle's native reasoning collapsible inside an
+                // assistant message.  Bundle uses Radix-style triggers with
+                // data-slot="collapsible-trigger"; multiple may exist if the
+                // model alternates phases — pick the LAST one (most recent).
+                "const findReasoningTrigger=(msg)=>{"
+                  "if(!msg)return null;"
+                  "const all=msg.querySelectorAll("
+                    "'[data-slot=\"collapsible-trigger\"]');"
+                  "return all.length?all[all.length-1]:null;"
                 "};"
-                "function closeThinking(){"
-                  "if(!window.__easyaiCustomThink)return;"
+                "const isTriggerOpen=(tr)=>{"
+                  "if(!tr)return false;"
+                  "return tr.getAttribute('data-state')==='open'"
+                    "||tr.getAttribute('aria-expanded')==='true';"
+                "};"
+                "const setReasoningOpen=(want)=>{"
                   "const msg=findLastAssistantMsg();"
-                  "if(!msg)return;"
-                  "const p=THINK.get(msg);"
-                  "if(!p)return;"
-                  "p.open=false;"
-                  "const lab=p.querySelector('.sumlabel');"
-                  "if(lab)lab.textContent='reasoning';"
-                  "THINK.delete(msg);"
+                  "if(!msg)return false;"
+                  "const tr=findReasoningTrigger(msg);"
+                  "if(!tr)return false;"
+                  "if(isTriggerOpen(tr)!==want){"
+                    // Click toggles — the bundle collapsible exposes no
+                    // imperative open() so this is the only handle.
+                    "tr.click();"
+                  "}"
+                  "return true;"
+                "};"
+                // appendThinking is fired per reasoning_content delta.  The
+                // bundle paints the text itself; our job is just to keep
+                // the panel open while the model is mid-think.  Retry until
+                // the bundle has rendered the trigger (first delta may
+                // arrive before mount).
+                "function appendThinking(text){"
+                  "if(window.__easyaiCustomThink)return;"
+                  "if(!setReasoningOpen(true)){"
+                    "let tries=0;"
+                    "const id=setInterval(()=>{"
+                      "if(setReasoningOpen(true)||++tries>20)clearInterval(id);"
+                    "},50);"
+                  "}"
+                "};"
+                // closeThinking is fired on first content delta after a
+                // reasoning phase AND on stream finish.  Collapse the
+                // bundle panel; if the model resumes thinking later, the
+                // next appendThinking re-opens it.
+                "function closeThinking(){"
+                  "if(window.__easyaiCustomThink)return;"
+                  "setReasoningOpen(false);"
                 "};"
                 "async function monitorSSE(stream){"
                   "const set=window.__easyaiSetStatus||(()=>{});"
