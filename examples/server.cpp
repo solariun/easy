@@ -3424,14 +3424,19 @@ int main(int argc, char ** argv) {
                         "stroke:var(--ea-icon, currentColor);stroke-width:2;fill:none;"
                         "stroke-linecap:round;stroke-linejoin:round;opacity:.75}"
                       ".count{color:var(--ea-fg, #8b949e);opacity:.7;font-size:.7rem}"
-                      ".pop{position:absolute;bottom:calc(100% + .35rem);"
-                        "left:0;display:none;pointer-events:auto;"
+                      // position:fixed (not absolute) so the popover floats
+                      // above the bundle's badge row, which is wrapped in
+                      // overflow:hidden and would clip an absolute child.
+                      // Coordinates are written in inline style on click
+                      // from the host's getBoundingClientRect.
+                      ".pop{position:fixed;display:none;pointer-events:auto;"
                         "min-width:14rem;max-width:22rem;"
                         "background:#0f1318;border:1px solid #2a313b;"
                         "border-radius:.5rem;padding:.45rem .5rem;"
                         "box-shadow:0 6px 24px rgba(0,0,0,.5);"
                         "color:#c9d1d9;font-size:.72rem;"
-                        "max-height:60vh;overflow-y:auto}"
+                        "max-height:60vh;overflow-y:auto;"
+                        "z-index:2147483646}"
                       ".pop.open{display:block}"
                       ".pop .row{padding:.32rem .35rem;border-radius:.3rem;"
                         "cursor:default;display:flex;flex-direction:column;"
@@ -3482,14 +3487,39 @@ int main(int argc, char ** argv) {
                   "fetch('/v1/tools').then(r=>r.json()).then(j=>{"
                     "renderList((j&&j.data)||[]);"
                   "}).catch(()=>{renderList([]);});"
+                  // Compute fixed-position coords from the host's bounding
+                  // box so the popover sits above the badge regardless of
+                  // ancestor overflow:hidden / transform / etc.
+                  "const placePop=()=>{"
+                    "const anchor=toolsHost||badge;"
+                    "if(!anchor)return;"
+                    "const r=anchor.getBoundingClientRect();"
+                    "const vw=window.innerWidth;"
+                    "const desired=Math.min(vw-16,Math.max(8,r.left));"
+                    "pop.style.left=desired+'px';"
+                    "pop.style.bottom=(window.innerHeight-r.top+6)+'px';"
+                  "};"
                   "badge.addEventListener('click',(e)=>{"
                     "e.preventDefault();e.stopPropagation();"
+                    "const willOpen=!pop.classList.contains('open');"
+                    "if(willOpen)placePop();"
                     "pop.classList.toggle('open');"
                   "});"
-                  // Close on outside click.
+                  "window.addEventListener('resize',()=>{"
+                    "if(pop.classList.contains('open'))placePop();"
+                  "});"
+                  "window.addEventListener('scroll',()=>{"
+                    "if(pop.classList.contains('open'))placePop();"
+                  "},true);"
+                  // Close on outside click.  Also handle clicks outside the
+                  // popover itself, which is now positioned in the viewport
+                  // and so isn't a descendant of toolsHost any more for
+                  // hit-testing — explicit check for both.
                   "document.addEventListener('click',(e)=>{"
                     "if(!toolsHost)return;"
-                    "if(!toolsHost.contains(e.target))pop.classList.remove('open');"
+                    "const inHost=toolsHost.contains(e.target);"
+                    "const inPop=pop.contains(e.target);"
+                    "if(!inHost&&!inPop)pop.classList.remove('open');"
                   "});"
                   "toolsRoot=root;"
                   "return root;"

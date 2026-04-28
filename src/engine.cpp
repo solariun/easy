@@ -571,6 +571,7 @@ struct Engine::Impl {
     common_chat_tool_choice tool_choice = COMMON_CHAT_TOOL_CHOICE_AUTO;
     bool         parallel_tool_calls    = false;
     int          max_tool_hops          = 8;     // default agentic safety cap
+    bool         retry_on_incomplete    = true;  // see Engine::retry_on_incomplete
 
     TokenCallback    on_token;
     ToolCallback     on_tool;
@@ -830,6 +831,7 @@ Engine & Engine::tool_choice_required()         { p_->tool_choice = COMMON_CHAT_
 Engine & Engine::tool_choice_none()             { p_->tool_choice = COMMON_CHAT_TOOL_CHOICE_NONE;     return *this; }
 Engine & Engine::parallel_tool_calls(bool e)    { p_->parallel_tool_calls = e; return *this; }
 Engine & Engine::max_tool_hops      (int  n)    { if (n > 0) p_->max_tool_hops = n; return *this; }
+Engine & Engine::retry_on_incomplete(bool on)   { p_->retry_on_incomplete = on; return *this; }
 Engine & Engine::verbose(bool v)                { p_->verbose = v; return *this; }
 
 // ---------------------------------------------------------------------------
@@ -1115,8 +1117,11 @@ std::string Engine::chat_continue() {
     if (!p_->loaded) { p_->last_error = "engine not loaded"; return {}; }
 
     const int kMaxToolHops          = p_->max_tool_hops;
-    constexpr int kMaxThoughtRetries = 2;   // budget for "thought-only" retries
-    int thought_retries = 0;
+    constexpr int kMaxThoughtRetries     = 2;   // thought-only retries
+    constexpr int kMaxIncompleteRetries  = 1;   // announce-without-action retries
+    constexpr size_t kAnnounceFloor      = 80;  // bytes — sub-tweet replies
+    int thought_retries    = 0;
+    int incomplete_retries = 0;
     std::string final_text;
 
     for (int hop = 0; hop < kMaxToolHops; ++hop) {
@@ -1186,6 +1191,42 @@ std::string Engine::chat_continue() {
 
         if (msg.tool_calls.empty()) {
             final_text = msg.content;
+
+            // Auto-retry-with-nudge on "incomplete" turn — model finished
+            // without a tool_call AND emitted only a tiny visible reply.
+            // Typical pattern: "Let me search…" / "I'll do that now"
+            // narration that promises action but never delivers.  We pop
+            // the bad assistant turn, push a corrective synthetic user
+            // message, fire on_hop_reset so streaming consumers can drop
+            // their incremental-parse state, and continue the loop.
+            // Mirrors libeasyai-cli's Client::retry_on_incomplete so every
+            // consumer of the lib gets the same recovery for free.
+            if (p_->retry_on_incomplete
+                    && incomplete_retries < kMaxIncompleteRetries
+                    && hop + 1 < kMaxToolHops
+                    && final_text.size() < kAnnounceFloor) {
+                ++incomplete_retries;
+                if (p_->verbose) std::fprintf(stderr,
+                    "[easyai] hop %d: incomplete turn (%zu B content, no tool_call) "
+                    "— discarding, nudging, retrying (%d/%d)\n",
+                    hop, final_text.size(),
+                    incomplete_retries, kMaxIncompleteRetries);
+                if (!p_->history.empty()) p_->history.pop_back();
+                p_->history.push_back({
+                    "user",
+                    "Your previous reply only announced an action without "
+                    "emitting any tool_call. Do NOT say 'let me…' / 'I'll…' "
+                    "unless the tool_call follows in the SAME turn. Either "
+                    "call the next tool you actually need, or give the user "
+                    "the final answer.",
+                    {}, {}, "", "", ""
+                });
+                llama_memory_clear(llama_get_memory(p_->ctx()), true);
+                if (p_->on_hop_reset) p_->on_hop_reset();
+                final_text.clear();
+                continue;
+            }
+
             // Highlight empty-content turns at hop end — usually means
             // the model thought, decided not to call a tool, and then
             // emitted EOS without any visible reply.  The streaming

@@ -79,6 +79,18 @@ class Engine {
     // when --allow-bash is in play, callers bump this to ~99999.
     Engine & max_tool_hops (int n);
 
+    // Auto-retry-with-nudge for "incomplete" turns — model finished without
+    // a tool_call AND emitted only a tiny visible reply (typical
+    // "Let me search…" / "I'll do that now" announce-without-action
+    // pattern).  When enabled (default ON) chat_continue discards the bad
+    // assistant turn, appends a corrective synthetic user message
+    // ("don't announce, execute"), fires on_hop_reset so streaming
+    // consumers can drop their accumulated parse state, and retries once.
+    // Mirrors libeasyai-cli's Client::retry_on_incomplete behaviour at the
+    // engine layer so every consumer (server, agent, recipes) gets the
+    // same recovery without each app rolling its own.
+    Engine & retry_on_incomplete (bool on = true);
+
     // ---------------- KV cache & model overrides ----------------------------
     // KV cache data type — accepts ggml_type names: "f32", "f16", "bf16",
     // "q8_0", "q4_0", "q4_1", "q5_0", "q5_1", "iq4_nl". Lower precision
