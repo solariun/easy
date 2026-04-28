@@ -55,6 +55,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <csignal>
 #include <cstdio>
@@ -1843,8 +1844,10 @@ static void handle_chat_stream(ServerCtx & ctx,
             // back to msg.content=raw.  Without this flag the client
             // would see an empty bubble — see the post-chat_continue
             // last-resort emit below.
-            bool   any_content_emitted   = false;
-            size_t content_bytes_emitted = 0;   // raw delta.content cumulative
+            bool        any_content_emitted   = false;
+            size_t      content_bytes_emitted = 0;   // raw delta.content cumulative
+            std::string content_text_emitted;        // accumulated visible text
+                                                      // (for announce-pattern check)
 
             auto emit_diff = [&](const common_chat_msg_diff & d) {
                 ordered_json delta = ordered_json::object();
@@ -1855,6 +1858,7 @@ static void handle_chat_stream(ServerCtx & ctx,
                     delta["content"] = d.content_delta;
                     any_content_emitted = true;
                     content_bytes_emitted += d.content_delta.size();
+                    content_text_emitted += d.content_delta;
                 }
                 // tool_call deltas: skipped — we already surface them via
                 // the easyai.tool_call / easyai.tool_result custom events.
@@ -2176,11 +2180,39 @@ static void handle_chat_stream(ServerCtx & ctx,
             // or render-placeholder).
             constexpr size_t kAnnounceFloor = 80;
             constexpr size_t kPostToolFloor = 350;
+
+            // Announce-pattern detector — same intent as Engine's
+            // retry_on_incomplete heuristic.  A *short* reply alone is
+            // not enough to call something "incomplete" (a greeting like
+            // "Hi! How can I help today?" is a valid 30-byte turn); it
+            // only counts when content is empty OR the visible text is
+            // a tool-announce narration ("Let me search…", "I'll look
+            // that up…").
+            auto looks_like_announce = [](const std::string & s) -> bool {
+                if (s.empty()) return true;
+                std::string lc;
+                lc.reserve(s.size());
+                for (char c : s) lc.push_back((char) std::tolower((unsigned char) c));
+                static const char * patterns[] = {
+                    "let me ",        "i'll ",          "i will ",
+                    "i'm going to ",  "i am going to ", "let's ",
+                    "one moment",     "hold on",        "give me a moment",
+                    "give me a sec",  "searching ",     "looking up",
+                    "looking that up","checking the",   "fetching ",
+                    "i'll check",     "i'll look",      "i'll search",
+                };
+                for (const char * p : patterns) {
+                    if (lc.find(p) != std::string::npos) return true;
+                }
+                return false;
+            };
+
             const bool incomplete =
                 tool_calls.empty()
                 && (content_bytes_emitted < kAnnounceFloor
                     || (req_state->last_is_tool
-                        && content_bytes_emitted < kPostToolFloor));
+                        && content_bytes_emitted < kPostToolFloor))
+                && looks_like_announce(content_text_emitted);
             if (incomplete) {
                 std::fprintf(stderr,
                     "[easyai-server] WARN incomplete response (content_bytes=%zu, "
@@ -3482,6 +3514,13 @@ int main(int argc, char ** argv) {
                   // positioning containing block in modern browsers.  A
                   // position:fixed child of that subtree gets clipped by
                   // the bar's bounds; pinning to body sidesteps the issue.
+                  //
+                  // CRITICAL: this script is injected into <head> BEFORE
+                  // the bundle's <body> hits the parser, so document.body
+                  // and document.head can both be null when ensureTools()
+                  // first runs.  Build the elements eagerly but defer the
+                  // attach until they exist (re-checked on click + via a
+                  // DOMContentLoaded listener).
                   "let pop=document.getElementById('__easyaiToolsPop');"
                   "if(pop)pop.remove();"
                   "pop=document.createElement('div');"
@@ -3498,7 +3537,8 @@ int main(int argc, char ** argv) {
                     "font-family:-apple-system,system-ui,sans-serif;"
                     "max-height:60vh;overflow-y:auto;"
                     "z-index:2147483646;';"
-                  "if(!document.getElementById('__easyaiToolsPopStyle')){"
+                  "const popStyleNode=(()=>{"
+                    "if(document.getElementById('__easyaiToolsPopStyle'))return null;"
                     "const ps=document.createElement('style');"
                     "ps.id='__easyaiToolsPopStyle';"
                     "ps.textContent="
@@ -3513,9 +3553,22 @@ int main(int argc, char ** argv) {
                       "#__easyaiToolsPop .desc{color:#8b949e;font-size:.68rem;"
                         "white-space:pre-wrap;line-height:1.4}"
                       "#__easyaiToolsPop .empty{color:#8b949e;padding:.4rem .35rem}';"
-                    "document.head.appendChild(ps);"
+                    "return ps;"
+                  "})();"
+                  "const ensurePopAttached=()=>{"
+                    "if(popStyleNode&&!popStyleNode.isConnected){"
+                      "const head=document.head||document.documentElement;"
+                      "if(head)head.appendChild(popStyleNode);"
+                    "}"
+                    "if(!pop.isConnected&&document.body){"
+                      "document.body.appendChild(pop);"
+                    "}"
+                  "};"
+                  "ensurePopAttached();"
+                  "if(!pop.isConnected){"
+                    "document.addEventListener('DOMContentLoaded',"
+                      "ensurePopAttached,{once:true});"
                   "}"
-                  "document.body.appendChild(pop);"
                   "const badge=root.querySelector('.badge');"
                   "const cnt=root.querySelector('.count');"
                   "const renderList=(tools)=>{"
@@ -3556,6 +3609,7 @@ int main(int argc, char ** argv) {
                   "};"
                   "badge.addEventListener('click',(e)=>{"
                     "e.preventDefault();e.stopPropagation();"
+                    "ensurePopAttached();"
                     "const willOpen=pop.style.display!=='block';"
                     "if(willOpen){placePop();pop.style.display='block';}"
                     "else{pop.style.display='none';}"
