@@ -2796,8 +2796,19 @@ int main(int argc, char ** argv) {
                       .sandbox   (args.sandbox)
                       .allow_bash(args.allow_bash);
         for (auto & t : tb.tools()) ctx->default_tools.push_back(std::move(t));
-        if (tb.bash_on()) ctx->engine.max_tool_hops(99999);
     }
+    // The webui drives long agentic flows (search → fetch → search → fetch
+    // → write_file → bash → …) and should never bump the per-turn safety
+    // cap.  Lift the engine's hop limit unconditionally; we still get
+    // bounded behaviour from the model itself ending its turn and from
+    // the per-hop retry budgets inside chat_continue.
+    ctx->engine.max_tool_hops(99999);
+    // retry-on-incomplete defaults ON in libeasyai but be explicit here:
+    // the webui relies on chat_continue's announce-pattern retry to
+    // recover from "Let me search…" / "I'll look that up…" turns the
+    // model never finishes.  Setting it here makes the contract visible
+    // in the server's startup config (see banner below).
+    ctx->engine.retry_on_incomplete(true);
 
     // -------- production knobs / auth --------------------------------------
     ctx->api_key  = args.api_key;
@@ -4428,7 +4439,8 @@ int main(int argc, char ** argv) {
         "[easyai-server] %s loaded\n"
         "                backend=%s  ctx=%d  tools=%zu  preset=%s\n"
         "                listening on http://%s:%d  (webui at /)\n"
-        "                inject_datetime=%s  cutoff=%s  verbose=%s\n",
+        "                inject_datetime=%s  cutoff=%s  verbose=%s\n"
+        "                max_tool_hops=99999  retry_on_incomplete=ON\n",
         ctx->model_id.c_str(), ctx->engine.backend_summary().c_str(),
         ctx->engine.n_ctx(), ctx->default_tools.size(),
         ctx->default_preset.name.c_str(),
