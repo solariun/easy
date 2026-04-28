@@ -4,12 +4,12 @@ This is the **hands-on** book. It assumes nothing beyond "I can compile a
 C++17 program". By the end you will know how to:
 
 * compile easyai and download a model
-* run `easyai-cli` and talk to it
+* run `easyai-local` and talk to it
 * host `easyai-server` and call it from Claude Code, OpenAI SDKs, or curl
 * embed `easyai::Engine` in your own program (local llama.cpp)
 * embed `easyai::Client` in your own program (remote OpenAI-compatible
   server, with local tools)
-* drive a remote server end-to-end with `easyai-cli-remote`, including
+* drive a remote server end-to-end with `easyai-cli`, including
   a planning tool and live system-observability tools
 * write a custom tool, with typed parameters
 * tune the sampler with presets and runtime overrides
@@ -24,7 +24,7 @@ C++17 program". By the end you will know how to:
 | Part | Chapter | What you get |
 |------|---------|--------------|
 | **1** | Getting set up         | Prereqs, repo layout, building, GPUs, models |
-| **2** | Using the binaries     | `easyai-cli`, `easyai-server`, `easyai-cli-remote`, `easyai-agent`, `easyai-chat`, `easyai-recipes` |
+| **2** | Using the binaries     | `easyai-local`, `easyai-server`, `easyai-cli`, `easyai-agent`, `easyai-chat`, `easyai-recipes` |
 | **3** | Embedding `libeasyai`  | `Agent` (3-line hello), `Backend` (local↔remote), `Engine` API top-to-bottom, callbacks, presets, tools, escape hatches |
 | **4** | Embedding `libeasyai-cli` | `Client` API top-to-bottom — your code drives a remote model with local tools |
 | **5** | Authoring custom tools | Builder API, schemas, sandboxes, error handling, the `Plan` tool, `system_*` tools cookbook |
@@ -119,7 +119,8 @@ cmake --build build -j
 Outputs land in `build/`:
 
 ```
-build/easyai-cli      # REPL with built-in tools
+build/easyai-local    # local-only REPL (loads a GGUF in-process)
+build/easyai-cli      # agentic REPL talking to a remote OpenAI-compat endpoint
 build/easyai-server   # HTTP server + webui
 build/easyai-agent    # demo agent (every tool + a custom one)
 build/easyai-chat     # bare REPL (no tools)
@@ -148,15 +149,15 @@ For real work upgrade to Qwen2.5-7B-Instruct or Llama-3.1-8B-Instruct.
 ### 2.1 Hello, REPL
 
 ```bash
-./build/easyai-cli -m models/qwen2.5-1.5b-instruct-q4_k_m.gguf
+./build/easyai-local -m models/qwen2.5-1.5b-instruct-q4_k_m.gguf
 ```
 
 You'll see something like:
 
 ```
-[easyai-cli] loaded models/qwen2.5-1.5b-instruct-q4_k_m.gguf
-             backend=MTL0  ctx=4096  tools=7  preset=balanced
-             type '/help' for commands, '/quit' to exit
+[easyai-local] loaded models/qwen2.5-1.5b-instruct-q4_k_m.gguf
+               backend=MTL0  ctx=4096  tools=7  preset=balanced
+               type '/help' for commands, '/quit' to exit
 > what's 2+2
 2 + 2 equals 4.
 >
@@ -1095,7 +1096,7 @@ cli.metrics(prom_text);                   // GET /metrics (Prometheus)
 cli.set_preset("creative");               // POST /v1/preset
 ```
 
-The `easyai-cli-remote` binary (`examples/cli_remote.cpp`) is a
+The `easyai-cli` binary (`examples/cli.cpp`) is a
 ready-to-run reference for all of the above — REPL or one-shot, every
 sampling knob exposed as a flag, seven management subcommands
 (`--list-models`, `--list-tools`, `--list-remote-tools`, `--health`,
@@ -1289,38 +1290,38 @@ cli.metrics(prom);                         // GET /metrics (Prometheus text)
 cli.set_preset("creative");                // POST /v1/preset
 ```
 
-### 4.8 The `easyai-cli-remote` binary as a reference
+### 4.8 The `easyai-cli` binary as a reference
 
-Everything above is exposed as flags on `examples/cli_remote.cpp`.
+Everything above is exposed as flags on `examples/cli.cpp`.
 Read its source to see one possible "wire it all up" pattern; lift
 chunks into your own app verbatim.
 
 ```bash
 # REPL with the default tool set (datetime, plan, web_search,
 # web_fetch, system_*); EASYAI_URL / EASYAI_API_KEY env vars work too.
-easyai-cli-remote --url http://ai.local:8080
+easyai-cli --url http://ai.local:8080
 
 # One-shot scripted call with a custom tool whitelist:
-easyai-cli-remote --url https://api.openai.com \
+easyai-cli --url https://api.openai.com \
   --api-key $OPENAI_API_KEY --model gpt-4o-mini \
   --tools datetime,plan,web_search,web_fetch \
   -p "Investigate today's most-cited mamba arxiv papers; produce a 5-bullet summary."
 
 # Pin sampling + add stop sequences:
-easyai-cli-remote --url http://ai.local:8080 \
+easyai-cli --url http://ai.local:8080 \
   --temperature 0.0 --top-p 0.9 --seed 42 --stop "USER:" --stop "Q:" \
   -p "Translate the next sentence to PT-BR: ..."
 
 # Non-standard reasoning_effort field via --extra-json:
-easyai-cli-remote --url https://api.openai.com --api-key $K --model o1-preview \
+easyai-cli --url https://api.openai.com --api-key $K --model o1-preview \
   --extra-json '{"reasoning_effort":"high"}' \
   -p "Plan the Mars-mission trajectory."
 
 # List local tools and exit (what the model will be told about):
-easyai-cli-remote --url http://x --list-tools
+easyai-cli --url http://x --list-tools
 
 # List server-side tools (easyai-server-only extension):
-easyai-cli-remote --url http://ai.local:8080 --list-remote-tools
+easyai-cli --url http://ai.local:8080 --list-remote-tools
 ```
 
 REPL specials inside the interactive mode:
@@ -1493,7 +1494,7 @@ plan.add("draft 5-bullet digest");
 
 ### 5.7 Cookbook — system observability tools
 
-`examples/cli_remote.cpp` ships four inline `system_*` tools that
+`examples/cli.cpp` ships four inline `system_*` tools that
 read `/proc/*` and report back.  The whole pattern is:
 
 1. Read a `/proc` file with `ifstream`.
@@ -1702,51 +1703,56 @@ verbose mode as `[easyai] hop 7: …`.
 
 ## Part 9 — recipes (cookbook)
 
-### 9.0 `easyai-cli` against any OpenAI-compatible endpoint
+### 9.0 Local vs. remote — pick the right binary
 
-> Since v0.1.0, `easyai-cli`'s remote backend uses `libeasyai-cli`
-> internally — same agentic loop, same HTTPS support, same SSE
-> handling as `easyai-cli-remote`.  Three flag families that come
-> from the lib:
->
-> | Flag                         | Effect                                                                |
-> |------------------------------|-----------------------------------------------------------------------|
-> | `--insecure-tls`             | Skip peer certificate verification (DEV ONLY, https only).            |
-> | `--ca-cert <path>`           | Trust a custom CA bundle (PEM) for `https://` endpoints.              |
-> | `--with-tools`               | Register the libeasyai builtin tools on the Client and dispatch them locally — turns `--url` into a remote agentic CLI.  Off by default (vanilla OpenAI streamer behaviour). |
+Since the rename, **two independent binaries** cover the two use cases.
+No more dual-mode flag juggling on a single binary.
 
-`easyai-cli` runs a REPL in two modes that share the same UI: local model
-(`-m model.gguf`) or remote server (`--url <api-base>`). Same preset
-commands, same `/help`, same `--no-think` switch.
+| Binary         | What it loads                  | Library link    |
+|----------------|--------------------------------|-----------------|
+| `easyai-local` | a local GGUF (no HTTP at all)  | `libeasyai`     |
+| `easyai-cli`   | a remote `/v1/chat/completions`| `libeasyai-cli` |
+
+`easyai-cli` (remote) supports the standard TLS + agentic flags:
+
+| Flag             | Effect                                                                |
+|------------------|-----------------------------------------------------------------------|
+| `--insecure-tls` | Skip peer certificate verification (DEV ONLY, https only).            |
+| `--ca-cert <path>` | Trust a custom CA bundle (PEM) for `https://` endpoints.            |
+
+Both binaries share the same preset commands, the same `/help`, and the
+same streaming-aware `<think>` stripper (`--no-reasoning` on `easyai-cli`,
+`--no-think` on `easyai-local`).
 
 ```bash
 # point at easyai-server running on the LAN
-./build/easyai-cli --url http://10.0.0.5:8080/v1
+./build/easyai-cli --url http://10.0.0.5:8080
 
-# point at openai.com (env vars EASYAI_API_KEY or OPENAI_API_KEY also work)
+# point at openai.com (env vars EASYAI_API_KEY also work)
 ./build/easyai-cli --url https://api.openai.com/v1 \
                    --api-key sk-... \
-                   --remote-model gpt-4o-mini
+                   --model gpt-4o-mini
 
 # point at a llama-server / vLLM / ollama endpoint — anything that speaks /v1
-./build/easyai-cli --url http://127.0.0.1:11434/v1 --remote-model llama3.1:8b
+./build/easyai-cli --url http://127.0.0.1:11434/v1 --model llama3.1:8b
 ```
 
 One-shot mode for scripting:
 
 ```bash
-# Grab a one-line answer; banners go to stderr so capturing stdout is clean.
-answer=$(./build/easyai-cli -m model.gguf -p "summarise: $(cat file.txt)")
+# Local one-liner; banners go to stderr so capturing stdout is clean.
+answer=$(./build/easyai-local -m model.gguf -p "summarise: $(cat file.txt)")
 
-# In remote mode with thinking suppressed:
-./build/easyai-cli --url http://localhost:8080/v1 --no-think \
+# Remote with reasoning suppressed:
+./build/easyai-cli --url http://localhost:8080 --no-reasoning \
     -p "explain BGP route reflectors in two sentences" \
     > brief.md
 ```
 
-`--no-think` strips `<think>…</think>` (and `<thinking>…</thinking>`) blocks
-from output. The filter is streaming-aware and works even when the open or
-close tag is split across two model-emitted token chunks.
+`--no-think` (local) and `--no-reasoning` (remote) strip `<think>…</think>`
+(and `<thinking>…</thinking>`) blocks from output. The filter is
+streaming-aware and works even when the open or close tag is split across
+two model-emitted token chunks.
 
 ### 9.1 Web search
 
@@ -1766,10 +1772,10 @@ Pass `--ngl 0` (CLI/server) or `engine.gpu_layers(0)` (lib).
 ### 9.3 Force-disable a built-in tool
 
 Just don't add it. There is no global "remove" — easyai has no global
-state. To run `easyai-cli` without any tools at all:
+state. To run `easyai-local` without any tools at all:
 
 ```bash
-./build/easyai-cli -m … --no-tools
+./build/easyai-local -m … --no-tools
 ```
 
 For the server: same flag, `--no-tools`.
@@ -2027,7 +2033,7 @@ If you want to go deeper:
 * `src/plan.cpp` — multi-action plan tool with `add/start/done/list`.
 * `examples/server.cpp` — the per-request flow is annotated; great
   starting point for a custom HTTP layer.
-* `examples/cli_remote.cpp` — REPL + management subcommands +
+* `examples/cli.cpp` — REPL + management subcommands +
   inline `system_*` tools, doubles as the cookbook for adding your
   own tool to a `Client`-based agent.
 * `scripts/install_easyai_server.sh` — production deployment as a

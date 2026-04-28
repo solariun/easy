@@ -6,8 +6,8 @@
 #   1. Installs build deps (CMake/Ninja/git/pkg-config + libcurl) and the
 #      backend SDK that matches your hardware (Vulkan / CUDA / ROCm-HIP).
 #   2. Clones llama.cpp + easyai (or uses existing sibling dirs).
-#   3. Builds easyai (libeasyai + easyai-cli + easyai-server +
-#      easyai-agent + easyai-recipes + easyai-chat) with the selected
+#   3. Builds easyai (libeasyai + easyai-local + easyai-cli + easyai-server
+#      + easyai-agent + easyai-recipes + easyai-chat) with the selected
 #      GPU backend.
 #   4. Installs the binaries to $prefix/bin.
 #   5. Creates a system user, /var/lib/easyai/{models,workspace}, an
@@ -454,6 +454,7 @@ if [[ $do_build -eq 1 ]]; then
     log "installing binaries to $install_prefix/bin"
     sudo install -Dm755 "$easyai_dir/build/easyai-server"  "$install_prefix/bin/easyai-server"
     sudo install -Dm755 "$easyai_dir/build/easyai-cli"     "$install_prefix/bin/easyai-cli"
+    sudo install -Dm755 "$easyai_dir/build/easyai-local"   "$install_prefix/bin/easyai-local"   || true
     sudo install -Dm755 "$easyai_dir/build/easyai-agent"   "$install_prefix/bin/easyai-agent"   || true
     sudo install -Dm755 "$easyai_dir/build/easyai-chat"    "$install_prefix/bin/easyai-chat"    || true
     # Tutorial agent (today_is + weather).  Only built when libcurl is

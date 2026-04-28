@@ -13,8 +13,8 @@ libraries** (`find_package(easyai)` exports `easyai::engine` and
 |-----------------------|---------|-----------------------------------------------------------------------------------------------------------------------------------------|
 | `libeasyai`           | library | local llama.cpp engine — `Engine`, `Tool`, `Plan`, built-in tools (datetime, web_search/fetch, fs_*), presets.  Linked via `easyai::engine`.    |
 | `libeasyai-cli`       | library | OpenAI-protocol client — `Client` mirrors `Engine`'s fluent API but the model runs remote and tools execute locally.  Linked via `easyai::cli`. |
-| `easyai-cli`          | binary  | Drop-in `llama-cli` replacement, also speaks OpenAI-compat HTTP via `--url`                                                            |
-| `easyai-cli-remote`   | binary  | Pure agentic CLI on top of `libeasyai-cli` — no local model.  REPL or `-p`, full sampling control, plan tool, server-management subcommands. |
+| `easyai-local`        | binary  | Local-only REPL: loads a GGUF in-process via `easyai::Engine`. Drop-in `llama-cli` replacement.                                       |
+| `easyai-cli`          | binary  | Agentic OpenAI-protocol client built on `libeasyai-cli` — no local model.  REPL or `-p`, full sampling control, plan tool, server-management subcommands. |
 | `easyai-server`       | binary  | Drop-in `llama-server` replacement: embeds llama-server's SvelteKit webui, no MCP                                                      |
 | `easyai-agent`        | binary  | Demo agent showing every built-in tool                                                                                                  |
 | `easyai-chat`         | binary  | Bare REPL                                                                                                                               |
@@ -60,7 +60,7 @@ easyai/
 │                   ui,text,log,cli,backend,agent,easyai}.hpp                  # public API
 ├── src/{engine,tool,builtin_tools,presets,plan,client,
 │        ui,log,cli,cli_client,backend,agent}.cpp                              # impl
-├── examples/{cli,cli_remote,server,agent,chat,recipes}.cpp                    # binaries
+├── examples/{local,cli,server,agent,chat,recipes}.cpp                         # binaries
 ├── webui/{index.html,bundle.js,bundle.css,loading.html,AI-brain.svg}          # llama-server fork
 ├── cmake/{xxd.cmake,easyaiConfig.cmake.in}                                    # build helpers + find_package
 ├── scripts/install_easyai_server.sh                                           # Linux installer
@@ -70,7 +70,7 @@ easyai/
 
 Build: `cmake -S . -B build && cmake --build build -j` (Metal auto on macOS;
 `-DGGML_VULKAN=ON` / `-DGGML_CUDA=ON` / `-DGGML_HIP=ON` for other GPUs).
-Selective targets: `cmake --build build --target easyai|easyai_cli|easyai-server|easyai-cli-remote|...`.
+Selective targets: `cmake --build build --target easyai|easyai_cli|easyai-server|easyai-cli|easyai-local|...`.
 
 Install: `cmake --install build --prefix /usr/local` lays out
 `<prefix>/lib/libeasyai{,-cli}.so.0.1.0`,
@@ -123,7 +123,7 @@ by creating IMPORTED targets at find_package time.
 - Auto-retry-with-nudge on `timings.incomplete=true`: discards the
   bad assistant turn, appends a corrective user message
   ("don't announce, execute"), re-issues once.  Default ON in
-  cli-remote; opt-out with `--no-retry-on-incomplete`.
+  `easyai-cli`; opt-out with `--no-retry-on-incomplete`.
 - Full sampling/penalty surface: `temperature`, `top_p`, `top_k`, `min_p`,
   `repeat_penalty`, `frequency_penalty`, `presence_penalty`, `seed`,
   `max_tokens`, `stop(vector)`, `extra_body_json` (free-form JSON merged
@@ -223,7 +223,7 @@ third-party agent can build the same CLI experience in a handful of lines.
   `<think>`/`</think>` tags so they don't visually glue to the stream),
   `prompt_wants_file_write` heuristic for the missing-fs_write_file tip.
 - `easyai::log::set_file(FILE*) / write(fmt, …)` — single-sink tee to
-  stderr + an optional `--log-file` FILE.  cli-remote's vlog is now a
+  stderr + an optional `--log-file` FILE.  `easyai-cli`'s vlog is now a
   4-line wrapper around this; libeasyai-cli ALSO writes raw SSE bytes
   to the SAME FILE via `Client::log_file(fp)` so timestamps interleave.
 - `easyai::cli::Toolbelt` — fluent builder.  `.sandbox(dir).allow_bash()
@@ -338,7 +338,7 @@ e3cf422  libeasyai-cli + cli-remote: RAW transaction log file for offline analys
 
 v0.1.0 (tag) — first formal release, 2026-04-26.
 
-dc74102  easyai-cli-remote phase 3 + full sampling control on Client
+dc74102  easyai-cli phase 3 + full sampling control on Client
 8e6c4e4  libeasyai-cli phase 2: full Client implementation (HTTP/SSE + agentic)
 5bf32c0  Lib-ise easyai + scaffold libeasyai-cli (phase 1 of 3)
 8a1ca33  Webui: live ctx during stream, override favicon, tools badge, lock UX

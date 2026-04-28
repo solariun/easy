@@ -179,18 +179,13 @@ if (EASYAI_BUILD_EXAMPLES)
         target_link_libraries(easyai-recipes PRIVATE easyai CURL::libcurl)
     endif()
 
-    add_executable(easyai-cli examples/cli.cpp)
-    # Links libeasyai-cli (which transitively pulls in libeasyai) so the
-    # RemoteBackend can drive a remote OpenAI-compatible endpoint via
-    # easyai::Client (HTTP + HTTPS via cpp-httplib + OpenSSL).  libcurl
-    # is now only needed for the LOCAL backend's web tools.
-    target_link_libraries(easyai-cli PRIVATE easyai_cli)
-    target_include_directories(easyai-cli PRIVATE
+    # easyai-local — local-only REPL: loads a GGUF model in-process via
+    # easyai::Engine.  No HTTP transport here.  For talking to a remote
+    # OpenAI-compatible endpoint, see easyai-cli below.
+    add_executable(easyai-local examples/local.cpp)
+    target_link_libraries(easyai-local PRIVATE easyai)
+    target_include_directories(easyai-local PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/../llama.cpp/vendor)
-    if (EASYAI_WITH_CURL AND CURL_FOUND)
-        target_link_libraries(easyai-cli PRIVATE CURL::libcurl)
-        target_compile_definitions(easyai-cli PRIVATE EASYAI_HAVE_CURL=1)
-    endif()
 
     # ----- embed the llama-server-derived webui (xxd-style binary embed) ---
     set(EASYAI_WEBUI_HEADERS "")
@@ -233,11 +228,13 @@ if (EASYAI_BUILD_EXAMPLES)
         target_compile_definitions(easyai-server PRIVATE EASYAI_BUILD_WEBUI=1)
     endif()
 
-    # easyai-cli-remote — agentic OpenAI-protocol client demo, talks to any
+    # easyai-cli — agentic OpenAI-protocol client.  Talks to any
     # /v1/chat/completions endpoint (our easyai-server, llama-server, etc.).
-    add_executable(easyai-cli-remote examples/cli_remote.cpp)
-    target_link_libraries(easyai-cli-remote PRIVATE easyai_cli)
-    target_include_directories(easyai-cli-remote PRIVATE
+    # No local model — pair with easyai-local when you want to run a GGUF
+    # in-process instead.
+    add_executable(easyai-cli examples/cli.cpp)
+    target_link_libraries(easyai-cli PRIVATE easyai_cli)
+    target_include_directories(easyai-cli PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/../llama.cpp/vendor)
 endif()
 
@@ -269,13 +266,13 @@ if (EASYAI_INSTALL)
 
     # The example binaries are installed too when EASYAI_BUILD_EXAMPLES
     # is on (default).  This is what makes `cmake --install` give you a
-    # ready-to-run easyai-server / easyai-cli / easyai-cli-remote on the
-    # PATH instead of leaving them under build/.  Skip this block when
+    # ready-to-run easyai-server / easyai-cli / easyai-local on the PATH
+    # instead of leaving them under build/.  Skip this block when
     # consumers only want the libs.
     if (EASYAI_BUILD_EXAMPLES)
         set(_easyai_install_bins
+            easyai-local
             easyai-cli
-            easyai-cli-remote
             easyai-server
             easyai-chat
             easyai-agent)

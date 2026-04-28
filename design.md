@@ -113,9 +113,9 @@ Tier 4: raw llama.cpp handles, raw HTTP, custom Tool handlers
   not a 5-step dance involving `Toolbelt`, `add_tool` calls, and
   `max_tool_hops` plumbing.
 - **Tier 3** is where real applications live.  The example
-  binaries (`easyai-cli-remote`, `easyai-server`) sit here, not
-  Tier 1, because they need fine-grained control over the agent
-  loop, callbacks, and HTTP stream.
+  binaries (`easyai-local`, `easyai-cli`, `easyai-server`) sit
+  here, not Tier 1, because they need fine-grained control over
+  the agent loop, callbacks, and HTTP stream.
 - **Tier 4** is the safety valve.  `agent.backend()` returns the
   underlying `Backend &`; `engine.raw_handle()` returns the
   llama.cpp pointer for anyone who needs to call a `llama_*`

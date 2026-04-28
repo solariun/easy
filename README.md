@@ -19,8 +19,8 @@ against, plus six ready-to-run binaries:
 
 | Binary               | What it gives you                                                                                                                                  |
 |----------------------|----------------------------------------------------------------------------------------------------------------------------------------------------|
-| `easyai-cli`         | Drop-in `llama-cli` replacement: local **or** remote OpenAI-compatible endpoint (HTTPS via OpenSSL), one-shot scripting (`-p`), tools, presets, optional `<think>` strip. `--with-tools` opts in to local tool dispatch over a remote model (agentic). `--insecure-tls` / `--ca-cert` for dev/internal CAs. |
-| `easyai-cli-remote`  | Pure agentic CLI built on `libeasyai-cli` — no local model required.  REPL or `-p`, full sampling control (`--temperature`, `--top-p`, `--top-k`, `--min-p`, `--repeat-penalty`, `--frequency-penalty`, `--presence-penalty`, `--seed`, `--max-tokens`, `--stop`), plan tool, server-management subcommands (`--list-models`, `--list-tools`, `--health`, `--props`, `--metrics`, `--set-preset`). |
+| `easyai-local`       | Local-only REPL: loads a GGUF in-process via `easyai::Engine`. Drop-in `llama-cli` replacement — one-shot scripting (`-p`), tools, presets, optional `<think>` strip, sandboxed `fs_*` tools, opt-in `bash` tool. |
+| `easyai-cli`         | Agentic OpenAI-protocol client built on `libeasyai-cli` — no local model.  REPL or `-p`, full sampling control (`--temperature`, `--top-p`, `--top-k`, `--min-p`, `--repeat-penalty`, `--frequency-penalty`, `--presence-penalty`, `--seed`, `--max-tokens`, `--stop`), plan tool, server-management subcommands (`--list-models`, `--list-tools`, `--health`, `--props`, `--metrics`, `--set-preset`).  HTTPS via OpenSSL; `--insecure-tls` / `--ca-cert` for dev/internal CAs. |
 | `easyai-server`      | Drop-in `llama-server` replacement: OpenAI-compat HTTP **with full SSE streaming**, embedded SvelteKit webui, Bearer auth, Prometheus `/metrics`, KV-cache controls, flash-attn, mlock. |
 | `easyai-agent`       | A demo agent showing every built-in tool plus an inline custom tool.                                                                                |
 | `easyai-recipes`     | Tutorial agent paired with `manual.md` — implements `today_is` and `weather` (HTTP-calling) from scratch.                                          |
@@ -173,7 +173,7 @@ engine.add_tool(
 
 #### Tool gating across all three CLIs
 
-All three example CLIs (`easyai-cli`, `easyai-cli-remote`, `easyai-server`)
+All three example CLIs (`easyai-local`, `easyai-cli`, `easyai-server`)
 follow the same gating model. Default is **safe**: no filesystem access,
 no shell.
 
@@ -183,14 +183,14 @@ no shell.
 | `--sandbox <dir>`| `fs_read_file / fs_write_file / fs_list_dir / fs_glob / fs_grep`, ALL scoped to `<dir>`. The model sees a virtual `/`-rooted filesystem; real path is hidden. |
 | `--allow-bash`   | `bash` (run `/bin/sh -c`). cwd = `--sandbox <dir>` if given, otherwise the binary's CWD. NOT a hardened sandbox — runs with your user privileges. Also bumps the agentic-loop `max_tool_hops` to 99999 (bash flows naturally span many turns). |
 
-#### `easyai-cli`
+#### `easyai-local`
 
 ```
-easyai-cli -m model.gguf [-s system.txt] [--ngl 99] [--no-tools]
-            [--sandbox DIR] [--allow-bash]
+easyai-local -m model.gguf [-s system.txt] [--ngl 99] [--no-tools]
+              [--sandbox DIR] [--allow-bash]
 ```
 
-Drop-in REPL.  Type any line to talk; type any of these to control the engine:
+Local-only REPL.  Type any line to talk; type any of these to control the engine:
 
 | Command                | Effect                                                                |
 |------------------------|-----------------------------------------------------------------------|
@@ -284,17 +284,17 @@ cd easyai
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release   # see "Build for your hardware" below
 cmake --build build -j
 
-# REPL with everything wired up — local model
-./build/easyai-cli -m models/qwen2.5-1.5b-instruct-q4_k_m.gguf
+# Local REPL with everything wired up
+./build/easyai-local -m models/qwen2.5-1.5b-instruct-q4_k_m.gguf
 
-# REPL talking to a remote OpenAI-compatible endpoint instead of loading a model
-./build/easyai-cli --url http://127.0.0.1:8080/v1
+# Agentic REPL talking to a remote OpenAI-compatible endpoint
+./build/easyai-cli --url http://127.0.0.1:8080
 ./build/easyai-cli --url https://api.openai.com/v1 \
-                   --api-key $OPENAI_API_KEY --remote-model gpt-4o-mini
+                   --api-key $OPENAI_API_KEY --model gpt-4o-mini
 
 # One-shot mode (great in scripts — banners on stderr, model text on stdout)
-./build/easyai-cli -m models/qwen2.5-1.5b-instruct-q4_k_m.gguf -p "What is 2+2?"
-result=$(./build/easyai-cli --url http://127.0.0.1:8080/v1 --no-think -p "summarise this commit")
+./build/easyai-local -m models/qwen2.5-1.5b-instruct-q4_k_m.gguf -p "What is 2+2?"
+result=$(./build/easyai-cli --url http://127.0.0.1:8080 --no-reasoning -p "summarise this commit")
 
 # Open http://127.0.0.1:8080 in a browser
 ./build/easyai-server -m models/qwen2.5-1.5b-instruct-q4_k_m.gguf
@@ -327,7 +327,10 @@ cmake --build build -j --target easyai
 cmake --build build -j --target easyai_cli
 
 # Just the agentic remote CLI (links libeasyai-cli):
-cmake --build build -j --target easyai-cli-remote
+cmake --build build -j --target easyai-cli
+
+# Just the local-only REPL (links libeasyai):
+cmake --build build -j --target easyai-local
 
 # Just the server:
 cmake --build build -j --target easyai-server
