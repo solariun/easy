@@ -3489,19 +3489,22 @@ int main(int argc, char ** argv) {
                   "host.style.zIndex='';"
                   "host.style.pointerEvents='';"
                 "};"
-                "const findModelBadge=(form)=>{"
-                  "const cand=form.querySelectorAll("
-                    "'[class*=badge i],[data-testid*=model i],"
-                    "[aria-label*=model i]'"
-                  ");"
-                  "for(const el of cand){"
-                    "if(el===toneHost||el===toolsHost)continue;"
-                    "if(toneHost&&toneHost.contains(el))continue;"
-                    "if(toolsHost&&toolsHost.contains(el))continue;"
-                    "const t=(el.innerText||el.textContent||'').trim();"
-                    "if(t&&t.length<40)return el;"
-                  "}"
-                  "return null;"
+                // Find the bundle's prompt-form badge anchor:
+                //   <div style="container-type: inline-size">
+                //     <div class="flex min-w-0 flex-wrap items-center gap-1
+                //                 min-w-0 overflow-hidden">… model badge …</div>
+                //     <!-- tone + tools go here, as siblings AFTER the row -->
+                //   </div>
+                // We don't touch the existing flex row — we attach our hosts
+                // as siblings inside the same container, keeping the bundle's
+                // layout intact and following its container-query reflow.
+                "const findBadgeAnchor=(form)=>{"
+                  "const cont=form.querySelector('[style*=\"container-type\"]');"
+                  "if(!cont)return null;"
+                  "const row=cont.querySelector('.flex-wrap.items-center')"
+                    "||cont.querySelector('[class~=\"flex-wrap\"][class~=\"items-center\"]')"
+                    "||cont.querySelector('.flex-wrap');"
+                  "return {cont,row};"
                 "};"
                 "const reposition=()=>{"
                   "if(!toneHost||!toolsHost)return;"
@@ -3512,36 +3515,37 @@ int main(int argc, char ** argv) {
                     "if(getComputedStyle(form).position==='static'){"
                       "form.style.position='relative';"
                     "}"
-                    // Tone + tools sit next to the model badge in the same
-                    // row.  Falling back to the form keeps them visible
-                    // even when the badge can't be located.
-                    "const modelBadge=findModelBadge(form);"
-                    "const badgeRow=(modelBadge&&modelBadge.parentElement)||form;"
-                    "if(toneHost.parentElement!==badgeRow||toneHost.dataset.eaiAttach!=='flow'){"
+                    "const a=findBadgeAnchor(form);"
+                    "const parent=(a&&a.cont)||form;"
+                    "const after=a&&a.row;"
+                    "const placeAfter=(host,prev)=>{"
+                      "const target=prev&&prev.parentElement===parent?prev:after;"
+                      "if(target&&target.nextSibling){"
+                        "parent.insertBefore(host,target.nextSibling);"
+                      "}else{"
+                        "parent.appendChild(host);"
+                      "}"
+                    "};"
+                    // Tone — first sibling after the bundle's flex-wrap row.
+                    "if(toneHost.parentElement!==parent||toneHost.dataset.eaiAttach!=='flow'){"
                       "detachFixed(toneHost);"
                       "toneHost.style.cssText="
                         "'all:initial;display:inline-flex;align-items:center;"
-                        "margin:0 .15rem;vertical-align:middle;"
+                        "margin:.35rem .25rem 0 0;vertical-align:middle;"
                         "font:14px/1 -apple-system,system-ui,sans-serif;';"
                       "toneHost.dataset.eaiAttach='flow';"
-                      "if(modelBadge&&modelBadge.nextSibling){"
-                        "badgeRow.insertBefore(toneHost,modelBadge.nextSibling);"
-                      "}else{"
-                        "badgeRow.appendChild(toneHost);"
-                      "}"
+                      "placeAfter(toneHost,after);"
                     "}"
-                    "if(toolsHost.parentElement!==badgeRow||toolsHost.dataset.eaiAttach!=='flow'){"
+                    // Tools — directly after tone, sharing the same row when
+                    // there's room (inline-flex), wrapping otherwise.
+                    "if(toolsHost.parentElement!==parent||toolsHost.dataset.eaiAttach!=='flow'){"
                       "detachFixed(toolsHost);"
                       "toolsHost.style.cssText="
                         "'all:initial;display:inline-flex;align-items:center;"
-                        "margin:0 .15rem;vertical-align:middle;"
+                        "margin:.35rem .25rem 0 0;vertical-align:middle;"
                         "font:14px/1 -apple-system,system-ui,sans-serif;';"
                       "toolsHost.dataset.eaiAttach='flow';"
-                      "if(toneHost.nextSibling){"
-                        "badgeRow.insertBefore(toolsHost,toneHost.nextSibling);"
-                      "}else{"
-                        "badgeRow.appendChild(toolsHost);"
-                      "}"
+                      "placeAfter(toolsHost,toneHost);"
                     "}"
                   "}else{"
                     // Fallback while hydrating: viewport-anchored bottom strip.
