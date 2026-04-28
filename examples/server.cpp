@@ -1868,6 +1868,39 @@ static void handle_chat_stream(ServerCtx & ctx,
                 emit_data(safe_dump(env));
             };
 
+            // Defensive: re-route any <think>...</think> spans the partial
+            // parser left inside msg.content into msg.reasoning_content.
+            // Triggered when the model emits content BEFORE a reasoning
+            // block (recap-thoughts pattern).  The auto-extract logic in
+            // common_chat_parse only fires for a leading reasoning block,
+            // so secondary <think> blocks leak into the bubble unless we
+            // catch them here.  Keeps both content and reasoning monotonic
+            // so compute_diffs doesn't throw on \"content shrunk\".
+            auto extract_think_into_reasoning = [](common_chat_msg & m) {
+                static const std::string kOpen  = "<think>";
+                static const std::string kClose = "</think>";
+                auto & c = m.content;
+                auto & r = m.reasoning_content;
+                size_t scan = 0;
+                while (scan < c.size()) {
+                    size_t open = c.find(kOpen, scan);
+                    if (open == std::string::npos) break;
+                    size_t close = c.find(kClose, open + kOpen.size());
+                    if (close == std::string::npos) {
+                        // Open without close yet — move tail to reasoning
+                        // so it doesn't appear in content while streaming.
+                        // Next pass picks up the close marker normally.
+                        r.append(c, open + kOpen.size(), std::string::npos);
+                        c.erase(open);
+                        break;
+                    }
+                    r.append(c, open + kOpen.size(),
+                             close - open - kOpen.size());
+                    c.erase(open, close + kClose.size() - open);
+                    scan = open;
+                }
+            };
+
             ctx.engine.on_token([&](const std::string & piece) {
                 accumulated += piece;
                 common_chat_msg new_msg;
@@ -1880,6 +1913,7 @@ static void handle_chat_stream(ServerCtx & ctx,
                     return;
                 }
                 new_msg.role = "assistant";
+                extract_think_into_reasoning(new_msg);
                 std::vector<common_chat_msg_diff> diffs;
                 try {
                     diffs = common_chat_msg_diff::compute_diffs(prev_msg, new_msg);
@@ -2019,6 +2053,7 @@ static void handle_chat_stream(ServerCtx & ctx,
                                                    /*is_partial=*/false,
                                                    parser_params);
                 final_msg.role = "assistant";
+                extract_think_into_reasoning(final_msg);
                 auto diffs = common_chat_msg_diff::compute_diffs(prev_msg, final_msg);
                 for (const auto & d : diffs) emit_diff(d);
             } catch (...) { /* best-effort drain */ }
