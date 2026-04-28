@@ -246,6 +246,38 @@ static size_t curl_write_cb(void * buf, size_t sz, size_t n, void * ud) {
     return incoming;
 }
 
+// Microsoft Edge on Windows 11 — current-stable User-Agent string.  Many
+// sites (Cloudflare-fronted, news outlets, search engines) gate or
+// degrade content for "easyai/0.1" and similar non-browser UAs; this
+// pretends to be a vanilla Edge install so the bot heuristics treat us
+// like an interactive user.  Bumped manually as Edge releases — kept
+// in one place so web_search and web_fetch share the same persona.
+static const char * const kEdgeUserAgent =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0";
+
+// Companion headers Edge always sends.  Appended to whatever header list
+// the caller is already building so we don't clobber Content-Type for
+// the search POST.
+static curl_slist * append_edge_browser_headers(curl_slist * headers) {
+    headers = curl_slist_append(headers,
+        "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "image/avif,image/webp,image/apng,*/*;q=0.8,"
+        "application/signed-exchange;v=b3;q=0.7");
+    headers = curl_slist_append(headers, "Accept-Language: en-US,en;q=0.9");
+    headers = curl_slist_append(headers,
+        "sec-ch-ua: \"Chromium\";v=\"130\", \"Microsoft Edge\";v=\"130\", "
+        "\"Not?A_Brand\";v=\"99\"");
+    headers = curl_slist_append(headers, "sec-ch-ua-mobile: ?0");
+    headers = curl_slist_append(headers, "sec-ch-ua-platform: \"Windows\"");
+    headers = curl_slist_append(headers, "Upgrade-Insecure-Requests: 1");
+    headers = curl_slist_append(headers, "Sec-Fetch-Dest: document");
+    headers = curl_slist_append(headers, "Sec-Fetch-Mode: navigate");
+    headers = curl_slist_append(headers, "Sec-Fetch-Site: none");
+    headers = curl_slist_append(headers, "Sec-Fetch-User: ?1");
+    return headers;
+}
+
 // SECURITY: refuse non-http(s) URLs at the top of every fetch.  Without
 // this gate, the model could ask for `file:///etc/passwd`, `gopher://...`,
 // or `dict://internal`, all of which curl supports by default.  We also
@@ -296,7 +328,8 @@ static bool http_get(const std::string & url,
                      (long) (CURLPROTO_HTTP | CURLPROTO_HTTPS));
 #endif
     curl_easy_setopt(c, CURLOPT_TIMEOUT, timeout_s);
-    curl_easy_setopt(c, CURLOPT_USERAGENT, "easyai/0.1 (+https://github.com/)");
+    // Impersonate Microsoft Edge — Cloudflare/news/etc gate generic UAs.
+    curl_easy_setopt(c, CURLOPT_USERAGENT, kEdgeUserAgent);
     curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, curl_write_cb);
     curl_easy_setopt(c, CURLOPT_WRITEDATA, &sink);
     curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
@@ -304,6 +337,7 @@ static bool http_get(const std::string & url,
 
     curl_slist * headers = nullptr;
     for (const auto & h : extra_headers) headers = curl_slist_append(headers, h.c_str());
+    headers = append_edge_browser_headers(headers);
     if (headers) curl_easy_setopt(c, CURLOPT_HTTPHEADER, headers);
 
     CURLcode rc = curl_easy_perform(c);
@@ -356,10 +390,9 @@ static bool http_post_form(const std::string & url,
                      (long) (CURLPROTO_HTTP | CURLPROTO_HTTPS));
 #endif
     curl_easy_setopt(c, CURLOPT_TIMEOUT,         timeout_s);
-    // A real-browser User-Agent is required by html.duckduckgo.com.
-    curl_easy_setopt(c, CURLOPT_USERAGENT,
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_5) AppleWebKit/605.1.15 "
-        "(KHTML, like Gecko) Version/16.6 Safari/605.1.15");
+    // Impersonate Microsoft Edge — html.duckduckgo.com (and most search
+    // backends) reject or degrade non-browser UAs.
+    curl_easy_setopt(c, CURLOPT_USERAGENT,        kEdgeUserAgent);
     curl_easy_setopt(c, CURLOPT_WRITEFUNCTION,   curl_write_cb);
     curl_easy_setopt(c, CURLOPT_WRITEDATA,       &sink);
     curl_easy_setopt(c, CURLOPT_NOSIGNAL,        1L);
@@ -368,11 +401,14 @@ static bool http_post_form(const std::string & url,
     curl_easy_setopt(c, CURLOPT_POSTFIELDS,      form_body.c_str());
     curl_easy_setopt(c, CURLOPT_POSTFIELDSIZE,   (long) form_body.size());
 
+    // Form POST + Edge persona.  append_edge_browser_headers() sets
+    // Accept/Accept-Language/sec-ch-ua/etc; we add Content-Type for
+    // the form payload.  The richer Accept from the Edge helper
+    // supersedes the trimmed one we used to send.
     curl_slist * headers = nullptr;
     headers = curl_slist_append(headers,
         "Content-Type: application/x-www-form-urlencoded");
-    headers = curl_slist_append(headers,
-        "Accept: text/html,application/xhtml+xml");
+    headers = append_edge_browser_headers(headers);
     curl_easy_setopt(c, CURLOPT_HTTPHEADER, headers);
 
     CURLcode rc = curl_easy_perform(c);
