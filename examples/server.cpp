@@ -1491,6 +1491,46 @@ static bool parse_chat_request(const httplib::Request & req,
                         !body["tools"].empty();
     if (out.client_tools) out.tools_blob = body["tools"];
 
+    // ENCODING AUDIT — detect the OpenAI-protocol round-trip lossiness
+    // we suspect is breaking multi-hop agentic flows from external
+    // clients (cli-remote, OpenAI SDK, Claude-Code).  parse_chat_request
+    // currently flattens every message to (role, content) only:
+    // assistant `tool_calls` and tool message `tool_call_id` / `name`
+    // are dropped before replace_history, so the chat template renders
+    // a tool message with no preceding tool_call markup → model sees
+    // an orphan tool result → produces malformed output → retry path
+    // kicks in.  Logging this here makes the issue visible per request.
+    {
+        size_t lost_tool_calls = 0;
+        size_t lost_tool_ids   = 0;
+        for (const auto & m : body["messages"]) {
+            if (m.value("role", "") == "assistant"
+                    && m.contains("tool_calls")
+                    && m["tool_calls"].is_array()
+                    && !m["tool_calls"].empty()) {
+                lost_tool_calls += m["tool_calls"].size();
+            }
+            if (m.value("role", "") == "tool"
+                    && (m.contains("tool_call_id") || m.contains("name"))) {
+                ++lost_tool_ids;
+            }
+        }
+        if (lost_tool_calls || lost_tool_ids) {
+            easyai::log::mark_problem(
+                "Server: OpenAI-protocol round-trip is LOSSY for this request\n"
+                "incoming history dropped: assistant tool_calls=%zu tool messages "
+                "with tool_call_id/name=%zu\n"
+                "parse_chat_request flattens to (role, content); engine's "
+                "replace_history takes (role, content) only — chat template will "
+                "render the tool message without its matching tool_call markup, "
+                "which is a likely root cause of malformed output on agentic "
+                "multi-hop turns.\n"
+                "fix path: extend Engine::push_message to accept tool_calls + "
+                "preserve them in parse_chat_request -> prepare_engine_for_request.",
+                lost_tool_calls, lost_tool_ids);
+        }
+    }
+
     auto get_num = [&](const char * k, double dflt) -> double {
         if (body.contains(k) && body[k].is_number()) return body[k].get<double>();
         return dflt;
@@ -1712,6 +1752,10 @@ static void handle_chat_sync(ServerCtx & ctx, ChatRequest & req,
         res.set_content(error_json(std::string("engine error: ") + e.what(),
                                    "internal_error"),
                         "application/json");
+        easyai::log::error(
+            "[easyai-server] handle_chat_sync engine threw: %s "
+            "(client_tools=%s last_user_bytes=%zu)",
+            e.what(), req.client_tools ? "yes" : "no", req.last_user.size());
         return;
     }
     if (!tool_calls.empty()) ctx.n_tool_calls.fetch_add(tool_calls.size(),
@@ -1719,10 +1763,21 @@ static void handle_chat_sync(ServerCtx & ctx, ChatRequest & req,
     if (ctx.no_think) content = strip_think_blocks(content);
 
     res.status = 200;
-    res.set_content(build_chat_response(ctx.model_id, content,
-                                         tool_calls, tool_call_ids,
-                                         finish_reason),
-                     "application/json");
+    const std::string body = build_chat_response(ctx.model_id, content,
+                                                  tool_calls, tool_call_ids,
+                                                  finish_reason);
+    res.set_content(body, "application/json");
+    if (auto * fp = easyai::log::file()) {
+        std::fprintf(fp,
+            "----- RESPONSE (sync) -----\n"
+            "http_status=200 finish_reason=%s content_bytes=%zu tool_calls=%zu\n"
+            "----- ASSISTANT CONTENT -----\n%s\n"
+            "----- BODY (json) -----\n%s\n"
+            "==========\n",
+            finish_reason.c_str(), content.size(), tool_calls.size(),
+            content.c_str(), body.c_str());
+        std::fflush(fp);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2056,6 +2111,11 @@ static void handle_chat_stream(ServerCtx & ctx,
                 ordered_json err;
                 err["error"] = { {"message", e.what()}, {"type", "internal_error"} };
                 emit_data(safe_dump(err));
+                easyai::log::error(
+                    "[easyai-server] handle_chat_stream engine threw: %s "
+                    "(client_tools=%s last_user_bytes=%zu)",
+                    e.what(), req_state->client_tools ? "yes" : "no",
+                    req_state->last_user.size());
             }
 
             // Final non-partial parse to flush any reasoning/content the
@@ -2230,6 +2290,18 @@ static void handle_chat_stream(ServerCtx & ctx,
                     "prompt, model exhausted on a niche question.\n",
                     content_bytes_emitted, prompt_n, predicted_n,
                     finish_reason.c_str());
+                std::string content_snippet = content_text_emitted;
+                if (content_snippet.size() > 400)
+                    content_snippet = content_snippet.substr(0, 400) + "…";
+                easyai::log::mark_problem(
+                    "Server: stream marked incomplete=true\n"
+                    "content_bytes=%zu predicted_n=%d prompt_n=%d "
+                    "finish_reason=%s last_is_tool=%s\n"
+                    "content text: %s",
+                    content_bytes_emitted, predicted_n, prompt_n,
+                    finish_reason.c_str(),
+                    req_state->last_is_tool ? "yes" : "no",
+                    content_snippet.c_str());
             }
 
             ordered_json done_delta;
@@ -2277,6 +2349,41 @@ static void handle_chat_stream(ServerCtx & ctx,
             emit_data(safe_dump(done_delta));
             emit_data("[DONE]");
 
+            // ALWAYS log the produced assistant turn — exactly the data
+            // the operator needs to correlate "model misbehaved" reports
+            // against what actually crossed the wire.  Stays off stderr
+            // (still gated on --verbose); only the /tmp raw log gets
+            // this block.
+            if (auto * fp = easyai::log::file()) {
+                std::fprintf(fp,
+                    "----- RESPONSE (stream) -----\n"
+                    "finish_reason=%s incomplete=%s prompt_n=%d predicted_n=%d "
+                    "content_bytes=%zu accumulated_bytes=%zu tool_calls=%zu\n"
+                    "----- ASSISTANT CONTENT -----\n%s\n"
+                    "----- ACCUMULATED RAW (model output incl. tool_call markup) -----\n%s\n",
+                    finish_reason.c_str(), incomplete ? "yes" : "no",
+                    prompt_n, predicted_n,
+                    content_bytes_emitted, accumulated.size(),
+                    tool_calls.size(),
+                    content_text_emitted.c_str(),
+                    accumulated.c_str());
+                if (!tool_calls.empty()) {
+                    std::fputs("----- TOOL CALLS -----\n", fp);
+                    for (size_t i = 0; i < tool_calls.size(); ++i) {
+                        const std::string & tid = i < tool_call_ids.size()
+                                                       ? tool_call_ids[i]
+                                                       : std::string();
+                        std::fprintf(fp,
+                            "tool_call[%zu]: name=%s id=%s args=%s\n",
+                            i, tool_calls[i].first.c_str(),
+                            tid.empty() ? "(none)" : tid.c_str(),
+                            tool_calls[i].second.c_str());
+                    }
+                }
+                std::fputs("==========\n", fp);
+                std::fflush(fp);
+            }
+
             sink.done();
             return true;
         });
@@ -2287,10 +2394,63 @@ static void handle_chat_stream(ServerCtx & ctx,
 // ---------------------------------------------------------------------------
 static void route_chat_completions(ServerCtx & ctx, const httplib::Request & req,
                                    httplib::Response & res) {
+    // ALWAYS log the full incoming POST body + summary to the raw
+    // transaction log (auto-opened by Engine::load).  No verbose flag
+    // gate: this is exactly the data the operator needs when a turn
+    // misbehaves — we suspect the OpenAI-protocol round-trip is
+    // dropping tool_calls / tool_call_id from history (see audit
+    // notes in the commit), and capturing the wire-level body lets us
+    // confirm what every client actually sent.  Stderr is left alone
+    // (still gated on --verbose) so the journal doesn't drown.
+    if (auto * fp = easyai::log::file()) {
+        char ts[32] = {0};
+        const auto t = std::time(nullptr);
+        std::strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%S", std::localtime(&t));
+        std::fprintf(fp,
+            "\n========== REQUEST %s ==========\n"
+            "POST %s  remote=%s  body_bytes=%zu  ct=%s\n"
+            "----- HEADERS -----\n",
+            ts, req.path.c_str(),
+            req.remote_addr.c_str(), req.body.size(),
+            req.get_header_value("Content-Type").c_str());
+        for (const auto & h : req.headers) {
+            // Redact bearer auth so log files are safe to share.
+            const std::string & k = h.first;
+            std::string v = h.second;
+            if (k == "Authorization" || k == "X-Easyai-Api-Key") v = "<redacted>";
+            std::fprintf(fp, "%s: %s\n", k.c_str(), v.c_str());
+        }
+        std::fprintf(fp, "----- BODY -----\n%s\n", req.body.c_str());
+        std::fflush(fp);
+    }
+
     auto state = std::make_shared<ChatRequest>();
-    if (!parse_chat_request(req, res, *state)) return;
+    if (!parse_chat_request(req, res, *state)) {
+        easyai::log::mark_problem(
+            "Server: parse_chat_request rejected POST /v1/chat/completions "
+            "(http_status=%d body_bytes=%zu)\nbody: %.*s",
+            res.status, req.body.size(),
+            (int) std::min<size_t>(2048, req.body.size()),
+            req.body.c_str());
+        return;
+    }
 
     ctx.n_requests.fetch_add(1, std::memory_order_relaxed);
+
+    if (auto * fp = easyai::log::file()) {
+        std::fprintf(fp,
+            "----- PARSED REQUEST -----\n"
+            "client_tools=%s stream=%s tools=%zu hist=%zu "
+            "last_user_bytes=%zu last_is_tool=%s inject_override=%s\n",
+            state->client_tools ? "yes" : "no",
+            state->stream       ? "yes" : "no",
+            state->client_tools ? state->tools_blob.size() : ctx.default_tools.size(),
+            state->hist.size(),
+            state->last_user.size(),
+            state->last_is_tool ? "yes" : "no",
+            state->inject_override.empty() ? "(default)" : state->inject_override.c_str());
+        std::fflush(fp);
+    }
 
     if (ctx.verbose) {
         std::fprintf(stderr,
