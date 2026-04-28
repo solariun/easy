@@ -1979,19 +1979,27 @@ static void handle_chat_stream(ServerCtx & ctx,
                 res_evt["is_error"] = r.is_error;
                 emit_event("easyai.tool_result", safe_dump(res_evt));
 
-                std::ostringstream md;
-                md << "\n*" << (r.is_error ? "❌ " : "🔧 ") << c.name;
+                // Tool-call status line goes into the reasoning channel
+                // (`delta.reasoning_content`) instead of the visible
+                // content body, so the bundle paints it inside the
+                // collapsible Reasoning panel — same place the model's
+                // thoughts live, since a tool dispatch is part of the
+                // reasoning flow, not the user-facing answer.  Plain text
+                // (no markdown asterisks) because the bundle renders
+                // reasoning with whitespace-pre-wrap, not as markdown.
+                std::ostringstream tlog;
+                tlog << "\n" << (r.is_error ? "❌ " : "🔧 ") << c.name;
                 if (r.is_error) {
                     std::string reason = r.content;
                     if (reason.size() > 80) { reason.resize(80); reason += "…"; }
-                    md << " — " << reason;
+                    tlog << " — " << reason;
                 }
-                md << "*\n";
+                tlog << "\n";
 
                 ordered_json delta;
                 delta["choices"] = json::array({{
                     {"index", 0},
-                    {"delta", {{"content", md.str()}}},
+                    {"delta", {{"reasoning_content", tlog.str()}}},
                     {"finish_reason", nullptr},
                 }});
                 emit_data(safe_dump(delta));
