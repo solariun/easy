@@ -3236,75 +3236,30 @@ int main(int argc, char ** argv) {
                 "}"
               "})();</script>";
 
-            // ----- live metrics bar + tone chip + per-message status -------
-            //   Metrics bar — its own Shadow DOM host, anchored ABOVE the
-            //                 prompt textarea.  Live-updates ctx / token
-            //                 count / elapsed / t/s while the model is
-            //                 streaming, then freezes on finish_reason.
-            //   Tone chip   — separate Shadow DOM host, anchored at the
-            //                 right edge of the prompt form so it sits
-            //                 visually next to the model-name badge and
-            //                 the send arrow.  Both hosts use fixed
-            //                 positioning anchored via getBoundingClientRect
-            //                 of the form so layout follows the bundle.
-            //   Per-msg     — for each assistant message, we append a small
-            //   status        live status indicator inline next to the
-            //                 copy/edit/fork/delete actions; chip text is
-            //                 updated by window.__easyaiSetStatus.
+            // ----- live metrics + tone chip + per-message status ------------
+            //   Metrics    — painted directly inside the bundle's existing
+            //                `.chat-processing-info-detail` element via
+            //                renderOverview() — no custom host of our own.
+            //                Live-updates ctx / token count / elapsed / t/s
+            //                while the model is streaming, then freezes on
+            //                finish_reason.  A MutationObserver re-injects
+            //                whenever Svelte re-renders the anchor.
+            //   Tone chip  — separate Shadow DOM host, mounted as a sibling
+            //                of the bundle's model-name badge inside the
+            //                prompt form, so layout follows hydration.
+            //   Per-msg    — for each assistant message, we append a small
+            //   status       live status indicator inline next to the
+            //                copy/edit/fork/delete actions; chip text is
+            //                updated by window.__easyaiSetStatus.
             inj <<
               "<script>(()=>{"
-                "console.log('[easyai-inject] block5 metrics-bar + tone-badge + chip');"
+                "console.log('[easyai-inject] block5 metrics + tone-badge + chip');"
 
-                // --- shared style snippets ---
-                "const SHARED_STYLE='"
-                  ":host,*{box-sizing:border-box}"
-                  ".pill{pointer-events:auto;display:inline-flex;"
-                    "align-items:center;gap:.55rem;"
-                    "background:rgba(30,33,38,.85);"
-                    "border:1px solid #2a313b;border-radius:.5rem;"
-                    "padding:.28rem .7rem;color:#8b949e;"
-                    "font:.72rem -apple-system,system-ui,sans-serif;}"
-                  ".grp{display:inline-flex;align-items:center;gap:.3rem}"
-                  ".sep{color:#3a414b}"
-                  ".v{color:#e6edf3}"
-                  ".mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.7rem}"
-                  "select{background:transparent;color:#e6edf3;border:0;"
-                    "font:inherit;cursor:pointer;outline:none;padding:0 .15rem}"
-                  "select option{background:#15191f;color:#e6edf3}"
-                  "';"
-
-                // --- METRICS BAR (above textarea) ---
-                "const BAR_ID='__easyaiBarHost';"
-                "let barRoot=null,barHost=null;"
-                "const ensureBar=()=>{"
-                  "let h=document.getElementById(BAR_ID);"
-                  "if(h&&barRoot){barHost=h;return barRoot;}"
-                  "if(h)h.remove();"
-                  "h=document.createElement('div');"
-                  "h.id=BAR_ID;"
-                  "h.setAttribute('aria-hidden','false');"
-                  // No positioning here — reposition() decides whether to
-                  // attach in-flow inside the prompt form (preferred — fixes
-                  // Safari mobile keyboard misalignment) or fall back to
-                  // fixed positioning before the form has mounted.
-                  "h.style.cssText="
-                    "'all:initial;display:block;"
-                    "font:14px/1 -apple-system,system-ui,sans-serif;';"
-                  "barHost=h;"
-                  "const root=h.attachShadow({mode:'open'});"
-                  "root.innerHTML='<style>'+SHARED_STYLE+'</style>'+"
-                    "'<div class=\"pill\">"
-                      "<span class=\"grp mono\">"
-                        "<span>ctx</span><span class=\"v ctx\">—</span>"
-                      "</span>"
-                      "<span class=\"sep\">·</span>"
-                      "<span class=\"grp mono\">"
-                        "<span>last</span><span class=\"v last\">—</span>"
-                      "</span>"
-                    "</div>';"
-                  "barRoot=root;"
-                  "return root;"
-                "};"
+                // Metrics moved out of a custom pill — we now paint them
+                // directly into the bundle's own `.chat-processing-info-detail`
+                // element (see renderOverview() below).  That element is
+                // already correctly anchored by the SvelteKit layout, so the
+                // pill / its Shadow DOM host / SHARED_STYLE were removed.
 
                 // --- TONE BADGE (same look as the bundle's model badge,
                 //                 anchored at bottom-LEFT of the form, same
@@ -3549,23 +3504,13 @@ int main(int argc, char ** argv) {
                   "return null;"
                 "};"
                 "const reposition=()=>{"
-                  "if(!barHost||!toneHost||!toolsHost)return;"
+                  "if(!toneHost||!toolsHost)return;"
                   "const ta=document.querySelector('textarea');"
                   "const form=ta&&(ta.closest('form')||ta.parentElement);"
                   "const formOk=form&&form.getBoundingClientRect().width>60;"
                   "if(formOk){"
                     "if(getComputedStyle(form).position==='static'){"
                       "form.style.position='relative';"
-                    "}"
-                    // Bar — first child of the form, in block flow.
-                    "if(barHost.parentElement!==form||barHost.dataset.eaiAttach!=='flow'){"
-                      "detachFixed(barHost);"
-                      "barHost.style.cssText="
-                        "'all:initial;display:flex;justify-content:center;"
-                        "padding:.35rem 0 .15rem;width:100%;"
-                        "font:14px/1 -apple-system,system-ui,sans-serif;';"
-                      "barHost.dataset.eaiAttach='flow';"
-                      "form.insertBefore(barHost,form.firstChild);"
                     "}"
                     // Tone + tools sit next to the model badge in the same
                     // row.  Falling back to the form keeps them visible
@@ -3600,15 +3545,6 @@ int main(int argc, char ** argv) {
                     "}"
                   "}else{"
                     // Fallback while hydrating: viewport-anchored bottom strip.
-                    "if(barHost.parentElement!==document.documentElement||barHost.dataset.eaiAttach!=='fixed'){"
-                      "barHost.style.cssText="
-                        "'all:initial;position:fixed;left:50%;bottom:6.5rem;"
-                        "transform:translateX(-50%);z-index:2147483646;"
-                        "pointer-events:none;"
-                        "font:14px/1 -apple-system,system-ui,sans-serif;';"
-                      "barHost.dataset.eaiAttach='fixed';"
-                      "document.documentElement.appendChild(barHost);"
-                    "}"
                     "if(toneHost.parentElement!==document.documentElement||toneHost.dataset.eaiAttach!=='fixed'){"
                       "toneHost.style.cssText="
                         "'all:initial;position:fixed;left:1rem;bottom:1rem;"
@@ -3628,17 +3564,19 @@ int main(int argc, char ** argv) {
                   "}"
                 "};"
 
-                "if(document.documentElement){ensureBar();ensureTone();ensureTools();reposition();}"
+                "if(document.documentElement){ensureTone();ensureTools();reposition();}"
                 "document.addEventListener('DOMContentLoaded',()=>{"
-                  "ensureBar();ensureTone();ensureTools();reposition();"
+                  "ensureTone();ensureTools();reposition();"
                 "});"
                 "window.addEventListener('resize',reposition);"
                 "window.addEventListener('scroll',reposition,true);"
                 "setInterval(()=>{"
-                  "if(!document.getElementById(BAR_ID)){barRoot=null;ensureBar();}"
                   "if(!document.getElementById(TONE_ID)){toneRoot=null;ensureTone();}"
                   "if(!document.getElementById(TOOLS_ID)){toolsRoot=null;ensureTools();}"
                   "reposition();"
+                  // Re-paint metrics every tick: the bundle re-mounts the
+                  // .chat-processing-info-detail element on stream lifecycle.
+                  "renderOverview();"
                 "},250);"
 
                 // --- per-message inline status chip -----------------------
@@ -3817,11 +3755,15 @@ int main(int argc, char ** argv) {
                   "}"
                 "};"
 
-                // --- overview values inside the combined bar ----------------
+                // --- overview values painted inside the bundle's
+                //     .chat-processing-info-detail element -------------------
                 // Fetch n_ctx once at boot so we can render Context: X/Y%
                 // even before the first reply.  Then monitorSSE feeds us
                 // timings via __easyaiPushTimings, and we paint into the
-                // .ctx and .last spans of the bar.
+                // .__easyai-ovr span we inject (and re-inject) inside the
+                // bundle's processing-info element.  That element is already
+                // anchored correctly by the SvelteKit layout, so we don't
+                // own a custom pill anymore.
                 "let lastTimings=null;"
                 "let lastSessionUsed=0;"   // sticky cumulative ctx used
                 "window.__easyaiNCtx=0;"
@@ -3873,11 +3815,22 @@ int main(int argc, char ** argv) {
                     "if(form)form.querySelectorAll('button[disabled]').forEach(b=>{b.disabled=false;});"
                   "}"
                 "};"
+                // Observer tracks the bundle's `.chat-processing-info-detail`:
+                // when Svelte re-renders or replaces it, our content gets
+                // overwritten — the observer fires renderOverview again so we
+                // re-inject.  An equality check prevents an infinite ping-pong
+                // because re-setting the same innerHTML triggers the observer,
+                // which then no-ops on the next call.
+                "let __eaiOvrTarget=null,__eaiOvrObs=null;"
+                "function __eaiBindOvr(t){"
+                  "if(t===__eaiOvrTarget)return;"
+                  "if(__eaiOvrObs){__eaiOvrObs.disconnect();__eaiOvrObs=null;}"
+                  "__eaiOvrTarget=t;"
+                  "if(!t)return;"
+                  "__eaiOvrObs=new MutationObserver(()=>{renderOverview();});"
+                  "__eaiOvrObs.observe(t,{childList:true,characterData:true,subtree:true});"
+                "}"
                 "function renderOverview(){"
-                  "const r=ensureBar();if(!r)return;"
-                  "const ctxEl=r.querySelector('.ctx');"
-                  "const lastEl=r.querySelector('.last');"
-                  "if(!ctxEl||!lastEl)return;"
                   "const t=lastTimings;"
                   // Cumulative session usage:
                   //   Prefer ctx_used (post-turn KV fill from the engine).
@@ -3904,18 +3857,12 @@ int main(int argc, char ** argv) {
                   "const total=(t&&t.n_ctx)||window.__easyaiNCtx||0;"
                   "if(total&&!window.__easyaiNCtx)window.__easyaiNCtx=total;"
                   "const pct=total?used/total:0;"
-                  "if(total){"
-                    "ctxEl.textContent="
-                      "used.toLocaleString()+' / '+total.toLocaleString()+"
-                      "' ('+Math.round(pct*100)+'%)';"
-                  "}else{"
-                    "ctxEl.textContent=used.toLocaleString();"
-                  "}"
-                  // Color the ctx number based on pressure.
-                  "ctxEl.style.color="
-                    "pct>=CTX_HARD?'#f85149':"
-                    "pct>=CTX_SOFT?'#d29922':"
-                    "'#e6edf3';"
+                  "const ctxText=total?"
+                    "(used.toLocaleString()+' / '+total.toLocaleString()+"
+                      "' ('+Math.round(pct*100)+'%)'):"
+                    "used.toLocaleString();"
+                  "const ctxColor=pct>=CTX_HARD?'#f85149':"
+                    "pct>=CTX_SOFT?'#d29922':'#e6edf3';"
                   // Lock input if we've crossed the hard threshold.
                   "if(total){"
                     "if(pct>=CTX_HARD){"
@@ -3925,13 +3872,30 @@ int main(int argc, char ** argv) {
                       "setInputLocked(false);"
                     "}"
                   "}"
+                  "let lastText='—';"
                   "if(t&&t.predicted_n&&t.predicted_ms){"
                     "const tps=(t.predicted_n/(t.predicted_ms/1000));"
-                    "lastEl.textContent="
-                      "t.predicted_n+' tok · '+(t.predicted_ms/1000).toFixed(1)+'s · '+tps.toFixed(1)+' t/s';"
-                  "}else if(!t){"
-                    "lastEl.textContent='—';"
+                    "lastText=t.predicted_n+' tok · '+(t.predicted_ms/1000).toFixed(1)+"
+                      "'s · '+tps.toFixed(1)+' t/s';"
                   "}"
+                  // Inject directly inside the bundle's processing-info detail.
+                  // No wrapper element of our own — we set innerHTML on the
+                  // bundle's own anchor so positioning stays exactly where
+                  // SvelteKit puts it.
+                  "const target=document.querySelector('.chat-processing-info-detail');"
+                  "if(target!==__eaiOvrTarget)__eaiBindOvr(target);"
+                  "if(!target)return;"
+                  "const html="
+                    "'<span style=\"font-family:ui-monospace,SFMono-Regular,"
+                      "Menlo,monospace;font-size:.7rem;display:inline-flex;"
+                      "gap:.4rem;align-items:center;color:#8b949e;\">'+"
+                      "'<span style=\"opacity:.7\">ctx</span>'+"
+                      "'<span style=\"color:'+ctxColor+'\">'+ctxText+'</span>'+"
+                      "'<span style=\"opacity:.4\">·</span>'+"
+                      "'<span style=\"opacity:.7\">last</span>'+"
+                      "'<span style=\"color:#e6edf3\">'+lastText+'</span>'+"
+                    "'</span>';"
+                  "if(target.innerHTML!==html)target.innerHTML=html;"
                 "};"
                 "window.__easyaiPushTimings=(t)=>{"
                   "if(t)lastTimings=t;"
@@ -3939,9 +3903,9 @@ int main(int argc, char ** argv) {
                 "};"
 
                 // Reached the end of block5 — if you see this in the
-                // console you know the bar/tone/chip IIFE parsed and
+                // console you know the metrics/tone/chip IIFE parsed and
                 // executed completely.  No log == SyntaxError further up.
-                "console.log('[easyai-inject] block5 OK — bar/tone/chip live');"
+                "console.log('[easyai-inject] block5 OK — metrics/tone/chip live');"
               "})();</script>";
 
             // ----- CSS hiding for features we don't support ------------------
