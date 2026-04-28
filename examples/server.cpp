@@ -3491,13 +3491,14 @@ int main(int argc, char ** argv) {
                 "};"
                 // Find the bundle's prompt-form badge anchor:
                 //   <div style="container-type: inline-size">
+                //     <!-- tone + tools go here, as siblings BEFORE the row -->
                 //     <div class="flex min-w-0 flex-wrap items-center gap-1
                 //                 min-w-0 overflow-hidden">… model badge …</div>
-                //     <!-- tone + tools go here, as siblings AFTER the row -->
                 //   </div>
                 // We don't touch the existing flex row — we attach our hosts
-                // as siblings inside the same container, keeping the bundle's
-                // layout intact and following its container-query reflow.
+                // as siblings inside the same container, immediately to the
+                // LEFT (in DOM order, before) the bundle's row, so they
+                // appear at the start of the form's bottom strip.
                 "const findBadgeAnchor=(form)=>{"
                   "const cont=form.querySelector('[style*=\"container-type\"]');"
                   "if(!cont)return null;"
@@ -3517,35 +3518,35 @@ int main(int argc, char ** argv) {
                     "}"
                     "const a=findBadgeAnchor(form);"
                     "const parent=(a&&a.cont)||form;"
-                    "const after=a&&a.row;"
-                    "const placeAfter=(host,prev)=>{"
-                      "const target=prev&&prev.parentElement===parent?prev:after;"
-                      "if(target&&target.nextSibling){"
-                        "parent.insertBefore(host,target.nextSibling);"
-                      "}else{"
-                        "parent.appendChild(host);"
-                      "}"
-                    "};"
-                    // Tone — first sibling after the bundle's flex-wrap row.
+                    "const row=a&&a.row;"
+                    // Tone goes immediately BEFORE the bundle's flex-wrap row.
                     "if(toneHost.parentElement!==parent||toneHost.dataset.eaiAttach!=='flow'){"
                       "detachFixed(toneHost);"
                       "toneHost.style.cssText="
                         "'all:initial;display:inline-flex;align-items:center;"
-                        "margin:.35rem .25rem 0 0;vertical-align:middle;"
+                        "margin:0 .25rem 0 0;vertical-align:middle;"
                         "font:14px/1 -apple-system,system-ui,sans-serif;';"
                       "toneHost.dataset.eaiAttach='flow';"
-                      "placeAfter(toneHost,after);"
+                      "if(row){parent.insertBefore(toneHost,row);}"
+                      "else{parent.appendChild(toneHost);}"
                     "}"
-                    // Tools — directly after tone, sharing the same row when
-                    // there's room (inline-flex), wrapping otherwise.
+                    // Tools sits between tone and the row.
                     "if(toolsHost.parentElement!==parent||toolsHost.dataset.eaiAttach!=='flow'){"
                       "detachFixed(toolsHost);"
                       "toolsHost.style.cssText="
                         "'all:initial;display:inline-flex;align-items:center;"
-                        "margin:.35rem .25rem 0 0;vertical-align:middle;"
+                        "margin:0 .25rem 0 0;vertical-align:middle;"
                         "font:14px/1 -apple-system,system-ui,sans-serif;';"
                       "toolsHost.dataset.eaiAttach='flow';"
-                      "placeAfter(toolsHost,toneHost);"
+                      "if(row){parent.insertBefore(toolsHost,row);}"
+                      "else{parent.appendChild(toolsHost);}"
+                    "}"
+                    // After both insertions, ensure DOM order is
+                    // [tone][tools][row] — fix it up in case Svelte
+                    // re-mounted the row in the wrong relative position.
+                    "if(row&&toolsHost.previousSibling!==toneHost){"
+                      "parent.insertBefore(toolsHost,row);"
+                      "parent.insertBefore(toneHost,toolsHost);"
                     "}"
                   "}else{"
                     // Fallback while hydrating: viewport-anchored bottom strip.
