@@ -91,6 +91,21 @@ class Engine {
     // same recovery without each app rolling its own.
     Engine & retry_on_incomplete (bool on = true);
 
+    // Hard ceiling on context fill — once the rendered prompt + KV
+    // cache reach this percentage of n_ctx, chat_continue stops
+    // dispatching further tool calls, sets last_error to a context-
+    // full message, and returns whatever the model produced this hop
+    // so the caller can show the user the result + a clear note.
+    // Default 100 (only stops at the wall); pass 0 to disable.
+    Engine & stop_at_ctx_pct(int pct);
+
+    // Mirror of Client::last_was_ctx_full — true when the most recent
+    // chat() / chat_continue() ran out of context window and the
+    // agentic loop bailed early.  Lets the app layer pick a friendlier
+    // banner ("contexto cheio, recomece a conversa") rather than the
+    // raw last_error string.
+    bool last_was_ctx_full() const;
+
     // ---------------- KV cache & model overrides ----------------------------
     // KV cache data type — accepts ggml_type names: "f32", "f16", "bf16",
     // "q8_0", "q4_0", "q4_1", "q5_0", "q5_1", "iq4_nl". Lower precision

@@ -713,6 +713,22 @@ int run_one(easyai::Client & cli, easyai::Plan & plan,
     spinner.stop_heartbeat();
     spinner.finish();
     std::fputc('\n', stdout);
+
+    // Context-full guard fires BEFORE the generic error/incomplete
+    // banners — it's the cleanest of the bad outcomes (the model
+    // produced a partial reply, we just have nowhere to put more
+    // tokens).  Show the latest content (already streamed) plus a
+    // distinct "context full" note so the operator knows to start a
+    // new chat instead of debugging a "tool didn't fire" loop.
+    if (cli.last_was_ctx_full()) {
+        std::fprintf(stdout,
+            "\n%s── context full ──%s\n"
+            "%s%s%s\n"
+            "Start a new conversation (or shorten the prompt) to keep going.\n",
+            st.yellow(), st.reset(),
+            st.dim(), cli.last_error().c_str(), st.reset());
+        return 0;
+    }
     if (answer.empty() && !cli.last_error().empty()) {
         std::fprintf(stderr, "%serror:%s %s\n", st.red(), st.reset(),
                      cli.last_error().c_str());

@@ -120,6 +120,8 @@ struct CliArgs {
     std::string preset = "balanced";
     std::string prompt;          // -p one-shot mode; empty => REPL
     bool        no_think = false;
+    bool        quiet    = false;   // --quiet/-q: disable spinner + ctx-% gauge
+                                     // (batch / scripted / service usage)
 
     // sampling overrides — when set, win over the preset baseline.
     // Sentinel values: <0 / 0u means "unset" (use preset value).
@@ -173,6 +175,9 @@ struct CliArgs {
         "      --preset <name>           Initial preset (default 'balanced')\n"
         "      --no-think                Strip <think>...</think> from output\n"
         "                                 (thinking is shown by default)\n"
+        "  -q, --quiet                   Disable the spinner glyph + ctx-fill\n"
+        "                                 gauge (e.g. |45%%).  For batch /\n"
+        "                                 scripted runs where stdout is captured.\n"
         "\nSampling overrides (apply on top of --preset):\n"
         "      --temperature <f>         Override temperature (0.0-2.0)\n"
         "      --top-p <f>               Override nucleus sampling p\n"
@@ -233,6 +238,7 @@ static CliArgs parse(int argc, char ** argv) {
         else if (s == "--preset")                     a.preset        = need(i, "--preset");
         else if (s == "-p" || s == "--prompt")        a.prompt        = need(i, "-p");
         else if (s == "--no-think")                   a.no_think      = true;
+        else if (s == "-q" || s == "--quiet")         a.quiet         = true;
         else if (s == "--temperature" || s == "--temp") a.temperature  = std::atof(need(i, "--temperature"));
         else if (s == "--top-p")                      a.top_p         = std::atof(need(i, "--top-p"));
         else if (s == "--top-k")                      a.top_k         = std::atoi(need(i, "--top-k"));
@@ -388,7 +394,7 @@ int main(int argc, char ** argv) {
 
         easyai::text::ThinkStripper strip;
         strip.enabled = args.no_think;
-        easyai::ui::Spinner spinner(/*enabled=*/true);
+        easyai::ui::Spinner spinner(/*enabled=*/!args.quiet);
         spinner.start_heartbeat();
 
         // Honour an inline preset prefix in the prompt too.
@@ -404,8 +410,11 @@ int main(int argc, char ** argv) {
             backend->chat(text, [&](const std::string & p){
                 std::string visible = strip.filter(p);
                 if (!visible.empty()) spinner.write(visible);
-                // empty visible (hidden think) — heartbeat keeps the
-                // glyph alive on its own.
+                // Refresh the ctx-fill gauge each token so `|45%`
+                // tracks the cursor live.  No-op when --quiet (the
+                // spinner is disabled and ignores set_context_pct).
+                int pct = backend->ctx_pct();
+                if (pct >= 0) spinner.set_context_pct(pct);
             });
         } catch (const std::exception & e) {
             spinner.stop_heartbeat();
@@ -418,6 +427,16 @@ int main(int argc, char ** argv) {
         spinner.stop_heartbeat();
         spinner.finish();
         std::cout << std::endl;
+        // Distinct ctx-full note before any other diagnostics — the
+        // model produced a partial answer and the loop bailed because
+        // n_ctx is full.  Operator needs to know to /reset (REPL) or
+        // start a new process (one-shot).
+        if (backend->last_was_ctx_full()) {
+            std::fprintf(stderr,
+                "\n── context full ──\n%s\n"
+                "Start a new conversation (or shorten the prompt) to keep going.\n",
+                backend->last_error().c_str());
+        }
         return 0;
     }
 
@@ -430,7 +449,7 @@ int main(int argc, char ** argv) {
 
     easyai::text::ThinkStripper strip;
     strip.enabled = args.no_think;
-    easyai::ui::Spinner spinner(/*enabled=*/true);
+    easyai::ui::Spinner spinner(/*enabled=*/!args.quiet);
 
     std::string line;
     while (true) {
@@ -479,6 +498,8 @@ int main(int argc, char ** argv) {
             backend->chat(line, [&](const std::string & p){
                 std::string visible = strip.filter(p);
                 if (!visible.empty()) spinner.write(visible);
+                int pct = backend->ctx_pct();
+                if (pct >= 0) spinner.set_context_pct(pct);
             });
             std::string tail = strip.flush();
             if (!tail.empty()) spinner.write(tail);
@@ -491,7 +512,16 @@ int main(int argc, char ** argv) {
         }
         std::cout << "\033[0m" << std::endl;
 
-        if (!backend->last_error().empty()) {
+        // Distinct context-full banner — bail-out at the wall, not an
+        // error.  REPL stays open; the operator can /reset and keep
+        // going.  When this fires we suppress the generic last_error
+        // line below since they'd be redundant.
+        if (backend->last_was_ctx_full()) {
+            std::fprintf(stderr,
+                "── context full ──\n%s\n"
+                "Use /reset to clear history and free the context window.\n",
+                backend->last_error().c_str());
+        } else if (!backend->last_error().empty()) {
             std::fprintf(stderr, "[easyai-cli] %s\n", backend->last_error().c_str());
         }
     }

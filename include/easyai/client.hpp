@@ -108,6 +108,23 @@ public:
     // -1 when either side is unknown.
     int  last_ctx_pct  () const;
 
+    // Hard stop when the chat context fills up.  After each agentic
+    // hop, if the server-reported `timings.ctx_used / n_ctx` ratio is
+    // >= this percentage, run_chat_loop aborts: it stops dispatching
+    // further tool calls, sets last_error to a context-full message,
+    // and returns the latest assistant content so the caller can
+    // show the user what they got plus a note that the conversation
+    // ran out of room.  Default 100 — pinned at the wall, no false
+    // positives on chats that are merely large.  Pass 0 to disable
+    // (legacy "burn until you OOM" behaviour).
+    Client & stop_at_ctx_pct(int pct);
+
+    // Whether the LAST turn was aborted because last_ctx_pct hit the
+    // threshold above.  Lets the app layer pick a different banner
+    // ("contexto cheio, recomece a conversa") rather than the
+    // generic last_error string.
+    bool last_was_ctx_full() const;
+
     // Agentic-loop safety cap: how many tool round-trips before chat()
     // bails out with "max tool hops exceeded".  Default 8 — fine for
     // small research flows.  Bash-driven flows often need many more

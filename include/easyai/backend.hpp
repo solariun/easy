@@ -48,6 +48,16 @@ public:
     virtual std::string last_error () const                                             = 0;
     virtual std::size_t tool_count () const                                             = 0;
     virtual std::vector<std::pair<std::string,std::string>> tool_list() const           = 0;
+
+    // Live context-window load: 0..100 percentage of n_ctx currently
+    // occupied, or -1 if the backend doesn't have a number yet (Local
+    // before first chat; Remote before the first SSE timings).
+    virtual int  ctx_pct        () const { return -1; }
+    // True when the LAST chat() ran out of context window and the
+    // agentic loop bailed early.  Default false — overrides in
+    // LocalBackend / RemoteBackend mirror Engine::last_was_ctx_full /
+    // Client::last_was_ctx_full.
+    virtual bool last_was_ctx_full() const { return false; }
 };
 
 
@@ -96,6 +106,8 @@ public:
     std::string last_error () const override;
     std::size_t tool_count () const override;
     std::vector<std::pair<std::string,std::string>> tool_list() const override;
+    int         ctx_pct        () const override;
+    bool        last_was_ctx_full() const override;
 
 private:
     struct Impl;
@@ -141,6 +153,8 @@ public:
     std::string last_error () const override;
     std::size_t tool_count () const override;
     std::vector<std::pair<std::string,std::string>> tool_list() const override;
+    int         ctx_pct        () const override;
+    bool        last_was_ctx_full() const override;
 
 private:
     struct Impl;

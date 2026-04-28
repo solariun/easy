@@ -109,4 +109,19 @@ std::vector<std::pair<std::string,std::string>> LocalBackend::tool_list() const 
     return out;
 }
 
+int LocalBackend::ctx_pct() const {
+    auto pd = p_->engine.perf_data();
+    int n_ctx = p_->engine.n_ctx();
+    if (n_ctx <= 0 || pd.n_ctx_used < 0) return -1;
+    long long n = (long long) pd.n_ctx_used * 100;
+    int pct = (int) (n / n_ctx);
+    if (pct < 0)   pct = 0;
+    if (pct > 100) pct = 100;
+    return pct;
+}
+
+bool LocalBackend::last_was_ctx_full() const {
+    return p_->engine.last_was_ctx_full();
+}
+
 }  // namespace easyai

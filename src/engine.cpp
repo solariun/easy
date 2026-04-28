@@ -573,6 +573,9 @@ struct Engine::Impl {
     bool         parallel_tool_calls    = false;
     int          max_tool_hops          = 8;     // default agentic safety cap
     bool         retry_on_incomplete    = true;  // see Engine::retry_on_incomplete
+    int          stop_at_ctx_pct        = 100;   // 0 disables; otherwise abort
+                                                  // chat_continue when KV >= this %
+    bool         last_was_ctx_full      = false;
 
     TokenCallback    on_token;
     ToolCallback     on_tool;
@@ -850,6 +853,13 @@ Engine & Engine::tool_choice_none()             { p_->tool_choice = COMMON_CHAT_
 Engine & Engine::parallel_tool_calls(bool e)    { p_->parallel_tool_calls = e; return *this; }
 Engine & Engine::max_tool_hops      (int  n)    { if (n > 0) p_->max_tool_hops = n; return *this; }
 Engine & Engine::retry_on_incomplete(bool on)   { p_->retry_on_incomplete = on; return *this; }
+Engine & Engine::stop_at_ctx_pct    (int  pct)  {
+    if (pct < 0)   pct = 0;
+    if (pct > 100) pct = 100;
+    p_->stop_at_ctx_pct = pct;
+    return *this;
+}
+bool     Engine::last_was_ctx_full() const      { return p_->last_was_ctx_full; }
 Engine & Engine::verbose(bool v)                { p_->verbose = v; return *this; }
 
 // ---------------------------------------------------------------------------
@@ -1156,6 +1166,7 @@ std::string Engine::chat_continue() {
     int thought_retries    = 0;
     int incomplete_retries = 0;
     std::string final_text;
+    p_->last_was_ctx_full = false;
 
     for (int hop = 0; hop < kMaxToolHops; ++hop) {
         auto chat_p = p_->render(/*add_generation_prompt=*/true);
@@ -1236,6 +1247,35 @@ std::string Engine::chat_continue() {
         }
 
         p_->history.push_back(msg);
+
+        // Hard ceiling on context fill — once the KV cache hits the
+        // configured pct of n_ctx, the next hop will either truncate
+        // from the head or just OOM the decode.  Stop here, surface
+        // the latest assistant content, set a clear last_error.
+        // Threshold 0 disables; default 100 = pinned at the wall.
+        if (p_->stop_at_ctx_pct > 0 && p_->ctx()) {
+            const int n_ctx_total = llama_n_ctx(p_->ctx());
+            int n_ctx_used = llama_memory_seq_pos_max(
+                                 llama_get_memory(p_->ctx()), 0) + 1;
+            if (n_ctx_used < 0) n_ctx_used = 0;
+            if (n_ctx_total > 0
+                    && (long long) n_ctx_used * 100
+                           >= (long long) p_->stop_at_ctx_pct * n_ctx_total) {
+                p_->last_was_ctx_full = true;
+                p_->last_error = "context full ("
+                              + std::to_string(n_ctx_used) + "/"
+                              + std::to_string(n_ctx_total) + " tokens — "
+                              + std::to_string(p_->stop_at_ctx_pct)
+                              + "%) — stopping agentic loop. "
+                                "Start a new chat to free the context window.";
+                easyai::log::mark_problem(
+                    "Engine::chat_continue ctx full hop=%d ctx_used=%d n_ctx=%d "
+                    "threshold=%d%%",
+                    hop, n_ctx_used, n_ctx_total, p_->stop_at_ctx_pct);
+                final_text = msg.content;
+                return final_text;
+            }
+        }
 
         if (msg.tool_calls.empty()) {
             final_text = msg.content;

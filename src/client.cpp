@@ -214,6 +214,9 @@ struct Client::Impl {
     int         last_ctx_used       = -1;    // mirror of last turn's timings.ctx_used
     int         last_n_ctx          = -1;    // mirror of last turn's timings.n_ctx
     int         max_tool_hops       = 8;     // agentic loop safety cap; bumped by bash
+    int         stop_at_ctx_pct     = 100;   // 0 disables; otherwise abort agentic
+                                              // loop when ctx_used/n_ctx >= this %
+    bool        last_was_ctx_full   = false; // tripped this turn's stop_at_ctx_pct
     // Per-chat budget for the announce-without-action / malformed-turn
     // recovery loop.  Bumped from 1 → 10 in 2026-04-28 so a flaky model
     // gets the same chances as the local Engine path before we surface
@@ -670,6 +673,7 @@ struct Client::Impl {
 
     std::string run_chat_loop() {
         last_was_incomplete         = false;
+        last_was_ctx_full           = false;
         int incomplete_retries      = 0;
 
         for (int hop = 0; hop < max_tool_hops; ++hop) {
@@ -772,6 +776,31 @@ struct Client::Impl {
             last_was_incomplete = turn.incomplete;
             if (turn.ctx_used >= 0) last_ctx_used = turn.ctx_used;
             if (turn.n_ctx    >  0) last_n_ctx    = turn.n_ctx;
+
+            // Hard ceiling on context fill — once the chat has filled
+            // (or about to fill) n_ctx, the next hop will either
+            // truncate from the head or just OOM the request.  Stop
+            // here, surface the latest assistant content, and tag the
+            // turn so the app layer can show a clear note.  Threshold
+            // 0 disables; default 100 = pinned at the wall.
+            if (stop_at_ctx_pct > 0
+                    && last_ctx_used >= 0
+                    && last_n_ctx    >  0
+                    && (long long) last_ctx_used * 100
+                           >= (long long) stop_at_ctx_pct * last_n_ctx) {
+                last_was_ctx_full = true;
+                last_error = "context full ("
+                           + std::to_string(last_ctx_used) + "/"
+                           + std::to_string(last_n_ctx) + " tokens — "
+                           + std::to_string(stop_at_ctx_pct)
+                           + "%) — stopping agentic loop. "
+                             "Start a new chat to free the context window.";
+                easyai::log::mark_problem(
+                    "Client::run_chat_loop ctx full hop=%d ctx_used=%d n_ctx=%d "
+                    "threshold=%d%%",
+                    hop, last_ctx_used, last_n_ctx, stop_at_ctx_pct);
+                return turn.content;
+            }
 
             // If we land here with `turn.incomplete` set, the retry budget
             // was exhausted (or retry_on_incomplete was off).  Mark it
@@ -885,6 +914,13 @@ int      Client::last_ctx_pct()               const  {
     if (pct > 100) pct = 100;
     return pct;
 }
+Client & Client::stop_at_ctx_pct(int pct) {
+    if (pct < 0)   pct = 0;
+    if (pct > 100) pct = 100;
+    p_->stop_at_ctx_pct = pct;
+    return *this;
+}
+bool     Client::last_was_ctx_full()          const  { return p_->last_was_ctx_full; }
 
 Client & Client::model              (std::string id)     { p_->model_id          = std::move(id);     return *this; }
 Client & Client::system             (std::string prompt) { p_->system_prompt     = std::move(prompt); return *this; }

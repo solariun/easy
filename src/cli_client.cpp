@@ -246,4 +246,7 @@ std::vector<std::pair<std::string,std::string>> RemoteBackend::tool_list() const
     return out;
 }
 
+int  RemoteBackend::ctx_pct()           const { return p_->client ? p_->client->last_ctx_pct() : -1; }
+bool RemoteBackend::last_was_ctx_full() const { return p_->client && p_->client->last_was_ctx_full(); }
+
 }  // namespace easyai
