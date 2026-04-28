@@ -140,16 +140,62 @@ bool read_json_string(const std::string & j, size_t i, std::string & out) {
 
 namespace args {
 
+// Tolerant string getter — accepts:
+//   "value"           → "value"           (the spec form)
+//   123 / -1.5 / 1e3  → "123" / "-1.5" / "1e3"   (model emitted a number
+//                                                  for a string field)
+//   true / false      → "true" / "false"  (likewise for booleans)
+//   null              → returns false     (treat as missing)
+// This mirrors how lenient tool-arg parsers (nlohmann's value<>, OpenAI
+// SDK's tool-arg coercion) handle real-world model output where the
+// model imitates the format it saw in the prompt rather than the schema.
+// Concrete repro: plan tool's schema declares id="string", but its
+// render shows "1.", "2.", "3." — many models emit `"id": 1` (integer)
+// and expect us to accept it.  Without this coercion the call fails
+// with "needs id" even though the value is right there.
 bool get_string(const std::string & json, const std::string & key, std::string & out) {
     size_t i = find_key(json, key);
     if (i == std::string::npos) return false;
-    return read_json_string(json, i, out);
+    i = skip_ws(json, i);
+    if (i >= json.size()) return false;
+    char c = json[i];
+    if (c == '"') return read_json_string(json, i, out);
+    if (c == 't' && json.compare(i, 4, "true")  == 0) { out = "true";  return true; }
+    if (c == 'f' && json.compare(i, 5, "false") == 0) { out = "false"; return true; }
+    if (c == 'n' && json.compare(i, 4, "null")  == 0) return false;
+    // Number (integer or floating-point, with optional sign / exponent).
+    // Scan the literal and copy its bytes verbatim so we don't lose
+    // precision converting through double.
+    if (c == '-' || c == '+' || (c >= '0' && c <= '9')) {
+        size_t start = i;
+        if (c == '-' || c == '+') ++i;
+        while (i < json.size() &&
+               ((json[i] >= '0' && json[i] <= '9') ||
+                json[i] == '.' || json[i] == 'e' || json[i] == 'E' ||
+                json[i] == '+' || json[i] == '-')) ++i;
+        if (i > start) {
+            out.assign(json, start, i - start);
+            return true;
+        }
+    }
+    return false;
 }
 
+// Tolerant int getter — also accepts a quoted integer literal `"42"`,
+// which models occasionally emit when they see a string-typed example
+// in the prompt next to a numeric field.
 bool get_int(const std::string & json, const std::string & key, long long & out) {
     size_t i = find_key(json, key);
     if (i == std::string::npos) return false;
     i = skip_ws(json, i);
+    if (i >= json.size()) return false;
+    if (json[i] == '"') {
+        std::string s;
+        if (!read_json_string(json, i, s)) return false;
+        char * end = nullptr;
+        out = std::strtoll(s.c_str(), &end, 10);
+        return end != s.c_str() && *end == '\0';
+    }
     char * end = nullptr;
     out = std::strtoll(json.c_str() + i, &end, 10);
     return end != json.c_str() + i;
@@ -159,6 +205,14 @@ bool get_double(const std::string & json, const std::string & key, double & out)
     size_t i = find_key(json, key);
     if (i == std::string::npos) return false;
     i = skip_ws(json, i);
+    if (i >= json.size()) return false;
+    if (json[i] == '"') {
+        std::string s;
+        if (!read_json_string(json, i, s)) return false;
+        char * end = nullptr;
+        out = std::strtod(s.c_str(), &end);
+        return end != s.c_str() && *end == '\0';
+    }
     char * end = nullptr;
     out = std::strtod(json.c_str() + i, &end);
     return end != json.c_str() + i;
@@ -168,8 +222,17 @@ bool get_bool(const std::string & json, const std::string & key, bool & out) {
     size_t i = find_key(json, key);
     if (i == std::string::npos) return false;
     i = skip_ws(json, i);
+    if (i >= json.size()) return false;
+    // Native booleans.
     if (json.compare(i, 4, "true")  == 0) { out = true;  return true; }
     if (json.compare(i, 5, "false") == 0) { out = false; return true; }
+    // Quoted booleans (`"true"` / `"false"`) — same model-tolerance idea.
+    if (json[i] == '"') {
+        std::string s;
+        if (!read_json_string(json, i, s)) return false;
+        if (s == "true"  || s == "1") { out = true;  return true; }
+        if (s == "false" || s == "0") { out = false; return true; }
+    }
     return false;
 }
 
