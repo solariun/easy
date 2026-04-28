@@ -96,16 +96,26 @@ public:
     void start_heartbeat(int interval_ms = 250);
     void stop_heartbeat();
 
+    // Show a context-fill percentage (0..100) next to the spinner
+    // glyph — drawn as `<glyph><pct>%` so the operator can tell at a
+    // glance how close the chat is to filling n_ctx.  Pass -1 to hide
+    // the suffix.  The next redraw picks the new value up; nothing
+    // forces an immediate refresh, the heartbeat handles that.
+    void set_context_pct(int pct);
+
 private:
     void maybe_advance_locked_();
+    void erase_active_locked_();
     void draw_locked_();
     void heartbeat_loop_();
 
     static constexpr int kFrameAdvanceMs = 100;     // 10 Hz throttle floor
 
-    bool enabled_ = false;
-    bool active_  = false;
-    int  frame_   = 0;
+    bool enabled_      = false;
+    bool active_       = false;
+    int  frame_        = 0;
+    int  active_width_ = 0;   // chars currently on stdout — backspace count for erase
+    int  context_pct_  = -1;  // -1 = no suffix; 0..100 = "<pct>%"
     std::chrono::steady_clock::time_point last_advance_{};
 
     std::mutex              mu_;               // stdout + state

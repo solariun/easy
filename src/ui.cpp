@@ -32,10 +32,7 @@ Spinner::WriteScope::WriteScope(Spinner & s)
     : s_(s.enabled_ ? &s : nullptr) {
     if (!s_) return;
     s_->mu_.lock();
-    if (s_->active_) {
-        std::fputs("\b \b", stdout);
-        s_->active_ = false;
-    }
+    s_->erase_active_locked_();
 }
 
 Spinner::WriteScope::~WriteScope() {
@@ -67,12 +64,25 @@ void Spinner::initial_draw() {
 void Spinner::finish() {
     if (!enabled_) return;
     std::lock_guard<std::mutex> lg(mu_);
-    if (active_) {
-        std::fputs("\b \b", stdout);
-        std::fflush(stdout);
-        active_ = false;
-    }
+    erase_active_locked_();
+    std::fflush(stdout);
     frame_ = 0;
+}
+
+void Spinner::set_context_pct(int pct) {
+    if (!enabled_) return;
+    if (pct < 0)         pct = -1;
+    else if (pct > 100)  pct = 100;
+    std::lock_guard<std::mutex> lg(mu_);
+    if (context_pct_ == pct) return;
+    context_pct_ = pct;
+    // Repaint immediately if a glyph is currently visible so the
+    // suffix updates without waiting for the next heartbeat tick.
+    if (active_) {
+        erase_active_locked_();
+        draw_locked_();
+        std::fflush(stdout);
+    }
 }
 
 void Spinner::start_heartbeat(int interval_ms) {
@@ -98,11 +108,39 @@ void Spinner::maybe_advance_locked_() {
     }
 }
 
+void Spinner::erase_active_locked_() {
+    if (!active_ || active_width_ <= 0) return;
+    // Wipe `active_width_` chars to the left of the cursor.  We can't
+    // assume \b is repeatable across all terminals when crossing a
+    // line boundary, but the spinner is always drawn after the most
+    // recent newline, so a simple backspace-space-backspace per char
+    // is safe.
+    for (int i = 0; i < active_width_; ++i) std::fputc('\b', stdout);
+    for (int i = 0; i < active_width_; ++i) std::fputc(' ',  stdout);
+    for (int i = 0; i < active_width_; ++i) std::fputc('\b', stdout);
+    active_       = false;
+    active_width_ = 0;
+}
+
 void Spinner::draw_locked_() {
     static const char frames[] = { '|', '/', '-', '\\' };
-    std::fputc(frames[frame_ % 4], stdout);
+    char buf[16];
+    int  n;
+    if (context_pct_ < 0) {
+        buf[0] = frames[frame_ % 4];
+        n = 1;
+    } else {
+        // `<glyph><pct>%` — no separator, so the suffix sits flush
+        // with the glyph and tracks the cursor as it moves.
+        n = std::snprintf(buf, sizeof(buf), "%c%d%%",
+                          frames[frame_ % 4], context_pct_);
+        if (n < 0)                  n = 1;          // snprintf failure
+        if (n >= (int) sizeof(buf)) n = (int) sizeof(buf) - 1;
+    }
+    std::fwrite(buf, 1, (size_t) n, stdout);
     std::fflush(stdout);
-    active_ = true;
+    active_       = true;
+    active_width_ = n;
 }
 
 void Spinner::heartbeat_loop_() {
@@ -116,7 +154,7 @@ void Spinner::heartbeat_loop_() {
         if (!hb_running_) break;
         std::lock_guard<std::mutex> lg(mu_);
         if (!active_) continue;            // nothing drawn yet
-        std::fputs("\b \b", stdout);
+        erase_active_locked_();
         ++frame_;
         last_advance_ = std::chrono::steady_clock::now();
         draw_locked_();

@@ -211,6 +211,8 @@ struct Client::Impl {
     // retry_on_incomplete(false).
     bool        retry_on_incomplete = true;
     bool        last_was_incomplete = false; // mirror of last turn's timings.incomplete
+    int         last_ctx_used       = -1;    // mirror of last turn's timings.ctx_used
+    int         last_n_ctx          = -1;    // mirror of last turn's timings.n_ctx
     int         max_tool_hops       = 8;     // agentic loop safety cap; bumped by bash
     // Per-chat budget for the announce-without-action / malformed-turn
     // recovery loop.  Bumped from 1 → 10 in 2026-04-28 so a flaky model
@@ -378,6 +380,8 @@ struct Client::Impl {
         std::vector<PendingToolCall> tool_calls;
         std::string                  finish_reason = "stop";
         bool                         incomplete = false;  // mirrors timings.incomplete
+        int                          ctx_used   = -1;     // tokens currently in KV
+        int                          n_ctx      = -1;     // configured context window
     };
 
     bool stream_chat(AssistantTurn & out) {
@@ -470,6 +474,12 @@ struct Client::Impl {
                     const auto & tm = j["timings"];
                     if (tm.contains("incomplete") && tm["incomplete"].is_boolean()) {
                         out.incomplete = tm["incomplete"].get<bool>();
+                    }
+                    if (tm.contains("ctx_used") && tm["ctx_used"].is_number_integer()) {
+                        out.ctx_used = tm["ctx_used"].get<int>();
+                    }
+                    if (tm.contains("n_ctx") && tm["n_ctx"].is_number_integer()) {
+                        out.n_ctx = tm["n_ctx"].get<int>();
                     }
                 }
             }
@@ -760,6 +770,8 @@ struct Client::Impl {
 
             history_json.push_back(assistant_msg_json(turn));
             last_was_incomplete = turn.incomplete;
+            if (turn.ctx_used >= 0) last_ctx_used = turn.ctx_used;
+            if (turn.n_ctx    >  0) last_n_ctx    = turn.n_ctx;
 
             // If we land here with `turn.incomplete` set, the retry budget
             // was exhausted (or retry_on_incomplete was off).  Mark it
@@ -863,6 +875,16 @@ Client & Client::max_reasoning_chars(int n)        { p_->max_reasoning_chars = n
 Client & Client::retry_on_incomplete(bool v)       { p_->retry_on_incomplete = v; return *this; }
 Client & Client::max_tool_hops      (int n)         { if (n > 0) p_->max_tool_hops = n; return *this; }
 bool     Client::last_turn_was_incomplete() const   { return p_->last_was_incomplete; }
+int      Client::last_ctx_used()             const   { return p_->last_ctx_used; }
+int      Client::last_n_ctx()                 const  { return p_->last_n_ctx; }
+int      Client::last_ctx_pct()               const  {
+    if (p_->last_ctx_used < 0 || p_->last_n_ctx <= 0) return -1;
+    long long n = (long long) p_->last_ctx_used * 100;
+    int pct = (int) (n / p_->last_n_ctx);
+    if (pct < 0)   pct = 0;
+    if (pct > 100) pct = 100;
+    return pct;
+}
 
 Client & Client::model              (std::string id)     { p_->model_id          = std::move(id);     return *this; }
 Client & Client::system             (std::string prompt) { p_->system_prompt     = std::move(prompt); return *this; }

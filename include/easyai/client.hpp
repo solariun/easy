@@ -97,6 +97,17 @@ public:
     // budget was exhausted.
     bool last_turn_was_incomplete() const;
 
+    // Live context-window usage (mirror of the server's
+    // timings.{ctx_used,n_ctx} on the most recent turn).  Returns -1
+    // until the first turn lands.  Used by the CLI spinner to render
+    // a "%XX" load gauge next to its glyph so the operator can tell at
+    // a glance how close the chat is to filling n_ctx.
+    int  last_ctx_used () const;
+    int  last_n_ctx    () const;
+    // Convenience: last_ctx_used / last_n_ctx as a 0..100 percentage,
+    // -1 when either side is unknown.
+    int  last_ctx_pct  () const;
+
     // Agentic-loop safety cap: how many tool round-trips before chat()
     // bails out with "max tool hops exceeded".  Default 8 — fine for
     // small research flows.  Bash-driven flows often need many more

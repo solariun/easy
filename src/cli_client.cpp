@@ -114,11 +114,28 @@ namespace easyai::ui {
 // Streaming::attach(Client &) — Client-specific because Engine has no
 // on_reason channel (reasoning is only streamed in the SSE/remote
 // path).  Same dispatch as the Engine variant otherwise.
+//
+// Also wires the Client's last_ctx_pct into the Spinner: each tool
+// dispatch and each token batch is a natural moment to refresh the
+// gauge — by the time the next turn lands, the spinner already shows
+// the latest %, and the heartbeat keeps it visually animated.
 Streaming & Streaming::attach(Client & client) {
-    client.on_token ([this](const std::string & p){ this->on_token_(p); });
-    client.on_reason([this](const std::string & p){ this->on_reason_(p); });
-    client.on_tool  ([this](const ToolCall & c, const ToolResult & r){
+    Client * pcli = &client;
+    auto refresh_pct = [this, pcli]() {
+        int pct = pcli->last_ctx_pct();
+        if (pct >= 0) spinner_.set_context_pct(pct);
+    };
+    client.on_token ([this, refresh_pct](const std::string & p){
+        this->on_token_(p);
+        refresh_pct();
+    });
+    client.on_reason([this, refresh_pct](const std::string & p){
+        this->on_reason_(p);
+        refresh_pct();
+    });
+    client.on_tool  ([this, refresh_pct](const ToolCall & c, const ToolResult & r){
         this->on_tool_(c, r);
+        refresh_pct();
     });
     return *this;
 }

@@ -293,6 +293,8 @@ struct Options {
     int                      timeout           = 600;
     bool        show_reasoning   = true;   // default ON; --no-reasoning to opt out
     bool        verbose          = false;
+    bool        quiet            = false;  // --quiet/-q: disable spinner + ctx-% gauge
+                                            // (batch / scripted / service usage)
     std::string log_file_path;             // explicit --log-file override
     int         max_reasoning    = 0;      // 0 = unlimited (disable runaway abort)
     bool        retry_on_incomplete = true;    // matches libeasyai-cli default; --no-retry-on-incomplete to opt out
@@ -395,6 +397,11 @@ void usage(const char * argv0) {
 "                                file at /tmp/easyai-cli-{pid}-{epoch}.log.\n"
 "                                The path is printed at startup.  Override\n"
 "                                with --log-file PATH.\n"
+"    -q, --quiet                disable the spinner glyph + context-fill\n"
+"                                gauge (e.g. |45%%).  Use for batch / scripted\n"
+"                                runs where stdout is captured.  Streamed\n"
+"                                content + tool markers still print; only\n"
+"                                the in-place spinner is suppressed.\n"
 "    --log-file PATH            write the raw transaction log here instead\n"
 "                                of the auto-generated /tmp path.  Implies\n"
 "                                --verbose if --verbose wasn't passed.\n"
@@ -466,6 +473,7 @@ bool parse_args(int argc, char ** argv, Options & o) {
         else if (a == "--retry-on-incomplete")    o.retry_on_incomplete = true;   // legacy no-op (now default)
         else if (a == "--no-retry-on-incomplete") o.retry_on_incomplete = false;
         else if (a == "--verbose" || a == "-v") o.verbose = true;
+        else if (a == "--quiet"   || a == "-q") o.quiet   = true;
         else if (a == "--log-file")       o.log_file_path     = need(i, "--log-file");
         else if (a == "--insecure-tls")   o.tls_insecure = true;
         else if (a == "--ca-cert")        o.tls_ca_path  = need(i, "--ca-cert");
@@ -680,7 +688,11 @@ int run_one(easyai::Client & cli, easyai::Plan & plan,
             st.bold(),  st.reset());
     }
 
-    Spinner     spinner(/*enabled=*/true);
+    // --quiet/-q disables the in-place spinner glyph + ctx-% gauge.
+    // Streamed content + tool markers still print; only the cursor-
+    // tracking decoration is suppressed, which is what batch / scripted
+    // / service consumers want (no \b dance polluting captured stdout).
+    Spinner     spinner(/*enabled=*/!o.quiet);
     StreamStats stats;  stats.reset();
 
     // Attach the canonical streaming UX (spinner-locked content + dim
