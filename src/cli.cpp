@@ -22,6 +22,7 @@ namespace easyai::cli {
 // Toolbelt
 // ============================================================================
 Toolbelt & Toolbelt::sandbox    (std::string dir) { sandbox_     = std::move(dir); return *this; }
+Toolbelt & Toolbelt::allow_fs   (bool on)         { allow_fs_    = on;             return *this; }
 Toolbelt & Toolbelt::allow_bash (bool on)         { allow_bash_  = on;             return *this; }
 Toolbelt & Toolbelt::with_plan  (Plan & plan)     { plan_        = &plan;          return *this; }
 Toolbelt & Toolbelt::no_web     (bool on)         { no_web_      = on;             return *this; }
@@ -36,7 +37,7 @@ std::vector<Tool> Toolbelt::tools() const {
         out.push_back(easyai::tools::web_search());
         out.push_back(easyai::tools::web_fetch());
     }
-    if (!sandbox_.empty()) {
+    if (allow_fs_ && !sandbox_.empty()) {
         out.push_back(easyai::tools::fs_list_dir  (sandbox_));
         out.push_back(easyai::tools::fs_read_file (sandbox_));
         out.push_back(easyai::tools::fs_glob      (sandbox_));

@@ -48,6 +48,7 @@ namespace easyai::cli {
 class Toolbelt {
 public:
     Toolbelt & sandbox      (std::string dir);   // "" stays the default (no fs_*)
+    Toolbelt & allow_fs     (bool on = true);    // gate fs_* registration
     Toolbelt & allow_bash   (bool on = true);
     Toolbelt & with_plan    (Plan & plan);
     Toolbelt & no_web       (bool on = true);    // drop web_search/web_fetch
@@ -69,6 +70,10 @@ public:
 
 private:
     std::string sandbox_;
+    // allow_fs_ defaults TRUE so callers that pre-date this flag (Agent,
+    // backend.cpp, examples/cli.cpp) keep the legacy "sandbox dir auto-
+    // enables fs_*" behaviour.  Server flips it OFF unless --allow-fs.
+    bool        allow_fs_    = true;
     bool        allow_bash_  = false;
     bool        no_web_      = false;
     bool        no_datetime_ = false;

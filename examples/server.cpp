@@ -2074,8 +2074,36 @@ static void handle_chat_stream(ServerCtx & ctx,
                 // reasoning flow, not the user-facing answer.  Plain text
                 // (no markdown asterisks) because the bundle renders
                 // reasoning with whitespace-pre-wrap, not as markdown.
+                //
+                // Best-effort target hint: the most useful field of the
+                // arguments JSON for "what is the model trying to reach".
+                // We pick `url` (web_fetch) first, then `query`
+                // (web_search), then `path` (fs_*), then `command` (bash).
+                // Falls back to a short prefix of the raw args blob so
+                // lesser-known tools still get *something* on the line.
+                // Truncated to 80 chars to keep the log a single line.
+                std::string target;
+                try {
+                    auto j = json::parse(c.arguments_json);
+                    static constexpr const char * kKeys[] = {
+                        "url", "query", "path", "command", "expr", "name",
+                    };
+                    for (const char * k : kKeys) {
+                        if (j.contains(k) && j[k].is_string()) {
+                            target = j[k].get<std::string>();
+                            break;
+                        }
+                    }
+                } catch (...) { /* leave target empty */ }
+                if (target.empty() && !c.arguments_json.empty()
+                                   && c.arguments_json != "{}") {
+                    target = c.arguments_json;
+                }
+                if (target.size() > 80) { target.resize(80); target += "…"; }
+
                 std::ostringstream tlog;
                 tlog << "\n" << (r.is_error ? "❌ " : "🔧 ") << c.name;
+                if (!target.empty()) tlog << " " << target;
                 if (r.is_error) {
                     std::string reason = r.content;
                     if (reason.size() > 80) { reason.resize(80); reason += "…"; }
@@ -2639,11 +2667,19 @@ static bool require_auth(const ServerCtx & ctx, const httplib::Request & req,
         "  -s, --system-file <path>     Server-default system prompt from file\n"
         "      --system <text>          Inline system prompt\n"
         "      --no-tools               Don't expose the built-in toolbelt\n"
-        "      --sandbox <dir>          Enable fs_* tools (read_file,\n"
-        "                                list_dir, glob, grep, write_file),\n"
-        "                                ALL scoped to <dir>. Without\n"
-        "                                --sandbox these tools are NOT\n"
-        "                                registered or exposed in the webui.\n"
+        "      --sandbox <dir>          Restrict fs_* and bash to <dir>\n"
+        "                                (when --allow-fs / --allow-bash\n"
+        "                                register them).  Without --sandbox\n"
+        "                                the tools default to the server's\n"
+        "                                cwd. NOTE: --sandbox alone NO LONGER\n"
+        "                                auto-enables fs_*; pass --allow-fs.\n"
+        "      --allow-fs               Register the fs_* tools (fs_read_file,\n"
+        "                                fs_list_dir, fs_glob, fs_grep,\n"
+        "                                fs_write_file).  Scoped to --sandbox\n"
+        "                                dir if given, otherwise the server's\n"
+        "                                cwd.  Off by default — fs_* are NOT\n"
+        "                                registered (and not exposed in the\n"
+        "                                webui) without this flag.\n"
         "      --allow-bash             Register the `bash` tool (run shell\n"
         "                                commands). cwd = --sandbox dir if\n"
         "                                given, otherwise the server's cwd.\n"
@@ -2720,7 +2756,8 @@ struct ServerArgs {
     int         ngl        = -1;
     int         n_threads  = 0;
     bool        load_tools = true;
-    std::string sandbox;            // empty = fs_* tools NOT registered
+    std::string sandbox;            // optional: scope fs_* / bash to this dir
+    bool        allow_fs   = false; // explicit opt-in for the fs_* tools
     bool        allow_bash = false; // explicit opt-in for the `bash` tool
     std::string preset     = "balanced";
     size_t      max_body   = 8u * 1024u * 1024u;
@@ -2786,6 +2823,7 @@ static ServerArgs parse_args(int argc, char ** argv) {
         else if (s == "-t" || s == "--threads")      a.n_threads      = std::atoi(need(i, "-t"));
         else if (s == "--no-tools")                  a.load_tools     = false;
         else if (s == "--sandbox")                   a.sandbox        = need(i, "--sandbox");
+        else if (s == "--allow-fs")                  a.allow_fs       = true;
         else if (s == "--allow-bash")                a.allow_bash     = true;
         else if (s == "--preset")                    a.preset         = need(i, "--preset");
         else if (s == "--max-body")                  a.max_body       = (size_t) std::atoll(need(i, "--max-body"));
@@ -2978,14 +3016,24 @@ int main(int argc, char ** argv) {
 
     // Default toolbelt — opt-out via --no-tools.
     //
-    // fs_* and bash are SHIPPED OFF by default: --sandbox <dir> turns on
-    // the filesystem set (scoped to <dir>), and --allow-bash turns on the
-    // shell tool. Without these flags the model — and the webui's "tools"
-    // listing — never sees them, so we don't accidentally expose write
-    // access or shell to a fresh `easyai-server` install.
+    // fs_* and bash are SHIPPED OFF by default: --allow-fs turns on the
+    // filesystem read/write set, and --allow-bash turns on the shell
+    // tool.  Both honour --sandbox <dir> if given (otherwise they fall
+    // back to the server's cwd).  Without an --allow-* flag the model —
+    // and the webui's "tools" listing — never sees the corresponding
+    // tools, so a fresh easyai-server install can't accidentally expose
+    // write access or shell.
     if (args.load_tools) {
+        // fs_* and bash share a root: --sandbox if given, else cwd.
+        // We only pass that root through to Toolbelt when SOMETHING is
+        // about to use it (allow_fs or allow_bash), so the engine
+        // doesn't spuriously hold onto a sandbox dir the user never
+        // intended to use.
+        std::string sb = args.sandbox;
+        if (sb.empty() && (args.allow_fs || args.allow_bash)) sb = ".";
         auto tb = easyai::cli::Toolbelt()
-                      .sandbox   (args.sandbox)
+                      .sandbox   (sb)
+                      .allow_fs  (args.allow_fs)
                       .allow_bash(args.allow_bash);
         for (auto & t : tb.tools()) ctx->default_tools.push_back(std::move(t));
     }
@@ -3633,6 +3681,38 @@ int main(int argc, char ** argv) {
                     "[stroke=\"#0d1117\"],[stroke=\"#000\"],[stroke=\"black\"],"
                     "[stroke=\"#000000\"],[stroke=\"#15191f\"],[stroke=\"#1a1f29\"]"
                     "{stroke:currentColor!important}';"
+                  "(document.head||document.documentElement).appendChild(st);"
+                "}"
+
+                // Lock the bundle's reasoning / collapsible panel to ~15
+                // lines when open.  The bundle's CollapsibleContentBlock
+                // body uses --max-message-height (24rem to 80dvh), which
+                // means a long chain-of-thought scrolls the whole chat
+                // out of view.  We cap the inner scroll at ~15 lines and
+                // let the panel scroll internally — the message body stays
+                // anchored and the user can scrub through reasoning
+                // without losing the answer below.
+                //
+                // 18em ≈ 15 lines for the bundle's font-mono.text-xs.
+                // leading-relaxed (text-xs=.75rem * 1.625 = 1.22rem/line,
+                // 15 * 1.22 ≈ 18.3rem; 18em is plenty close and matches
+                // the panel's existing font-size scale).  Scoped to
+                // assistant messages so we don't accidentally clamp other
+                // collapsibles (e.g. the system-message preview).
+                "if(!document.getElementById('__easyaiThinkLockStyle')){"
+                  "const st=document.createElement('style');"
+                  "st.id='__easyaiThinkLockStyle';"
+                  "st.textContent="
+                    "'[aria-label=\"Assistant message with actions\"] "
+                      "[data-slot=\"collapsible-content\"]{"
+                      "max-height:18em!important;"
+                      "overflow-y:auto!important}'"
+                    // Same lock for our own custom thinking panel body
+                    // (still present as a fallback when the bundle's
+                    // collapsible isn't mounted yet) — ~15 lines.
+                    "+'.__easyai-thinking>div.t{"
+                      "max-height:18em!important;"
+                      "overflow-y:auto!important}';"
                   "(document.head||document.documentElement).appendChild(st);"
                 "}"
 
