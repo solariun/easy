@@ -632,6 +632,305 @@ easyai-cli   --sandbox ./work --tools-json mytools.json --url http://...
 easyai-server -m model.gguf --sandbox /srv/agent --tools-json /srv/agent/tools.json
 ```
 
+### 3.3.5 External tools — recipes, corner cases, best practices
+
+This section is the practical companion to §3.3.4. It assumes you've
+read the schema and security model and now want to actually ship a
+manifest.
+
+#### Recipes
+
+**Recipe 1 — read-only system inspector (no parameters).**
+
+Useful for "give me the model the ability to talk about the host" without
+any attack surface beyond reading public OS state.
+
+```json
+{
+  "name": "host_status",
+  "description": "Return uptime, load average, kernel name, and free memory of the host. Use when the user asks 'how is the box doing'.",
+  "command": "/usr/bin/uptime",
+  "argv": [],
+  "parameters": { "type": "object", "properties": {} },
+  "timeout_ms": 2000,
+  "max_output_bytes": 4096,
+  "cwd": "$SANDBOX",
+  "env_passthrough": [],
+  "stderr": "discard"
+}
+```
+
+Teaches: zero-parameter tool, conservative `timeout_ms` and
+`max_output_bytes`, empty env, `stderr: "discard"` keeps the model's
+context clean of harmless noise.
+
+**Recipe 2 — code search via ripgrep (with `--` sentinel).**
+
+```json
+{
+  "name": "code_search",
+  "description": "Search the project tree for a literal string or regex. Returns file:line:match. Limit yourself to specific patterns — broad searches are slow and noisy.",
+  "command": "/usr/bin/rg",
+  "argv": [
+    "--no-heading",
+    "--line-number",
+    "--max-count", "100",
+    "--",
+    "{pattern}",
+    "."
+  ],
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "pattern": {
+        "type": "string",
+        "description": "Literal string or regex to search for. Quote multi-word phrases."
+      }
+    },
+    "required": ["pattern"]
+  },
+  "timeout_ms": 15000,
+  "max_output_bytes": 262144,
+  "cwd": "$SANDBOX",
+  "env_passthrough": ["HOME"],
+  "stderr": "merge",
+  "treat_nonzero_exit_as_error": false
+}
+```
+
+Teaches: `"--"` sentinel before the string placeholder so a model
+prompt of `pattern = "-r"` or `"--type=cpp"` is interpreted as a
+search pattern, not a flag. `treat_nonzero_exit_as_error: false`
+because rg returns 1 when the pattern is not found — that's
+informational, not a failure.
+
+**Recipe 3 — JSON filter via jq (no shell escaping headaches).**
+
+```json
+{
+  "name": "json_filter",
+  "description": "Apply a jq expression to an existing JSON file in the sandbox. The 'filter' argument is the jq expression (e.g. '.users[] | .email').",
+  "command": "/usr/bin/jq",
+  "argv": ["--", "{filter}", "{file}"],
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "filter": { "type": "string", "description": "jq expression." },
+      "file":   { "type": "string", "description": "Path to a JSON file inside the sandbox." }
+    },
+    "required": ["filter", "file"]
+  },
+  "timeout_ms": 5000,
+  "max_output_bytes": 65536,
+  "cwd": "$SANDBOX"
+}
+```
+
+Teaches: complex filter strings with quotes / pipes / `$()` are passed
+through as a single argv element — no shell, no escaping. The library
+guarantees `{filter}` fills exactly one argv slot regardless of its
+contents.
+
+**Recipe 4 — internal CLI with a credential.**
+
+```json
+{
+  "name": "deploy_status",
+  "description": "Return the deployment status of a service from our internal control plane. Service must be one we own.",
+  "command": "/opt/internal/bin/deploy-cli",
+  "argv": ["status", "--", "{service}"],
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "service": { "type": "string", "description": "Service name (e.g. 'billing-api')." }
+    },
+    "required": ["service"]
+  },
+  "timeout_ms": 10000,
+  "max_output_bytes": 32768,
+  "cwd": "$SANDBOX",
+  "env_passthrough": ["DEPLOY_TOKEN", "HOME", "PATH"]
+}
+```
+
+Teaches: opt-in env passthrough for credentials. `DEPLOY_TOKEN` is
+read from the parent's environment at every call (so rotating it in
+the systemd unit re-reads on next call without a restart). Without
+the allowlist the subprocess gets a clean env.
+
+**Recipe 5 — Python one-liner (no shell, but execve still works).**
+
+```json
+{
+  "name": "python_eval",
+  "description": "Evaluate a SHORT Python expression and return its repr. Single line, no imports beyond math/datetime/json. Use for arithmetic / date math the model would otherwise get wrong.",
+  "command": "/usr/bin/python3",
+  "argv": ["-c", "{expr}"],
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "expr": { "type": "string", "description": "Python expression. Output goes to stdout via print(repr(...)). Example: 'print(repr(__import__(\"datetime\").datetime.now()))'." }
+    },
+    "required": ["expr"]
+  },
+  "timeout_ms": 3000,
+  "max_output_bytes": 16384,
+  "cwd": "$SANDBOX",
+  "env_passthrough": []
+}
+```
+
+Teaches: `-c "{expr}"` works because `{expr}` is one argv element.
+`python3 -c 'print(1)'` and `python3 -c 'print(1); __import__("os").system("rm -rf /")'` reach
+python the same way; whether to allow it is your policy decision
+(this is essentially `bash` with a Python-shaped surface area —
+narrower, but still arbitrary code execution).
+
+**Recipe 6 — git porcelain (integer parameter, no leading-dash worry).**
+
+```json
+{
+  "name": "git_log",
+  "description": "Show the last N commits of the repository in the sandbox. Format: short hash, author, ISO date, subject.",
+  "command": "/usr/bin/git",
+  "argv": ["log", "--max-count", "{count}", "--pretty=format:%h %an %ad %s", "--date=iso-strict"],
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "count": { "type": "integer", "description": "1..100 commits to show." }
+    },
+    "required": ["count"]
+  },
+  "timeout_ms": 8000,
+  "max_output_bytes": 131072,
+  "cwd": "$SANDBOX",
+  "env_passthrough": ["HOME", "PATH"]
+}
+```
+
+Teaches: integer parameters skip the leading-dash worry — `1` cannot
+be parsed as a flag. `HOME` is needed for `~/.gitconfig`; `PATH` is
+needed because git invokes sub-commands like `git-log` via PATH.
+
+**Recipe 7 — long-running task with cooperative timeout.**
+
+```json
+{
+  "name": "build_project",
+  "description": "Run the build script in the sandbox. Returns build log. May take up to 5 minutes.",
+  "command": "/usr/bin/make",
+  "argv": ["-j", "{jobs}"],
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "jobs": { "type": "integer", "description": "Parallel jobs (1..16)." }
+    },
+    "required": ["jobs"]
+  },
+  "timeout_ms": 300000,
+  "max_output_bytes": 4194304,
+  "cwd": "$SANDBOX",
+  "env_passthrough": ["HOME", "PATH", "CC", "CXX"],
+  "stderr": "merge"
+}
+```
+
+Teaches: `timeout_ms` at the 5-min ceiling, `max_output_bytes` at the
+4-MiB ceiling. On timeout the runner sends SIGTERM to the process
+group (so child compilers die too), then SIGKILL after 1 s. Make
+gets one chance to flush — typical build systems handle this fine.
+
+#### Corner cases
+
+| Situation | What happens |
+| --- | --- |
+| Binary doesn't exist when manifest loads | Load fails with a precise error. Agent doesn't start. |
+| Binary removed AFTER successful load | Tool call returns `exit=127  external_tool: execve failed`. |
+| Binary on a stalled NFS mount | Call blocks until `timeout_ms`, then SIGTERM/SIGKILL the way a hung child gets killed anywhere. |
+| Required parameter missing in model's call | `ToolResult::error` before `fork()`. |
+| Optional parameter missing | Empty string substituted into the argv slot. (For tools that distinguish "" from "not present", make the param required.) |
+| Extra keys in the model's JSON arguments | Silently ignored. |
+| Two manifest entries with the same name | Load fails with `duplicate tool name`. |
+| Manifest entry shadows a built-in (e.g. names itself `bash`) | Load fails with collision error. |
+| `argv` is `[]` (empty array) | Valid. Command runs with `argv[0] = basename(command)` and nothing else. |
+| Model sends `"true"` (string) for a `boolean` parameter | Validation rejects: `expected boolean`. |
+| Model sends `1.5` for an `integer` parameter | Validation rejects: `expected integer`. nlohmann's `is_number_integer()` is strict. |
+| Model sends `NaN` / `Infinity` for a `number` parameter | Rejected: `must be a finite number`. |
+| Manifest is edited while the agent is running | No effect — loaded once at startup. Restart to pick up changes. |
+| `cwd: "$SANDBOX"` but the agent didn't `chdir` | `$SANDBOX` is captured at LOAD time. The manifest's `cwd` resolves to whatever the process CWD was when `load_external_tools_from_json` ran. The CLIs `chdir(--sandbox)` BEFORE loading, so `$SANDBOX` ≡ `--sandbox`. |
+| Want `LD_PRELOAD` to leak through | Can't, by design. Listed env vars are validated against `^[a-zA-Z][a-zA-Z0-9_]{0,63}$` — `LD_PRELOAD` matches the pattern, so technically allowed. But you have to opt in explicitly. |
+| `stderr: "discard"` and the command writes to stderr | Bytes go to `/dev/null`. Model never sees them. |
+| Command writes binary / non-UTF-8 bytes to stdout | Captured as-is. Returned as a `std::string` to the model — it'll see invalid bytes. Best-effort. |
+| Command spawns a daemon (forks, parent exits) | Parent reaped immediately; daemon survives but inherits stdout=pipe with no reader; first write gets `SIGPIPE` and dies. Don't use this design for daemonising commands. |
+| Subprocess takes 3 seconds; `timeout_ms = 5000` | Runs to completion, output captured normally. |
+| Subprocess outputs more than `max_output_bytes` | Excess is silently discarded (drained, not buffered). Response notes `[truncated at N bytes]`. The child stays unblocked. |
+| Subprocess writes 1 KB then sleeps 30 minutes | Output captured immediately; SIGTERM on `timeout_ms`, SIGKILL after 1 s grace. |
+| Two concurrent calls to the same tool | Each `fork`s its own subprocess. No shared state on the library side. The wrapped command is responsible for its own concurrency. |
+| Agent (parent) crashes mid-call | On Linux, `PR_SET_PDEATHSIG(SIGKILL)` ensures the subprocess dies with the agent. Otherwise it'd reparent to PID 1 and survive. |
+| Manifest path is `/dev/zero` or a directory | `slurp()` rejects with `manifest is not a regular file`. |
+| Manifest is 2 MB | Rejected: `manifest exceeds 1048576 bytes`. |
+
+#### Best practices
+
+**DO:**
+
+- Use absolute paths in `command` (the loader requires it; don't fight it).
+- Insert `"--"` literal element before any string placeholder for binaries that accept options (rg, grep, find, pgrep, kill, …).
+- Set `treat_nonzero_exit_as_error: false` for tools where non-zero is informational (`pgrep`, `grep`, `diff`).
+- Match `timeout_ms` and `max_output_bytes` to the worst plausible case for that tool — not a global default. Short-running status tools should have small caps so a hung command doesn't waste the 5-min ceiling.
+- Use `env_passthrough` to pass exactly the env vars the wrapped command needs (`HOME`, `PATH`, sometimes `LANG`, `TZ`, a credential token). Default `[]` and grow only when something fails.
+- Spend real time on `description` text — that string is how the model picks WHICH tool to call. Mention edge cases ("returns empty when nothing matches"), expected use ("call this AFTER web_search"), and units ("returns kilobytes").
+- Name parameters to match the wrapped CLI's vocabulary (`pattern` if the binary calls it pattern, not `regex`).
+- Group related tools in one manifest — the `--tools` allowlist applies after load, so a single big manifest is fine for the operator.
+- Validate the manifest before deploy: `easyai-local --tools-json mytools.json --no-tools` (no model call, just load — exits cleanly if valid, errors if not).
+- Run easyai-server as a dedicated unprivileged user when external tools are in play — the security guarantees stop shell injection, not "runs with your full uid".
+
+**DON'T:**
+
+- Don't put a placeholder inside a larger string — split into separate elements. `["--flag={x}"]` is rejected at load. Use `["--flag", "{x}"]`.
+- Don't reach for the `bash` builtin to wrap a command you could declare in the manifest. The manifest gives you fork+execve safety, schema validation, hard timeouts, fd hygiene, env hygiene. `bash` gives you none of those.
+- Don't rely on the agent's CWD matching what you think it is — be explicit with `cwd: "$SANDBOX"` or an absolute path.
+- Don't put credentials in `argv` — they end up in `/proc/<pid>/cmdline` (world-readable on most distros). Use `env_passthrough` instead.
+- Don't declare more than ~10–15 tools in a single manifest unless the model is large. Every tool's name + description + schema is serialised into the prompt on every turn — too many tools = too much token budget eaten before the user's actual question.
+- Don't use the manifest for tools that need shared in-process state (a database connection pool, an HTTP client with a session cookie). Those are C++ tools — `Tool::builder().handle(...)`.
+- Don't expose interactive tools (`vim`, `nano`, `more`) — stdin is closed; they'll behave strangely or hang until timeout.
+- Don't expose tools that fork-and-exit (daemonising launchers) — the daemon's stdout is the now-orphaned pipe; first write SIGPIPEs.
+
+#### Validating a manifest before deploy
+
+```sh
+# Loads the manifest, prints the resulting tool list, exits.
+# Any load error fails the command — wire it into your CI.
+easyai-local --no-tools --tools-json mytools.json --print-models 2>&1 \
+  | grep -E "(loaded|error)"
+```
+
+You can also unit-test a manifest from C++:
+
+```cpp
+auto loaded = easyai::load_external_tools_from_json("mytools.json", {});
+assert(loaded.error.empty() && "manifest invalid");
+assert(loaded.tools.size() == kExpectedToolCount);
+for (const auto & t : loaded.tools) {
+    // sanity-check the auto-generated parameter schema
+    auto schema = nlohmann::json::parse(t.parameters_json);
+    assert(schema["type"] == "object");
+}
+```
+
+#### What this is NOT
+
+- **Not a sandbox.** External tools run with the agent's full uid/gid.
+  Network, FS, signals — everything the agent can do, the tool can
+  do. The library closes inheritance leaks; it doesn't isolate.
+- **Not a process supervisor.** No restart-on-failure, no PID file,
+  no log rotation. Each call is a one-shot fork+exec.
+- **Not async.** A tool call blocks the agent loop until it returns
+  or times out. Latency budget = timeout_ms.
+- **Not stateful.** Each call gets a fresh subprocess. If you need
+  state, write a C++ tool with a captured `std::shared_ptr` to a
+  state object.
+
 ### 3.4 Streaming token output
 
 Just register `on_token`:

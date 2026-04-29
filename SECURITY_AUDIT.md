@@ -344,3 +344,129 @@ isolation, not the framework.
 - JSON parse exceptions — every `nlohmann::json::parse(user_data)`
   is wrapped in try/catch.
 
+---
+
+## 16. External tools manifest — `src/external_tools.cpp` (NEW SURFACE)
+
+Introduced in commit `d0f7965`, hardened in `e966cf1`. Operator
+declares custom commands in a JSON manifest; the library compiles
+each entry into a regular `Tool` that the model can dispatch like a
+built-in. New surface, audited from scratch in the same pass.
+
+The trust boundary is **operator → model**: the manifest is part of
+the operator's deploy artefact (treat it like a sudoers file —
+anyone who can write it can run arbitrary commands as the agent's
+user). The model only fills in parameter values, which are
+type-checked against the per-tool JSON Schema before any process is
+spawned.
+
+### 16.1 Guarantees enforced at LOAD time
+
+1. **Absolute command path.** Validated via `stat()` + `S_ISREG` +
+   `access(X_OK)`. Relative names rejected → no PATH search → no
+   PATH-hijack.
+2. **Manifest is a regular file.** `slurp()` does `stat()` first
+   and rejects directories, FIFOs, devices, sockets. Stops a
+   misconfigured `--tools-json /dev/zero` from spinning instead of
+   erroring cleanly.
+3. **Whole-element argv placeholders only.** `"{name}"` accepted,
+   `"--flag={x}"` rejected. The model's value flows through as one
+   whole argv element — quoting, `;`, `$(…)`, backticks, embedded
+   newlines cannot escape into adjacent elements.
+4. **No name collisions.** Tool names cannot shadow built-ins
+   (`bash`, `read_file`, `get_current_dir`, …) or
+   already-registered tools. Operator notices on startup, not at
+   first call.
+5. **Hard caps** (each closes a class of DoS):
+   - manifest size: 1 MiB
+   - tools per manifest: 128
+   - params per tool: 32
+   - argv elements: 256
+   - per-arg bytes: 4 KiB
+   - env passthrough entries: 16
+   - timeout: clamped to [100 ms, 300 000 ms]
+   - output cap: clamped to [1 KiB, 4 MiB]
+   - tool-name length: 64 chars (matches the validator regex)
+   - tool-description length: 4096 chars
+   - parameter-description length: 2048 chars
+
+### 16.2 Guarantees enforced at CALL time
+
+1. **Schema-validated arguments.** Type errors and missing-required
+   args surface as `ToolResult::error` *before* `fork()` is called.
+2. **Non-finite numbers rejected.** `nlohmann::json` accepts NaN /
+   Inf as valid numbers; we explicitly call `std::isfinite()` so
+   the wrapped command never receives the literal string `"nan"` or
+   `"inf"` as an argv value.
+3. **No shell.** Spawn is `fork()` + `execve(absolute_path, argv,
+   envp)`. Never `/bin/sh -c …`.
+4. **Closed stdin.** Child gets `/dev/null` on fd 0; the model
+   cannot feed bytes into the subprocess.
+5. **Bounded fd inheritance.** All fds ≥ 3 closed in the child
+   between `fork()` and `execve()`. The close-loop is bounded by
+   `kMaxFdScan = 65536` regardless of `RLIMIT_NOFILE`, so
+   `ulimit -n unlimited` (which produces `rlim_cur = RLIM_INFINITY`
+   ≈ `ULONG_MAX`, casts to `-1`, silently disables a naive loop)
+   does NOT leak parent fds into the child.
+6. **Linux PDEATHSIG.** Child sets `prctl(PR_SET_PDEATHSIG,
+   SIGKILL)`. If the agent process dies (segfault, OOM-kill,
+   `kill -9`) before the subprocess finishes, the kernel sends the
+   subprocess SIGKILL instead of leaving an orphan reparented to
+   PID 1.
+7. **Process-group lifetime.** Both child and parent call `setpgid`
+   so the parent's `kill(-pid, …)` reaches grandchildren. Timeout
+   path: SIGTERM, then SIGKILL after a 1 s grace, then a blocking
+   `waitpid` after 5 s if the child still hasn't been reaped
+   (uninterruptible-sleep / kernel-bug safety net).
+8. **Output capped.** `max_output_bytes` enforced in the read loop
+   on the parent side; the child stays unblocked because we keep
+   draining the pipe (and discarding overflow) instead of letting
+   it stall on a full buffer.
+9. **Clean env by default.** Only operator-listed `env_passthrough`
+   vars inherit; `LD_PRELOAD`, `PATH`, etc. don't leak in unless
+   asked. Each passthrough value is also capped at
+   `kMaxArgElementBytes` so a hostile env (`HOME=<2 MB string>`)
+   can't push the execve table toward `ARG_MAX`.
+
+### 16.3 Issues found during the second-pass review (FIXED)
+
+| # | Issue | Severity | Fix landed |
+| --- | --- | --- | --- |
+| 1 | `RLIMIT_NOFILE = RLIM_INFINITY` skipped the close-loop, leaking every parent fd into the child | HIGH | `kMaxFdScan` cap, `RLIM_INFINITY` guard (e966cf1) |
+| 2 | `slurp()` on `/dev/zero` / FIFO / dir gave misleading sizes; cap merely limited the damage | MEDIUM | stat-first, reject non-regular (e966cf1) |
+| 3 | `nlohmann::json` accepts NaN/Inf; `std::to_string` rendered them as literal `"nan"` / `"inf"` to the wrapped command | MEDIUM | `std::isfinite()` reject (e966cf1) |
+| 4 | Orphan subprocess survived agent crash | LOW | `PR_SET_PDEATHSIG(SIGKILL)` on Linux (e966cf1) |
+| 5 | `env_passthrough` value length uncapped — 2 MB `HOME` would push toward `ARG_MAX` | LOW | per-value cap = `kMaxArgElementBytes` (e966cf1) |
+| 6 | Magic numbers (poll cadence, kill grace, drain buffer, exit codes) inline | quality | promoted to named `constexpr` with rationale (e966cf1) |
+
+### 16.4 Accepted residual risk
+
+- **TOCTOU between `stat()`+`access(X_OK)` at load and `execve()` at
+  call.** If the operator's command binary is replaced between manifest
+  load and the first call, the agent runs whatever the new file
+  contains. Operator-controlled environment, no PATH involved, low
+  practical risk. Could be tightened with `O_PATH` + `fexecve()` if
+  ever needed; not done.
+- **Argv injection via leading dash.** The library guarantees one
+  argv slot per model argument; it cannot know whether the wrapped
+  binary parses `pattern = "-V"` as a flag. Mitigation is
+  manifest-side: insert `"--"` literal before string placeholders.
+  Documented in `manual.md` §3.3.4 and demonstrated in
+  `examples/tools.example.json` (`pgrep` entry uses `["-a", "--",
+  "{pattern}"]`).
+- **`kBuiltInNames` hard-coded list duplicates the actual builtin
+  registry.** A future builtin added to `src/builtin_tools.cpp` must
+  also be added to the reservation list, or a manifest could
+  shadow it. Defence-in-depth: callers also pass their own
+  `reserved_names`; the duplicated list only matters if the caller
+  forgets. Acceptable given the small surface.
+
+### 16.5 The new `get_current_dir` builtin
+
+Zero-parameter tool that returns `getcwd()` at call time. The CLIs
+`chdir()` into `--sandbox` at startup, so what `get_current_dir`
+reports is exactly the directory the model's `bash` / `fs_*` tools
+operate against. No security implications beyond the
+already-audited sandbox semantics — `getcwd` is async-signal-safe
+and bounded by `PATH_MAX` on Linux.
+
