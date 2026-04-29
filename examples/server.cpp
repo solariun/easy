@@ -3684,6 +3684,25 @@ int main(int argc, char ** argv) {
                   "(document.head||document.documentElement).appendChild(st);"
                 "}"
 
+                // Hide the floating top-right Settings gear button.  The
+                // bundle's ChatScreenHeader is a `position:fixed` header
+                // whose sole content is a round Settings-icon button
+                // wired to chatSettingsDialog.open().  Server operators
+                // who want the model to be the only surface (no in-page
+                // sampling tweaks, no theme switching from the chat tab)
+                // need it gone — this hides the whole header so the
+                // gear doesn't even register a click target.  Settings
+                // are still reachable from the bundle's sidebar menu if
+                // an operator un-hides this rule.
+                "if(!document.getElementById('__easyaiHideSettingsStyle')){"
+                  "const st=document.createElement('style');"
+                  "st.id='__easyaiHideSettingsStyle';"
+                  "st.textContent="
+                    "'header.fixed.top-0.right-0.left-0.z-50.justify-end"
+                      "{display:none!important}';"
+                  "(document.head||document.documentElement).appendChild(st);"
+                "}"
+
                 // Lock the bundle's reasoning / collapsible panel to ~15
                 // lines when open.  The bundle's CollapsibleContentBlock
                 // body uses --max-message-height (24rem to 80dvh), which
