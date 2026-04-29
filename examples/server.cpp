@@ -3632,7 +3632,21 @@ int main(int argc, char ** argv) {
                 "const TONE_ORDER="
                   "['deterministic','precise','balanced','creative'];"
                 "let toneBtn=null,toolsBtn=null,toolsPop=null;"
-                "const findPill=()=>document.querySelector(PILL_SEL);"
+                // findPill MUST skip our own clones — `cloneNode(false)`
+                // copies the pill's class string, so toneBtn and toolsBtn
+                // also match PILL_SEL.  Without this guard, querySelector
+                // would return whichever clone happens to be first in DOM
+                // order, and reposition() would treat it as the anchor on
+                // the next tick — causing tone+tools to swap positions on
+                // every reposition (visible as a continuous flicker).
+                "const findPill=()=>{"
+                  "const all=document.querySelectorAll(PILL_SEL);"
+                  "for(const p of all){"
+                    "if(p.id===TONE_ID||p.id===TOOLS_ID)continue;"
+                    "return p;"
+                  "}"
+                  "return null;"
+                "};"
                 "const setToneLabel=(b)=>{"
                   "const lbl=b.querySelector('[data-tone-current]');"
                   "if(lbl)lbl.textContent=window.__easyaiTone||'balanced';"
