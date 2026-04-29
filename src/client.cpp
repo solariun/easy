@@ -607,7 +607,11 @@ struct Client::Impl {
             }
             msg["tool_calls"] = std::move(tcs);
         }
-        return msg.dump();
+        // Tool output and model content can carry stray non-UTF-8 bytes
+        // (e.g. bash piping a sed result with Windows-1252 curly quotes,
+        // 0x92). Strict dump throws type_error.316; replace invalid bytes
+        // with U+FFFD instead so the agent loop survives.
+        return msg.dump(-1, ' ', false, ordered_json::error_handler_t::replace);
     }
 
     std::string tool_msg_json(const std::string & tool_call_id,
@@ -619,7 +623,7 @@ struct Client::Impl {
         msg["tool_call_id"] = tool_call_id;
         msg["name"]         = tool_name;
         msg["content"]      = is_error ? ("ERROR: " + content) : content;
-        return msg.dump();
+        return msg.dump(-1, ' ', false, ordered_json::error_handler_t::replace);
     }
 
     // -----------------------------------------------------------------
