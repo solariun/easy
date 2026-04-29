@@ -3615,30 +3615,24 @@ int main(int argc, char ** argv) {
                   "const st=document.createElement('style');"
                   "st.id='__easyaiSvgThemeStyle';"
                   "st.textContent="
-                    // (1) Re-anchor every <svg>'s color to currentColor —
-                    // catches icons whose paths have NO fill attribute and
-                    // would otherwise default to black on the canvas.
-                    "'svg{color:currentColor!important}"
-                    // (2) Any explicit non-none, non-currentColor fill on
-                    // an SVG element or its descendants is rewritten to
-                    // currentColor.  Aggressive but correct for this
-                    // bundle's monochrome icon set.
-                    "svg [fill]:not([fill=\"none\"]):not([fill=\"currentColor\"]),"
-                    "svg[fill]:not([fill=\"none\"]):not([fill=\"currentColor\"])"
+                    // Narrow rule: only icons that hardcode a near-black
+                    // fill / stroke get re-pointed at currentColor.  The
+                    // broader rules we tried earlier (anything with an
+                    // explicit non-none fill, plus paths with neither fill
+                    // nor stroke) flattened sidebar icons that have
+                    // intentional multi-color fills (e.g. the New Chat
+                    // bubble with a light interior).  Targeting the
+                    // specific dark hex values that read invisibly on the
+                    // dark theme avoids the collateral damage while still
+                    // rescuing legacy icons with hardcoded #000.  The
+                    // favicon ships its own brand colors via media query,
+                    // so it doesn't need this rule.
+                    "'[fill=\"#0d1117\"],[fill=\"#000\"],[fill=\"black\"],"
+                    "[fill=\"#000000\"],[fill=\"#15191f\"],[fill=\"#1a1f29\"]"
                     "{fill:currentColor!important}"
-                    "svg [stroke]:not([stroke=\"none\"]):not([stroke=\"currentColor\"]),"
-                    "svg[stroke]:not([stroke=\"none\"]):not([stroke=\"currentColor\"])"
-                    "{stroke:currentColor!important}"
-                    // (3) Paths/circles/rects/polygons with NEITHER fill
-                    // NOR stroke attribute default to black-fill in the
-                    // browser — give them currentColor so the theme can
-                    // tint them.
-                    "svg path:not([fill]):not([stroke]),"
-                    "svg circle:not([fill]):not([stroke]),"
-                    "svg rect:not([fill]):not([stroke]),"
-                    "svg polygon:not([fill]):not([stroke]),"
-                    "svg ellipse:not([fill]):not([stroke])"
-                    "{fill:currentColor!important}';"
+                    "[stroke=\"#0d1117\"],[stroke=\"#000\"],[stroke=\"black\"],"
+                    "[stroke=\"#000000\"],[stroke=\"#15191f\"],[stroke=\"#1a1f29\"]"
+                    "{stroke:currentColor!important}';"
                   "(document.head||document.documentElement).appendChild(st);"
                 "}"
 
