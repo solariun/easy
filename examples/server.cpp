@@ -3800,34 +3800,58 @@ int main(int argc, char ** argv) {
                   "return b;"
                 "};"
 
-                // Reposition: locate the pill, build tone+tools by cloning
-                // it (only once — guarded by the `if(toneBtn)return` inside
-                // each builder), and mount as siblings RIGHT BEFORE the pill
-                // in pill.parentElement.  Final order:
+                // Reposition: walk UP from the pill until we hit a
+                // horizontal flex container (display:flex, flex-direction
+                // anything but column).  The pill itself often lives in
+                // a vertical-flex column on the right side of the prompt
+                // form — its immediate parent stacks children top-down,
+                // which is exactly what just put tone+tools above the pill
+                // last time.  By walking up to the enclosing horizontal
+                // row and inserting tone+tools as siblings of the column
+                // (the "pillBranch"), we get true left-to-right placement:
                 //
-                //     [ tone ][ tools ][ pill ][ ...rest of toolbar ]
+                //     [ ...left content ][ tone ][ tools ][ pill-col ][ send ]
                 //
-                // Fast-path: if everything is already in place, do nothing.
-                // Critical for breaking the MutationObserver feedback loop
-                // (insertBefore on a node already at its target position is
-                // still a recorded mutation, so the observer would feed
-                // itself otherwise).
+                // Fast-path early-return keeps the MutationObserver from
+                // feeding itself.
+                "const findHorizontalRow=(pill)=>{"
+                  "let p=pill.parentElement;"
+                  "while(p&&p!==document.body){"
+                    "const cs=getComputedStyle(p);"
+                    "if(cs.display==='flex'"
+                       "&&cs.flexDirection!=='column'"
+                       "&&cs.flexDirection!=='column-reverse'){"
+                      "return p;"
+                    "}"
+                    "p=p.parentElement;"
+                  "}"
+                  "return null;"
+                "};"
                 "const reposition=()=>{"
                   "const pill=findPill();"
                   "if(!pill)return;"
                   "if(!toneBtn)buildToneFromPill(pill);"
                   "if(!toolsBtn)buildToolsFromPill(pill);"
                   "if(!toneBtn||!toolsBtn)return;"
-                  "const row=pill.parentElement;"
+                  "const row=findHorizontalRow(pill);"
                   "if(!row)return;"
+                  // The pill may be nested several levels deep inside a
+                  // flex-column.  Find the direct child of `row` that
+                  // contains the pill — that's where tone+tools must land
+                  // as siblings, ahead of it.
+                  "let pillBranch=pill;"
+                  "while(pillBranch&&pillBranch.parentElement!==row){"
+                    "pillBranch=pillBranch.parentElement;"
+                  "}"
+                  "if(!pillBranch)return;"
                   "if(toneBtn.parentElement===row&&"
                      "toolsBtn.parentElement===row&&"
                      "toneBtn.nextSibling===toolsBtn&&"
-                     "toolsBtn.nextSibling===pill){"
+                     "toolsBtn.nextSibling===pillBranch){"
                     "return;"
                   "}"
-                  "row.insertBefore(toneBtn,pill);"
-                  "row.insertBefore(toolsBtn,pill);"
+                  "row.insertBefore(toneBtn,pillBranch);"
+                  "row.insertBefore(toolsBtn,pillBranch);"
                 "};"
 
                 "if(document.documentElement){reposition();}"
