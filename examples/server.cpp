@@ -3902,16 +3902,34 @@ int main(int argc, char ** argv) {
                 // rip our hosts out; the parentElement guards put them back.
                 // Sample any non-transparent badge inside the row that isn't
                 // ours, so we copy the bundle's palette.
+                // Prefer the bundle's model/EasyAi pill button (the one with
+                // `bg-muted-foreground/10` + rounded-sm + text-xs Tailwind
+                // classes) since that's the exact look the user wants tone +
+                // tools to share.  Fall back to any non-transparent button-
+                // like element if the pill isn't found.  getComputedStyle
+                // re-reads CSS variables on every call so dark/light theme
+                // toggles propagate within one reposition tick.
                 "const sampleBadge=(row)=>{"
                   "if(!row)return null;"
-                  "const all=row.querySelectorAll('button,label,[role=button],[class*=rounded]');"
-                  "for(const el of all){"
-                    "if(el===toneHost||el===toolsHost)continue;"
-                    "if(toneHost&&toneHost.contains(el))continue;"
-                    "if(toolsHost&&toolsHost.contains(el))continue;"
-                    "const cs=getComputedStyle(el);"
-                    "const bg=cs.backgroundColor;"
-                    "if(bg&&bg!=='rgba(0, 0, 0, 0)'&&bg!=='transparent')return el;"
+                  "const lists=["
+                    // 1. Exact match for the EasyAi pill button.
+                    "row.querySelectorAll("
+                      "'button[class*=\"bg-muted-foreground\"]'),"
+                    // 2. Any rounded-sm button — same family.
+                    "row.querySelectorAll("
+                      "'button[class*=\"rounded-sm\"],button[class*=\"rounded-md\"]'),"
+                    // 3. Last-resort fallback — anything button-shaped.
+                    "row.querySelectorAll("
+                      "'button,label,[role=button],[class*=rounded]')];"
+                  "for(const list of lists){"
+                    "for(const el of list){"
+                      "if(el===toneHost||el===toolsHost)continue;"
+                      "if(toneHost&&toneHost.contains(el))continue;"
+                      "if(toolsHost&&toolsHost.contains(el))continue;"
+                      "const cs=getComputedStyle(el);"
+                      "const bg=cs.backgroundColor;"
+                      "if(bg&&bg!=='rgba(0, 0, 0, 0)'&&bg!=='transparent')return el;"
+                    "}"
                   "}"
                   "return null;"
                 "};"
@@ -3934,18 +3952,24 @@ int main(int argc, char ** argv) {
                   "};"
                   "apply(toneHost);apply(toolsHost);"
                 "};"
-                // Mount tone + tools INSIDE the bundle's badge row, ahead of
-                // the model badge.  Inheriting the row's flex / gap / wrap
-                // means our items align like native bundle badges with no
-                // margin math of our own.  If the row isn't in the DOM yet
-                // we hide instead of falling back to viewport-fixed (which
-                // dropped them in random corners during hydration).
+                // Mount tone + tools as SIBLINGS of the bundle's model/EasyAi
+                // pill button — placed right after it inside the parent row
+                // `flex.w-full.items-center.gap-3.px-3`.  Previously we were
+                // inserting them INSIDE the pill button's own flex-wrap
+                // (which is a child of the button), which meant tone + tools
+                // ended up nested inside the button.  Now they live one
+                // level up, alongside the button, with their own .badge
+                // styling adopted from the button so the look is identical.
                 "const reposition=()=>{"
                   "if(!toneHost||!toolsHost)return;"
                   "const row=document.querySelector("
-                    "'[class~=\"flex-wrap\"][class~=\"items-center\"][class~=\"gap-1\"]')"
+                    "'[class~=\"flex\"][class~=\"w-full\"][class~=\"items-center\"]"
+                    "[class~=\"gap-3\"][class~=\"px-3\"]')"
+                    // Fallback: same row but minus px-3 (in case Tailwind
+                    // ordering or a class-name change drops it).
                     "||document.querySelector("
-                      "'[class~=\"flex-wrap\"][class~=\"items-center\"]');"
+                      "'[class~=\"flex\"][class~=\"w-full\"][class~=\"items-center\"]"
+                      "[class~=\"gap-3\"]');"
                   "if(!row){"
                     "toneHost.style.display='none';"
                     "toolsHost.style.display='none';"
@@ -3954,19 +3978,29 @@ int main(int argc, char ** argv) {
                   "const baseStyle="
                     "'all:initial;display:inline-flex;align-items:center;"
                     "font:14px/1 -apple-system,system-ui,sans-serif;';"
-                  "const orderOk="
+                  // Find the bundle's pill button so we can place tone +
+                  // tools right after it.  If absent, fall back to row's
+                  // last child as the anchor.
+                  "const btn=row.querySelector("
+                    "'button[class*=\"bg-muted-foreground\"]')"
+                    "||row.querySelector('button');"
+                  "const anchor=btn||row.lastElementChild;"
+                  "const inRow="
                     "toneHost.parentElement===row&&"
-                    "toolsHost.parentElement===row&&"
-                    "row.firstChild===toneHost&&"
+                    "toolsHost.parentElement===row;"
+                  "const orderOk=inRow&&"
+                    "(!anchor||anchor.nextSibling===toneHost)&&"
                     "toneHost.nextSibling===toolsHost;"
                   "if(!orderOk){"
                     "toneHost.style.cssText=baseStyle;"
                     "toolsHost.style.cssText=baseStyle;"
-                    // Insert tools first (right after row.firstChild's
-                    // current position), then tone before it — final order
-                    // is [tone][tools][...bundle's children].
-                    "row.insertBefore(toolsHost,row.firstChild);"
-                    "row.insertBefore(toneHost,toolsHost);"
+                    "if(anchor&&anchor.parentNode===row){"
+                      "row.insertBefore(toneHost,anchor.nextSibling);"
+                      "row.insertBefore(toolsHost,toneHost.nextSibling);"
+                    "}else{"
+                      "row.appendChild(toneHost);"
+                      "row.appendChild(toolsHost);"
+                    "}"
                   "}else{"
                     "toneHost.style.display='';"
                     "toolsHost.style.display='';"
