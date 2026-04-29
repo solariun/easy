@@ -3599,6 +3599,52 @@ int main(int argc, char ** argv) {
               "<script>(()=>{"
                 "console.log('[easyai-inject] block5 metrics + tone-badge + chip');"
 
+                // Theme-aware SVG icons.  The bundle ships some icons with
+                // a hardcoded dark fill/stroke (e.g. fill=\"#0d1117\") that
+                // only reads on light backgrounds — invisible in dark mode.
+                // We inject a CSS rule that forces SVGs inside buttons,
+                // headings, and any element whose fill/stroke is a known
+                // dark hex value to use `currentColor` instead.  This makes
+                // the icon track the active foreground (text-foreground via
+                // CSS variable) so it flips automatically with the theme.
+                //
+                // Applied EAGERLY at script start (before DOMContentLoaded)
+                // so the empty-state landing page (just the form, no chat
+                // yet) also benefits.
+                "if(!document.getElementById('__easyaiSvgThemeStyle')){"
+                  "const st=document.createElement('style');"
+                  "st.id='__easyaiSvgThemeStyle';"
+                  "st.textContent="
+                    // SVGs inside any button or heading: any element with
+                    // an explicit fill/stroke that isn't 'none' or already
+                    // currentColor gets re-pointed at currentColor.
+                    "'button svg [fill]:not([fill=\"none\"]):not([fill=\"currentColor\"]),"
+                    "button svg[fill]:not([fill=\"none\"]):not([fill=\"currentColor\"]),"
+                    "h1 svg [fill]:not([fill=\"none\"]):not([fill=\"currentColor\"]),"
+                    "h1 svg[fill]:not([fill=\"none\"]):not([fill=\"currentColor\"]),"
+                    "h2 svg [fill]:not([fill=\"none\"]):not([fill=\"currentColor\"]),"
+                    "h2 svg[fill]:not([fill=\"none\"]):not([fill=\"currentColor\"])"
+                    "{fill:currentColor}"
+                    "button svg [stroke]:not([stroke=\"none\"]):not([stroke=\"currentColor\"]),"
+                    "button svg[stroke]:not([stroke=\"none\"]):not([stroke=\"currentColor\"]),"
+                    "h1 svg [stroke]:not([stroke=\"none\"]):not([stroke=\"currentColor\"]),"
+                    "h1 svg[stroke]:not([stroke=\"none\"]):not([stroke=\"currentColor\"]),"
+                    "h2 svg [stroke]:not([stroke=\"none\"]):not([stroke=\"currentColor\"]),"
+                    "h2 svg[stroke]:not([stroke=\"none\"]):not([stroke=\"currentColor\"])"
+                    "{stroke:currentColor}"
+                    // Any element with a hardcoded near-black fill or
+                    // stroke — covers icons that live outside buttons /
+                    // headings (e.g., the EasyAi brand glyph above the
+                    // landing form when the chat is empty).
+                    "[fill=\"#0d1117\"],[fill=\"#000\"],[fill=\"black\"],"
+                    "[fill=\"#000000\"],[fill=\"#15191f\"],[fill=\"#1a1f29\"]"
+                    "{fill:currentColor!important}"
+                    "[stroke=\"#0d1117\"],[stroke=\"#000\"],[stroke=\"black\"],"
+                    "[stroke=\"#000000\"],[stroke=\"#15191f\"],[stroke=\"#1a1f29\"]"
+                    "{stroke:currentColor!important}';"
+                  "(document.head||document.documentElement).appendChild(st);"
+                "}"
+
                 // Metrics moved out of a custom pill — we now paint them
                 // directly into the bundle's own `.chat-processing-info-detail`
                 // element (see renderOverview() below).  That element is
