@@ -23,7 +23,6 @@
 //     allocated in the parent.
 
 #include "easyai/external_tools.hpp"
-#include "easyai/log.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -31,6 +30,7 @@
 #include <cerrno>
 #include <chrono>
 #include <climits>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -49,6 +49,10 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+#if defined(__linux__)
+#include <sys/prctl.h>
+#endif
 
 namespace easyai {
 
@@ -91,6 +95,62 @@ constexpr std::size_t kOutputCapMin          = 1024;
 constexpr std::size_t kOutputCapMax          = 4u  << 20;   // 4 MiB
 constexpr std::size_t kOutputCapDefault      = 64u << 10;   // 64 KiB
 
+// Identifier and description size caps. The tool-name cap mirrors the
+// validator regex `^[a-zA-Z][a-zA-Z0-9_]{0,63}$` (1 lead + up to 63 = 64
+// total). Description caps are generous enough to fit a paragraph but
+// small enough that a hostile manifest can't blow up the schema
+// serialiser.
+constexpr std::size_t kMaxToolNameBytes      = 64;
+constexpr std::size_t kMaxToolDescBytes      = 4096;
+constexpr std::size_t kMaxParamDescBytes     = 2048;
+
+// Child-side fd-close cap. Used as the upper bound on the close() loop
+// that runs between fork() and execve() so the spawned command doesn't
+// inherit the parent's HTTP transport, log file, KV cache mmap, etc.
+//
+// We cannot just trust RLIMIT_NOFILE: on systems with `ulimit -n
+// unlimited` `rlim_cur` is RLIM_INFINITY (≈ULONG_MAX), which when cast
+// to `int` becomes -1 and silently disables the loop. Capping at a
+// large-but-finite number keeps the protection effective AND keeps the
+// loop fast even when rlim_cur is set to something huge like 1 << 20.
+constexpr long        kMaxFdScan             = 65536;
+
+// Exit codes for child-side failure paths between fork() and execve().
+// POSIX shells use 126 for "found but not executable" and 127 for "not
+// found"; we re-use the convention so the parent can distinguish
+// chdir failure (post-validation race) from execve failure (binary
+// vanished or got chmod -x'd between manifest load and call).
+constexpr int         kExitChdirFailed       = 126;
+constexpr int         kExitExecveFailed      = 127;
+
+// Parent poll/kill timing.
+//
+//   kParentPollMs       cadence at which the parent re-checks the
+//                       deadline (200 ms = 5 wakeups/sec — cheap, and
+//                       a SIGTERM sent within 200 ms of deadline is
+//                       still well within human-perceptible latency).
+//   kKillGraceMs        SIGTERM → SIGKILL window. Long enough for a
+//                       cooperative process to flush; short enough
+//                       that a hung process gets killed promptly.
+//   kUnkillableWaitSec  After SIGKILL, if waitpid still hasn't reaped
+//                       the child within this many seconds something
+//                       is very wrong (uninterruptible sleep, kernel
+//                       bug). Fall back to blocking waitpid so we
+//                       don't spin.
+constexpr int         kParentPollMs          = 200;
+constexpr int         kKillGraceMs           = 1000;
+constexpr int         kUnkillableWaitSec     = 5;
+
+// Output drain plumbing.
+//
+//   kDrainBufBytes        per-read() syscall buffer; 4 KiB matches the
+//                         kernel pipe buffer chunk size on Linux.
+//   kInitialOutputReserve initial std::string::reserve cap so a
+//                         "Hello\n"-sized response doesn't allocate
+//                         the full max_output_bytes up front.
+constexpr std::size_t kDrainBufBytes         = 4096;
+constexpr std::size_t kInitialOutputReserve  = 8192;
+
 // PATH_MAX is technically optional in POSIX — fall back to a sane number
 // on platforms that don't define it (Linux defines it via <linux/limits.h>
 // pulled in by <climits>).
@@ -126,7 +186,7 @@ const std::unordered_set<std::string> kBuiltInNames = {
 // behaviour on adversarial input (the same reason the rest of the
 // codebase avoids it). Hand-rolled char scan is O(n), bounded.
 bool is_valid_tool_name(const std::string & s) {
-    if (s.empty() || s.size() > 64) return false;
+    if (s.empty() || s.size() > kMaxToolNameBytes) return false;
     auto is_alpha = [](char c) {
         return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
     };
@@ -356,7 +416,17 @@ bool validate_call_arguments(const std::string &                args_json,
                 err = "argument " + p.name + ": expected number";
                 return false;
             }
-            s = std::to_string(v.get<double>());
+            const double d = v.get<double>();
+            // nlohmann::json accepts non-finite extensions (NaN, Inf);
+            // std::to_string would render them as "nan" / "inf" and the
+            // wrapped command would receive that as an argv literal.
+            // Reject — finite numbers are the only contract worth
+            // exposing to a model.
+            if (!std::isfinite(d)) {
+                err = "argument " + p.name + ": must be a finite number";
+                return false;
+            }
+            s = std::to_string(d);
         } else if (p.type == "boolean") {
             if (!v.is_boolean()) {
                 err = "argument " + p.name + ": expected boolean";
@@ -447,6 +517,17 @@ RunResult run_external_command(const std::string &              command,
         // runs first wins.
         ::setpgid(0, 0);
 
+#if defined(__linux__)
+        // Tie our lifetime to the parent: if the agent process dies
+        // (segfault, kill -9, OOM-killer) before we exec or while we
+        // run, the kernel sends us SIGKILL. Without this an orphaned
+        // tool subprocess would survive after reparenting to PID 1
+        // and keep consuming resources until its own timeout. prctl
+        // is async-signal-safe on Linux. Setting fires after execve
+        // too, so it covers the long-running case as well.
+        ::prctl(PR_SET_PDEATHSIG, SIGKILL);
+#endif
+
         // stdin → /dev/null (we do not give the model an stdin path).
         int devnull = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
         if (devnull >= 0) {
@@ -471,11 +552,27 @@ RunResult run_external_command(const std::string &              command,
         // Close every other inherited fd. The parent might have files,
         // sockets, the agent's HTTP transport etc. open without
         // O_CLOEXEC; we don't want the spawned command inheriting any
-        // of them. POSIX provides closefrom on BSD/Solaris; on Linux
-        // the closest portable thing is a getrlimit-bounded loop.
+        // of them.
+        //
+        // Three pitfalls to avoid here:
+        //
+        //   1. RLIMIT_NOFILE = RLIM_INFINITY. `rlim_cur` is rlim_t
+        //      (unsigned), `(long) RLIM_INFINITY` wraps to -1 on most
+        //      systems, `(int) -1` makes the loop body never run, and
+        //      every parent fd silently leaks into the child. Cap at
+        //      kMaxFdScan to defeat that.
+        //   2. Reasonable-but-large rlim_cur (e.g. 1<<20 set by some
+        //      container runtimes). Looping a million close() syscalls
+        //      delays exec by tens of milliseconds. Same cap helps.
+        //   3. Some systems set `rlim_cur = 0` after sandboxing —
+        //      treat that as "use kMaxFdScan" too rather than skipping
+        //      the loop.
         struct rlimit rl{};
-        long maxfd = 1024;
-        if (::getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur > 0) {
+        long maxfd = kMaxFdScan;
+        if (::getrlimit(RLIMIT_NOFILE, &rl) == 0
+                && rl.rlim_cur != RLIM_INFINITY
+                && rl.rlim_cur > 0
+                && rl.rlim_cur < (rlim_t) kMaxFdScan) {
             maxfd = (long) rl.rlim_cur;
         }
         for (int fd = 3; fd < (int) maxfd; ++fd) {
@@ -496,7 +593,7 @@ RunResult run_external_command(const std::string &              command,
             const char msg[] = "external_tool: chdir failed\n";
             ssize_t w = ::write(1, msg, sizeof(msg) - 1);
             (void) w;
-            ::_exit(126);
+            ::_exit(kExitChdirFailed);
         }
 
         // execve. On success, never returns.
@@ -506,7 +603,7 @@ RunResult run_external_command(const std::string &              command,
         const char msg[] = "external_tool: execve failed\n";
         ssize_t w = ::write(1, msg, sizeof(msg) - 1);
         (void) w;
-        ::_exit(127);
+        ::_exit(kExitExecveFailed);
     }
 
     // ---- PARENT ----
@@ -517,7 +614,8 @@ RunResult run_external_command(const std::string &              command,
     ::close(pipefd[1]);
     ::fcntl(pipefd[0], F_SETFL, O_NONBLOCK);
 
-    res.output.reserve(std::min<std::size_t>(max_output_bytes, 8192));
+    res.output.reserve(std::min<std::size_t>(max_output_bytes,
+                                             kInitialOutputReserve));
 
     auto deadline = std::chrono::steady_clock::now()
                   + std::chrono::milliseconds(timeout_ms);
@@ -528,7 +626,7 @@ RunResult run_external_command(const std::string &              command,
     int  status     = 0;
 
     auto drain = [&]() {
-        char buf[4096];
+        char buf[kDrainBufBytes];
         ssize_t n;
         while ((n = ::read(pipefd[0], buf, sizeof(buf))) > 0) {
             if (res.output.size() < max_output_bytes) {
@@ -551,18 +649,17 @@ RunResult run_external_command(const std::string &              command,
             ::kill(-pid, SIGTERM);
             sent_term     = true;
             res.timed_out = true;
-            kill_deadline = now + std::chrono::seconds(1);
+            kill_deadline = now + std::chrono::milliseconds(kKillGraceMs);
         }
         if (sent_term && !sent_kill && now >= kill_deadline) {
             ::kill(-pid, SIGKILL);
             sent_kill = true;
         }
 
-        // Compute the next poll wait window — bounded so we recheck
-        // the timeout deadlines frequently.
-        int wait_ms = 200;
+        // Re-check the timeout deadlines on every poll cadence —
+        // kParentPollMs is the longest we'll sleep between checks.
         struct pollfd pfd{ pipefd[0], POLLIN, 0 };
-        int prc = ::poll(&pfd, 1, wait_ms);
+        int prc = ::poll(&pfd, 1, kParentPollMs);
         if (prc < 0 && errno == EINTR) continue;
         if (prc > 0 && (pfd.revents & (POLLIN | POLLHUP))) {
             drain();
@@ -575,12 +672,13 @@ RunResult run_external_command(const std::string &              command,
             break;
         }
 
-        // Safety: if we already killed and an unexpected number of
-        // seconds elapsed, do a blocking waitpid so we don't spin
-        // forever on an unkillable zombie scenario.
+        // Safety: if we already SIGKILLed and the child still hasn't
+        // been reaped after kUnkillableWaitSec, fall back to blocking
+        // waitpid so we don't spin forever on an unkillable scenario
+        // (uninterruptible D state, kernel bug, exotic LSM policy).
         if (sent_kill) {
             auto since_kill = std::chrono::steady_clock::now() - kill_deadline;
-            if (since_kill > std::chrono::seconds(5)) {
+            if (since_kill > std::chrono::seconds(kUnkillableWaitSec)) {
                 drain();
                 ::waitpid(pid, &status, 0);
                 reaped = true;
@@ -646,9 +744,10 @@ bool parse_param(const json & j, const std::string & name,
             return false;
         }
         desc = j["description"].get<std::string>();
-        if (desc.size() > 2048) {
+        if (desc.size() > kMaxParamDescBytes) {
             err = ctx + ".parameters.properties." + name
-                + ".description: exceeds 2048 chars";
+                + ".description: exceeds "
+                + std::to_string(kMaxParamDescBytes) + " chars";
             return false;
         }
     }
@@ -694,8 +793,10 @@ bool parse_tool_entry(const json & j, ExternalToolSpec & spec,
         err = ctx + ".description: must be a string"; return false;
     }
     std::string desc = j["description"].get<std::string>();
-    if (desc.empty() || desc.size() > 4096) {
-        err = ctx + ".description: must be 1..4096 chars"; return false;
+    if (desc.empty() || desc.size() > kMaxToolDescBytes) {
+        err = ctx + ".description: must be 1.."
+            + std::to_string(kMaxToolDescBytes) + " chars";
+        return false;
     }
 
     if (!j["command"].is_string()) {
@@ -975,15 +1076,21 @@ ToolHandler make_handler(std::shared_ptr<const ExternalToolSpec> spec) {
 
         // Build envp from the allowlist. Each entry is "KEY=VALUE";
         // missing vars are skipped silently (the operator opted in
-        // but the var doesn't exist in this process).
+        // but the var doesn't exist in this process). Values longer
+        // than kMaxArgElementBytes are also skipped — a hostile env
+        // (e.g. HOME set to a multi-megabyte string) would otherwise
+        // push the execve table toward the kernel ARG_MAX ceiling and
+        // make every spawn slower for no legitimate reason.
         std::vector<std::string> envp;
         envp.reserve(spec->env_passthrough.size());
         for (const auto & vn : spec->env_passthrough) {
             const char * v = ::getenv(vn.c_str());
             if (v == nullptr) continue;
+            const std::size_t vlen = std::strlen(v);
+            if (vlen > kMaxArgElementBytes) continue;
             std::string entry;
-            entry.reserve(vn.size() + 1 + std::strlen(v));
-            entry.append(vn).append("=").append(v);
+            entry.reserve(vn.size() + 1 + vlen);
+            entry.append(vn).append("=").append(v, vlen);
             envp.push_back(std::move(entry));
         }
 
@@ -1023,26 +1130,35 @@ ToolHandler make_handler(std::shared_ptr<const ExternalToolSpec> spec) {
 }
 
 // Slurp a file with a hard size cap.
+//
+// stat()-first so we reject directories, FIFOs, devices, and sockets
+// up front with a precise error message. Without that pre-check
+// `ifstream` + `seekg(end)` on /dev/zero / a named pipe / a directory
+// produces seekable-but-meaningless tellg() values, and the cap
+// merely limits the damage instead of preventing it.
 bool slurp(const std::string & path, std::string & out, std::string & err) {
+    struct stat st{};
+    if (::stat(path.c_str(), &st) != 0) {
+        err = "manifest stat failed: " + path
+            + ": " + std::strerror(errno);
+        return false;
+    }
+    if (!S_ISREG(st.st_mode)) {
+        err = "manifest is not a regular file: " + path;
+        return false;
+    }
+    if ((std::size_t) st.st_size > kMaxManifestBytes) {
+        err = "manifest exceeds " + std::to_string(kMaxManifestBytes)
+            + " bytes";
+        return false;
+    }
     std::ifstream f(path, std::ios::binary);
     if (!f) {
         err = "cannot open: " + path;
         return false;
     }
-    f.seekg(0, std::ios::end);
-    auto sz = f.tellg();
-    if (sz < 0) {
-        err = "tellg failed on: " + path;
-        return false;
-    }
-    if ((std::size_t) sz > kMaxManifestBytes) {
-        err = "manifest exceeds " + std::to_string(kMaxManifestBytes)
-            + " bytes";
-        return false;
-    }
-    f.seekg(0, std::ios::beg);
-    out.assign((std::size_t) sz, '\0');
-    f.read(out.data(), sz);
+    out.assign((std::size_t) st.st_size, '\0');
+    f.read(out.data(), st.st_size);
     out.resize((std::size_t) f.gcount());
     return true;
 }

@@ -607,6 +607,24 @@ The manifest is the operator's deploy artefact — treat it like a
 sudoers file. Anyone who can write it can run arbitrary commands as
 the agent's user.
 
+**Argv-injection via leading dashes.** The library guarantees that a
+model's argument fills exactly one argv slot — quoting and shell
+metacharacters can't escape it. What the library *cannot* know is
+whether the wrapped command treats a value starting with `-` as a
+flag. If your tool wraps a binary that accepts options
+(`pgrep "-V"`, `grep "-r"`, `find "-delete"`, …), insert the
+end-of-options sentinel `"--"` as a literal argv element BEFORE the
+placeholder:
+
+```json
+"argv": ["-a", "--", "{pattern}"]
+```
+
+GNU coreutils, util-linux, git, grep, ripgrep, find, and pgrep all
+honour `--`. Integer/number/boolean parameters are immune (they're
+not strings) and don't need this. See `examples/tools.example.json`
+for the pattern.
+
 ```sh
 # enable from the CLIs
 easyai-local --sandbox ./work --tools-json mytools.json

@@ -30,7 +30,7 @@
       "name": "list_processes",
       "description": "List running processes whose name matches a regex pattern. Returns one process per line: PID and name.",
       "command": "/usr/bin/pgrep",
-      "argv": ["-a", "{pattern}"],
+      "argv": ["-a", "--", "{pattern}"],
       "parameters": {
         "type": "object",
         "properties": {
