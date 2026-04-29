@@ -3843,57 +3843,56 @@ int main(int argc, char ** argv) {
                 // Re-runs every 250 ms (setInterval below).  Hydration may
                 // rip our hosts out; the parentElement guards put them back.
                 // Mount tone + tools as siblings to the LEFT of the bundle's
-                // pill button — they live inside the parent row
-                // `flex.w-full.items-center.gap-3.px-3` (or the same minus
-                // px-3 as a fallback).  Placement order, left-to-right:
+                // pill button.  Placement order, left-to-right:
                 //
                 //     [ tone ]  [ tools ]  [ EasyAi pill ]
                 //
-                // We don't need adoptBundleStyles / sampleBadge anymore: the
-                // hosts are real <button>s using the bundle's exact Tailwind
-                // class string (PILL_CLASS), so theme toggling and palette
-                // come for free via :root CSS variables.
+                // We find the pill button DIRECTLY (instead of guessing the
+                // row by Tailwind utilities) and use `pill.parentElement` as
+                // the row.  The page can have multiple `flex.w-full.gap-3`
+                // rows; the previous selector-based approach was matching
+                // the wrong one on some layouts, which both hid the buttons
+                // visually and broke their click handlers because the rest
+                // of the bundle stacked over them.
                 //
-                // FLICKER FIX: previously the only mounting trigger was a
-                // 250 ms setInterval, so every Svelte re-render of this row
-                // would unparent our hosts for up to 250 ms before we put
-                // them back — visible blink.  We now also subscribe to a
-                // MutationObserver (childList + subtree on document.body)
-                // so any reflow that touches the row schedules a synchronous
-                // reposition() within the same animation frame.  The 250 ms
-                // tick remains as a safety net for cases the observer can
-                // miss (e.g. attribute-only changes that swap the row).
+                // Pill signature is the full distinguishing class string
+                // (bg-muted-foreground/10 + rounded-sm + px-1.5).  Anything
+                // less specific picked up other buttons like "send" first.
+                //
+                // No more adoptBundleStyles / sampleBadge: the hosts use
+                // the bundle's exact Tailwind class string (PILL_CLASS), so
+                // theme/palette flow through :root CSS variables for free.
+                //
+                // FLICKER FIX: a MutationObserver (childList + subtree on
+                // document.body) reposts on any reflow within the same
+                // animation frame, so Svelte re-renders that displace our
+                // hosts are corrected long before the next paint.  The 500
+                // ms safety-net interval covers attribute-only swaps the
+                // observer doesn't see.
+                "const findPill=()=>document.querySelector("
+                  "'button[class*=\"bg-muted-foreground\"]"
+                  "[class*=\"rounded-sm\"][class*=\"px-1.5\"]')"
+                  "||document.querySelector("
+                    "'button[class*=\"bg-muted-foreground\"]"
+                    "[class*=\"rounded-sm\"]');"
                 "const reposition=()=>{"
                   "if(!toneHost||!toolsHost)return;"
-                  "const row=document.querySelector("
-                    "'[class~=\"flex\"][class~=\"w-full\"][class~=\"items-center\"]"
-                    "[class~=\"gap-3\"][class~=\"px-3\"]')"
-                    "||document.querySelector("
-                      "'[class~=\"flex\"][class~=\"w-full\"][class~=\"items-center\"]"
-                      "[class~=\"gap-3\"]');"
+                  "const pill=findPill();"
+                  "const row=pill?pill.parentElement:null;"
                   "if(!row){"
                     "toneHost.style.display='none';"
                     "toolsHost.style.display='none';"
                     "return;"
                   "}"
-                  "const btn=row.querySelector("
-                    "'button[class*=\"bg-muted-foreground\"]')"
-                    "||row.querySelector('button');"
-                  // Order: [tone][tools][btn].  If btn is missing, append.
                   "const inRow="
                     "toneHost.parentElement===row&&"
                     "toolsHost.parentElement===row;"
                   "const orderOk=inRow&&"
                     "toneHost.nextSibling===toolsHost&&"
-                    "(!btn||toolsHost.nextSibling===btn);"
+                    "toolsHost.nextSibling===pill;"
                   "if(!orderOk){"
-                    "if(btn&&btn.parentNode===row){"
-                      "row.insertBefore(toneHost,btn);"
-                      "row.insertBefore(toolsHost,btn);"
-                    "}else{"
-                      "row.appendChild(toneHost);"
-                      "row.appendChild(toolsHost);"
-                    "}"
+                    "row.insertBefore(toneHost,pill);"
+                    "row.insertBefore(toolsHost,pill);"
                   "}"
                   "toneHost.style.display='';"
                   "toolsHost.style.display='';"
