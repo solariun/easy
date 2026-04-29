@@ -3615,20 +3615,30 @@ int main(int argc, char ** argv) {
                   "const st=document.createElement('style');"
                   "st.id='__easyaiSvgThemeStyle';"
                   "st.textContent="
-                    // Force every SVG element/child with an explicit
-                    // fill or stroke (that isn't 'none' or already
-                    // 'currentColor') to use currentColor.  All UI icons
-                    // in this bundle are monochrome — the only ones
-                    // intentionally colored are status indicators (sonner
-                    // toasts) which don't set a literal hex either.
-                    // Aggressive but correct for this UI; flips icons
-                    // automatically with the active light/dark theme.
-                    "'svg [fill]:not([fill=\"none\"]):not([fill=\"currentColor\"]),"
+                    // (1) Re-anchor every <svg>'s color to currentColor —
+                    // catches icons whose paths have NO fill attribute and
+                    // would otherwise default to black on the canvas.
+                    "'svg{color:currentColor!important}"
+                    // (2) Any explicit non-none, non-currentColor fill on
+                    // an SVG element or its descendants is rewritten to
+                    // currentColor.  Aggressive but correct for this
+                    // bundle's monochrome icon set.
+                    "svg [fill]:not([fill=\"none\"]):not([fill=\"currentColor\"]),"
                     "svg[fill]:not([fill=\"none\"]):not([fill=\"currentColor\"])"
                     "{fill:currentColor!important}"
                     "svg [stroke]:not([stroke=\"none\"]):not([stroke=\"currentColor\"]),"
                     "svg[stroke]:not([stroke=\"none\"]):not([stroke=\"currentColor\"])"
-                    "{stroke:currentColor!important}';"
+                    "{stroke:currentColor!important}"
+                    // (3) Paths/circles/rects/polygons with NEITHER fill
+                    // NOR stroke attribute default to black-fill in the
+                    // browser — give them currentColor so the theme can
+                    // tint them.
+                    "svg path:not([fill]):not([stroke]),"
+                    "svg circle:not([fill]):not([stroke]),"
+                    "svg rect:not([fill]):not([stroke]),"
+                    "svg polygon:not([fill]):not([stroke]),"
+                    "svg ellipse:not([fill]):not([stroke])"
+                    "{fill:currentColor!important}';"
                   "(document.head||document.documentElement).appendChild(st);"
                 "}"
 
