@@ -697,13 +697,14 @@ int run_one(easyai::Client & cli, easyai::Plan & plan,
 
     // Attach the canonical streaming UX (spinner-locked content + dim
     // reasoning + 🔧/✗ tool markers + live plan render) to the client
-    // and plan.  Lifetime: this Streaming object outlives cli.chat()
-    // below, which is the only context in which the lambdas fire.
-    easyai::ui::Streaming(spinner, stats, st)
-        .show_reasoning(o.show_reasoning)
-        .verbose       (o.verbose)
-        .attach        (cli)
-        .attach        (plan);
+    // and plan.  MUST be a named local — the attach() lambdas capture
+    // `this`, so a temporary that died at the end of its expression
+    // would leave them dangling for the duration of cli.chat().
+    easyai::ui::Streaming streaming(spinner, stats, st);
+    streaming.show_reasoning(o.show_reasoning)
+             .verbose       (o.verbose)
+             .attach        (cli)
+             .attach        (plan);
 
     spinner.initial_draw();
     spinner.start_heartbeat();

@@ -7,9 +7,11 @@
 #include "easyai/text.hpp"
 #include "easyai/tool.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <sstream>
+#include <string_view>
 #include <unistd.h>
 
 namespace easyai::ui {
@@ -204,29 +206,135 @@ Streaming::Streaming(Spinner & spinner, StreamStats & stats, const Style & style
 Streaming & Streaming::show_reasoning(bool v) { show_reasoning_ = v; return *this; }
 Streaming & Streaming::verbose       (bool v) { verbose_        = v; return *this; }
 
-void Streaming::on_token_(const std::string & piece_in) {
-    ++stats_.content_pieces;
-    if (stats_.ms_to_first_tok < 0) stats_.ms_to_first_tok = stats_.elapsed_ms();
-    std::string piece = easyai::text::punctuate_think_tags(piece_in);
-    if (last_kind_ == StreamKind::REASON) piece.insert(0, "\n");
+void Streaming::emit_content_(const std::string & seg) {
+    if (seg.empty()) return;
+    std::string out = seg;
+    if (last_kind_ == StreamKind::REASON) out.insert(0, "\n");
     last_kind_ = StreamKind::CONTENT;
-    spinner_.write(piece);
+    spinner_.write(out);
 }
 
-void Streaming::on_reason_(const std::string & piece_in) {
-    ++stats_.reason_pieces;
+void Streaming::emit_reason_(const std::string & seg) {
+    if (seg.empty()) return;
     if (show_reasoning_) {
         std::string buf;
-        buf.reserve(piece_in.size() + 16);
+        buf.reserve(seg.size() + 16);
         if (last_kind_ == StreamKind::CONTENT) buf += "\n";
         buf += style_.dim();
-        buf += easyai::text::punctuate_think_tags(piece_in);
+        buf += seg;
         buf += style_.reset();
         spinner_.write(buf);
     }
     last_kind_ = StreamKind::REASON;
     // When show_reasoning is off, the spinner heartbeat keeps the glyph
     // ticking on its own — no explicit refresh needed here.
+}
+
+namespace {
+
+// Strip bare <think>/<thinking> open and close markers from `s`. Used
+// on the reasoning_content stream as a defense in depth — the parser
+// usually removes the wrappers, but a few templates leak them through.
+std::string strip_think_markers(const std::string & s) {
+    std::string out;
+    out.reserve(s.size());
+    for (std::size_t i = 0; i < s.size(); ) {
+        if (s.compare(i, 7,  "<think>")     == 0) { i += 7;  continue; }
+        if (s.compare(i, 10, "<thinking>")  == 0) { i += 10; continue; }
+        if (s.compare(i, 8,  "</think>")    == 0) { i += 8;  continue; }
+        if (s.compare(i, 11, "</thinking>") == 0) { i += 11; continue; }
+        out.push_back(s[i++]);
+    }
+    return out;
+}
+
+// True if `tail` could still extend into one of the four think markers.
+// Used to decide which trailing bytes of the content buffer to hold for
+// the next chunk vs. flush immediately.
+bool tail_is_partial_think_marker(const std::string & tail) {
+    static const char * const kTags[] = {
+        "<think>", "<thinking>", "</think>", "</thinking>",
+    };
+    for (const char * tag : kTags) {
+        std::string_view tv(tag);
+        if (tail.size() < tv.size() && tv.compare(0, tail.size(), tail) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+}  // namespace
+
+void Streaming::on_token_(const std::string & piece_in) {
+    ++stats_.content_pieces;
+    if (stats_.ms_to_first_tok < 0) stats_.ms_to_first_tok = stats_.elapsed_ms();
+
+    // Stateful filter: strip <think>/</think> markers from the content
+    // stream and reroute any text between them through emit_reason_ so
+    // it gets dim styling (or is dropped when --no-reasoning).  Defends
+    // against servers/parsers that occasionally let the bare tags slip
+    // into delta.content — typically the first piece after a tool call,
+    // when the partial-parse state has just been reset.
+    think_buf_ += piece_in;
+    while (true) {
+        if (in_think_) {
+            std::size_t a = think_buf_.find("</think>");
+            std::size_t b = think_buf_.find("</thinking>");
+            std::size_t close = std::min(a, b);  // npos == -1 stays largest
+            if (close == std::string::npos) {
+                // No close marker yet.  Flush as reasoning everything
+                // up to the last byte sequence that could still be the
+                // start of a "</thinking>" / "</think>"; hold the rest.
+                std::size_t hold = 0;
+                for (std::size_t k = std::min<std::size_t>(think_buf_.size(), 11);
+                     k > 0; --k) {
+                    if (tail_is_partial_think_marker(
+                            think_buf_.substr(think_buf_.size() - k))) {
+                        hold = k;
+                        break;
+                    }
+                }
+                emit_reason_(think_buf_.substr(0, think_buf_.size() - hold));
+                think_buf_.erase(0, think_buf_.size() - hold);
+                return;
+            }
+            emit_reason_(think_buf_.substr(0, close));
+            std::size_t end = think_buf_.find('>', close);
+            if (end == std::string::npos) return;  // wait for tag close
+            think_buf_.erase(0, end + 1);
+            in_think_ = false;
+        } else {
+            std::size_t a = think_buf_.find("<think>");
+            std::size_t b = think_buf_.find("<thinking>");
+            std::size_t open = std::min(a, b);
+            if (open == std::string::npos) {
+                // No open marker.  Same trailing-bytes-might-be-tag dance.
+                std::size_t hold = 0;
+                for (std::size_t k = std::min<std::size_t>(think_buf_.size(), 10);
+                     k > 0; --k) {
+                    if (tail_is_partial_think_marker(
+                            think_buf_.substr(think_buf_.size() - k))) {
+                        hold = k;
+                        break;
+                    }
+                }
+                emit_content_(think_buf_.substr(0, think_buf_.size() - hold));
+                think_buf_.erase(0, think_buf_.size() - hold);
+                return;
+            }
+            emit_content_(think_buf_.substr(0, open));
+            std::size_t end = think_buf_.find('>', open);
+            if (end == std::string::npos) return;  // wait for tag close
+            think_buf_.erase(0, end + 1);
+            in_think_ = true;
+        }
+    }
+}
+
+void Streaming::on_reason_(const std::string & piece_in) {
+    ++stats_.reason_pieces;
+    emit_reason_(strip_think_markers(piece_in));
 }
 
 void Streaming::on_tool_(const ToolCall & call, const ToolResult & result) {

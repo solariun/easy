@@ -233,6 +233,14 @@ private:
     void on_reason_(const std::string & piece);
     void on_tool_(const ToolCall & call, const ToolResult & result);
 
+    // Segment emitters used by the stateful <think>/</think> filter
+    // inside on_token_: content goes through emit_content_, the inner
+    // text of any leaked <think>…</think> block in the content stream
+    // is rerouted through emit_reason_ so it gets dim styling (or stays
+    // hidden when --no-reasoning).
+    void emit_content_(const std::string & seg);
+    void emit_reason_ (const std::string & seg);
+
     Spinner &     spinner_;
     StreamStats & stats_;
     const Style & style_;
@@ -244,6 +252,12 @@ private:
     // together as "...phase.I have created..." in the terminal).
     enum class StreamKind { NONE, REASON, CONTENT };
     StreamKind last_kind_ = StreamKind::NONE;
+
+    // Cross-chunk buffer for the <think>/</think> filter on the content
+    // stream. Only the trailing bytes that COULD still be a partial tag
+    // are held here; everything else is flushed immediately.
+    std::string think_buf_;
+    bool        in_think_ = false;
 };
 
 }  // namespace easyai::ui
