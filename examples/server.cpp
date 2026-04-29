@@ -1761,6 +1761,11 @@ static void handle_chat_sync(ServerCtx & ctx, ChatRequest & req,
     std::vector<std::string> tool_call_ids;
     std::string finish_reason = "stop";
 
+    // Symmetric with the streaming path — drop any cancel flag left
+    // over from a prior turn (the streaming path can race a disconnect
+    // between turns; the sync path stays consistent for free).
+    ctx.engine.clear_cancel();
+
     try {
         if (req.client_tools) {
             // Only push the user message when this is a fresh turn — when
@@ -1847,19 +1852,44 @@ static void handle_chat_stream(ServerCtx & ctx,
             ctx.reset_engine_defaults();
             prepare_engine_for_request(ctx, *req_state);
 
+            // Drop any cancel flag left over from a prior turn before we
+            // start decoding. Without this, a single dropped client would
+            // poison the engine for every subsequent request.
+            ctx.engine.clear_cancel();
+
             // Snapshot perf counters BEFORE this request so we can diff
             // them out at the end (llama_perf_context() returns cumulative
             // values across the lifetime of the llama_context).
             const auto perf_before = ctx.engine.perf_data();
 
             // ---- emit helpers --------------------------------------------
-            auto emit_data = [&sink](const std::string & ev) {
+            //
+            // Both helpers honour cpp-httplib's DataSink::write contract:
+            // it returns false when the underlying socket can no longer
+            // accept bytes — i.e. the client dropped. We surface that as
+            // engine.request_cancel() so the decode loop bails out at the
+            // next token boundary (otherwise the engine happily generates
+            // for minutes against a dead socket; that's the bug Gustavo
+            // hit, where two turns kept running after Ctrl+C and required
+            // a server restart).
+            //
+            // Once cancelled, subsequent emits short-circuit to no-ops so
+            // the unwinding agentic loop doesn't keep retrying the dead
+            // sink and doesn't keep flipping the cancel flag back on (the
+            // checks above already broke the decode loop).
+            auto emit_data = [&sink, &ctx](const std::string & ev) {
+                if (ctx.engine.cancel_requested()) return;
                 std::string s = "data: " + ev + "\n\n";
-                sink.write(s.data(), s.size());
+                if (!sink.write(s.data(), s.size())) {
+                    ctx.engine.request_cancel();
+                }
             };
-            auto emit_event = [&sink](const std::string & evt_type, const std::string & ev) {
+            auto emit_event = [&sink, &ctx](const std::string & evt_type, const std::string & ev) {
+                if (ctx.engine.cancel_requested()) return;
                 std::string s = "event: " + evt_type + "\ndata: " + ev + "\n\n";
-                sink.write(s.data(), s.size());
+                if (!sink.write(s.data(), s.size())) {
+                    ctx.engine.request_cancel();
+                }
             };
             // Dump JSON tolerantly: a multi-byte UTF-8 character can split
             // across two model tokens (one piece ends with the lead byte,
@@ -2442,6 +2472,18 @@ static void handle_chat_stream(ServerCtx & ctx,
                 }
                 std::fputs("==========\n", fp);
                 std::fflush(fp);
+            }
+
+            // If we got here because the client dropped, leave a clear
+            // marker in the raw log — operators looking at "why did the
+            // server suddenly stop generating" should not have to guess.
+            if (ctx.engine.cancel_requested()) {
+                std::fprintf(stderr,
+                    "[easyai-server] turn cancelled (client disconnected)\n");
+                if (auto * fp = easyai::log::file()) {
+                    std::fputs("----- CANCELLED (client dropped) -----\n", fp);
+                    std::fflush(fp);
+                }
             }
 
             sink.done();

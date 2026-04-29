@@ -9,6 +9,7 @@
 #include "ggml-backend.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cstdio>
@@ -581,6 +582,13 @@ struct Engine::Impl {
     ToolCallback     on_tool;
     HopResetCallback on_hop_reset;
 
+    // Cooperative cancel — flipped from another thread (typically the
+    // server's SSE provider when the client drops) and polled by the
+    // decode loop between every sampled token, plus the chat_continue
+    // loop between agentic hops. See Engine::request_cancel for the
+    // design rationale.
+    std::atomic<bool> cancel_requested{false};
+
     std::string last_error;
     std::string backend_summary;
 
@@ -688,6 +696,16 @@ struct Engine::Impl {
 
         llama_token id = 0;
         while (true) {
+            // Cooperative cancel — checked every sampled token. Flipped
+            // by the SSE provider when the client connection drops, so
+            // the engine doesn't keep decoding into a dead socket.
+            if (cancel_requested.load(std::memory_order_relaxed)) {
+                if (verbose) std::fprintf(stderr,
+                    "[easyai] generate cancelled (after %d tokens)\n", generated);
+                last_error = "cancelled";
+                break;
+            }
+
             id = common_sampler_sample(sampler, ctx(), -1);
             common_sampler_accept(sampler, id, /*accept_grammar=*/true);
 
@@ -861,6 +879,19 @@ Engine & Engine::stop_at_ctx_pct    (int  pct)  {
 }
 bool     Engine::last_was_ctx_full() const      { return p_->last_was_ctx_full; }
 Engine & Engine::verbose(bool v)                { p_->verbose = v; return *this; }
+
+// Cooperative cancel — see engine.hpp for design notes.
+Engine & Engine::request_cancel() {
+    p_->cancel_requested.store(true, std::memory_order_relaxed);
+    return *this;
+}
+Engine & Engine::clear_cancel()   {
+    p_->cancel_requested.store(false, std::memory_order_relaxed);
+    return *this;
+}
+bool     Engine::cancel_requested() const {
+    return p_->cancel_requested.load(std::memory_order_relaxed);
+}
 
 // ---------------------------------------------------------------------------
 // KV cache & model overrides
@@ -1169,6 +1200,16 @@ std::string Engine::chat_continue() {
     p_->last_was_ctx_full = false;
 
     for (int hop = 0; hop < kMaxToolHops; ++hop) {
+        // Bail out between agentic hops if the caller cancelled. The
+        // per-token check inside generate() catches mid-decode aborts;
+        // this catches aborts that arrive AFTER a hop returns (e.g.
+        // during tool dispatch) and BEFORE the next hop starts.
+        if (p_->cancel_requested.load(std::memory_order_relaxed)) {
+            if (p_->verbose) std::fprintf(stderr,
+                "[easyai] chat_continue cancelled at hop %d\n", hop);
+            p_->last_error = "cancelled";
+            break;
+        }
         auto chat_p = p_->render(/*add_generation_prompt=*/true);
         std::string raw = generate();
         if (!p_->last_error.empty() && raw.empty()) return {};

@@ -200,6 +200,22 @@ public:
     // ----- introspection ---------------------------------------------------
     std::string last_error() const;
 
+    // ----- cooperative cancel ----------------------------------------------
+    // Thread-safe: call request_cancel() from a signal handler or any
+    // other thread to abort an in-flight chat()/chat_continue(). The SSE
+    // content receiver polls the flag every chunk and aborts the read by
+    // returning false to cpp-httplib, which closes the TCP connection.
+    // The remote server detects the dropped socket on its next write and
+    // cancels its own decode loop — no /cancel endpoint, no protocol
+    // change, OpenAI-compatible.
+    //
+    // The flag is sticky: once set, the current and any subsequent chat()
+    // call short-circuits until clear_cancel() is invoked. Call
+    // clear_cancel() between turns of an interactive REPL.
+    Client & request_cancel();
+    Client & clear_cancel();
+    bool     cancel_requested() const;
+
 private:
     struct Impl;
     std::unique_ptr<Impl> p_;

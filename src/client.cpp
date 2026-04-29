@@ -24,6 +24,7 @@
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -256,6 +257,13 @@ struct Client::Impl {
 
     std::string last_error;
 
+    // Cooperative cancel — flipped from any thread (typically the cli's
+    // SIGINT handler). Polled by the SSE content_receiver every chunk;
+    // returning false from the receiver makes cpp-httplib abort the read
+    // and close the socket. The remote server detects the dropped TCP
+    // connection on its next write and cancels its own decode loop.
+    std::atomic<bool> cancel_requested{false};
+
     // -----------------------------------------------------------------
     // Transport helpers
     // -----------------------------------------------------------------
@@ -398,6 +406,16 @@ struct Client::Impl {
         bool reasoning_aborted = false;
 
         auto on_chunk = [&](const char * data, size_t len) -> bool {
+            // Cooperative cancel — checked first thing on every SSE
+            // chunk. Returning false from a content_receiver makes
+            // cpp-httplib abort the read and close the socket, which
+            // the server picks up on its next sink.write() and uses to
+            // cancel its decode loop. No /cancel endpoint, no protocol
+            // change.
+            if (cancel_requested.load(std::memory_order_relaxed)) {
+                last_error = "cancelled";
+                return false;
+            }
             // Tee raw SSE bytes verbatim into the log file when one is
             // attached.  Lets the operator see exactly what crossed the
             // wire (including custom easyai.* events, server timings,
@@ -681,6 +699,15 @@ struct Client::Impl {
         int incomplete_retries      = 0;
 
         for (int hop = 0; hop < max_tool_hops; ++hop) {
+            // Honour cancel between agentic hops too — the per-chunk
+            // check inside stream_chat catches mid-stream aborts; this
+            // catches aborts that arrive AFTER a hop returns and
+            // BEFORE the next stream_chat starts (e.g. signal arriving
+            // during local tool dispatch).
+            if (cancel_requested.load(std::memory_order_relaxed)) {
+                last_error = "cancelled";
+                return {};
+            }
             AssistantTurn turn;
             if (!stream_chat(turn)) {
                 if (!last_error.empty()) {
@@ -947,6 +974,19 @@ const std::vector<Tool> & Client::tools() const { return p_->tools; }
 Client & Client::on_token  (TokenCallback cb) { p_->on_token  = std::move(cb); return *this; }
 Client & Client::on_reason (TokenCallback cb) { p_->on_reason = std::move(cb); return *this; }
 Client & Client::on_tool   (ToolCallback  cb) { p_->on_tool   = std::move(cb); return *this; }
+
+// Cooperative cancel — see client.hpp for design notes.
+Client & Client::request_cancel() {
+    p_->cancel_requested.store(true, std::memory_order_relaxed);
+    return *this;
+}
+Client & Client::clear_cancel() {
+    p_->cancel_requested.store(false, std::memory_order_relaxed);
+    return *this;
+}
+bool     Client::cancel_requested() const {
+    return p_->cancel_requested.load(std::memory_order_relaxed);
+}
 
 std::string Client::chat(const std::string & user_message) {
     p_->last_error.clear();

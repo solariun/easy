@@ -46,7 +46,9 @@
 #include "easyai/ui.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -663,6 +665,40 @@ using easyai::text::prompt_wants_file_write;
 
 using easyai::cli::client_has_tool;
 
+// ---- Ctrl+C / SIGTERM handling --------------------------------------------
+//
+// On a signal, we want two things to happen:
+//   1. The Client's cooperative-cancel flag flips, so the active SSE read
+//      aborts on its next chunk. Returning false from the content_receiver
+//      makes cpp-httplib close the TCP socket; the server detects the
+//      dropped connection on its next sink.write() and cancels its own
+//      decode loop. End result: model stops, no /cancel endpoint needed.
+//   2. A separate atomic ("did the user just hit Ctrl+C?") flips so the
+//      REPL can decide whether to abandon the current turn (first signal)
+//      or exit the process (second signal in the same prompt).
+//
+// std::atomic<T>::store on a lock-free atomic_bool is async-signal-safe in
+// practice on every platform we care about (x86, ARM64, RISC-V) — that's
+// the only operation we do from inside the handler.
+static std::atomic<bool>   g_signal_caught{false};
+static easyai::Client *    g_active_client = nullptr;
+
+static void on_terminating_signal(int /*sig*/) {
+    g_signal_caught.store(true, std::memory_order_relaxed);
+    if (g_active_client != nullptr) {
+        g_active_client->request_cancel();
+    }
+}
+
+static void install_cancel_handlers() {
+    struct sigaction sa{};
+    sa.sa_handler = on_terminating_signal;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;   // no SA_RESTART → blocked syscalls return EINTR
+    sigaction(SIGINT,  &sa, nullptr);
+    sigaction(SIGTERM, &sa, nullptr);
+}
+
 int run_one(easyai::Client & cli, easyai::Plan & plan,
             const std::string & prompt,
             const Options & o, const Style & st) {
@@ -715,6 +751,17 @@ int run_one(easyai::Client & cli, easyai::Plan & plan,
     spinner.finish();
     std::fputc('\n', stdout);
 
+    // Cancel guard fires BEFORE every other diagnostic: when the user
+    // hit Ctrl+C the streamed bytes already include whatever made it
+    // through, the TCP connection was closed by our content_receiver
+    // returning false, and the server is winding down its decode loop.
+    // Show a clean status line and skip the incomplete-turn banner that
+    // would otherwise misdiagnose the cancel as a model malfunction.
+    if (g_signal_caught.load(std::memory_order_relaxed)) {
+        std::fprintf(stderr, "%s── cancelled ──%s\n", st.yellow(), st.reset());
+        return 130;   // conventional exit code for SIGINT
+    }
+
     // Context-full guard fires BEFORE the generic error/incomplete
     // banners — it's the cleanest of the bad outcomes (the model
     // produced a partial reply, we just have nowhere to put more
@@ -761,13 +808,33 @@ int run_one(easyai::Client & cli, easyai::Plan & plan,
 int run_repl(easyai::Client & cli, easyai::Plan & plan,
              const Options & o, const Style & st) {
     std::fprintf(stderr,
-        "%seasyai-cli-remote%s — interactive.  /exit to quit, /help for commands.\n",
+        "%seasyai-cli-remote%s — interactive.  /exit to quit, /help for commands.\n"
+        "Ctrl+C cancels the current turn; press it again at an empty prompt to exit.\n",
         st.bold(), st.reset());
     std::string line;
     while (true) {
+        // Reset cancel state at the top of each prompt: a Ctrl+C during
+        // the previous turn flipped the Client's flag (sticky), and
+        // without clearing it the next chat() would short-circuit
+        // immediately. The signal-caught atomic also resets here so we
+        // can detect a Ctrl+C that arrives DURING getline below.
+        cli.clear_cancel();
+        g_signal_caught.store(false, std::memory_order_relaxed);
+
         std::fprintf(stdout, "%s>%s ", st.cyan(), st.reset());
         std::fflush(stdout);
-        if (!std::getline(std::cin, line)) { std::fputc('\n', stdout); break; }
+        if (!std::getline(std::cin, line)) {
+            // getline returned false — could be EOF (Ctrl+D), or EINTR
+            // from our SIGINT handler interrupting the read. Distinguish
+            // the two so Ctrl+C at an empty prompt exits cleanly without
+            // also turning Ctrl+D into a confusing "cancelled" message.
+            std::fputc('\n', stdout);
+            if (g_signal_caught.load(std::memory_order_relaxed)) {
+                std::fprintf(stderr, "%s(interrupted)%s\n",
+                             st.dim(), st.reset());
+            }
+            break;
+        }
         if (line.empty()) continue;
 
         if (is_special(line, "/exit") || is_special(line, "/quit")) break;
@@ -922,6 +989,13 @@ int main(int argc, char ** argv) {
         log_fp = nullptr;
     };
 
+    // Wire SIGINT/SIGTERM so Ctrl+C aborts the in-flight stream, closes
+    // the TCP connection, and lets the server cancel its decode loop —
+    // instead of leaving the model running for minutes against a dead
+    // socket and forcing an operator to restart the server.
+    g_active_client = &cli;
+    install_cancel_handlers();
+
     int rc;
     if (any_management(o)) {
         rc = run_management(cli, o, st);
@@ -931,6 +1005,7 @@ int main(int argc, char ** argv) {
         if (!o.prompt.empty()) rc = run_one(cli, plan, o.prompt, o, st);
         else                   rc = run_repl(cli, plan, o, st);
     }
+    g_active_client = nullptr;
     close_log_fp();
     return rc;
 }

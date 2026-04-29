@@ -254,6 +254,24 @@ class Engine {
     // Lower-level: just generate raw text from current state.
     std::string generate();
 
+    // ---------------- cooperative cancel ------------------------------------
+    // Thread-safe shutdown signal for an in-flight chat()/chat_continue()/
+    // generate(). request_cancel() flips an atomic flag that the decode
+    // loop checks between every sampled token, and that chat_continue()
+    // checks between agentic hops — so the next token boundary is the
+    // worst-case latency before the engine returns. clear_cancel() resets
+    // the flag and SHOULD be called before each new turn (the server's
+    // SSE handler does this). cancel_requested() is the read accessor.
+    //
+    // The server uses this to react to a dropped client connection: when
+    // the SSE sink's write fails it calls request_cancel() and the engine
+    // unwinds cleanly instead of running to completion against a dead
+    // socket. The library is OpenAI-protocol-compatible — there is no new
+    // /cancel endpoint; the signal is intra-process only.
+    Engine & request_cancel();
+    Engine & clear_cancel();
+    bool     cancel_requested() const;
+
     // ---------------- introspection -----------------------------------------
     std::string                 last_error()        const;
     int                         turns()             const;
