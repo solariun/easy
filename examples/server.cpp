@@ -3605,96 +3605,153 @@ int main(int argc, char ** argv) {
                 // already correctly anchored by the SvelteKit layout, so the
                 // pill / its Shadow DOM host / SHARED_STYLE were removed.
 
-                // --- TONE BUTTON ----------------------------------------
-                // A real <button> using the bundle's exact pill class string
-                // (PILL_CLASS, defined just below).  Click cycles through
-                // tone values; current value is shown next to the icon.
-                // No shadow DOM — Tailwind utilities like
-                // `bg-muted-foreground/10` resolve from the bundle's :root
-                // CSS variables, so dark/light theming Just Works without
-                // any palette copying.  This is also why the previous
-                // version blinked: a foreign shadow-DOM host inside Svelte's
-                // managed row got rearranged on every render, while our
-                // 250ms tick fought to put it back.  Using a normal <button>
-                // with bundle classes lets MutationObserver below catch any
-                // detachment instantly (no fight-loop with timers).
-                "const PILL_CLASS="
-                  "'inline-flex cursor-pointer items-center gap-1.5 rounded-sm "
-                  "bg-muted-foreground/10 px-1.5 py-1 text-xs transition "
-                  "hover:text-foreground focus:outline-none focus-visible:ring-2 "
-                  "focus-visible:ring-ring focus-visible:ring-offset-2 "
-                  "disabled:cursor-not-allowed disabled:opacity-60 text-foreground';"
-                "const TONE_ORDER=['deterministic','precise','balanced','creative'];"
+                // --- TONE BADGE (same look as the bundle's model badge,
+                //                 anchored at bottom-LEFT of the form, same
+                //                 vertical height as the model badge) ----
                 "const TONE_ID='__easyaiToneHost';"
-                "let toneHost=null;"
-                "const setToneLabel=(b)=>{"
-                  "const lbl=b.querySelector('[data-tone-current]');"
-                  "if(lbl)lbl.textContent=window.__easyaiTone||'balanced';"
-                "};"
+                "let toneRoot=null,toneHost=null;"
                 "const ensureTone=()=>{"
                   "let h=document.getElementById(TONE_ID);"
-                  "if(h){toneHost=h;return h;}"
-                  "h=document.createElement('button');"
+                  "if(h&&toneRoot){toneHost=h;return toneRoot;}"
+                  "if(h)h.remove();"
+                  "h=document.createElement('div');"
                   "h.id=TONE_ID;"
-                  "h.type='button';"
-                  "h.className=PILL_CLASS;"
-                  "h.setAttribute('aria-label','tone');"
-                  "h.style.userSelect='none';"
-                  "h.innerHTML="
-                    "'<svg width=\"14\" height=\"14\" viewBox=\"0 0 24 24\" fill=\"none\" "
-                      "stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" "
-                      "stroke-linejoin=\"round\" style=\"opacity:.75;flex-shrink:0\">"
-                      "<line x1=\"4\" y1=\"7\" x2=\"20\" y2=\"7\"/>"
-                      "<line x1=\"4\" y1=\"17\" x2=\"20\" y2=\"17\"/>"
-                      "<circle cx=\"10\" cy=\"7\" r=\"2.4\" fill=\"currentColor\"/>"
-                      "<circle cx=\"15\" cy=\"17\" r=\"2.4\" fill=\"currentColor\"/>"
-                    "</svg>"
-                    "<span data-tone-current style=\"font-variant-numeric:tabular-nums\">"
-                      "balanced</span>';"
-                  "setToneLabel(h);"
-                  "h.addEventListener('click',(e)=>{"
-                    "e.preventDefault();e.stopPropagation();"
-                    "const cur=window.__easyaiTone||'balanced';"
-                    "const i=TONE_ORDER.indexOf(cur);"
-                    "const next=TONE_ORDER[(i+1)%TONE_ORDER.length];"
-                    "window.__easyaiTone=next;"
-                    "try{localStorage.setItem('easyai-tone',next);}catch(_){}"
-                    "setToneLabel(h);"
-                  "});"
+                  "h.setAttribute('aria-hidden','false');"
+                  // Like ensureBar: no positioning here. reposition() inserts
+                  // this host as a sibling of the bundle's model-name badge
+                  // inside the prompt form so it flows with the layout —
+                  // fixes Safari-mobile drift and matches the bundle's own
+                  // badge alignment without manual offset math.
+                  "h.style.cssText="
+                    "'all:initial;display:inline-flex;align-items:center;"
+                    "vertical-align:middle;"
+                    "font:14px/1 -apple-system,system-ui,sans-serif;';"
                   "toneHost=h;"
-                  "return h;"
+                  "const root=h.attachShadow({mode:'open'});"
+                  // Match the bundle model-badge look: rounded rectangle
+                  // (not full pill), subtle dark fill, thin border, small
+                  // icon + label.  Slider-knob icon for "tone".
+                  // NOTE: backticks (JS template literal) on the outer
+                  // strings — the inline SVG inside the CSS background-image
+                  // contains xmlns='http://...' (single quotes), and the
+                  // <label class="badge"> uses double quotes.  Mixing both
+                  // inside a JS string requires backticks; otherwise the
+                  // first inner quote terminates the literal early and the
+                  // parser explodes on the bare `http` identifier (which
+                  // is exactly what was killing the tone-badge IIFE).
+                  "root.innerHTML="
+                    "`<style>"
+                      ":host,*{box-sizing:border-box}"
+                      // Palette consumed via custom properties on the host —
+                      // adoptBundleStyles() in reposition() copies the
+                      // bundle's badge palette into them so we match its
+                      // theme.  Fallbacks keep us readable pre-hydration.
+                      ".badge{pointer-events:auto;display:inline-flex;"
+                        "align-items:center;gap:.4rem;"
+                        "background:var(--ea-bg, rgba(30,33,38,.85));"
+                        "border:var(--ea-border, 1px solid #2a313b);"
+                        "border-radius:var(--ea-radius, .5rem);"
+                        "padding:var(--ea-padding, .32rem .6rem);"
+                        "color:var(--ea-fg, #c9d1d9);"
+                        "font-family:var(--ea-font-family, -apple-system,system-ui,sans-serif);"
+                        "font-size:var(--ea-font-size, .78rem);"
+                        "line-height:1;cursor:pointer;"
+                        "transition:background .15s ease;"
+                      "}"
+                      ".badge:hover{background:var(--ea-bg-hover, rgba(255,255,255,.08))}"
+                      ".badge svg{width:14px;height:14px;flex-shrink:0;"
+                        "stroke:var(--ea-icon, currentColor);stroke-width:2;fill:none;"
+                        "stroke-linecap:round;stroke-linejoin:round;opacity:.75}"
+                      ".badge select{background:transparent;color:inherit;"
+                        "border:0;font:inherit;cursor:pointer;outline:none;"
+                        "padding:0;appearance:none;-webkit-appearance:none;"
+                        "padding-right:.9rem;"
+                        "background-image:url(\"data:image/svg+xml;utf8,"
+                          "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 10 6' fill='none'"
+                          " stroke='%238b949e' stroke-width='1.5' stroke-linecap='round'"
+                          " stroke-linejoin='round'><polyline points='1 1 5 5 9 1'/></svg>\");"
+                        "background-repeat:no-repeat;background-position:right center;"
+                        "background-size:.55rem auto}"
+                      ".badge select option{background:#15191f;color:#e6edf3}"
+                    "</style>`+"
+                    "`<label class=\"badge\">"
+                      // Sliders icon (tabler-ish): two horizontal rails
+                      // with knob handles, matches the geometric flat look
+                      // of the bundle's model badge cube icon.
+                      "<svg viewBox=\"0 0 24 24\">"
+                        "<line x1=\"4\" y1=\"7\" x2=\"20\" y2=\"7\"/>"
+                        "<line x1=\"4\" y1=\"17\" x2=\"20\" y2=\"17\"/>"
+                        "<circle cx=\"10\" cy=\"7\" r=\"2.4\" fill=\"#0d1117\"/>"
+                        "<circle cx=\"15\" cy=\"17\" r=\"2.4\" fill=\"#0d1117\"/>"
+                      "</svg>"
+                      "<select aria-label=\"tone\">"
+                        "<option value=\"deterministic\">deterministic</option>"
+                        "<option value=\"precise\">precise</option>"
+                        "<option value=\"balanced\">balanced</option>"
+                        "<option value=\"creative\">creative</option>"
+                      "</select>"
+                    "</label>`;"
+                  "const sel=root.querySelector('select');"
+                  "sel.value=window.__easyaiTone||'balanced';"
+                  "sel.onchange=()=>{"
+                    "window.__easyaiTone=sel.value;"
+                    "try{localStorage.setItem('easyai-tone',sel.value);}catch(e){}"
+                  "};"
+                  "toneRoot=root;"
+                  "return root;"
                 "};"
 
-                // --- TOOLS BUTTON (sibling of tone, click → popover with
-                //                   catalog + per-tool descriptions) -------
-                // Same approach as ensureTone above: a real <button> with the
-                // bundle's PILL_CLASS, no shadow DOM.  This makes it look
-                // identical to the EasyAi pill button and fixes the flicker
-                // (foreign Svelte children in shadow hosts kept getting
-                // shuffled by the bundle's reconciler).
+                // --- TOOLS BADGE (sibling of tone, click → popover with
+                //                  catalog + per-tool descriptions) ----
                 "const TOOLS_ID='__easyaiToolsHost';"
-                "let toolsHost=null;"
+                "let toolsRoot=null,toolsHost=null;"
                 "const ensureTools=()=>{"
                   "let h=document.getElementById(TOOLS_ID);"
-                  "if(h){toolsHost=h;return h;}"
-                  "h=document.createElement('button');"
+                  "if(h&&toolsRoot){toolsHost=h;return toolsRoot;}"
+                  "if(h)h.remove();"
+                  "h=document.createElement('div');"
                   "h.id=TOOLS_ID;"
-                  "h.type='button';"
-                  "h.className=PILL_CLASS;"
-                  "h.setAttribute('aria-label','available tools');"
-                  "h.setAttribute('aria-haspopup','dialog');"
-                  "h.style.userSelect='none';"
-                  "h.innerHTML="
-                    "'<svg width=\"14\" height=\"14\" viewBox=\"0 0 24 24\" fill=\"none\" "
-                      "stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" "
-                      "stroke-linejoin=\"round\" style=\"opacity:.75;flex-shrink:0\">"
-                      "<path d=\"M14.7 6.3a3.5 3.5 0 0 1 4.6 4.6l-2.8-2.8-1.8 1.8 2.8 2.8 a3.5 3.5 0 0 1-4.6-4.6\"/>"
-                      "<path d=\"M5 19l8.5-8.5\"/>"
-                    "</svg>"
-                    "<span>tools</span>"
-                    "<span data-count style=\"opacity:.7;font-variant-numeric:tabular-nums\">"
-                      "</span>';"
+                  "h.setAttribute('aria-hidden','false');"
+                  // See ensureTone — same in-flow attach via reposition().
+                  "h.style.cssText="
+                    "'all:initial;display:inline-flex;align-items:center;"
+                    "vertical-align:middle;"
+                    "font:14px/1 -apple-system,system-ui,sans-serif;';"
                   "toolsHost=h;"
+                  "const root=h.attachShadow({mode:'open'});"
+                  "root.innerHTML="
+                    "`<style>"
+                      ":host,*{box-sizing:border-box}"
+                      // Same palette adoption as ensureTone — values arrive
+                      // via custom properties set by adoptBundleStyles().
+                      ".badge{pointer-events:auto;display:inline-flex;"
+                        "align-items:center;gap:.4rem;"
+                        "background:var(--ea-bg, rgba(30,33,38,.85));"
+                        "border:var(--ea-border, 1px solid #2a313b);"
+                        "border-radius:var(--ea-radius, .5rem);"
+                        "padding:var(--ea-padding, .32rem .6rem);"
+                        "color:var(--ea-fg, #c9d1d9);"
+                        "font-family:var(--ea-font-family, -apple-system,system-ui,sans-serif);"
+                        "font-size:var(--ea-font-size, .78rem);"
+                        "line-height:1;cursor:pointer;"
+                        "transition:background .15s ease;"
+                        "user-select:none;"
+                      "}"
+                      ".badge:hover{background:var(--ea-bg-hover, rgba(255,255,255,.08))}"
+                      ".badge svg{width:14px;height:14px;flex-shrink:0;"
+                        "stroke:var(--ea-icon, currentColor);stroke-width:2;fill:none;"
+                        "stroke-linecap:round;stroke-linejoin:round;opacity:.75}"
+                      ".count{color:var(--ea-fg, #8b949e);opacity:.7;font-size:.7rem}"
+                    "</style>"
+                    "<label class=\"badge\" data-trigger=\"1\">"
+                      "<svg viewBox=\"0 0 24 24\">"
+                        // Wrench icon
+                        "<path d=\"M14.7 6.3a3.5 3.5 0 0 1 4.6 4.6l-2.8-2.8-1.8 1.8 2.8 2.8a3.5 3.5 0 0 1-4.6-4.6\"/>"
+                        "<path d=\"M5 19l8.5-8.5\"/>"
+                      "</svg>"
+                      "<span>tools</span>"
+                      "<span class=\"count\"></span>"
+                    "</label>`;"
                   // Popover lives at document.body — NOT in shadow DOM —
                   // because the bundle's `.chat-processing-info-detail`
                   // ancestor uses `backdrop-blur-sm` which creates a fixed-
@@ -3756,8 +3813,8 @@ int main(int argc, char ** argv) {
                     "document.addEventListener('DOMContentLoaded',"
                       "ensurePopAttached,{once:true});"
                   "}"
-                  "const badge=h;"
-                  "const cnt=h.querySelector('[data-count]');"
+                  "const badge=root.querySelector('.badge');"
+                  "const cnt=root.querySelector('.count');"
                   "const renderList=(tools)=>{"
                     "if(!tools||!tools.length){"
                       "pop.innerHTML='<div class=\"empty\">no tools registered</div>';"
@@ -3817,7 +3874,8 @@ int main(int argc, char ** argv) {
                     "const inPop=pop.contains(e.target);"
                     "if(!inHost&&!inPop)pop.style.display='none';"
                   "});"
-                  "return h;"
+                  "toolsRoot=root;"
+                  "return root;"
                 "};"
 
                 // ATTACH STRATEGY (replaces the old getBoundingClientRect /
@@ -3842,32 +3900,73 @@ int main(int argc, char ** argv) {
                 //
                 // Re-runs every 250 ms (setInterval below).  Hydration may
                 // rip our hosts out; the parentElement guards put them back.
-                // Mount tone + tools as siblings to the LEFT of the bundle's
-                // pill button — they live inside the parent row
-                // `flex.w-full.items-center.gap-3.px-3` (or the same minus
-                // px-3 as a fallback).  Placement order, left-to-right:
-                //
-                //     [ tone ]  [ tools ]  [ EasyAi pill ]
-                //
-                // We don't need adoptBundleStyles / sampleBadge anymore: the
-                // hosts are real <button>s using the bundle's exact Tailwind
-                // class string (PILL_CLASS), so theme toggling and palette
-                // come for free via :root CSS variables.
-                //
-                // FLICKER FIX: previously the only mounting trigger was a
-                // 250 ms setInterval, so every Svelte re-render of this row
-                // would unparent our hosts for up to 250 ms before we put
-                // them back — visible blink.  We now also subscribe to a
-                // MutationObserver (childList + subtree on document.body)
-                // so any reflow that touches the row schedules a synchronous
-                // reposition() within the same animation frame.  The 250 ms
-                // tick remains as a safety net for cases the observer can
-                // miss (e.g. attribute-only changes that swap the row).
+                // Sample any non-transparent badge inside the row that isn't
+                // ours, so we copy the bundle's palette.
+                // Prefer the bundle's model/EasyAi pill button (the one with
+                // `bg-muted-foreground/10` + rounded-sm + text-xs Tailwind
+                // classes) since that's the exact look the user wants tone +
+                // tools to share.  Fall back to any non-transparent button-
+                // like element if the pill isn't found.  getComputedStyle
+                // re-reads CSS variables on every call so dark/light theme
+                // toggles propagate within one reposition tick.
+                "const sampleBadge=(row)=>{"
+                  "if(!row)return null;"
+                  "const lists=["
+                    // 1. Exact match for the EasyAi pill button.
+                    "row.querySelectorAll("
+                      "'button[class*=\"bg-muted-foreground\"]'),"
+                    // 2. Any rounded-sm button — same family.
+                    "row.querySelectorAll("
+                      "'button[class*=\"rounded-sm\"],button[class*=\"rounded-md\"]'),"
+                    // 3. Last-resort fallback — anything button-shaped.
+                    "row.querySelectorAll("
+                      "'button,label,[role=button],[class*=rounded]')];"
+                  "for(const list of lists){"
+                    "for(const el of list){"
+                      "if(el===toneHost||el===toolsHost)continue;"
+                      "if(toneHost&&toneHost.contains(el))continue;"
+                      "if(toolsHost&&toolsHost.contains(el))continue;"
+                      "const cs=getComputedStyle(el);"
+                      "const bg=cs.backgroundColor;"
+                      "if(bg&&bg!=='rgba(0, 0, 0, 0)'&&bg!=='transparent')return el;"
+                    "}"
+                  "}"
+                  "return null;"
+                "};"
+                "const adoptBundleStyles=(row)=>{"
+                  "const s=sampleBadge(row);if(!s)return;"
+                  "const cs=getComputedStyle(s);"
+                  "const border="
+                    "(cs.borderTopWidth||'1px')+' '+"
+                    "(cs.borderTopStyle||'solid')+' '+"
+                    "(cs.borderTopColor||'transparent');"
+                  "const apply=(host)=>{"
+                    "host.style.setProperty('--ea-bg',cs.backgroundColor);"
+                    "host.style.setProperty('--ea-fg',cs.color);"
+                    "host.style.setProperty('--ea-border',border);"
+                    "host.style.setProperty('--ea-radius',cs.borderRadius);"
+                    "host.style.setProperty('--ea-padding',cs.padding);"
+                    "host.style.setProperty('--ea-font-family',cs.fontFamily);"
+                    "host.style.setProperty('--ea-font-size',cs.fontSize);"
+                    "host.style.setProperty('--ea-icon',cs.color);"
+                  "};"
+                  "apply(toneHost);apply(toolsHost);"
+                "};"
+                // Mount tone + tools as SIBLINGS of the bundle's model/EasyAi
+                // pill button — placed right after it inside the parent row
+                // `flex.w-full.items-center.gap-3.px-3`.  Previously we were
+                // inserting them INSIDE the pill button's own flex-wrap
+                // (which is a child of the button), which meant tone + tools
+                // ended up nested inside the button.  Now they live one
+                // level up, alongside the button, with their own .badge
+                // styling adopted from the button so the look is identical.
                 "const reposition=()=>{"
                   "if(!toneHost||!toolsHost)return;"
                   "const row=document.querySelector("
                     "'[class~=\"flex\"][class~=\"w-full\"][class~=\"items-center\"]"
                     "[class~=\"gap-3\"][class~=\"px-3\"]')"
+                    // Fallback: same row but minus px-3 (in case Tailwind
+                    // ordering or a class-name change drops it).
                     "||document.querySelector("
                       "'[class~=\"flex\"][class~=\"w-full\"][class~=\"items-center\"]"
                       "[class~=\"gap-3\"]');"
@@ -3876,66 +3975,53 @@ int main(int argc, char ** argv) {
                     "toolsHost.style.display='none';"
                     "return;"
                   "}"
+                  "const baseStyle="
+                    "'all:initial;display:inline-flex;align-items:center;"
+                    "font:14px/1 -apple-system,system-ui,sans-serif;';"
+                  // Find the bundle's pill button so we can place tone +
+                  // tools right after it.  If absent, fall back to row's
+                  // last child as the anchor.
                   "const btn=row.querySelector("
                     "'button[class*=\"bg-muted-foreground\"]')"
                     "||row.querySelector('button');"
-                  // Order: [tone][tools][btn].  If btn is missing, append.
+                  "const anchor=btn||row.lastElementChild;"
                   "const inRow="
                     "toneHost.parentElement===row&&"
                     "toolsHost.parentElement===row;"
                   "const orderOk=inRow&&"
-                    "toneHost.nextSibling===toolsHost&&"
-                    "(!btn||toolsHost.nextSibling===btn);"
+                    "(!anchor||anchor.nextSibling===toneHost)&&"
+                    "toneHost.nextSibling===toolsHost;"
                   "if(!orderOk){"
-                    "if(btn&&btn.parentNode===row){"
-                      "row.insertBefore(toneHost,btn);"
-                      "row.insertBefore(toolsHost,btn);"
+                    "toneHost.style.cssText=baseStyle;"
+                    "toolsHost.style.cssText=baseStyle;"
+                    "if(anchor&&anchor.parentNode===row){"
+                      "row.insertBefore(toneHost,anchor.nextSibling);"
+                      "row.insertBefore(toolsHost,toneHost.nextSibling);"
                     "}else{"
                       "row.appendChild(toneHost);"
                       "row.appendChild(toolsHost);"
                     "}"
+                  "}else{"
+                    "toneHost.style.display='';"
+                    "toolsHost.style.display='';"
                   "}"
-                  "toneHost.style.display='';"
-                  "toolsHost.style.display='';"
+                  "adoptBundleStyles(row);"
                 "};"
 
-                // Throttled scheduler — coalesces bursts of mutations into
-                // one rAF tick so we never thrash on heavy re-renders.
-                "let __ea_pendingReposition=false;"
-                "const scheduleReposition=()=>{"
-                  "if(__ea_pendingReposition)return;"
-                  "__ea_pendingReposition=true;"
-                  "requestAnimationFrame(()=>{"
-                    "__ea_pendingReposition=false;"
-                    "if(!document.getElementById(TONE_ID))ensureTone();"
-                    "if(!document.getElementById(TOOLS_ID))ensureTools();"
-                    "reposition();"
-                  "});"
-                "};"
-
-                "if(document.documentElement){"
-                  "ensureTone();ensureTools();reposition();"
-                "}"
+                "if(document.documentElement){ensureTone();ensureTools();reposition();}"
                 "document.addEventListener('DOMContentLoaded',()=>{"
                   "ensureTone();ensureTools();reposition();"
-                  "if(window.MutationObserver){"
-                    "const mo=new MutationObserver(scheduleReposition);"
-                    "mo.observe(document.body,{childList:true,subtree:true});"
-                  "}"
                 "});"
-                "window.addEventListener('resize',scheduleReposition);"
-                "window.addEventListener('scroll',scheduleReposition,true);"
-                // Safety-net interval at low frequency — observer + rAF
-                // already handle the fast path; this catches cases where
-                // the row is swapped via attribute-only changes.
+                "window.addEventListener('resize',reposition);"
+                "window.addEventListener('scroll',reposition,true);"
                 "setInterval(()=>{"
-                  "if(!document.getElementById(TONE_ID))ensureTone();"
-                  "if(!document.getElementById(TOOLS_ID))ensureTools();"
+                  "if(!document.getElementById(TONE_ID)){toneRoot=null;ensureTone();}"
+                  "if(!document.getElementById(TOOLS_ID)){toolsRoot=null;ensureTools();}"
                   "reposition();"
                   // Re-paint metrics every tick: the bundle re-mounts the
                   // .chat-processing-info-detail element on stream lifecycle.
                   "renderOverview();"
-                "},500);"
+                "},250);"
 
                 // --- per-message inline status chip -----------------------
                 // For every <... aria-label='Assistant message with actions'>
