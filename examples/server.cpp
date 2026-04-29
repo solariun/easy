@@ -3615,32 +3615,19 @@ int main(int argc, char ** argv) {
                   "const st=document.createElement('style');"
                   "st.id='__easyaiSvgThemeStyle';"
                   "st.textContent="
-                    // SVGs inside any button or heading: any element with
-                    // an explicit fill/stroke that isn't 'none' or already
-                    // currentColor gets re-pointed at currentColor.
-                    "'button svg [fill]:not([fill=\"none\"]):not([fill=\"currentColor\"]),"
-                    "button svg[fill]:not([fill=\"none\"]):not([fill=\"currentColor\"]),"
-                    "h1 svg [fill]:not([fill=\"none\"]):not([fill=\"currentColor\"]),"
-                    "h1 svg[fill]:not([fill=\"none\"]):not([fill=\"currentColor\"]),"
-                    "h2 svg [fill]:not([fill=\"none\"]):not([fill=\"currentColor\"]),"
-                    "h2 svg[fill]:not([fill=\"none\"]):not([fill=\"currentColor\"])"
-                    "{fill:currentColor}"
-                    "button svg [stroke]:not([stroke=\"none\"]):not([stroke=\"currentColor\"]),"
-                    "button svg[stroke]:not([stroke=\"none\"]):not([stroke=\"currentColor\"]),"
-                    "h1 svg [stroke]:not([stroke=\"none\"]):not([stroke=\"currentColor\"]),"
-                    "h1 svg[stroke]:not([stroke=\"none\"]):not([stroke=\"currentColor\"]),"
-                    "h2 svg [stroke]:not([stroke=\"none\"]):not([stroke=\"currentColor\"]),"
-                    "h2 svg[stroke]:not([stroke=\"none\"]):not([stroke=\"currentColor\"])"
-                    "{stroke:currentColor}"
-                    // Any element with a hardcoded near-black fill or
-                    // stroke — covers icons that live outside buttons /
-                    // headings (e.g., the EasyAi brand glyph above the
-                    // landing form when the chat is empty).
-                    "[fill=\"#0d1117\"],[fill=\"#000\"],[fill=\"black\"],"
-                    "[fill=\"#000000\"],[fill=\"#15191f\"],[fill=\"#1a1f29\"]"
+                    // Force every SVG element/child with an explicit
+                    // fill or stroke (that isn't 'none' or already
+                    // 'currentColor') to use currentColor.  All UI icons
+                    // in this bundle are monochrome — the only ones
+                    // intentionally colored are status indicators (sonner
+                    // toasts) which don't set a literal hex either.
+                    // Aggressive but correct for this UI; flips icons
+                    // automatically with the active light/dark theme.
+                    "'svg [fill]:not([fill=\"none\"]):not([fill=\"currentColor\"]),"
+                    "svg[fill]:not([fill=\"none\"]):not([fill=\"currentColor\"])"
                     "{fill:currentColor!important}"
-                    "[stroke=\"#0d1117\"],[stroke=\"#000\"],[stroke=\"black\"],"
-                    "[stroke=\"#000000\"],[stroke=\"#15191f\"],[stroke=\"#1a1f29\"]"
+                    "svg [stroke]:not([stroke=\"none\"]):not([stroke=\"currentColor\"]),"
+                    "svg[stroke]:not([stroke=\"none\"]):not([stroke=\"currentColor\"])"
                     "{stroke:currentColor!important}';"
                   "(document.head||document.documentElement).appendChild(st);"
                 "}"
