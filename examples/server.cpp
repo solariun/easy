@@ -3605,166 +3605,100 @@ int main(int argc, char ** argv) {
                 // already correctly anchored by the SvelteKit layout, so the
                 // pill / its Shadow DOM host / SHARED_STYLE were removed.
 
-                // --- TONE BADGE (same look as the bundle's model badge,
-                //                 anchored at bottom-LEFT of the form, same
-                //                 vertical height as the model badge) ----
+                // === TONE + TOOLS — cloned from the bundle's pill button =
+                //
+                // Instead of building bespoke shadow-DOM badges with copied
+                // palettes, we clone the bundle's existing pill button
+                // (cloneNode(false) — shallow, attrs+classes only) and inject
+                // our own innerHTML + click handler.  Result: pixel-identical
+                // to the bundle's pill, with zero PILL_CLASS strings to
+                // maintain, zero theme-mode palette copying, and zero shadow
+                // DOM.  If the bundle ever rethemes the pill, our clones
+                // follow automatically because Tailwind class semantics
+                // come straight from :root CSS variables.
+                //
+                // Caveats:
+                //   * the clones are detached from Svelte (no reactivity) —
+                //     fine, we attach our own click handlers;
+                //   * the bundle's reconciler may rip the clones out of its
+                //     managed row on re-renders — handled by the idempotent
+                //     reposition() below + a MutationObserver on body
+                //     childList (no subtree, to avoid feedback loops).
+                "const PILL_SEL="
+                  "'button[class*=\"bg-muted-foreground\"]"
+                  "[class*=\"rounded-sm\"][class*=\"px-1.5\"]';"
                 "const TONE_ID='__easyaiToneHost';"
-                "let toneRoot=null,toneHost=null;"
-                "const ensureTone=()=>{"
-                  "let h=document.getElementById(TONE_ID);"
-                  "if(h&&toneRoot){toneHost=h;return toneRoot;}"
-                  "if(h)h.remove();"
-                  "h=document.createElement('div');"
-                  "h.id=TONE_ID;"
-                  "h.setAttribute('aria-hidden','false');"
-                  // Like ensureBar: no positioning here. reposition() inserts
-                  // this host as a sibling of the bundle's model-name badge
-                  // inside the prompt form so it flows with the layout —
-                  // fixes Safari-mobile drift and matches the bundle's own
-                  // badge alignment without manual offset math.
-                  "h.style.cssText="
-                    "'all:initial;display:inline-flex;align-items:center;"
-                    "vertical-align:middle;"
-                    "font:14px/1 -apple-system,system-ui,sans-serif;';"
-                  "toneHost=h;"
-                  "const root=h.attachShadow({mode:'open'});"
-                  // Match the bundle model-badge look: rounded rectangle
-                  // (not full pill), subtle dark fill, thin border, small
-                  // icon + label.  Slider-knob icon for "tone".
-                  // NOTE: backticks (JS template literal) on the outer
-                  // strings — the inline SVG inside the CSS background-image
-                  // contains xmlns='http://...' (single quotes), and the
-                  // <label class="badge"> uses double quotes.  Mixing both
-                  // inside a JS string requires backticks; otherwise the
-                  // first inner quote terminates the literal early and the
-                  // parser explodes on the bare `http` identifier (which
-                  // is exactly what was killing the tone-badge IIFE).
-                  "root.innerHTML="
-                    "`<style>"
-                      ":host,*{box-sizing:border-box}"
-                      // Palette consumed via custom properties on the host —
-                      // adoptBundleStyles() in reposition() copies the
-                      // bundle's badge palette into them so we match its
-                      // theme.  Fallbacks keep us readable pre-hydration.
-                      ".badge{pointer-events:auto;display:inline-flex;"
-                        "align-items:center;gap:.4rem;"
-                        "background:var(--ea-bg, rgba(30,33,38,.85));"
-                        "border:var(--ea-border, 1px solid #2a313b);"
-                        "border-radius:var(--ea-radius, .5rem);"
-                        "padding:var(--ea-padding, .32rem .6rem);"
-                        "color:var(--ea-fg, #c9d1d9);"
-                        "font-family:var(--ea-font-family, -apple-system,system-ui,sans-serif);"
-                        "font-size:var(--ea-font-size, .78rem);"
-                        "line-height:1;cursor:pointer;"
-                        "transition:background .15s ease;"
-                      "}"
-                      ".badge:hover{background:var(--ea-bg-hover, rgba(255,255,255,.08))}"
-                      ".badge svg{width:14px;height:14px;flex-shrink:0;"
-                        "stroke:var(--ea-icon, currentColor);stroke-width:2;fill:none;"
-                        "stroke-linecap:round;stroke-linejoin:round;opacity:.75}"
-                      ".badge select{background:transparent;color:inherit;"
-                        "border:0;font:inherit;cursor:pointer;outline:none;"
-                        "padding:0;appearance:none;-webkit-appearance:none;"
-                        "padding-right:.9rem;"
-                        "background-image:url(\"data:image/svg+xml;utf8,"
-                          "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 10 6' fill='none'"
-                          " stroke='%238b949e' stroke-width='1.5' stroke-linecap='round'"
-                          " stroke-linejoin='round'><polyline points='1 1 5 5 9 1'/></svg>\");"
-                        "background-repeat:no-repeat;background-position:right center;"
-                        "background-size:.55rem auto}"
-                      ".badge select option{background:#15191f;color:#e6edf3}"
-                    "</style>`+"
-                    "`<label class=\"badge\">"
-                      // Sliders icon (tabler-ish): two horizontal rails
-                      // with knob handles, matches the geometric flat look
-                      // of the bundle's model badge cube icon.
-                      "<svg viewBox=\"0 0 24 24\">"
-                        "<line x1=\"4\" y1=\"7\" x2=\"20\" y2=\"7\"/>"
-                        "<line x1=\"4\" y1=\"17\" x2=\"20\" y2=\"17\"/>"
-                        "<circle cx=\"10\" cy=\"7\" r=\"2.4\" fill=\"#0d1117\"/>"
-                        "<circle cx=\"15\" cy=\"17\" r=\"2.4\" fill=\"#0d1117\"/>"
-                      "</svg>"
-                      "<select aria-label=\"tone\">"
-                        "<option value=\"deterministic\">deterministic</option>"
-                        "<option value=\"precise\">precise</option>"
-                        "<option value=\"balanced\">balanced</option>"
-                        "<option value=\"creative\">creative</option>"
-                      "</select>"
-                    "</label>`;"
-                  "const sel=root.querySelector('select');"
-                  "sel.value=window.__easyaiTone||'balanced';"
-                  "sel.onchange=()=>{"
-                    "window.__easyaiTone=sel.value;"
-                    "try{localStorage.setItem('easyai-tone',sel.value);}catch(e){}"
-                  "};"
-                  "toneRoot=root;"
-                  "return root;"
+                "const TOOLS_ID='__easyaiToolsHost';"
+                "const TONE_ORDER="
+                  "['deterministic','precise','balanced','creative'];"
+                "let toneBtn=null,toolsBtn=null,toolsPop=null;"
+                "const findPill=()=>document.querySelector(PILL_SEL);"
+                "const setToneLabel=(b)=>{"
+                  "const lbl=b.querySelector('[data-tone-current]');"
+                  "if(lbl)lbl.textContent=window.__easyaiTone||'balanced';"
                 "};"
 
-                // --- TOOLS BADGE (sibling of tone, click → popover with
-                //                  catalog + per-tool descriptions) ----
-                "const TOOLS_ID='__easyaiToolsHost';"
-                "let toolsRoot=null,toolsHost=null;"
-                "const ensureTools=()=>{"
-                  "let h=document.getElementById(TOOLS_ID);"
-                  "if(h&&toolsRoot){toolsHost=h;return toolsRoot;}"
-                  "if(h)h.remove();"
-                  "h=document.createElement('div');"
-                  "h.id=TOOLS_ID;"
-                  "h.setAttribute('aria-hidden','false');"
-                  // See ensureTone — same in-flow attach via reposition().
-                  "h.style.cssText="
-                    "'all:initial;display:inline-flex;align-items:center;"
-                    "vertical-align:middle;"
-                    "font:14px/1 -apple-system,system-ui,sans-serif;';"
-                  "toolsHost=h;"
-                  "const root=h.attachShadow({mode:'open'});"
-                  "root.innerHTML="
-                    "`<style>"
-                      ":host,*{box-sizing:border-box}"
-                      // Same palette adoption as ensureTone — values arrive
-                      // via custom properties set by adoptBundleStyles().
-                      ".badge{pointer-events:auto;display:inline-flex;"
-                        "align-items:center;gap:.4rem;"
-                        "background:var(--ea-bg, rgba(30,33,38,.85));"
-                        "border:var(--ea-border, 1px solid #2a313b);"
-                        "border-radius:var(--ea-radius, .5rem);"
-                        "padding:var(--ea-padding, .32rem .6rem);"
-                        "color:var(--ea-fg, #c9d1d9);"
-                        "font-family:var(--ea-font-family, -apple-system,system-ui,sans-serif);"
-                        "font-size:var(--ea-font-size, .78rem);"
-                        "line-height:1;cursor:pointer;"
-                        "transition:background .15s ease;"
-                        "user-select:none;"
-                      "}"
-                      ".badge:hover{background:var(--ea-bg-hover, rgba(255,255,255,.08))}"
-                      ".badge svg{width:14px;height:14px;flex-shrink:0;"
-                        "stroke:var(--ea-icon, currentColor);stroke-width:2;fill:none;"
-                        "stroke-linecap:round;stroke-linejoin:round;opacity:.75}"
-                      ".count{color:var(--ea-fg, #8b949e);opacity:.7;font-size:.7rem}"
-                    "</style>"
-                    "<label class=\"badge\" data-trigger=\"1\">"
-                      "<svg viewBox=\"0 0 24 24\">"
-                        // Wrench icon
-                        "<path d=\"M14.7 6.3a3.5 3.5 0 0 1 4.6 4.6l-2.8-2.8-1.8 1.8 2.8 2.8a3.5 3.5 0 0 1-4.6-4.6\"/>"
-                        "<path d=\"M5 19l8.5-8.5\"/>"
-                      "</svg>"
-                      "<span>tools</span>"
-                      "<span class=\"count\"></span>"
-                    "</label>`;"
-                  // Popover lives at document.body — NOT in shadow DOM —
-                  // because the bundle's `.chat-processing-info-detail`
-                  // ancestor uses `backdrop-blur-sm` which creates a fixed-
-                  // positioning containing block in modern browsers.  A
-                  // position:fixed child of that subtree gets clipped by
-                  // the bar's bounds; pinning to body sidesteps the issue.
-                  //
-                  // CRITICAL: this script is injected into <head> BEFORE
-                  // the bundle's <body> hits the parser, so document.body
-                  // and document.head can both be null when ensureTools()
-                  // first runs.  Build the elements eagerly but defer the
-                  // attach until they exist (re-checked on click + via a
-                  // DOMContentLoaded listener).
+                "const buildToneFromPill=(pill)=>{"
+                  "if(toneBtn)return toneBtn;"
+                  // Shallow clone — outer <button> with the pill's exact
+                  // classes / attrs, but no children.  We provide our own.
+                  "const b=pill.cloneNode(false);"
+                  "b.id=TONE_ID;"
+                  "b.type='button';"
+                  "b.removeAttribute('disabled');"
+                  "b.removeAttribute('aria-disabled');"
+                  "b.removeAttribute('data-svelte-h');"
+                  "b.setAttribute('aria-label','tone');"
+                  "b.innerHTML="
+                    "'<svg width=\"14\" height=\"14\" viewBox=\"0 0 24 24\" "
+                      "fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" "
+                      "stroke-linecap=\"round\" stroke-linejoin=\"round\" "
+                      "style=\"opacity:.75;flex-shrink:0\">"
+                      "<line x1=\"4\" y1=\"7\" x2=\"20\" y2=\"7\"/>"
+                      "<line x1=\"4\" y1=\"17\" x2=\"20\" y2=\"17\"/>"
+                      "<circle cx=\"10\" cy=\"7\" r=\"2.4\" fill=\"currentColor\"/>"
+                      "<circle cx=\"15\" cy=\"17\" r=\"2.4\" fill=\"currentColor\"/>"
+                    "</svg>"
+                    "<span data-tone-current "
+                      "style=\"font-variant-numeric:tabular-nums\">balanced</span>';"
+                  "setToneLabel(b);"
+                  "b.addEventListener('click',(e)=>{"
+                    "e.preventDefault();e.stopPropagation();"
+                    "const cur=window.__easyaiTone||'balanced';"
+                    "const i=TONE_ORDER.indexOf(cur);"
+                    "const next=TONE_ORDER[(i+1)%TONE_ORDER.length];"
+                    "window.__easyaiTone=next;"
+                    "try{localStorage.setItem('easyai-tone',next);}catch(_){}"
+                    "setToneLabel(b);"
+                  "});"
+                  "toneBtn=b;"
+                  "return b;"
+                "};"
+
+                "const buildToolsFromPill=(pill)=>{"
+                  "if(toolsBtn)return toolsBtn;"
+                  "const b=pill.cloneNode(false);"
+                  "b.id=TOOLS_ID;"
+                  "b.type='button';"
+                  "b.removeAttribute('disabled');"
+                  "b.removeAttribute('aria-disabled');"
+                  "b.removeAttribute('data-svelte-h');"
+                  "b.setAttribute('aria-label','available tools');"
+                  "b.setAttribute('aria-haspopup','dialog');"
+                  "b.innerHTML="
+                    "'<svg width=\"14\" height=\"14\" viewBox=\"0 0 24 24\" "
+                      "fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" "
+                      "stroke-linecap=\"round\" stroke-linejoin=\"round\" "
+                      "style=\"opacity:.75;flex-shrink:0\">"
+                      "<path d=\"M14.7 6.3a3.5 3.5 0 0 1 4.6 4.6l-2.8-2.8-1.8 1.8 2.8 2.8a3.5 3.5 0 0 1-4.6-4.6\"/>"
+                      "<path d=\"M5 19l8.5-8.5\"/>"
+                    "</svg>"
+                    "<span>tools</span>"
+                    "<span data-count "
+                      "style=\"opacity:.7;font-variant-numeric:tabular-nums\"></span>';"
+
+                  // Popover at document.body — escapes ancestor backdrop-
+                  // filter containing block, same as before.
                   "let pop=document.getElementById('__easyaiToolsPop');"
                   "if(pop)pop.remove();"
                   "pop=document.createElement('div');"
@@ -3781,8 +3715,8 @@ int main(int argc, char ** argv) {
                     "font-family:-apple-system,system-ui,sans-serif;"
                     "max-height:60vh;overflow-y:auto;"
                     "z-index:2147483646;';"
-                  "const popStyleNode=(()=>{"
-                    "if(document.getElementById('__easyaiToolsPopStyle'))return null;"
+
+                  "if(!document.getElementById('__easyaiToolsPopStyle')){"
                     "const ps=document.createElement('style');"
                     "ps.id='__easyaiToolsPopStyle';"
                     "ps.textContent="
@@ -3797,24 +3731,20 @@ int main(int argc, char ** argv) {
                       "#__easyaiToolsPop .desc{color:#8b949e;font-size:.68rem;"
                         "white-space:pre-wrap;line-height:1.4}"
                       "#__easyaiToolsPop .empty{color:#8b949e;padding:.4rem .35rem}';"
-                    "return ps;"
-                  "})();"
+                    "(document.head||document.documentElement).appendChild(ps);"
+                  "}"
+
                   "const ensurePopAttached=()=>{"
-                    "if(popStyleNode&&!popStyleNode.isConnected){"
-                      "const head=document.head||document.documentElement;"
-                      "if(head)head.appendChild(popStyleNode);"
-                    "}"
-                    "if(!pop.isConnected&&document.body){"
+                    "if(!pop.isConnected&&document.body)"
                       "document.body.appendChild(pop);"
-                    "}"
                   "};"
                   "ensurePopAttached();"
                   "if(!pop.isConnected){"
                     "document.addEventListener('DOMContentLoaded',"
                       "ensurePopAttached,{once:true});"
                   "}"
-                  "const badge=root.querySelector('.badge');"
-                  "const cnt=root.querySelector('.count');"
+
+                  "const cnt=b.querySelector('[data-count]');"
                   "const renderList=(tools)=>{"
                     "if(!tools||!tools.length){"
                       "pop.innerHTML='<div class=\"empty\">no tools registered</div>';"
@@ -3829,8 +3759,7 @@ int main(int argc, char ** argv) {
                         "c==='<'?'&lt;':c==='>'?'&gt;':'&amp;');"
                       "html+='<div class=\"row\" title=\"'+desc+'\">'+"
                         "'<span class=\"name\">'+name+'</span>'+"
-                        "'<span class=\"desc\">'+desc+'</span>'+"
-                      "'</div>';"
+                        "'<span class=\"desc\">'+desc+'</span></div>';"
                     "}"
                     "pop.innerHTML=html;"
                   "};"
@@ -3838,154 +3767,88 @@ int main(int argc, char ** argv) {
                   "fetch('/v1/tools').then(r=>r.json()).then(j=>{"
                     "renderList((j&&j.data)||[]);"
                   "}).catch(()=>{renderList([]);});"
-                  // Compute fixed-position coords from the host's bounding
-                  // box so the popover sits above the badge regardless of
-                  // ancestor overflow:hidden / transform / etc.  Anchor on
-                  // toolsHost (the badge wrapper) which is in normal flow.
+
                   "const placePop=()=>{"
-                    "const anchor=toolsHost;"
-                    "if(!anchor)return;"
-                    "const r=anchor.getBoundingClientRect();"
+                    "const r=b.getBoundingClientRect();"
                     "const vw=window.innerWidth;"
-                    "const desired=Math.min(vw-16,Math.max(8,r.left));"
-                    "pop.style.left=desired+'px';"
+                    "pop.style.left=Math.min(vw-16,Math.max(8,r.left))+'px';"
                     "pop.style.bottom=(window.innerHeight-r.top+6)+'px';"
                   "};"
-                  "badge.addEventListener('click',(e)=>{"
+
+                  "b.addEventListener('click',(e)=>{"
                     "e.preventDefault();e.stopPropagation();"
                     "ensurePopAttached();"
                     "const willOpen=pop.style.display!=='block';"
                     "if(willOpen){placePop();pop.style.display='block';}"
                     "else{pop.style.display='none';}"
                   "});"
+
                   "window.addEventListener('resize',()=>{"
                     "if(pop.style.display==='block')placePop();"
                   "});"
                   "window.addEventListener('scroll',()=>{"
                     "if(pop.style.display==='block')placePop();"
                   "},true);"
-                  // Close on outside click.  Pop now lives at document.body
-                  // (escapes ancestor backdrop-filter containing block);
-                  // host (badge) and pop are siblings under the document so
-                  // we hit-test both before deciding to close.
                   "document.addEventListener('click',(e)=>{"
-                    "if(!toolsHost)return;"
-                    "const inHost=toolsHost.contains(e.target);"
-                    "const inPop=pop.contains(e.target);"
-                    "if(!inHost&&!inPop)pop.style.display='none';"
+                    "if(!toolsBtn)return;"
+                    "if(toolsBtn.contains(e.target))return;"
+                    "if(pop.contains(e.target))return;"
+                    "pop.style.display='none';"
                   "});"
-                  "toolsRoot=root;"
-                  "return root;"
+
+                  "toolsBtn=b;toolsPop=pop;"
+                  "return b;"
                 "};"
 
-                // ATTACH STRATEGY (replaces the old getBoundingClientRect /
-                // position:fixed dance which broke on Safari mobile when
-                // the virtual keyboard / dynamic viewport shifted the
-                // prompt form independently from the document):
+                // Reposition: locate the pill, build tone+tools by cloning
+                // it (only once — guarded by the `if(toneBtn)return` inside
+                // each builder), and mount as siblings RIGHT BEFORE the pill
+                // in pill.parentElement.  Final order:
                 //
-                //   * Preferred path — form found:
-                //       bar  → prepended INSIDE the prompt form, in normal
-                //              block flow (centered above the textarea).
-                //       tone → appended next to the bundle's model-name
-                //              badge so it shares the row.
-                //       tools → appended next to tone.
-                //     All three become real DOM children of the form, so
-                //     the bundle's responsive layout (Safari mobile
-                //     keyboard included) carries them automatically.
+                //     [ tone ][ tools ][ pill ][ ...rest of toolbar ]
                 //
-                //   * Fallback path — form not yet mounted:
-                //       all three pinned via position:fixed at the bottom
-                //       of the viewport so something is visible while the
-                //       Svelte bundle hydrates.
-                //
-                // Re-runs every 250 ms (setInterval below).  Hydration may
-                // rip our hosts out; the parentElement guards put them back.
-                // Sample any non-transparent badge inside the row that isn't
-                // ours, so we copy the bundle's palette.
-                "const sampleBadge=(row)=>{"
-                  "if(!row)return null;"
-                  "const all=row.querySelectorAll('button,label,[role=button],[class*=rounded]');"
-                  "for(const el of all){"
-                    "if(el===toneHost||el===toolsHost)continue;"
-                    "if(toneHost&&toneHost.contains(el))continue;"
-                    "if(toolsHost&&toolsHost.contains(el))continue;"
-                    "const cs=getComputedStyle(el);"
-                    "const bg=cs.backgroundColor;"
-                    "if(bg&&bg!=='rgba(0, 0, 0, 0)'&&bg!=='transparent')return el;"
-                  "}"
-                  "return null;"
-                "};"
-                "const adoptBundleStyles=(row)=>{"
-                  "const s=sampleBadge(row);if(!s)return;"
-                  "const cs=getComputedStyle(s);"
-                  "const border="
-                    "(cs.borderTopWidth||'1px')+' '+"
-                    "(cs.borderTopStyle||'solid')+' '+"
-                    "(cs.borderTopColor||'transparent');"
-                  "const apply=(host)=>{"
-                    "host.style.setProperty('--ea-bg',cs.backgroundColor);"
-                    "host.style.setProperty('--ea-fg',cs.color);"
-                    "host.style.setProperty('--ea-border',border);"
-                    "host.style.setProperty('--ea-radius',cs.borderRadius);"
-                    "host.style.setProperty('--ea-padding',cs.padding);"
-                    "host.style.setProperty('--ea-font-family',cs.fontFamily);"
-                    "host.style.setProperty('--ea-font-size',cs.fontSize);"
-                    "host.style.setProperty('--ea-icon',cs.color);"
-                  "};"
-                  "apply(toneHost);apply(toolsHost);"
-                "};"
-                // Mount tone + tools INSIDE the bundle's badge row, ahead of
-                // the model badge.  Inheriting the row's flex / gap / wrap
-                // means our items align like native bundle badges with no
-                // margin math of our own.  If the row isn't in the DOM yet
-                // we hide instead of falling back to viewport-fixed (which
-                // dropped them in random corners during hydration).
+                // Fast-path: if everything is already in place, do nothing.
+                // Critical for breaking the MutationObserver feedback loop
+                // (insertBefore on a node already at its target position is
+                // still a recorded mutation, so the observer would feed
+                // itself otherwise).
                 "const reposition=()=>{"
-                  "if(!toneHost||!toolsHost)return;"
-                  "const row=document.querySelector("
-                    "'[class~=\"flex-wrap\"][class~=\"items-center\"][class~=\"gap-1\"]')"
-                    "||document.querySelector("
-                      "'[class~=\"flex-wrap\"][class~=\"items-center\"]');"
-                  "if(!row){"
-                    "toneHost.style.display='none';"
-                    "toolsHost.style.display='none';"
+                  "const pill=findPill();"
+                  "if(!pill)return;"
+                  "if(!toneBtn)buildToneFromPill(pill);"
+                  "if(!toolsBtn)buildToolsFromPill(pill);"
+                  "if(!toneBtn||!toolsBtn)return;"
+                  "const row=pill.parentElement;"
+                  "if(!row)return;"
+                  "if(toneBtn.parentElement===row&&"
+                     "toolsBtn.parentElement===row&&"
+                     "toneBtn.nextSibling===toolsBtn&&"
+                     "toolsBtn.nextSibling===pill){"
                     "return;"
                   "}"
-                  "const baseStyle="
-                    "'all:initial;display:inline-flex;align-items:center;"
-                    "font:14px/1 -apple-system,system-ui,sans-serif;';"
-                  "const orderOk="
-                    "toneHost.parentElement===row&&"
-                    "toolsHost.parentElement===row&&"
-                    "row.firstChild===toneHost&&"
-                    "toneHost.nextSibling===toolsHost;"
-                  "if(!orderOk){"
-                    "toneHost.style.cssText=baseStyle;"
-                    "toolsHost.style.cssText=baseStyle;"
-                    // Insert tools first (right after row.firstChild's
-                    // current position), then tone before it — final order
-                    // is [tone][tools][...bundle's children].
-                    "row.insertBefore(toolsHost,row.firstChild);"
-                    "row.insertBefore(toneHost,toolsHost);"
-                  "}else{"
-                    "toneHost.style.display='';"
-                    "toolsHost.style.display='';"
-                  "}"
-                  "adoptBundleStyles(row);"
+                  "row.insertBefore(toneBtn,pill);"
+                  "row.insertBefore(toolsBtn,pill);"
                 "};"
 
-                "if(document.documentElement){ensureTone();ensureTools();reposition();}"
+                "if(document.documentElement){reposition();}"
                 "document.addEventListener('DOMContentLoaded',()=>{"
-                  "ensureTone();ensureTools();reposition();"
+                  "reposition();"
+                  // Lightweight observer — body's direct children only,
+                  // no subtree, so streaming-text mutations don't trigger
+                  // us.  Combined with the fast-path return above, CPU is
+                  // negligible.
+                  "if(window.MutationObserver){"
+                    "const mo=new MutationObserver(reposition);"
+                    "mo.observe(document.body,{childList:true});"
+                  "}"
                 "});"
                 "window.addEventListener('resize',reposition);"
-                "window.addEventListener('scroll',reposition,true);"
+                // Safety-net interval: covers cases the observer misses
+                // (e.g. attribute-only changes that swap row identity).
                 "setInterval(()=>{"
-                  "if(!document.getElementById(TONE_ID)){toneRoot=null;ensureTone();}"
-                  "if(!document.getElementById(TOOLS_ID)){toolsRoot=null;ensureTools();}"
                   "reposition();"
-                  // Re-paint metrics every tick: the bundle re-mounts the
-                  // .chat-processing-info-detail element on stream lifecycle.
+                  // Re-paint metrics: the bundle re-mounts
+                  // .chat-processing-info-detail on stream lifecycle.
                   "renderOverview();"
                 "},250);"
 
