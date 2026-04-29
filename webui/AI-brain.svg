@@ -3,11 +3,9 @@
 <svg version="1.1" id="Слой_1" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" x="0px" y="0px"
 	 viewBox="0 0 500 500" style="enable-background:new 0 0 500 500;" xml:space="preserve">
 <style>
-	/* Brand color in light mode (default).  Switches to a lighter brand
-	   blue under dark mode so the glyph reads well as both an inline
-	   <img src="/favicon"> and as a <link rel="icon"> in the browser tab.
-	   Override at the operator level by passing --webui-icon <path>; the
-	   server's /favicon route prefers that file over this embedded SVG. */
+	/* Brand color: light mode default, dark mode override via media query.
+	   Override externally by passing --webui-icon PATH on the server CLI;
+	   /favicon prefers that file over this embedded SVG. */
 	.brand { fill: #5b8dee; }
 	@media (prefers-color-scheme: dark) {
 		.brand { fill: #7aa2ff; }
