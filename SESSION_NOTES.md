@@ -305,6 +305,46 @@ Webui title default also flips to `"Deep"`.
 ## 5. Recent commits (most recent first)
 
 ```
+2026-04-29 — External tools (operator-defined commands via JSON manifest).
+
+e966cf1  External tools: harden child setup, reject NaN/Inf, retire magic numbers
+                    (review follow-up: kMaxFdScan caps the close() loop so
+                     RLIMIT_NOFILE=infinity no longer leaks parent fds; PR_SET_PDEATHSIG
+                     ties subprocess lifetime to the agent; std::isfinite() rejects
+                     NaN/Inf model args; slurp() stat-first; env_passthrough value
+                     length cap; all magic numbers promoted to named constexprs.)
+d0f7965  Tools: get_current_dir builtin + JSON-manifest external tools
+                    (Two-part feature. (1) get_current_dir: zero-param builtin
+                     returning getcwd() at call time; CLIs chdir() into --sandbox
+                     at startup so what the tool reports == bash/fs_*'s effective
+                     dir. Toolbelt registers it whenever any fs-tool is enabled.
+                     (2) load_external_tools_from_json: operator declares
+                     name/description/abs-command/argv-template/parameters/timeout
+                     /max_output/cwd/env_passthrough/stderr in a JSON manifest;
+                     each entry compiles to a regular Tool. Fork+execve, never a
+                     shell; absolute path validated at load (no PATH-hijack);
+                     whole-element placeholders only ("{x}", never "--flag={x}");
+                     hard caps on manifest size / tools / params / argv / env;
+                     env passthrough opt-in allowlist; closed stdin; setpgid +
+                     SIGTERM-then-SIGKILL kills grandchildren. New --tools-json
+                     PATH flag in easyai-local / easyai-cli / easyai-server.
+                     manual.md §3.3.3 + §3.3.4. examples/tools.example.json.)
+
+2026-04-29 (earlier) — robustness pass on server + CLI streaming.
+
+84009a0  Cancel: stop server job when the client connection drops
+a3038fa  CLI: tolerate non-UTF-8 bytes in tool output and model content
+2af3fe8  Docs: add AI_TOOLS.md — a vendor-neutral book on AI tool calling
+6939e4c  CLI: stop <think> tags from bleeding into streamed content
+
+2026-04-28 — webui polish + fs/bash gating split.
+
+c10c812  Webui: hide the floating top-right Settings gear button
+4b3f9fa  Server: --allow-fs gate for fs_*; webui thinking lock + tool URL log
+36c5f10  Webui: remove HTML-like markup from AI-brain.svg <style> comment
+cedad05  Webui: restore original AI-brain favicon, add theme-aware brand fill
+f9ea948  Webui: narrow SVG theme rule to hardcoded near-black colors only
+
 2026-04-27 (afternoon) — Deep + lib-first refactor (phase 5/6).
 
 2dd5e79  Deep — name + persona for the default easyai-server assistant
@@ -496,6 +536,19 @@ c6a09d6  Single combined bar above the textarea (tone + ctx + last)
 - **(B) Qwen3-thinking model stops after `</think>`** —
   ✅ **FIXED via thought-only retry path** (see "Bug B root cause" above).
   Validated via curl in this session.  Pending user webui validation.
+
+- **External tools manifest (`--tools-json`)** — landed in `d0f7965`,
+  hardened in `e966cf1`. Operator declares command + argv + schema in
+  JSON; library spawns via `fork`+`execve` (never a shell). Security
+  guarantees enforced at load time (absolute command path, no embedded
+  placeholders, hard caps on manifest/argv/params/env/output/timeout),
+  at call time (JSON-Schema arg validation, NaN/Inf rejection,
+  `kMaxFdScan` close-loop, `PR_SET_PDEATHSIG`, process-group SIGTERM
+  → SIGKILL), and at deploy time (manifest is part of the operator's
+  trusted artefact, treat like sudoers). See `manual.md` §3.3.4 and
+  `examples/tools.example.json`. Also: paired `get_current_dir`
+  builtin so the model can find out the absolute path it's running in
+  (Toolbelt auto-registers it when any fs-tool is enabled).
 
 - **Webui core dump under heavy load** — user reported coredump while
   using webui.  Did NOT reproduce in this session.  Tooling now in
