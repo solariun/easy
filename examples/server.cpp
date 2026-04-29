@@ -4254,8 +4254,13 @@ int main(int argc, char ** argv) {
                     "(used.toLocaleString()+' / '+total.toLocaleString()+"
                       "' ('+Math.round(pct*100)+'%)'):"
                     "used.toLocaleString();"
+                  // ctx threshold colors are inline-only when crossed —
+                  // otherwise we leave the value uncolored so the bundle's
+                  // text-foreground class (set on the wrapping span below)
+                  // drives the color, which switches automatically with
+                  // the light/dark theme.
                   "const ctxColor=pct>=CTX_HARD?'#f85149':"
-                    "pct>=CTX_SOFT?'#d29922':'#e6edf3';"
+                    "pct>=CTX_SOFT?'#d29922':'';"
                   // Lock input if we've crossed the hard threshold.
                   "if(total){"
                     "if(pct>=CTX_HARD){"
@@ -4271,22 +4276,30 @@ int main(int argc, char ** argv) {
                     "lastText=t.predicted_n+' tok · '+(t.predicted_ms/1000).toFixed(1)+"
                       "'s · '+tps.toFixed(1)+' t/s';"
                   "}"
-                  // Inject directly inside the bundle's processing-info detail.
-                  // No wrapper element of our own — we set innerHTML on the
-                  // bundle's own anchor so positioning stays exactly where
-                  // SvelteKit puts it.
+                  // Inject directly inside the bundle's processing-info
+                  // detail.  We render with Tailwind utility classes the
+                  // bundle already ships:
+                  //   * `text-xs`            — same size as Output / t/s
+                  //   * `text-muted-foreground` — labels + separator
+                  //                              (dimmed in both themes)
+                  //   * `text-foreground`    — values (theme-aware fg)
+                  // No font-family override: the bundle's sans stack
+                  // inherits, matching the Output text exactly.
+                  // Threshold colors (ctxColor) are applied inline only
+                  // when crossed; otherwise the value uses text-foreground
+                  // and tracks the active light/dark theme automatically.
                   "const target=document.querySelector('.chat-processing-info-detail');"
                   "if(target!==__eaiOvrTarget)__eaiBindOvr(target);"
                   "if(!target)return;"
+                  "const ctxValStyle=ctxColor?"
+                    "' style=\"color:'+ctxColor+'\"':'';"
                   "const html="
-                    "'<span style=\"font-family:ui-monospace,SFMono-Regular,"
-                      "Menlo,monospace;font-size:.7rem;display:inline-flex;"
-                      "gap:.4rem;align-items:center;color:#8b949e;\">'+"
-                      "'<span style=\"opacity:.7\">ctx</span>'+"
-                      "'<span style=\"color:'+ctxColor+'\">'+ctxText+'</span>'+"
-                      "'<span style=\"opacity:.4\">·</span>'+"
-                      "'<span style=\"opacity:.7\">last</span>'+"
-                      "'<span style=\"color:#e6edf3\">'+lastText+'</span>'+"
+                    "'<span class=\"text-xs inline-flex items-center gap-1.5\">'+"
+                      "'<span class=\"text-muted-foreground\">ctx</span>'+"
+                      "'<span class=\"text-foreground\"'+ctxValStyle+'>'+ctxText+'</span>'+"
+                      "'<span class=\"text-muted-foreground opacity-60\">·</span>'+"
+                      "'<span class=\"text-muted-foreground\">last</span>'+"
+                      "'<span class=\"text-foreground\">'+lastText+'</span>'+"
                     "'</span>';"
                   "if(target.innerHTML!==html)target.innerHTML=html;"
                 "};"
