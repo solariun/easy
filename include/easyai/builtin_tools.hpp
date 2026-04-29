@@ -28,6 +28,17 @@ Tool fs_list_dir  (std::string root = ".");
 Tool fs_glob      (std::string root = ".");
 Tool fs_grep      (std::string root = ".");
 
+// get_current_dir: returns the absolute path of the process's current
+// working directory at call time (not at registration time — getcwd is
+// invoked on every call so a process that chdir'd later still reports
+// truthfully). Pair with --sandbox: the CLI / server chdir into the
+// sandbox at startup so the model's "current directory" matches the
+// boundary that fs_* and bash already enforce.
+//
+// No parameters; no arguments to validate; cannot fail in a meaningful
+// way except an OS-level getcwd error which we surface as a tool error.
+Tool get_current_dir();
+
 // ---------- shell -------------------------------------------------------
 // Run a shell command via /bin/sh -c. Working directory is set to `root`.
 //

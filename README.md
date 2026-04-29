@@ -177,11 +177,12 @@ All three example CLIs (`easyai-local`, `easyai-cli`, `easyai-server`)
 follow the same gating model. Default is **safe**: no filesystem access,
 no shell.
 
-| Flag             | What it enables                                                         |
-|------------------|-------------------------------------------------------------------------|
-| (no flag)        | `datetime`, `web_search`, `web_fetch` only.                             |
-| `--sandbox <dir>`| `fs_read_file / fs_write_file / fs_list_dir / fs_glob / fs_grep`, ALL scoped to `<dir>`. The model sees a virtual `/`-rooted filesystem; real path is hidden. |
-| `--allow-bash`   | `bash` (run `/bin/sh -c`). cwd = `--sandbox <dir>` if given, otherwise the binary's CWD. NOT a hardened sandbox — runs with your user privileges. Also bumps the agentic-loop `max_tool_hops` to 99999 (bash flows naturally span many turns). |
+| Flag                  | What it enables                                                         |
+|-----------------------|-------------------------------------------------------------------------|
+| (no flag)             | `datetime`, `web_search`, `web_fetch` only.                             |
+| `--sandbox <dir>`     | `fs_read_file / fs_write_file / fs_list_dir / fs_glob / fs_grep` plus `get_current_dir`, ALL scoped to `<dir>`. The CLIs `chdir` into `<dir>` so `get_current_dir` reports the sandbox path back to the model. |
+| `--allow-bash`        | `bash` (run `/bin/sh -c`). cwd = `--sandbox <dir>` if given, otherwise the binary's CWD. NOT a hardened sandbox — runs with your user privileges. Also bumps the agentic-loop `max_tool_hops` to 99999 (bash flows naturally span many turns). |
+| `--tools-json <path>` | Load extra tools from a JSON manifest (name / description / absolute command path / argv template / parameter schema / timeout / output cap / env allowlist). Spawns via `fork`+`execve` — never a shell. See `examples/tools.example.json` and `manual.md` (3.3.4 *External tools manifest*). |
 
 #### `easyai-local`
 

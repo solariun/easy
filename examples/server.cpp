@@ -56,16 +56,19 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cerrno>
 #include <chrono>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <ctime>
 #include <fstream>
 #include <memory>
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <unistd.h>     // chdir
 #include <vector>
 
 // (chat.h pulls in nlohmann::json + a `using json = nlohmann::ordered_json`
@@ -2728,6 +2731,14 @@ static bool require_auth(const ServerCtx & ctx, const httplib::Request & req,
         "                                NOT a hardened sandbox — the\n"
         "                                command runs with the server's\n"
         "                                user privileges.\n"
+        "      --tools-json <path>      Load extra tools from a JSON manifest.\n"
+        "                                The manifest declares each tool's\n"
+        "                                name, description, absolute command\n"
+        "                                path, argv template, parameter\n"
+        "                                schema, timeout, output cap, and\n"
+        "                                env passthrough allowlist.  See\n"
+        "                                examples/tools.example.json and\n"
+        "                                manual.md (External tools manifest).\n"
         "\nModel tuning (apply on top of --preset):\n"
         "      --preset <name>          Ambient preset (default 'balanced')\n"
         "      --temperature <f>        Override temperature (0.0-2.0)\n"
@@ -2801,6 +2812,7 @@ struct ServerArgs {
     std::string sandbox;            // optional: scope fs_* / bash to this dir
     bool        allow_fs   = false; // explicit opt-in for the fs_* tools
     bool        allow_bash = false; // explicit opt-in for the `bash` tool
+    std::string tools_json;         // optional: external-tools manifest path
     std::string preset     = "balanced";
     size_t      max_body   = 8u * 1024u * 1024u;
 
@@ -2867,6 +2879,7 @@ static ServerArgs parse_args(int argc, char ** argv) {
         else if (s == "--sandbox")                   a.sandbox        = need(i, "--sandbox");
         else if (s == "--allow-fs")                  a.allow_fs       = true;
         else if (s == "--allow-bash")                a.allow_bash     = true;
+        else if (s == "--tools-json")                a.tools_json     = need(i, "--tools-json");
         else if (s == "--preset")                    a.preset         = need(i, "--preset");
         else if (s == "--max-body")                  a.max_body       = (size_t) std::atoll(need(i, "--max-body"));
         else if (s == "--batch")                     a.n_batch        = std::atoi(need(i, "--batch"));
@@ -3028,6 +3041,21 @@ int main(int argc, char ** argv) {
     }
     if (default_system.empty()) default_system = kBuiltinSystem;
 
+    // Anchor process cwd to --sandbox before loading the external-tools
+    // manifest: $SANDBOX placeholders in the manifest are resolved
+    // against getcwd at load time, so chdir-ing here makes those
+    // placeholders mean "the dir the operator handed me", not
+    // "wherever systemd happened to start me from". Also lets
+    // get_current_dir surface the sandbox path to the model.
+    if (!args.sandbox.empty()) {
+        if (::chdir(args.sandbox.c_str()) != 0) {
+            std::fprintf(stderr,
+                "easyai-server: chdir(%s): %s\n",
+                args.sandbox.c_str(), std::strerror(errno));
+            return 2;
+        }
+    }
+
     // -------- build the context (heap-allocated so HTTP lambdas can capture
     // a stable reference; lifetime tied to main()'s scope via unique_ptr).
     auto ctx = std::make_unique<ServerCtx>();
@@ -3078,6 +3106,28 @@ int main(int argc, char ** argv) {
                       .allow_fs  (args.allow_fs)
                       .allow_bash(args.allow_bash);
         for (auto & t : tb.tools()) ctx->default_tools.push_back(std::move(t));
+    }
+
+    // External tools manifest. Loaded AFTER the built-in toolbelt so
+    // the loader can reject any manifest entry that collides with a
+    // name we already registered. Failures are fatal — the operator
+    // declared a manifest, we don't get to "best-effort" past a typo.
+    if (!args.tools_json.empty()) {
+        std::vector<std::string> reserved;
+        reserved.reserve(ctx->default_tools.size());
+        for (const auto & t : ctx->default_tools) reserved.push_back(t.name);
+        auto loaded = easyai::load_external_tools_from_json(
+            args.tools_json, reserved);
+        if (!loaded.error.empty()) {
+            std::fprintf(stderr,
+                "easyai-server: --tools-json: %s\n",
+                loaded.error.c_str());
+            return 2;
+        }
+        for (auto & t : loaded.tools) ctx->default_tools.push_back(std::move(t));
+        std::fprintf(stderr,
+            "easyai-server: loaded %zu external tool(s) from %s\n",
+            loaded.tools.size(), args.tools_json.c_str());
     }
     // The webui drives long agentic flows (search → fetch → search → fetch
     // → write_file → bash → …) and should never bump the per-turn safety

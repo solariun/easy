@@ -39,6 +39,7 @@
 #include "easyai/builtin_tools.hpp"
 #include "easyai/cli.hpp"
 #include "easyai/client.hpp"
+#include "easyai/external_tools.hpp"
 #include "easyai/log.hpp"
 #include "easyai/plan.hpp"
 #include "easyai/text.hpp"
@@ -47,6 +48,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <csignal>
 #include <cstdio>
@@ -279,6 +281,7 @@ struct Options {
     std::string sandbox;
     bool        allow_bash      = false;       // opt-in: register `bash` tool
     std::set<std::string> tools_enabled;       // empty = all defaults
+    std::string tools_json;                    // path to external-tools manifest
     std::string prompt;                        // -p one-shot
     // Sampling / penalty knobs — -1 / -2 / empty == server default.
     float                    temperature       = -1.0f;
@@ -363,6 +366,14 @@ void usage(const char * argv0) {
 "                                 user privileges (network, full FS, etc).\n"
 "                                 cwd is set to --sandbox DIR if given,\n"
 "                                 otherwise the current working dir.\n"
+"    --tools-json PATH          load extra tools from a JSON manifest.\n"
+"                                 The manifest declares name, description,\n"
+"                                 absolute command path, argv template,\n"
+"                                 parameter schema, timeout, output cap,\n"
+"                                 cwd ($SANDBOX accepted), and an env\n"
+"                                 passthrough allowlist.  See\n"
+"                                 examples/tools.example.json and\n"
+"                                 manual.md (External tools manifest).\n"
 "    --no-plan                  don't auto-register the planning tool\n"
 "\n"
 "  Behaviour:\n"
@@ -448,6 +459,7 @@ bool parse_args(int argc, char ** argv, Options & o) {
         else if (a == "--system-file")    o.system_file   = need(i, "--system-file");
         else if (a == "--sandbox")        o.sandbox       = need(i, "--sandbox");
         else if (a == "--allow-bash")     o.allow_bash    = true;
+        else if (a == "--tools-json")     o.tools_json    = need(i, "--tools-json");
         else if (a == "--temperature")    o.temperature       = std::stof(need(i, "--temperature"));
         else if (a == "--top-p")          o.top_p             = std::stof(need(i, "--top-p"));
         else if (a == "--top-k")          o.top_k             = std::stoi(need(i, "--top-k"));
@@ -533,6 +545,7 @@ bool any_management(const Options & o) {
 // Default catalog when --tools isn't given.
 const std::vector<std::string> kDefaultTools = {
     "datetime", "plan", "web_search", "web_fetch",
+    "get_current_dir",
     "system_meminfo", "system_loadavg", "system_cpu_usage", "system_swaps",
 };
 
@@ -562,10 +575,11 @@ void register_tools(easyai::Client & cli,
         return o.tools_enabled.count(name) != 0;
     };
 
-    if (wants("datetime"))   cli.add_tool(easyai::tools::datetime());
+    if (wants("datetime"))         cli.add_tool(easyai::tools::datetime());
     if (!o.no_plan && wants("plan")) cli.add_tool(plan.tool());
-    if (wants("web_search")) cli.add_tool(easyai::tools::web_search());
-    if (wants("web_fetch"))  cli.add_tool(easyai::tools::web_fetch());
+    if (wants("web_search"))       cli.add_tool(easyai::tools::web_search());
+    if (wants("web_fetch"))        cli.add_tool(easyai::tools::web_fetch());
+    if (wants("get_current_dir"))  cli.add_tool(easyai::tools::get_current_dir());
 
     // fs_* — scoped to --sandbox if given, otherwise CWD.
     const std::string root = o.sandbox.empty() ? "." : o.sandbox;
@@ -592,6 +606,32 @@ void register_tools(easyai::Client & cli,
     if (wants("system_loadavg"))   cli.add_tool(systools::make_system_loadavg());
     if (wants("system_cpu_usage")) cli.add_tool(systools::make_system_cpu_usage());
     if (wants("system_swaps"))     cli.add_tool(systools::make_system_swaps());
+
+    // External tools manifest (--tools-json PATH).  Names are added
+    // unconditionally — the operator declared them in the manifest, so
+    // the --tools allowlist applies AFTER registration. We pass the
+    // already-registered tool names as `reserved_names` so the loader
+    // surfaces collisions cleanly (a manifest entry trying to shadow
+    // `bash` is a load-time error, not a silent override).
+    if (!o.tools_json.empty()) {
+        std::vector<std::string> reserved;
+        reserved.reserve(cli.tools().size());
+        for (const auto & t : cli.tools()) reserved.push_back(t.name);
+        auto loaded = easyai::load_external_tools_from_json(
+            o.tools_json, reserved);
+        if (!loaded.error.empty()) {
+            std::fprintf(stderr,
+                "%serror:%s --tools-json: %s\n",
+                st.red(), st.reset(), loaded.error.c_str());
+            std::exit(2);
+        }
+        for (auto & t : loaded.tools) {
+            // Honour --tools allowlist if the operator passed one.
+            if (!o.tools_enabled.empty()
+                    && o.tools_enabled.count(t.name) == 0) continue;
+            cli.add_tool(std::move(t));
+        }
+    }
 
     if (o.verbose) {
         vlog("%s[easyai-cli-remote]%s registered %zu tool(s):\n",
@@ -885,6 +925,23 @@ int main(int argc, char ** argv) {
         std::fprintf(stderr, "%serror:%s %s\n",
                      st.red(), st.reset(), err.c_str());
         return 2;
+    }
+
+    // Anchor the process CWD to the sandbox if one was given. This
+    // means: get_current_dir reports the sandbox path, every external
+    // tool with `cwd: "$SANDBOX"` resolves there at load time, and the
+    // bash tool's relative paths land where the operator authorised
+    // file access. Without --sandbox we leave CWD alone and the
+    // model's "current directory" is wherever the user invoked us
+    // from — which is fine for read-only tools but means file-writing
+    // tools won't be registered (handled by --sandbox-gating above).
+    if (!o.sandbox.empty()) {
+        if (::chdir(o.sandbox.c_str()) != 0) {
+            std::fprintf(stderr, "%serror:%s chdir(%s): %s\n",
+                         st.red(), st.reset(),
+                         o.sandbox.c_str(), std::strerror(errno));
+            return 2;
+        }
     }
 
     // Auto-prepend http:// when --url omits a scheme — convenience for

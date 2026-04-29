@@ -27,8 +27,9 @@
 #include "easyai/easyai.hpp"
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
-#include <unistd.h>     // isatty
+#include <unistd.h>     // isatty, chdir
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
@@ -111,6 +112,7 @@ struct CliArgs {
     bool load_tools = true;
     std::string sandbox;        // empty = fs_* tools NOT registered
     bool allow_bash = false;    // explicit opt-in for `bash`
+    std::string tools_json;     // optional external-tools manifest path
 
     // KV cache controls
     std::string cache_type_k;      // empty = library default (f16)
@@ -161,6 +163,11 @@ struct CliArgs {
         "                                 given, otherwise CWD. NOT a\n"
         "                                 hardened sandbox — the command\n"
         "                                 runs with your user privileges.\n"
+        "      --tools-json <path>       Load extra tools from a JSON manifest\n"
+        "                                 declaring name/description/argv\n"
+        "                                 template/parameter schema/etc.\n"
+        "                                 See examples/tools.example.json and\n"
+        "                                 manual.md (External tools manifest).\n"
         "\nKV cache (all optional):\n"
         " -ctk, --cache-type-k <type>    K-cache dtype (f32|f16|bf16|q8_0|q4_0|q4_1|q5_0|q5_1|iq4_nl)\n"
         " -ctv, --cache-type-v <type>    V-cache dtype (same options) — quantising V saves a lot of VRAM\n"
@@ -206,6 +213,7 @@ static CliArgs parse(int argc, char ** argv) {
         else if (s == "--no-tools")                   a.load_tools    = false;
         else if (s == "--sandbox")                    a.sandbox       = need(i, "--sandbox");
         else if (s == "--allow-bash")                 a.allow_bash    = true;
+        else if (s == "--tools-json")                 a.tools_json    = need(i, "--tools-json");
         // KV controls
         else if (s == "-ctk" || s == "--cache-type-k") a.cache_type_k = need(i, "-ctk");
         else if (s == "-ctv" || s == "--cache-type-v") a.cache_type_v = need(i, "-ctv");
@@ -228,6 +236,19 @@ static CliArgs parse(int argc, char ** argv) {
 int main(int argc, char ** argv) {
     CliArgs args = parse(argc, argv);
     install_sigint();
+
+    // Anchor process cwd to --sandbox so get_current_dir surfaces the
+    // path the operator authorised, and so $SANDBOX placeholders in
+    // any --tools-json manifest resolve to the right directory at
+    // load time. Same idiom used by easyai-server / easyai-cli.
+    if (!args.sandbox.empty()) {
+        if (::chdir(args.sandbox.c_str()) != 0) {
+            std::fprintf(stderr,
+                "[easyai-local] chdir(%s): %s\n",
+                args.sandbox.c_str(), std::strerror(errno));
+            return 2;
+        }
+    }
 
     // Resolve system prompt: --system inline > -s file > built-in default.
     // The default discourages a small model from calling tools on simple
@@ -281,6 +302,7 @@ int main(int argc, char ** argv) {
     lc.system_prompt  = system_prompt;
     lc.sandbox        = args.sandbox;
     lc.allow_bash     = args.allow_bash;
+    lc.tools_json     = args.tools_json;
     lc.n_ctx          = args.n_ctx;
     lc.n_batch        = args.n_batch;
     lc.ngl            = args.ngl;

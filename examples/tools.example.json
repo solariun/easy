@@ -1,0 +1,81 @@
+{
+  "version": 1,
+  "tools": [
+    {
+      "name": "host_uname",
+      "description": "Return the kernel name and version of the machine the agent is running on. No arguments. Use when the user asks about the host OS or kernel.",
+      "command": "/usr/bin/uname",
+      "argv": ["-a"],
+      "parameters": { "type": "object", "properties": {} },
+      "timeout_ms": 2000,
+      "max_output_bytes": 4096,
+      "cwd": "$SANDBOX",
+      "env_passthrough": [],
+      "stderr": "merge",
+      "treat_nonzero_exit_as_error": true
+    },
+
+    {
+      "name": "host_uptime",
+      "description": "Return the system uptime and load averages in human-readable form. No arguments.",
+      "command": "/usr/bin/uptime",
+      "argv": [],
+      "parameters": { "type": "object", "properties": {} },
+      "timeout_ms": 2000,
+      "max_output_bytes": 4096,
+      "cwd": "$SANDBOX"
+    },
+
+    {
+      "name": "list_processes",
+      "description": "List running processes whose name matches a regex pattern. Returns one process per line: PID and name.",
+      "command": "/usr/bin/pgrep",
+      "argv": ["-a", "{pattern}"],
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "pattern": {
+            "type": "string",
+            "description": "Regex matched against the process name (e.g. \"node\", \"^postgres\")."
+          }
+        },
+        "required": ["pattern"]
+      },
+      "timeout_ms": 5000,
+      "max_output_bytes": 65536,
+      "cwd": "$SANDBOX",
+      "env_passthrough": [],
+      "stderr": "discard",
+      "treat_nonzero_exit_as_error": false
+    },
+
+    {
+      "name": "git_log",
+      "description": "Show the last N commits of the repository in the current directory (must be a git checkout). Format: short hash, author, ISO date, subject. Note: `count` becomes its own argv element so the placeholder isn't embedded inside a larger string — that's the rule the loader enforces.",
+      "command": "/usr/bin/git",
+      "argv": [
+        "log",
+        "--max-count",
+        "{count}",
+        "--pretty=format:%h %an %ad %s",
+        "--date=iso-strict"
+      ],
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "count": {
+            "type": "integer",
+            "description": "Number of commits to show (1-100)."
+          }
+        },
+        "required": ["count"]
+      },
+      "timeout_ms": 8000,
+      "max_output_bytes": 131072,
+      "cwd": "$SANDBOX",
+      "env_passthrough": ["HOME", "PATH"],
+      "stderr": "merge",
+      "treat_nonzero_exit_as_error": true
+    }
+  ]
+}

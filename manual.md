@@ -498,6 +498,122 @@ privileges. It's appropriate for local single-user agents; for
 anything multi-tenant or production, run easyai-server inside a
 container / firejail / unprivileged user.
 
+### 3.3.3 `get_current_dir` — anchor relative paths
+
+```cpp
+engine.add_tool(easyai::tools::get_current_dir());
+```
+
+A zero-parameter tool that returns the absolute path of the process's
+current working directory at call time. Pair it with `--sandbox`: the
+CLIs and server `chdir` into the sandbox at startup, so what
+`get_current_dir` reports is exactly the directory `bash`, `read_file`,
+`write_file`, `list_dir`, `glob` and `grep` operate against. Models
+that don't already know the path should call it once at the start of
+a task; for any subsequent file op, relative paths just work.
+
+The `Toolbelt` adds it automatically when any filesystem-flavoured
+tool is enabled (`allow_fs` or `allow_bash`); register it manually if
+you build the toolbelt by hand.
+
+### 3.3.4 External tools manifest — declare commands in JSON
+
+For tools that wrap an existing CLI binary (`uname`, `pgrep`, `git`,
+internal scripts, etc.) you can declare them in a JSON manifest
+without writing C++. The `--tools-json PATH` flag is supported by
+`easyai-local`, `easyai-cli`, and `easyai-server`. From C++:
+
+```cpp
+auto loaded = easyai::load_external_tools_from_json(path, /*reserved=*/{});
+if (!loaded.error.empty()) {
+    std::fprintf(stderr, "tools-json: %s\n", loaded.error.c_str());
+    return 1;
+}
+for (auto & t : loaded.tools) engine.add_tool(std::move(t));
+```
+
+Manifest schema (one entry — see `examples/tools.example.json` for
+more):
+
+```json
+{
+  "version": 1,
+  "tools": [
+    {
+      "name": "list_processes",
+      "description": "List running processes whose name matches a regex pattern.",
+      "command": "/usr/bin/pgrep",
+      "argv": ["-a", "{pattern}"],
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "pattern": { "type": "string", "description": "Regex." }
+        },
+        "required": ["pattern"]
+      },
+      "timeout_ms": 5000,
+      "max_output_bytes": 65536,
+      "cwd": "$SANDBOX",
+      "env_passthrough": ["PATH"],
+      "stderr": "discard",
+      "treat_nonzero_exit_as_error": false
+    }
+  ]
+}
+```
+
+**Field-by-field reference**
+
+| Field | Required | Notes |
+| --- | --- | --- |
+| `name` | yes | `^[a-zA-Z][a-zA-Z0-9_]{0,63}$`. Must not collide with built-ins (`bash`, `read_file`, …) or already-registered tools. |
+| `description` | yes | Plain-English text for the model. 1..4096 chars. The model uses this to decide *when* to call your tool, so write it well. |
+| `command` | yes | **Absolute** path to a regular, executable file. Relative names are rejected at load (no PATH search → no PATH-hijack risk). |
+| `argv` | yes | Array of strings. Each element is either a literal (no `{` or `}`) or exactly `"{paramname}"`. Embedded placeholders (`"--flag={x}"`) are rejected — split into two elements (`["--flag", "{x}"]`) instead. |
+| `parameters` | optional | JSON-Schema-shaped: `{type:"object", properties:{...}, required:[...]}`. Types accepted: `string`, `integer`, `number`, `boolean`. |
+| `timeout_ms` | optional | Default 10000. Clamped to [100, 300000]. |
+| `max_output_bytes` | optional | Default 65536. Clamped to [1024, 4 MiB]. Excess output is silently discarded; the response notes the truncation. |
+| `cwd` | optional | Either an absolute path or the magic token `"$SANDBOX"` which resolves to the process's CWD at load time. Default: `"$SANDBOX"`. |
+| `env_passthrough` | optional | Allowlist of parent-process env vars to inherit. **Default empty** — the subprocess gets a clean env. Add `"PATH"`, `"HOME"`, etc. only when the wrapped command needs them. |
+| `stderr` | optional | `"merge"` (default) or `"discard"`. |
+| `treat_nonzero_exit_as_error` | optional | Default `true`. Set `false` for tools whose non-zero exit is informational (`pgrep` returns 1 when nothing matches). |
+
+**Security guarantees** — these are enforced, not aspirational:
+
+1. **No shell.** The runner uses `fork` + `execve` with an argv array.
+   The model's argument never passes through a shell parser, so
+   quoting / `;` / backticks / `$(…)` cannot escape its argv slot.
+2. **Absolute command path.** Validated at load (regular file +
+   executable bit). No PATH lookup, no PATH-hijack.
+3. **Whole-element placeholders only.** A model argument fills exactly
+   one argv element; it can't be concatenated into a literal.
+4. **Schema-validated arguments.** Type errors are surfaced as a
+   `ToolResult::error` *before* anything is spawned. Required-but-
+   missing arguments are rejected.
+5. **Hard caps.** Manifest size (1 MiB), tools per manifest (128),
+   params per tool (32), env passthrough size (16), argv elements
+   (256), per-arg bytes (4 KiB). Each cap closes a class of DoS.
+6. **Clean env by default.** Only listed `env_passthrough` vars
+   inherit. `LD_PRELOAD`, `PATH`, etc. don't leak in unless asked.
+7. **Closed stdin.** No way to feed the subprocess from the model.
+8. **Process-group timeout.** SIGTERM to the group on `timeout_ms`,
+   SIGKILL after a 1 s grace — kills any grandchildren the command
+   spawned, not just the top-level process.
+9. **Inherited fds closed.** All fds ≥ 3 are closed in the child
+   before exec, so the agent's HTTP transport / log files / database
+   handles do not leak into the spawned command.
+
+The manifest is the operator's deploy artefact — treat it like a
+sudoers file. Anyone who can write it can run arbitrary commands as
+the agent's user.
+
+```sh
+# enable from the CLIs
+easyai-local --sandbox ./work --tools-json mytools.json
+easyai-cli   --sandbox ./work --tools-json mytools.json --url http://...
+easyai-server -m model.gguf --sandbox /srv/agent --tools-json /srv/agent/tools.json
+```
+
 ### 3.4 Streaming token output
 
 Just register `on_token`:

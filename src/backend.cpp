@@ -4,6 +4,7 @@
 
 #include "easyai/cli.hpp"
 #include "easyai/engine.hpp"
+#include "easyai/external_tools.hpp"
 #include "easyai/presets.hpp"
 #include "easyai/tool.hpp"
 
@@ -57,6 +58,23 @@ bool LocalBackend::init(std::string & err) {
             .sandbox   (cfg.sandbox)
             .allow_bash(cfg.allow_bash)
             .apply     (engine);
+    }
+
+    // External tools manifest. Loaded after the built-in toolbelt so
+    // collisions with built-in names surface as a load-time error
+    // instead of silently shadowing. Manifest failures are surfaced
+    // through `err` and abort init — the operator handed us a config
+    // file, we don't get to ignore it.
+    if (!cfg.tools_json.empty()) {
+        std::vector<std::string> reserved;
+        reserved.reserve(engine.tools().size());
+        for (const auto & t : engine.tools()) reserved.push_back(t.name);
+        auto loaded = load_external_tools_from_json(cfg.tools_json, reserved);
+        if (!loaded.error.empty()) {
+            err = "tools-json: " + loaded.error;
+            return false;
+        }
+        for (auto & t : loaded.tools) engine.add_tool(t);
     }
     engine.on_tool([](const ToolCall & c, const ToolResult & r){
         std::fprintf(stderr,

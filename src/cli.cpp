@@ -48,6 +48,14 @@ std::vector<Tool> Toolbelt::tools() const {
         const std::string root = sandbox_.empty() ? "." : sandbox_;
         out.push_back(easyai::tools::bash(root));
     }
+    // get_current_dir is registered whenever ANY filesystem-flavoured
+    // tool is on (fs_*, bash). It costs nothing, takes no parameters,
+    // and is the canonical way for the model to learn the sandbox path
+    // it should anchor relative paths against. Without an fs/bash tool
+    // there's nothing for it to anchor, so we keep it off — minimum
+    // surface area.
+    const bool any_fs_like = (allow_fs_ && !sandbox_.empty()) || allow_bash_;
+    if (any_fs_like) out.push_back(easyai::tools::get_current_dir());
     return out;
 }
 

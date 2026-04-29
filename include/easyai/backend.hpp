@@ -71,6 +71,7 @@ public:
         std::string system_prompt;
         std::string sandbox;            // empty = fs_* tools NOT registered
         bool        allow_bash = false; // explicit opt-in for the bash tool
+        std::string tools_json;         // optional external-tools manifest path
         int         n_ctx      = 4096;
         int         n_batch    = 0;     // 0 = follow ctx
         int         ngl        = -1;

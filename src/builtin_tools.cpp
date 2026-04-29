@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <climits>     // PATH_MAX
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -1038,12 +1039,56 @@ Tool fs_grep(std::string root) {
 //
 // We deliberately use /bin/sh -c so the model can pipe, redirect, &&,
 // quote, etc — i.e. behave like a normal shell user.
+// get_current_dir — returns the process's CWD. Cheap, parameterless,
+// safe. The CLI / server chdir() into the --sandbox root at startup, so
+// the path this returns is exactly the directory the model's other
+// tools (bash, fs_*) will operate in. We resolve via getcwd() at call
+// time (not at registration) so a process that chdir'd later still
+// reports truthfully.
+//
+// Two error paths surfaced as ToolResult::error:
+//   - getcwd returns nullptr (path too long, racing rmdir, EACCES on
+//     a parent component): we surface errno via strerror.
+//   - The path doesn't fit in PATH_MAX. POSIX guarantees PATH_MAX
+//     bytes are enough for any valid path that the kernel would let
+//     us land in via chdir, so this is a "should never happen" branch
+//     kept defensively.
+Tool get_current_dir() {
+    return Tool::builder("get_current_dir")
+        .describe(
+            "Returns the absolute path of the directory this agent is "
+            "running in. Other tools that take relative paths (bash, "
+            "read_file, write_file, list_dir, glob, grep) resolve them "
+            "against this directory. Call this once at the start of a "
+            "task if you need to know the absolute path; otherwise just "
+            "use relative paths and trust they land here. No parameters."
+        )
+        .handle([](const ToolCall & /*c*/) {
+            // PATH_MAX-sized stack buffer is the standard POSIX idiom;
+            // getcwd writes at most PATH_MAX bytes (incl. NUL) so this
+            // is bounded by the platform.
+            char buf[PATH_MAX];
+            if (::getcwd(buf, sizeof(buf)) == nullptr) {
+                return ToolResult::error(
+                    std::string("getcwd failed: ") + std::strerror(errno));
+            }
+            // strnlen is overkill (getcwd guarantees NUL-terminated on
+            // success) but treat it as a defence-in-depth bound anyway.
+            const size_t n = ::strnlen(buf, sizeof(buf));
+            return ToolResult::ok(std::string(buf, n));
+        })
+        .build();
+}
+
 Tool bash(std::string root) {
     auto sb = std::make_shared<Sandbox>(std::move(root));
     return Tool::builder("bash")
         .describe(
             "Run a shell command via `/bin/sh -c`. Output is stdout and stderr "
-            "merged; the working directory is `/` (the sandbox base). "
+            "merged; the working directory is the sandbox root — call "
+            "`get_current_dir` first if you need to know the absolute path "
+            "of where your command will run. Relative paths in your command "
+            "(e.g. `./build`, `src/main.cpp`) resolve against that directory. "
             "Use this for grep | xargs, find, git, package managers, anything "
             "you'd type in a terminal. "
             "WARNING: this is NOT a hardened sandbox — the command runs with the "
