@@ -3842,94 +3842,74 @@ int main(int argc, char ** argv) {
                 //
                 // Re-runs every 250 ms (setInterval below).  Hydration may
                 // rip our hosts out; the parentElement guards put them back.
-                // Mount tone + tools INSIDE the horizontal toolbar row that
-                // also contains the EasyAi pill button.  Layout, left to
-                // right inside the row:
+                // Mount tone + tools as siblings to the LEFT of the bundle's
+                // pill button.  Placement order, left-to-right:
                 //
-                //     [ tone ]  [ tools ]  [ <whatever holds the pill> ]
+                //     [ tone ]  [ tools ]  [ EasyAi pill ]
                 //
-                // The bundle's prompt-form layout has the pill nested INSIDE
-                // a vertical-flex column on the right side of the textarea,
-                // and the column is itself a child of a horizontal row
-                // (`flex.w-full.items-center.gap-3.px-3`).  If we mount as
-                // siblings of the pill we end up stacked vertically inside
-                // that column — which is exactly what just happened.  We
-                // need to mount inside the horizontal row instead.
+                // We find the pill button DIRECTLY (instead of guessing the
+                // row by Tailwind utilities) and use `pill.parentElement` as
+                // the row.  The page can have multiple `flex.w-full.gap-3`
+                // rows; the previous selector-based approach was matching
+                // the wrong one on some layouts, which both hid the buttons
+                // visually and broke their click handlers because the rest
+                // of the bundle stacked over them.
                 //
-                // The Tailwind selector `flex.w-full.items-center.gap-3.px-3`
-                // can match other rows too — we filter to the one that has
-                // the pill button as a descendant.
+                // Pill signature is the full distinguishing class string
+                // (bg-muted-foreground/10 + rounded-sm + px-1.5).  Anything
+                // less specific picked up other buttons like "send" first.
                 //
-                // CPU FIX: previously a MutationObserver(subtree:true) on
-                // document.body called reposition() on every mutation.
-                // During streams that's thousands of mutations per second,
-                // and our reposition was calling insertBefore even when
-                // already correctly placed (insertBefore on a node already
-                // at that position is still recorded as a mutation), so the
-                // observer fed itself in a hot loop.  Two changes here:
-                //   1. fast-path: if the hosts are already in a sane place,
-                //      return immediately and touch no DOM nodes;
-                //   2. drop subtree:true — observe only document.body's own
-                //      childList, plus a 250 ms safety-net interval.
-                "const ROW_SEL="
-                  "'[class~=\"flex\"][class~=\"w-full\"][class~=\"items-center\"]"
-                  "[class~=\"gap-3\"][class~=\"px-3\"]';"
-                "const PILL_SEL="
+                // No more adoptBundleStyles / sampleBadge: the hosts use
+                // the bundle's exact Tailwind class string (PILL_CLASS), so
+                // theme/palette flow through :root CSS variables for free.
+                //
+                // FLICKER FIX: a MutationObserver (childList + subtree on
+                // document.body) reposts on any reflow within the same
+                // animation frame, so Svelte re-renders that displace our
+                // hosts are corrected long before the next paint.  The 500
+                // ms safety-net interval covers attribute-only swaps the
+                // observer doesn't see.
+                "const findPill=()=>document.querySelector("
                   "'button[class*=\"bg-muted-foreground\"]"
-                  "[class*=\"rounded-sm\"][class*=\"px-1.5\"]';"
-                "const findToolbarRow=()=>{"
-                  "const cands=document.querySelectorAll(ROW_SEL);"
-                  "for(const c of cands){"
-                    "if(c.querySelector(PILL_SEL))return c;"
-                  "}"
-                  // Fallback: any horizontal row that contains the pill.
-                  "const pill=document.querySelector(PILL_SEL);"
-                  "if(!pill)return null;"
-                  "let p=pill.parentElement;"
-                  "while(p&&p!==document.body){"
-                    "const cs=getComputedStyle(p);"
-                    "if(cs.display==='flex'&&cs.flexDirection!=='column')return p;"
-                    "p=p.parentElement;"
-                  "}"
-                  "return null;"
-                "};"
+                  "[class*=\"rounded-sm\"][class*=\"px-1.5\"]')"
+                  "||document.querySelector("
+                    "'button[class*=\"bg-muted-foreground\"]"
+                    "[class*=\"rounded-sm\"]');"
                 "const reposition=()=>{"
                   "if(!toneHost||!toolsHost)return;"
-                  // Fast path — already placed and adjacent; do NOTHING.
-                  // (Touching the DOM here triggers the MutationObserver
-                  // which schedules another reposition, ad infinitum.)
-                  "if(toneHost.parentElement&&"
-                     "toneHost.parentElement===toolsHost.parentElement&&"
-                     "toneHost.nextSibling===toolsHost&&"
-                     "toneHost.parentElement.querySelector(PILL_SEL)){"
-                    "if(toneHost.style.display!=='')toneHost.style.display='';"
-                    "if(toolsHost.style.display!=='')toolsHost.style.display='';"
-                    "return;"
-                  "}"
-                  "const row=findToolbarRow();"
+                  "const pill=findPill();"
+                  "const row=pill?pill.parentElement:null;"
                   "if(!row){"
-                    "if(toneHost.style.display!=='none')toneHost.style.display='none';"
-                    "if(toolsHost.style.display!=='none')toolsHost.style.display='none';"
+                    "toneHost.style.display='none';"
+                    "toolsHost.style.display='none';"
                     "return;"
                   "}"
-                  "const pill=row.querySelector(PILL_SEL);"
-                  // Walk up from the pill to the direct child of row — the
-                  // pill may be inside a vertical-stack column; we want to
-                  // place tone+tools as siblings of that column, not of the
-                  // pill, so they sit on the horizontal axis.
-                  "let pillBranch=pill;"
-                  "while(pillBranch&&pillBranch.parentElement!==row){"
-                    "pillBranch=pillBranch.parentElement;"
+                  "const inRow="
+                    "toneHost.parentElement===row&&"
+                    "toolsHost.parentElement===row;"
+                  "const orderOk=inRow&&"
+                    "toneHost.nextSibling===toolsHost&&"
+                    "toolsHost.nextSibling===pill;"
+                  "if(!orderOk){"
+                    "row.insertBefore(toneHost,pill);"
+                    "row.insertBefore(toolsHost,pill);"
                   "}"
-                  "if(!pillBranch){"
-                    "row.appendChild(toneHost);"
-                    "row.appendChild(toolsHost);"
-                  "}else{"
-                    "row.insertBefore(toneHost,pillBranch);"
-                    "row.insertBefore(toolsHost,pillBranch);"
-                  "}"
-                  "if(toneHost.style.display!=='')toneHost.style.display='';"
-                  "if(toolsHost.style.display!=='')toolsHost.style.display='';"
+                  "toneHost.style.display='';"
+                  "toolsHost.style.display='';"
+                "};"
+
+                // Throttled scheduler — coalesces bursts of mutations into
+                // one rAF tick so we never thrash on heavy re-renders.
+                "let __ea_pendingReposition=false;"
+                "const scheduleReposition=()=>{"
+                  "if(__ea_pendingReposition)return;"
+                  "__ea_pendingReposition=true;"
+                  "requestAnimationFrame(()=>{"
+                    "__ea_pendingReposition=false;"
+                    "if(!document.getElementById(TONE_ID))ensureTone();"
+                    "if(!document.getElementById(TOOLS_ID))ensureTools();"
+                    "reposition();"
+                  "});"
                 "};"
 
                 "if(document.documentElement){"
@@ -3937,22 +3917,16 @@ int main(int argc, char ** argv) {
                 "}"
                 "document.addEventListener('DOMContentLoaded',()=>{"
                   "ensureTone();ensureTools();reposition();"
-                  // Lightweight observer: only document.body's direct
-                  // children — catches whole-page swaps but ignores all the
-                  // streaming text mutations deep in the chat tree.  The
-                  // 250 ms safety-net below picks up the rare cases this
-                  // misses.
                   "if(window.MutationObserver){"
-                    "const mo=new MutationObserver(()=>{"
-                      "if(!document.getElementById(TONE_ID))ensureTone();"
-                      "if(!document.getElementById(TOOLS_ID))ensureTools();"
-                      "reposition();"
-                    "});"
-                    "mo.observe(document.body,{childList:true});"
+                    "const mo=new MutationObserver(scheduleReposition);"
+                    "mo.observe(document.body,{childList:true,subtree:true});"
                   "}"
                 "});"
-                "window.addEventListener('resize',reposition);"
-                // Safety-net interval — fast-path return makes this cheap.
+                "window.addEventListener('resize',scheduleReposition);"
+                "window.addEventListener('scroll',scheduleReposition,true);"
+                // Safety-net interval at low frequency — observer + rAF
+                // already handle the fast path; this catches cases where
+                // the row is swapped via attribute-only changes.
                 "setInterval(()=>{"
                   "if(!document.getElementById(TONE_ID))ensureTone();"
                   "if(!document.getElementById(TOOLS_ID))ensureTools();"
@@ -3960,7 +3934,7 @@ int main(int argc, char ** argv) {
                   // Re-paint metrics every tick: the bundle re-mounts the
                   // .chat-processing-info-detail element on stream lifecycle.
                   "renderOverview();"
-                "},250);"
+                "},500);"
 
                 // --- per-message inline status chip -----------------------
                 // For every <... aria-label='Assistant message with actions'>
