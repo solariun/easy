@@ -3942,36 +3942,35 @@ int main(int argc, char ** argv) {
                       "animation:__easyaiPulse 1.05s ease-in-out infinite}';"
                   "document.head&&document.head.appendChild(st);"
                 "}"
-                // Build a chip element with the inline action-row look.
-                // Default visible so user sees something the moment SSE
-                // starts; setStatus updates the label/dot.  setStatus(idle)
-                // hides it explicitly.
-                // Per-message chip is now structurally part of the action
-                // row: same border-radius / border / background palette as
-                // the bundle's icon buttons (rounded rect, not full pill;
-                // no drop shadow), same ~icon-row height via padding.  The
-                // pulsing dot + metrics text are preserved verbatim, only
-                // the wrapper visuals change so the chip reads as a
-                // sibling of copy / edit / regenerate / branch / delete.
+                // Build a chip element matching the response-metrics text
+                // style (Output / t/s).  No background, no border, no pill
+                // wrapper — just inline text with a small status dot, using
+                // the bundle's Tailwind utilities so it tracks the active
+                // light/dark theme automatically:
+                //
+                //   * `text-xs`              — same size as ctx/last/Output
+                //   * `text-muted-foreground` — labels (matches Output's tone)
+                //   * `inline-flex items-center gap-1.5` — layout
+                //
+                // The dot color is state-specific (set inline by setStatus);
+                // base text color comes from text-muted-foreground so the
+                // label dims naturally on both themes.  No applyBarPalette
+                // anymore — CSS variables do the theme work for us.
                 "const buildChip=(initialState)=>{"
                   "const chip=document.createElement('span');"
-                  "chip.style.cssText="
-                    "'display:inline-flex;align-items:center;gap:.3rem;'+"
-                    "'align-self:center;vertical-align:middle;line-height:1;'+"
-                    "'margin:0 0 0 .35rem;padding:.22rem .5rem;'+"
-                    "'border:1px solid #2a313b;border-radius:.45rem;'+"
-                    "'color:#c9d1d9;background:rgba(30,33,38,.85);'+"
-                    "'font:.72rem -apple-system,system-ui,sans-serif;'+"
-                    "'letter-spacing:0;flex-shrink:0;white-space:nowrap;'+"
-                    "'box-shadow:none;';"
+                  "chip.className="
+                    "'text-xs inline-flex items-center gap-1.5 text-muted-foreground';"
+                  "chip.style.marginLeft='.5rem';"
+                  "chip.style.flexShrink='0';"
+                  "chip.style.whiteSpace='nowrap';"
                   "const isAnswered=initialState==='answered';"
-                  // Past assistant messages render as an empty circle: no
-                  // background fill, just a 1px gray ring.  Active turns
-                  // render as a solid dot in the appropriate state colour.
+                  // Past assistant messages render as an empty circle (1px
+                  // currentColor ring, transparent fill).  Active turns
+                  // render as a solid dot in the appropriate state color.
                   "const dotStyle=isAnswered"
                     "?'width:.5rem;height:.5rem;border-radius:50%;'+"
-                      "'background:transparent;border:1px solid #5b626a;'+"
-                      "'flex-shrink:0;box-sizing:border-box'"
+                      "'background:transparent;border:1px solid currentColor;'+"
+                      "'flex-shrink:0;box-sizing:border-box;opacity:.6'"
                     ":'width:.48rem;height:.48rem;border-radius:50%;'+"
                       "'background:#5b8dee;flex-shrink:0';"
                   "const initialLabel=isAnswered?'answered':'starting…';"
@@ -3980,31 +3979,14 @@ int main(int argc, char ** argv) {
                     "<span class=\"l\">'+initialLabel+'</span>';"
                   "return chip;"
                 "};"
-                // Sample the bundle's `.chat-processing-info-detail` bar
-                // (background, border, blur, radius, font) and project the
-                // same palette onto the chip so it reads as a sibling of
-                // the metrics bar rather than a custom overlay.  Cheap to
-                // call on every attach/update — getComputedStyle is fast
-                // and we set a handful of inline properties.
-                "const applyBarPalette=(chip)=>{"
-                  "if(!chip)return;"
-                  "const bar=document.querySelector('.chat-processing-info-detail');"
-                  "if(!bar)return;"
-                  "const cs=getComputedStyle(bar);"
-                  "const border="
-                    "(cs.borderTopWidth||'1px')+' '+"
-                    "(cs.borderTopStyle||'solid')+' '+"
-                    "(cs.borderTopColor||'transparent');"
-                  "chip.style.background=cs.backgroundColor;"
-                  "chip.style.color=cs.color;"
-                  "chip.style.border=border;"
-                  "chip.style.borderRadius=cs.borderRadius;"
-                  "chip.style.fontFamily=cs.fontFamily;"
-                  "chip.style.backdropFilter="
-                    "cs.backdropFilter||cs.webkitBackdropFilter||'';"
-                  "chip.style.webkitBackdropFilter="
-                    "cs.webkitBackdropFilter||cs.backdropFilter||'';"
-                "};"
+                // No-op kept as a stub for backwards-compatibility with the
+                // attach/update sites — the chip's palette is now handled
+                // by Tailwind's text-muted-foreground / text-foreground
+                // utilities, which read CSS variables that switch with
+                // the active theme.  Removing the calls entirely would
+                // also work; keeping the stub lets the surrounding code
+                // stay structurally identical.
+                "const applyBarPalette=(_chip)=>{};"
                 // attachChip(msg): place the chip in the best available
                 // anchor.  During streaming the bundle has NOT yet rendered
                 // the copy/edit/fork/delete row, so findActionRow returns
