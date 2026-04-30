@@ -367,7 +367,7 @@ spawned.
    PATH-hijack.
 2. **Manifest is a regular file.** `slurp()` does `stat()` first
    and rejects directories, FIFOs, devices, sockets. Stops a
-   misconfigured `--tools-json /dev/zero` from spinning instead of
+   misconfigured manifest path pointed at `/dev/zero` from spinning instead of
    erroring cleanly.
 3. **Whole-element argv placeholders only.** `"{name}"` accepted,
    `"--flag={x}"` rejected. The model's value flows through as one
@@ -452,7 +452,7 @@ spawned.
   binary parses `pattern = "-V"` as a flag. Mitigation is
   manifest-side: insert `"--"` literal before string placeholders.
   Documented in `manual.md` §3.3.4 and demonstrated in
-  `examples/tools.example.json` (`pgrep` entry uses `["-a", "--",
+  `examples/EASYAI-example.tools` (`pgrep` entry uses `["-a", "--",
   "{pattern}"]`).
 - **`kBuiltInNames` hard-coded list duplicates the actual builtin
   registry.** A future builtin added to `src/builtin_tools.cpp` must
@@ -469,4 +469,55 @@ reports is exactly the directory the model's `bash` / `fs_*` tools
 operate against. No security implications beyond the
 already-audited sandbox semantics — `getcwd` is async-signal-safe
 and bounded by `PATH_MAX` on Linux.
+
+### 16.6 Directory loader + per-file fault isolation
+
+The `--external-tools DIR` form (replaces the original `--tools-json
+PATH`) scans `DIR` for files matching `EASYAI-<name>.tools` and
+loads each one independently. Security-relevant behaviour:
+
+- **Top-level only.** Subdirectories are skipped. Operators use a
+  `disabled/` or `archive/` subfolder to keep `.tools` files out of
+  the load path without renaming.
+- **Pattern is exact and case-sensitive.** A file named
+  `easyai-foo.tools` (lowercase) does NOT match. Same for
+  `EASYAI-foo.json`. Disabling without deletion is achieved by
+  adding any suffix after `.tools` (e.g. `.tools.disabled`,
+  `.tools.bak`).
+- **Deterministic load order.** Filenames are sorted before loading
+  so duplicate-name resolution is stable across machines and
+  reboots: alphabetically-earlier file wins; later file's load
+  fails with a collision error AND the rest of that file's tools
+  are skipped (file-level all-or-nothing within the dir-level
+  per-file isolation).
+- **Per-file fault isolation.** A parse / schema / sanity error in
+  `EASYAI-experimental.tools` does NOT prevent
+  `EASYAI-system.tools` from loading. The agent starts; the
+  operator sees the error in the journal.
+- **Empty dir is a normal state.** No error, no warning. Loading
+  zero tools from a dir that exists is the design — operators can
+  enable `--external-tools` in advance and add tools later.
+
+### 16.7 Security sanity-check warnings (new audit pass)
+
+Beyond the load-time hard rejections (§16.1), the loader runs a
+non-fatal audit on each parsed spec. These produce human-readable
+warnings to stderr (or journal); the tool still loads. Quiet mode
+(`-q` on `easyai-cli` / `easyai-local`) suppresses warnings,
+preserving errors. Server (daemon) always logs both.
+
+Warning classes:
+
+| Class | Trigger | Why it's flagged |
+| --- | --- | --- |
+| Shell wrapper | `command` is sh/bash/dash/zsh/ksh/ash/fish AND argv has `-c {placeholder}` | Reintroduces shell-injection surface that the manifest design exists to remove. |
+| Shell binary as command (no -c) | `command` is a shell binary, argv shape isn't standard `-c {placeholder}` | argv may still reach shell parsing depending on shell mode. |
+| Dynamic-linker env passthrough | `env_passthrough` includes `LD_PRELOAD`, `LD_LIBRARY_PATH`, `LD_AUDIT`, `DYLD_INSERT_LIBRARIES`, `DYLD_LIBRARY_PATH` | Lets the model influence dynamic linking in the subprocess. Almost always wrong. |
+| World-writable command | wrapped binary has `S_IWOTH` mode bit | Anyone with shell on the host can replace it; agent runs the replacement on next call. |
+| World-writable manifest | the `.tools` file has `S_IWOTH` mode bit | Anyone with write access can register additional tools that survive the next restart. |
+
+The warnings are intentionally narrow — false positives would
+train the operator to ignore them. False negatives (a manifest
+the audit *fails* to flag but should) are a real risk; the audit
+is best-effort, not a substitute for code review.
 

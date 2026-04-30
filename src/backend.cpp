@@ -60,19 +60,30 @@ bool LocalBackend::init(std::string & err) {
             .apply     (engine);
     }
 
-    // External tools manifest. Loaded after the built-in toolbelt so
+    // External tools directory. Loaded after the built-in toolbelt so
     // collisions with built-in names surface as a load-time error
-    // instead of silently shadowing. Manifest failures are surfaced
-    // through `err` and abort init — the operator handed us a config
-    // file, we don't get to ignore it.
-    if (!cfg.tools_json.empty()) {
+    // instead of silently shadowing. Per-file fault isolation: a bad
+    // file in the directory is logged and skipped — the agent still
+    // starts. The operator sees the error in stderr/journal.
+    //
+    // Quiet mode (`cfg.quiet`) suppresses the security sanity-check
+    // warnings (shell wrappers, dynamic-linker env passthrough,
+    // world-writable binaries / manifests) so an interactive `-q`
+    // CLI session isn't noisy. Errors are always emitted, regardless.
+    if (!cfg.external_tools_dir.empty()) {
         std::vector<std::string> reserved;
         reserved.reserve(engine.tools().size());
         for (const auto & t : engine.tools()) reserved.push_back(t.name);
-        auto loaded = load_external_tools_from_json(cfg.tools_json, reserved);
-        if (!loaded.error.empty()) {
-            err = "tools-json: " + loaded.error;
-            return false;
+        auto loaded = load_external_tools_from_dir(
+            cfg.external_tools_dir, reserved);
+
+        for (const auto & e_msg : loaded.errors) {
+            std::fprintf(stderr, "[external-tools] error: %s\n", e_msg.c_str());
+        }
+        if (!cfg.quiet) {
+            for (const auto & w : loaded.warnings) {
+                std::fprintf(stderr, "[external-tools] warning: %s\n", w.c_str());
+            }
         }
         for (auto & t : loaded.tools) engine.add_tool(t);
     }

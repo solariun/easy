@@ -522,14 +522,40 @@ field — keeping it in the headers means OpenAI-compat client SDKs
 that don't know about easyai pass through cleanly without trying to
 forward the field to the model.
 
-## 5f. External tools — operator-defined commands via JSON manifest
+## 5f. External tools — operator-defined commands via JSON manifests
 
 Lives in `src/external_tools.cpp` (the implementation) and
 `include/easyai/external_tools.hpp` (the public API). User-facing
-documentation: `manual.md` §3.3.4 (reference) and §3.3.5 (recipes /
-corner cases / best practices). Security review: `SECURITY_AUDIT.md`
-§16. This section describes *why* the subsystem is shaped the way
-it is.
+documentation: [`EXTERNAL_TOOLS.md`](EXTERNAL_TOOLS.md) is the
+authoritative guide; `manual.md` §3.3.4 is the schema quick-ref.
+Security review: `SECURITY_AUDIT.md` §16. This section describes
+*why* the subsystem is shaped the way it is.
+
+### Directory of files, not a single file
+
+The deploy surface is a directory of `EASYAI-<name>.tools` files,
+not a single manifest. Three reasons:
+
+1. **Per-file fault isolation.** A syntax error in
+   `EASYAI-experimental.tools` does NOT prevent
+   `EASYAI-system.tools` from loading. The agent starts with what
+   parsed; the operator sees the broken file in the journal and
+   fixes it without an outage.
+2. **Multi-author collaboration.** System tools belong to the
+   sysadmin, deploy tools to the SRE, personal helpers to the
+   user. One file per owner means PRs route cleanly and disabling
+   one pack doesn't churn the others.
+3. **No-touch deploy.** The systemd unit unconditionally passes
+   `--external-tools /etc/easyai/external-tools`. An empty dir is
+   a normal state (no extra tools registered). Operators add new
+   capabilities by dropping a file in the dir and restarting the
+   service — no `systemctl edit` of the unit, no template
+   re-render, no install-script re-run.
+
+The single-file API (`load_external_tools_from_json`) remains
+public for unit testing and programmatic use; the directory API
+(`load_external_tools_from_dir`) calls it once per matching file
+and aggregates results.
 
 ### The trust boundary
 
@@ -678,7 +704,7 @@ context the model needs to do useful work.
 | --- | --- | --- |
 | 1 — façade | beginner | `easyai::Agent a("model.gguf")` — no manifest, builtins only. |
 | 2 — fluent | intermediate | `a.allow_bash().sandbox("/srv/x")` — opt into sharper tools. |
-| 3 — operator | deployment | `--tools-json /etc/easyai/tools.json` — declare your own surface. *This subsystem.* |
+| 3 — operator | deployment | `--external-tools /etc/easyai/external-tools` — drop `EASYAI-*.tools` files declaring your own surface. *This subsystem.* |
 | 4 — escape hatch | extension | `Tool::builder().handle(...)` in C++ — in-process tool with shared state. |
 
 Tier 3 is intentionally not in C++. Operators who can write a JSON

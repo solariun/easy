@@ -695,7 +695,7 @@ The fix is not in the library — the library can't know how each binary parses 
 
 GNU coreutils, util-linux, git, grep, ripgrep, find, pgrep, jq — all of them honour `--` as "end of options, the rest are positional." Integer/number/boolean parameters don't need this (they can't start with `-` after JSON validation). String parameters do.
 
-This is one of those gotchas that you only think of *after* the first time someone in your organisation makes a manifest mistake. Bake the convention into your code review checklist for `--tools-json`.
+This is one of those gotchas that you only think of *after* the first time someone in your organisation makes a manifest mistake. Bake the convention into your code review checklist whenever a teammate proposes a new manifest entry.
 
 > **🔬 Under the hood — argument parsing without options-end.** GNU `getopt_long` rewrites `argv` in place by default: it scans every element, classifies each as "option" or "positional," and shuffles options to the front. Once it sees `--` it stops scanning. Without `--`, a positional argument that happens to start with `-` is misclassified. This is a feature; nobody is "going to fix" it. Defending against it is the operator's job.
 

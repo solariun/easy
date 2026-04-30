@@ -516,24 +516,41 @@ The `Toolbelt` adds it automatically when any filesystem-flavoured
 tool is enabled (`allow_fs` or `allow_bash`); register it manually if
 you build the toolbelt by hand.
 
-### 3.3.4 External tools manifest — declare commands in JSON
+### 3.3.4 External tools — operator-defined commands via JSON manifests
+
+> **The authoritative guide is [`EXTERNAL_TOOLS.md`](EXTERNAL_TOOLS.md)
+> at the repo root.** It covers quickstart, ten recipes, anti-patterns,
+> corner cases, sanity warnings, the collaboration workflow, and full
+> troubleshooting. The sub-sections below are a quick reference; refer
+> to that document when actually writing or reviewing manifests.
+
+### 3.3.4a Schema reference
 
 For tools that wrap an existing CLI binary (`uname`, `pgrep`, `git`,
-internal scripts, etc.) you can declare them in a JSON manifest
-without writing C++. The `--tools-json PATH` flag is supported by
-`easyai-local`, `easyai-cli`, and `easyai-server`. From C++:
+internal scripts, etc.) you declare them in JSON manifest files
+inside a directory. The `--external-tools DIR` flag is supported by
+`easyai-local`, `easyai-cli`, and `easyai-server`. The directory is
+scanned for files matching `EASYAI-<name>.tools` (top-level, exact,
+case-sensitive); per-file fault isolation means a syntax error in
+one file does NOT prevent the others from loading.
+
+From C++:
 
 ```cpp
-auto loaded = easyai::load_external_tools_from_json(path, /*reserved=*/{});
-if (!loaded.error.empty()) {
-    std::fprintf(stderr, "tools-json: %s\n", loaded.error.c_str());
-    return 1;
-}
+// Directory model (recommended):
+auto loaded = easyai::load_external_tools_from_dir(dir, /*reserved=*/{});
+for (const auto & e : loaded.errors)   std::fprintf(stderr, "error: %s\n", e.c_str());
+for (const auto & w : loaded.warnings) std::fprintf(stderr, "warn:  %s\n", w.c_str());
 for (auto & t : loaded.tools) engine.add_tool(std::move(t));
+
+// Single-file (for unit tests / programmatic use):
+auto one = easyai::load_external_tools_from_json(path, /*reserved=*/{});
+if (!one.error.empty()) { std::fprintf(stderr, "%s\n", one.error.c_str()); return 1; }
+for (auto & t : one.tools) engine.add_tool(std::move(t));
 ```
 
-Manifest schema (one entry — see `examples/tools.example.json` for
-more):
+Manifest schema (one entry — see `examples/EASYAI-example.tools` and
+`EXTERNAL_TOOLS.md` for more):
 
 ```json
 {
@@ -622,15 +639,21 @@ placeholder:
 
 GNU coreutils, util-linux, git, grep, ripgrep, find, and pgrep all
 honour `--`. Integer/number/boolean parameters are immune (they're
-not strings) and don't need this. See `examples/tools.example.json`
-for the pattern.
+not strings) and don't need this. See
+`examples/EASYAI-example.tools` and `EXTERNAL_TOOLS.md` for the
+pattern.
 
 ```sh
-# enable from the CLIs
-easyai-local --sandbox ./work --tools-json mytools.json
-easyai-cli   --sandbox ./work --tools-json mytools.json --url http://...
-easyai-server -m model.gguf --sandbox /srv/agent --tools-json /srv/agent/tools.json
+# enable from the CLIs (DIR contains EASYAI-*.tools files)
+easyai-local --sandbox ./work --external-tools ./tools.d
+easyai-cli   --sandbox ./work --external-tools ./tools.d --url http://...
+easyai-server -m model.gguf --sandbox /srv/agent --external-tools /etc/easyai/external-tools
 ```
+
+The default install ships `/etc/easyai/external-tools/` empty;
+operators drop `EASYAI-<name>.tools` files in to add tools. The
+systemd unit always passes `--external-tools` so a restart picks up
+new files.
 
 ### 3.3.5 External tools — recipes, corner cases, best practices
 
@@ -882,7 +905,7 @@ gets one chance to flush — typical build systems handle this fine.
 - Spend real time on `description` text — that string is how the model picks WHICH tool to call. Mention edge cases ("returns empty when nothing matches"), expected use ("call this AFTER web_search"), and units ("returns kilobytes").
 - Name parameters to match the wrapped CLI's vocabulary (`pattern` if the binary calls it pattern, not `regex`).
 - Group related tools in one manifest — the `--tools` allowlist applies after load, so a single big manifest is fine for the operator.
-- Validate the manifest before deploy: `easyai-local --tools-json mytools.json --no-tools` (no model call, just load — exits cleanly if valid, errors if not).
+- Validate the manifest dir before deploy: `easyai-local --no-tools --external-tools ./tools.d` (no model call, just load — exits cleanly if valid, errors emitted to stderr if not).
 - Run easyai-server as a dedicated unprivileged user when external tools are in play — the security guarantees stop shell injection, not "runs with your full uid".
 
 **DON'T:**
@@ -901,7 +924,7 @@ gets one chance to flush — typical build systems handle this fine.
 ```sh
 # Loads the manifest, prints the resulting tool list, exits.
 # Any load error fails the command — wire it into your CI.
-easyai-local --no-tools --tools-json mytools.json --print-models 2>&1 \
+easyai-local --no-tools --external-tools ./tools.d --print-models 2>&1 \
   | grep -E "(loaded|error)"
 ```
 

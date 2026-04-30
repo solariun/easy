@@ -2731,14 +2731,15 @@ static bool require_auth(const ServerCtx & ctx, const httplib::Request & req,
         "                                NOT a hardened sandbox — the\n"
         "                                command runs with the server's\n"
         "                                user privileges.\n"
-        "      --tools-json <path>      Load extra tools from a JSON manifest.\n"
-        "                                The manifest declares each tool's\n"
-        "                                name, description, absolute command\n"
-        "                                path, argv template, parameter\n"
-        "                                schema, timeout, output cap, and\n"
-        "                                env passthrough allowlist.  See\n"
-        "                                examples/tools.example.json and\n"
-        "                                manual.md (External tools manifest).\n"
+        "      --external-tools <dir>   Load every EASYAI-*.tools file in <dir>\n"
+        "                                as an external-tools manifest. Empty\n"
+        "                                directory is a normal state (no extra\n"
+        "                                tools). Per-file errors are logged and\n"
+        "                                skipped; other files still load. The\n"
+        "                                server logs every load error AND every\n"
+        "                                security sanity-check warning to stderr.\n"
+        "                                See EXTERNAL_TOOLS.md for the schema and\n"
+        "                                collaboration workflow.\n"
         "\nModel tuning (apply on top of --preset):\n"
         "      --preset <name>          Ambient preset (default 'balanced')\n"
         "      --temperature <f>        Override temperature (0.0-2.0)\n"
@@ -2812,7 +2813,7 @@ struct ServerArgs {
     std::string sandbox;            // optional: scope fs_* / bash to this dir
     bool        allow_fs   = false; // explicit opt-in for the fs_* tools
     bool        allow_bash = false; // explicit opt-in for the `bash` tool
-    std::string tools_json;         // optional: external-tools manifest path
+    std::string external_tools_dir; // optional: dir of EASYAI-*.tools files
     std::string preset     = "balanced";
     size_t      max_body   = 8u * 1024u * 1024u;
 
@@ -2879,7 +2880,7 @@ static ServerArgs parse_args(int argc, char ** argv) {
         else if (s == "--sandbox")                   a.sandbox        = need(i, "--sandbox");
         else if (s == "--allow-fs")                  a.allow_fs       = true;
         else if (s == "--allow-bash")                a.allow_bash     = true;
-        else if (s == "--tools-json")                a.tools_json     = need(i, "--tools-json");
+        else if (s == "--external-tools")            a.external_tools_dir = need(i, "--external-tools");
         else if (s == "--preset")                    a.preset         = need(i, "--preset");
         else if (s == "--max-body")                  a.max_body       = (size_t) std::atoll(need(i, "--max-body"));
         else if (s == "--batch")                     a.n_batch        = std::atoi(need(i, "--batch"));
@@ -3108,26 +3109,37 @@ int main(int argc, char ** argv) {
         for (auto & t : tb.tools()) ctx->default_tools.push_back(std::move(t));
     }
 
-    // External tools manifest. Loaded AFTER the built-in toolbelt so
+    // External tools directory. Loaded AFTER the built-in toolbelt so
     // the loader can reject any manifest entry that collides with a
-    // name we already registered. Failures are fatal — the operator
-    // declared a manifest, we don't get to "best-effort" past a typo.
-    if (!args.tools_json.empty()) {
+    // name we already registered. Per-file fault isolation: a bad
+    // file is logged and skipped, the server still starts.
+    //
+    // The server is a daemon — we always log warnings AND errors to
+    // stderr (which lands in journalctl). Operators read those when
+    // the model misbehaves or when a sysadmin asks "what's that
+    // tool?". No quiet mode here.
+    if (!args.external_tools_dir.empty()) {
         std::vector<std::string> reserved;
         reserved.reserve(ctx->default_tools.size());
         for (const auto & t : ctx->default_tools) reserved.push_back(t.name);
-        auto loaded = easyai::load_external_tools_from_json(
-            args.tools_json, reserved);
-        if (!loaded.error.empty()) {
+        auto loaded = easyai::load_external_tools_from_dir(
+            args.external_tools_dir, reserved);
+
+        for (const auto & e_msg : loaded.errors) {
             std::fprintf(stderr,
-                "easyai-server: --tools-json: %s\n",
-                loaded.error.c_str());
-            return 2;
+                "easyai-server: [external-tools] error: %s\n",
+                e_msg.c_str());
+        }
+        for (const auto & w : loaded.warnings) {
+            std::fprintf(stderr,
+                "easyai-server: [external-tools] warn: %s\n",
+                w.c_str());
         }
         for (auto & t : loaded.tools) ctx->default_tools.push_back(std::move(t));
         std::fprintf(stderr,
-            "easyai-server: loaded %zu external tool(s) from %s\n",
-            loaded.tools.size(), args.tools_json.c_str());
+            "easyai-server: loaded %zu external tool(s) from %zu file(s) in %s\n",
+            loaded.tools.size(), loaded.loaded_files.size(),
+            args.external_tools_dir.c_str());
     }
     // The webui drives long agentic flows (search → fetch → search → fetch
     // → write_file → bash → …) and should never bump the per-turn safety

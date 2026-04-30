@@ -95,6 +95,10 @@ service_name="easyai-server.service"
 config_dir="/etc/easyai"
 system_file="$config_dir/system.txt"
 api_key_file="$config_dir/api_key"
+external_tools_dir="$config_dir/external-tools"
+# We always pass --external-tools to the server. An empty dir is a
+# normal state (no extra tools); operators add EASYAI-*.tools files
+# without touching the systemd unit.
 
 ctx_size=128000
 # --ngl: -1 = auto-fit (llama.cpp picks how many layers fit), 0 = CPU only,
@@ -555,6 +559,79 @@ SYS
         warn "leaving existing $api_key_file in place (use --api-key '' to clear)"
     fi
 
+    # ---- external-tools dir: empty by default --------------------------
+    # Operators drop EASYAI-<name>.tools files here; the server picks them
+    # up at startup. We intentionally leave the dir empty; an empty dir
+    # is a normal state (no extra tools registered). A short README and a
+    # disabled example land alongside so the operator knows what the
+    # directory is for.
+    log "creating $external_tools_dir (empty by default)"
+    sudo install -d -o root -g "$service_group" -m 750 "$external_tools_dir"
+
+    if [[ ! -f "$external_tools_dir/README.md" ]]; then
+        sudo bash -c "cat > '$external_tools_dir/README.md'" <<'EXT_README'
+# External tools — operator-defined commands the model can dispatch
+
+Drop manifest files here named `EASYAI-<anything>.tools` (JSON). Each
+file declares one or more tools with their absolute command path,
+argv template, JSON-Schema parameters, timeout, output cap, cwd, and
+env passthrough. The server picks up every matching file at startup;
+restart the service after changes:
+
+    sudo systemctl restart easyai-server
+
+Filename pattern is exact and case-sensitive:
+
+    EASYAI-system.tools         loaded
+    EASYAI-deploy.tools         loaded
+    EASYAI-blah.tools.disabled  skipped (rename to enable)
+    notes.md                    skipped
+
+Per-file fault isolation: a syntax/schema error in one file is logged
+to journalctl and the file is skipped — other files still load.
+
+Authoritative documentation is in EXTERNAL_TOOLS.md (root of the
+easyai repo). See also:
+  - manual.md §3.3.4 / §3.3.5
+  - SECURITY_AUDIT.md §16
+  - the disabled example next to this README
+
+Treat this directory like sudoers — anyone who can write here can
+make the model run arbitrary commands as the agent's user.
+EXT_README
+        sudo chmod 640 "$external_tools_dir/README.md"
+        sudo chown root:"$service_group" "$external_tools_dir/README.md"
+    fi
+
+    # Disabled example — sufix `.disabled` keeps it out of the load path.
+    # The operator can `mv EASYAI-example.tools.disabled EASYAI-example.tools`
+    # to enable a sample read-only system inspector.
+    example_disabled="$external_tools_dir/EASYAI-example.tools.disabled"
+    if [[ ! -f "$example_disabled" ]]; then
+        sudo bash -c "cat > '$example_disabled'" <<'EXT_EXAMPLE'
+{
+  "version": 1,
+  "_comment": "This file is disabled. Rename to EASYAI-example.tools to enable. Read-only system inspector — no parameters, conservative caps.",
+  "tools": [
+    {
+      "name": "host_uptime",
+      "description": "Return the system uptime and load averages of the easyai-server host. Use when the user asks about how long the box has been up or its current load.",
+      "command": "/usr/bin/uptime",
+      "argv": [],
+      "parameters": { "type": "object", "properties": {} },
+      "timeout_ms": 2000,
+      "max_output_bytes": 4096,
+      "cwd": "$SANDBOX",
+      "env_passthrough": [],
+      "stderr": "discard"
+    }
+  ]
+}
+EXT_EXAMPLE
+        sudo chmod 640 "$example_disabled"
+        sudo chown root:"$service_group" "$example_disabled"
+    fi
+
     # ---- favicon: copy operator-supplied icon to /etc/easyai/favicon
     #              and let the unit point easyai-server at it -----------
     if [[ -n "$webui_icon" ]]; then
@@ -678,6 +755,7 @@ if [[ $do_service -eq 1 ]]; then
     args+=( --preset "$preset" )
     args+=( --sandbox "$service_workspace" )
     args+=( --system-file "$system_file" )
+    args+=( --external-tools "$external_tools_dir" )
     [[ -n "$webui_title"     ]] && args+=( --webui-title "$webui_title" )
     [[ -n "$webui_icon_dest" ]] && args+=( --webui-icon  "$webui_icon_dest" )
     [[ "$enable_flash_attn" -eq 1 ]] && args+=( -fa )

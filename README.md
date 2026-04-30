@@ -182,7 +182,54 @@ no shell.
 | (no flag)             | `datetime`, `web_search`, `web_fetch` only.                             |
 | `--sandbox <dir>`     | `fs_read_file / fs_write_file / fs_list_dir / fs_glob / fs_grep` plus `get_current_dir`, ALL scoped to `<dir>`. The CLIs `chdir` into `<dir>` so `get_current_dir` reports the sandbox path back to the model. |
 | `--allow-bash`        | `bash` (run `/bin/sh -c`). cwd = `--sandbox <dir>` if given, otherwise the binary's CWD. NOT a hardened sandbox — runs with your user privileges. Also bumps the agentic-loop `max_tool_hops` to 99999 (bash flows naturally span many turns). |
-| `--tools-json <path>` | Load extra tools from a JSON manifest (name / description / absolute command path / argv template / parameter schema / timeout / output cap / env allowlist). Spawns via `fork`+`execve` — never a shell. See `examples/tools.example.json` and `manual.md` (3.3.4 *External tools manifest*). |
+| `--external-tools <dir>` | Load every `EASYAI-<name>.tools` file in `<dir>` as an operator-defined tool pack. Per-file fault isolation (a bad file is logged + skipped, the agent still starts). Spawns via `fork`+`execve` — never a shell. **This is the supported way to give the model focused powers without flipping `--allow-bash`.** See [`EXTERNAL_TOOLS.md`](EXTERNAL_TOOLS.md). |
+
+#### Why `--external-tools` is the answer to "give the model more power"
+
+Most agent frameworks force a binary choice: either you ship the model
+with the tools the framework's authors thought of, or you give it a
+generic shell. The framework's authors don't know about your internal
+deploy CLI, your jq wrappers, your monitoring queries — and a generic
+shell is a structurally unsafe surface no matter how careful you are.
+
+easyai's `--external-tools` is the missing third option. Drop a JSON
+file in the configured directory:
+
+```json
+{
+  "version": 1,
+  "tools": [
+    {
+      "name": "deploy_status",
+      "description": "Status of one of our services in the control plane.",
+      "command": "/opt/internal/bin/deploy-cli",
+      "argv": ["status", "--", "{service}"],
+      "parameters": {
+        "type": "object",
+        "properties": { "service": {"type":"string"} },
+        "required": ["service"]
+      },
+      "timeout_ms": 10000,
+      "max_output_bytes": 32768,
+      "cwd": "$SANDBOX",
+      "env_passthrough": ["DEPLOY_TOKEN"]
+    }
+  ]
+}
+```
+
+Restart the server. The model can now ask for `deploy_status(service:"billing-api")`. The framework guarantees:
+
+- **No shell.** `fork` + `execve` directly. The model's argument fills exactly one argv slot — `; rm -rf /` cannot escape it.
+- **No PATH-hijack.** Absolute command paths are mandatory and validated at load.
+- **No quoting bugs.** Whole-element placeholders only; `--flag={x}` is rejected at load (split into `["--flag","{x}"]`).
+- **Schema-validated arguments.** Type errors rejected before `fork()`.
+- **Bounded resources.** Timeout, output size, env-var inheritance, fd inheritance — every channel capped.
+- **Per-file fault isolation.** A typo in `EASYAI-experimental.tools` doesn't prevent `EASYAI-system.tools` from loading.
+- **Operator/user collaboration.** Drop additional `EASYAI-*.tools` files in the dir and they appear after a restart. Different teams can own different files. `chmod o-w` enforced at the directory level.
+- **Sanity-check warnings at load.** Wrap a shell? Let the model influence `LD_PRELOAD`? Manifest world-writable? You'll see it in the startup log.
+
+The default install creates `/etc/easyai/external-tools/` empty — drop your first `.tools` file in and you're live. Full guide and ten worked recipes in [`EXTERNAL_TOOLS.md`](EXTERNAL_TOOLS.md).
 
 #### `easyai-local`
 

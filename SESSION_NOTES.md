@@ -305,7 +305,25 @@ Webui title default also flips to `"Deep"`.
 ## 5. Recent commits (most recent first)
 
 ```
-2026-04-29 — External tools (operator-defined commands via JSON manifest).
+2026-04-30 — External tools v2: directory loader + sanity-check warnings.
+
+(pending commit) External tools: rename --tools-json PATH to
+                 --external-tools DIR, scanning EASYAI-*.tools files in
+                 a directory. Per-file fault isolation: a syntax/schema
+                 error in one file is logged and skipped, others still
+                 load. Empty dir is a normal state (silent, no
+                 error/warning). Sanity-check pass at load: warns on
+                 shell wrappers, dynamic-linker env passthrough
+                 (LD_PRELOAD etc), world-writable command binaries,
+                 world-writable manifest files. easyai-cli -q
+                 suppresses warnings; load errors always emit. Install
+                 script creates /etc/easyai/external-tools/ empty +
+                 README + EASYAI-example.tools.disabled. New top-level
+                 doc EXTERNAL_TOOLS.md (collaboration guide with 10
+                 recipes, anti-patterns, corner cases, troubleshooting).
+                 README sales pitch + cross-link.
+
+2026-04-29 — External tools v1 (operator-defined commands via JSON manifest).
 
 e966cf1  External tools: harden child setup, reject NaN/Inf, retire magic numbers
                     (review follow-up: kMaxFdScan caps the close() loop so
@@ -537,17 +555,23 @@ c6a09d6  Single combined bar above the textarea (tone + ctx + last)
   ✅ **FIXED via thought-only retry path** (see "Bug B root cause" above).
   Validated via curl in this session.  Pending user webui validation.
 
-- **External tools manifest (`--tools-json`)** — landed in `d0f7965`,
-  hardened in `e966cf1`. Operator declares command + argv + schema in
-  JSON; library spawns via `fork`+`execve` (never a shell). Security
-  guarantees enforced at load time (absolute command path, no embedded
-  placeholders, hard caps on manifest/argv/params/env/output/timeout),
-  at call time (JSON-Schema arg validation, NaN/Inf rejection,
+- **External tools (`--external-tools DIR`)** — landed in `d0f7965`,
+  hardened in `e966cf1`, evolved to dir loader + sanity warnings in
+  the 2026-04-30 commit. Operators drop `EASYAI-<name>.tools` files
+  in a directory; library scans the directory at startup (per-file
+  fault isolation: a bad file is logged + skipped, others still
+  load; empty dir is silent). Spawn path is `fork`+`execve` (never
+  a shell). Security guarantees enforced at load time (absolute
+  command path, no embedded placeholders, hard caps on
+  manifest/argv/params/env/output/timeout, regular-file check), at
+  call time (JSON-Schema arg validation, NaN/Inf rejection,
   `kMaxFdScan` close-loop, `PR_SET_PDEATHSIG`, process-group SIGTERM
-  → SIGKILL), and at deploy time (manifest is part of the operator's
-  trusted artefact, treat like sudoers). See `manual.md` §3.3.4 and
-  `examples/tools.example.json`. Also: paired `get_current_dir`
-  builtin so the model can find out the absolute path it's running in
+  → SIGKILL, env-value cap), and at deploy time (manifest is the
+  operator's trusted artefact, treat like sudoers). Sanity-check
+  warnings at load: shell wrappers, `LD_*` passthrough,
+  world-writable binaries / manifests. Authoritative doc:
+  `EXTERNAL_TOOLS.md`. Also: paired `get_current_dir` builtin so
+  the model can find out the absolute path it's running in
   (Toolbelt auto-registers it when any fs-tool is enabled).
 
 - **Webui core dump under heavy load** — user reported coredump while

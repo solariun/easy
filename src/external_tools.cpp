@@ -34,6 +34,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <memory>
 #include <sstream>
@@ -150,6 +151,17 @@ constexpr int         kUnkillableWaitSec     = 5;
 //                         the full max_output_bytes up front.
 constexpr std::size_t kDrainBufBytes         = 4096;
 constexpr std::size_t kInitialOutputReserve  = 8192;
+
+// Manifest-file naming convention for directory-mode loads. Files
+// whose name doesn't match `EASYAI-<at-least-1-char>.tools` are
+// silently skipped at scan time — that's how operators "disable" a
+// pack without deleting it (rename to `.tools.disabled` etc).
+constexpr char        kManifestPrefix[]      = "EASYAI-";
+constexpr char        kManifestSuffix[]      = ".tools";
+constexpr std::size_t kManifestPrefixLen     = sizeof(kManifestPrefix) - 1;
+constexpr std::size_t kManifestSuffixLen     = sizeof(kManifestSuffix) - 1;
+constexpr std::size_t kManifestMinFilename   =
+    kManifestPrefixLen + 1 + kManifestSuffixLen;   // e.g. "EASYAI-x.tools"
 
 // PATH_MAX is technically optional in POSIX — fall back to a sane number
 // on platforms that don't define it (Linux defines it via <linux/limits.h>
@@ -1163,10 +1175,136 @@ bool slurp(const std::string & path, std::string & out, std::string & err) {
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// Sanity-check pass — security warnings, not errors.
+// ---------------------------------------------------------------------------
+//
+// We run this once per successfully-parsed spec. The output is a
+// list of human-readable warning strings (one per finding) prefixed
+// with `<manifest_path>: tool "<name>": …` so the operator can grep
+// the startup log and find the offending entry quickly.
+//
+// Findings are classes of decision the operator probably wants to
+// make consciously rather than by accident:
+//
+//   1. Shell wrapper. The whole point of the manifest subsystem is
+//      structural absence of a shell parser. Wrapping `/bin/sh -c
+//      "{cmd}"` reintroduces the entire shell-injection surface;
+//      it's functionally equivalent to `--allow-bash`. Sometimes
+//      this is what the operator wants, sometimes it's a mistake.
+//      We flag it either way.
+//
+//   2. Dynamic-linker env passthrough. `LD_PRELOAD`,
+//      `LD_LIBRARY_PATH`, `LD_AUDIT`, `DYLD_INSERT_LIBRARIES`,
+//      `DYLD_LIBRARY_PATH` let the model influence which shared
+//      objects get loaded into the subprocess. Almost always wrong.
+//
+//   3. World-writable command binary. If the wrapped binary's mode
+//      bits include S_IWOTH, anyone with shell on this box can
+//      replace it — and the agent will run their replacement next
+//      time the model calls the tool. Acceptable on a single-user
+//      dev box; very much not in production.
+//
+//   4. World-writable manifest file. Same reasoning, one level up:
+//      anyone with write access to the manifest can declare new
+//      tools that survive the next restart.
+//
+// `manifest_mode` is the st_mode reported by stat() on the
+// manifest file — the dir loader passes it in; the single-file
+// loader stat()s the file itself and passes its mode.
+std::vector<std::string> audit_spec(const ExternalToolSpec & spec,
+                                    const std::string &      manifest_path,
+                                    mode_t                   manifest_mode) {
+    std::vector<std::string> out;
+    auto pfx = [&](const std::string & body) {
+        return manifest_path + ": tool \"" + spec.name + "\": " + body;
+    };
+
+    // 1. Shell wrapper detection — command basename in known-shell set.
+    {
+        std::string base = spec.command;
+        if (auto pos = base.find_last_of('/'); pos != std::string::npos) {
+            base.erase(0, pos + 1);
+        }
+        const bool is_shell =
+            base == "sh"   || base == "bash" || base == "dash" ||
+            base == "zsh"  || base == "ksh"  || base == "ash"  ||
+            base == "fish";
+        if (is_shell) {
+            // If argv contains "-c" followed by a placeholder, the
+            // model directly controls a full shell command line.
+            bool dash_c_placeholder = false;
+            for (std::size_t i = 0; i + 1 < spec.argv_template.size(); ++i) {
+                const auto & a = spec.argv_template[i];
+                const auto & b = spec.argv_template[i + 1];
+                if (!a.is_placeholder && a.text == "-c" && b.is_placeholder) {
+                    dash_c_placeholder = true;
+                    break;
+                }
+            }
+            if (dash_c_placeholder) {
+                out.push_back(pfx(
+                    "wraps a shell with -c {placeholder}; this is "
+                    "functionally equivalent to --allow-bash. "
+                    "Prefer declaring focused tools that wrap the "
+                    "specific binaries you need."));
+            } else {
+                out.push_back(pfx(
+                    "command is a shell binary (" + base + "); "
+                    "the structural \"no shell\" guarantee of the "
+                    "manifest subsystem doesn't apply if argv reaches "
+                    "shell parsing."));
+            }
+        }
+    }
+
+    // 2. Dynamic-linker env passthrough.
+    {
+        static const std::vector<std::string> kDangerEnv = {
+            "LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT",
+            "DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH",
+        };
+        for (const auto & vn : spec.env_passthrough) {
+            for (const auto & danger : kDangerEnv) {
+                if (vn == danger) {
+                    out.push_back(pfx(
+                        "env_passthrough includes \"" + vn + "\" which "
+                        "lets the model influence dynamic linking in the "
+                        "subprocess. Almost never the right thing; remove "
+                        "it unless you have a specific, documented reason."));
+                }
+            }
+        }
+    }
+
+    // 3. World-writable command binary.
+    {
+        struct stat st{};
+        if (::stat(spec.command.c_str(), &st) == 0
+                && (st.st_mode & S_IWOTH)) {
+            out.push_back(pfx(
+                "command \"" + spec.command + "\" is world-writable "
+                "(mode includes S_IWOTH). Anyone with shell on this "
+                "host can replace the binary; the agent will run the "
+                "replacement on next call. Fix: chmod o-w."));
+        }
+    }
+
+    // 4. World-writable manifest file.
+    if (manifest_mode & S_IWOTH) {
+        out.push_back(pfx(
+            "manifest file \"" + manifest_path + "\" is world-writable. "
+            "Anyone with write access can register additional tools "
+            "that survive the next restart. Fix: chmod o-w."));
+    }
+
+    return out;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
-// Public entry point
+// Public entry points
 // ---------------------------------------------------------------------------
 ExternalToolsLoad load_external_tools_from_json(
     const std::string &              json_path,
@@ -1176,6 +1314,18 @@ ExternalToolsLoad load_external_tools_from_json(
     if (json_path.empty()) {
         out.error = "external tools manifest path is empty";
         return out;
+    }
+
+    // Capture manifest mode so the sanity-check pass can warn on
+    // world-writable manifest files. slurp() already stat()s the
+    // file; we re-stat here to keep the data accessible without
+    // changing slurp's signature.
+    mode_t manifest_mode = 0;
+    {
+        struct stat st{};
+        if (::stat(json_path.c_str(), &st) == 0) {
+            manifest_mode = st.st_mode;
+        }
     }
 
     std::string raw;
@@ -1235,10 +1385,18 @@ ExternalToolsLoad load_external_tools_from_json(
         if (!seen_names.insert(spec.name).second) {
             out.error = ctx + ": duplicate tool name \"" + spec.name + "\"";
             out.tools.clear();
+            out.warnings.clear();
             return out;
         }
         // Reserve this name so subsequent entries collide cleanly.
         reserved.insert(spec.name);
+
+        // Sanity-check audit (security warnings, not errors). The
+        // tool still loads; the operator gets to decide whether to
+        // accept the surface they exposed.
+        for (auto & w : audit_spec(spec, json_path, manifest_mode)) {
+            out.warnings.push_back(std::move(w));
+        }
 
         Tool t;
         t.name            = spec.name;
@@ -1247,6 +1405,98 @@ ExternalToolsLoad load_external_tools_from_json(
         t.handler         = make_handler(
             std::make_shared<const ExternalToolSpec>(std::move(spec)));
         out.tools.push_back(std::move(t));
+    }
+
+    return out;
+}
+
+ExternalToolsDirLoad load_external_tools_from_dir(
+    const std::string &              dir,
+    const std::vector<std::string> & reserved_names) {
+    ExternalToolsDirLoad out;
+    namespace fs = std::filesystem;
+
+    // Empty path is a programmer error, not a deploy state we
+    // should silently swallow.
+    if (dir.empty()) {
+        out.errors.push_back("external-tools dir path is empty");
+        return out;
+    }
+
+    std::error_code ec;
+    if (!fs::exists(dir, ec) || ec) {
+        out.errors.push_back(
+            "external-tools dir does not exist: " + dir);
+        return out;
+    }
+    if (!fs::is_directory(dir, ec) || ec) {
+        out.errors.push_back(
+            "external-tools path is not a directory: " + dir);
+        return out;
+    }
+
+    // Two passes through the directory: first collect filenames
+    // matching the EASYAI-*.tools pattern, then load them in
+    // sorted order. Sorting makes load order deterministic across
+    // machines and reboots, so duplicate-name resolution is stable
+    // (the alphabetically-earlier file wins).
+    std::vector<fs::path> matched;
+    for (const auto & entry : fs::directory_iterator(dir, ec)) {
+        if (ec) {
+            out.errors.push_back(
+                "external-tools dir iteration failed: " + ec.message());
+            return out;
+        }
+        // Skip subdirectories silently — operators use them for
+        // organisation (a `disabled/` folder, an `archive/`).
+        if (!entry.is_regular_file()) continue;
+
+        const std::string fname = entry.path().filename().string();
+        // Pattern: starts with "EASYAI-", ends with ".tools",
+        // at least one char in between. Anything else is silently
+        // skipped (operators drop READMEs, sample files with
+        // `.disabled` extensions, etc. in this directory).
+        if (fname.size() < kManifestMinFilename
+            || fname.compare(0, kManifestPrefixLen, kManifestPrefix) != 0
+            || fname.compare(fname.size() - kManifestSuffixLen,
+                             kManifestSuffixLen, kManifestSuffix) != 0) {
+            out.skipped_files.push_back(entry.path().string());
+            continue;
+        }
+        matched.push_back(entry.path());
+    }
+
+    std::sort(matched.begin(), matched.end());
+
+    // An empty result set is a normal deploy state: the dir exists,
+    // the operator just hasn't dropped any tool packs in yet. Do
+    // not surface this as an error or warning. Quiet success.
+    if (matched.empty()) {
+        return out;
+    }
+
+    // Load each file independently. Per-file fault isolation: a
+    // syntax error or schema violation in one file does not
+    // prevent the others from loading. The reserved-names set
+    // grows as we go, so a name from `EASYAI-aaa.tools` blocks
+    // the same name in `EASYAI-zzz.tools` (load error localised
+    // to the second file; the first file's tools are still live).
+    std::vector<std::string> reserved = reserved_names;
+    for (const auto & p : matched) {
+        const std::string path_s = p.string();
+        ExternalToolsLoad one = load_external_tools_from_json(path_s, reserved);
+        if (!one.error.empty()) {
+            out.errors.push_back(path_s + ": " + one.error);
+            continue;
+        }
+        for (auto & t : one.tools) {
+            reserved.push_back(t.name);
+            out.tools.push_back(std::move(t));
+        }
+        for (auto & w : one.warnings) {
+            out.warnings.push_back(std::move(w));
+        }
+        out.loaded_files.push_back(path_s);
     }
 
     return out;

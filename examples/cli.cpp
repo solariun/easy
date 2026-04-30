@@ -281,7 +281,7 @@ struct Options {
     std::string sandbox;
     bool        allow_bash      = false;       // opt-in: register `bash` tool
     std::set<std::string> tools_enabled;       // empty = all defaults
-    std::string tools_json;                    // path to external-tools manifest
+    std::string external_tools_dir;            // dir of EASYAI-*.tools files
     std::string prompt;                        // -p one-shot
     // Sampling / penalty knobs — -1 / -2 / empty == server default.
     float                    temperature       = -1.0f;
@@ -366,14 +366,13 @@ void usage(const char * argv0) {
 "                                 user privileges (network, full FS, etc).\n"
 "                                 cwd is set to --sandbox DIR if given,\n"
 "                                 otherwise the current working dir.\n"
-"    --tools-json PATH          load extra tools from a JSON manifest.\n"
-"                                 The manifest declares name, description,\n"
-"                                 absolute command path, argv template,\n"
-"                                 parameter schema, timeout, output cap,\n"
-"                                 cwd ($SANDBOX accepted), and an env\n"
-"                                 passthrough allowlist.  See\n"
-"                                 examples/tools.example.json and\n"
-"                                 manual.md (External tools manifest).\n"
+"    --external-tools DIR       load every EASYAI-*.tools file in DIR as an\n"
+"                                 external-tools manifest. Empty dir is a\n"
+"                                 normal state (no extra tools). Per-file\n"
+"                                 errors are logged and skipped; other files\n"
+"                                 still load. -q hides security sanity-check\n"
+"                                 warnings (errors are always shown).\n"
+"                                 See EXTERNAL_TOOLS.md.\n"
 "    --no-plan                  don't auto-register the planning tool\n"
 "\n"
 "  Behaviour:\n"
@@ -459,7 +458,7 @@ bool parse_args(int argc, char ** argv, Options & o) {
         else if (a == "--system-file")    o.system_file   = need(i, "--system-file");
         else if (a == "--sandbox")        o.sandbox       = need(i, "--sandbox");
         else if (a == "--allow-bash")     o.allow_bash    = true;
-        else if (a == "--tools-json")     o.tools_json    = need(i, "--tools-json");
+        else if (a == "--external-tools") o.external_tools_dir = need(i, "--external-tools");
         else if (a == "--temperature")    o.temperature       = std::stof(need(i, "--temperature"));
         else if (a == "--top-p")          o.top_p             = std::stof(need(i, "--top-p"));
         else if (a == "--top-k")          o.top_k             = std::stoi(need(i, "--top-k"));
@@ -607,23 +606,35 @@ void register_tools(easyai::Client & cli,
     if (wants("system_cpu_usage")) cli.add_tool(systools::make_system_cpu_usage());
     if (wants("system_swaps"))     cli.add_tool(systools::make_system_swaps());
 
-    // External tools manifest (--tools-json PATH).  Names are added
-    // unconditionally — the operator declared them in the manifest, so
-    // the --tools allowlist applies AFTER registration. We pass the
-    // already-registered tool names as `reserved_names` so the loader
-    // surfaces collisions cleanly (a manifest entry trying to shadow
-    // `bash` is a load-time error, not a silent override).
-    if (!o.tools_json.empty()) {
+    // External tools directory (--external-tools DIR). Loads every
+    // EASYAI-*.tools file in DIR. Per-file fault isolation: a bad
+    // file is logged and skipped, the agent still starts. We pass
+    // the already-registered tool names as `reserved_names` so a
+    // manifest entry trying to shadow `bash` becomes a load error,
+    // not a silent override.
+    //
+    // Quiet-mode policy (-q): suppress sanity-check WARNINGS but
+    // ALWAYS surface load ERRORS. Errors mean the operator's
+    // manifest is broken and the model isn't getting that tool —
+    // they need to know even in scripted invocations. Warnings are
+    // informational ("you wrapped a shell" / "this is world-
+    // writable") and would just clutter a -q session.
+    if (!o.external_tools_dir.empty()) {
         std::vector<std::string> reserved;
         reserved.reserve(cli.tools().size());
         for (const auto & t : cli.tools()) reserved.push_back(t.name);
-        auto loaded = easyai::load_external_tools_from_json(
-            o.tools_json, reserved);
-        if (!loaded.error.empty()) {
-            std::fprintf(stderr,
-                "%serror:%s --tools-json: %s\n",
-                st.red(), st.reset(), loaded.error.c_str());
-            std::exit(2);
+        auto loaded = easyai::load_external_tools_from_dir(
+            o.external_tools_dir, reserved);
+
+        for (const auto & e_msg : loaded.errors) {
+            std::fprintf(stderr, "%serror:%s [external-tools] %s\n",
+                         st.red(), st.reset(), e_msg.c_str());
+        }
+        if (!o.quiet) {
+            for (const auto & w : loaded.warnings) {
+                std::fprintf(stderr, "%swarn:%s  [external-tools] %s\n",
+                             st.yellow(), st.reset(), w.c_str());
+            }
         }
         for (auto & t : loaded.tools) {
             // Honour --tools allowlist if the operator passed one.
