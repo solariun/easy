@@ -1200,7 +1200,13 @@ std::string Engine::chat_continue() {
     // (Qwen3 fine-tunes especially) and a 10x retry ceiling absorbs the
     // long tail without losing the "no infinite spiral" guarantee.  Set in
     // the lib so every server / CLI / agent inherits the same recovery.
-    constexpr int kMaxThoughtRetries     = 10;  // thought-only retries
+    // Thought-only retries share the operator-tunable cap with the
+    // announce-only path below: a single `--max-incomplete-retries N`
+    // (or [ENGINE] max_incomplete_retries) knob covers both failure
+    // modes from the operator's POV — "the model isn't producing a
+    // useful answer, please retry harder". Counters stay separate so
+    // each pathology gets its own budget; the cap is shared.
+    const int kMaxThoughtRetries = std::max(0, p_->max_incomplete_retries);
     // Operator-tunable via Engine::max_incomplete_retries (server flag
     // --max-incomplete-retries / INI [ENGINE] max_incomplete_retries).
     // Default 10; clamp to ≥0 since negative values would never enter
@@ -1253,9 +1259,21 @@ std::string Engine::chat_continue() {
         // intended to call a tool but failed to emit the tool_call header.
         // Discard the empty turn, clear KV, and retry — sampling is
         // stochastic so the second pass usually produces a real answer.
+        //
+        // Whitespace-only content counts as empty: 1-bit quants (Bonsai-
+        // 8B-Q1_0 hits this often) frequently emit a stray `\n` or two
+        // after </think> before EOS. Without this trim the .empty() check
+        // misses, no retry fires, and the user sees what looks like an
+        // empty assistant bubble even though the engine had budget left.
+        auto is_blank = [](const std::string & s) {
+            for (char c : s) {
+                if (c != ' ' && c != '\t' && c != '\n' && c != '\r') return false;
+            }
+            return true;
+        };
         const bool thought_only =
             msg.tool_calls.empty()
-            && msg.content.empty()
+            && (msg.content.empty() || is_blank(msg.content))
             && !msg.reasoning_content.empty();
 
         if (thought_only && thought_retries < kMaxThoughtRetries
@@ -1278,6 +1296,16 @@ std::string Engine::chat_continue() {
                 thought_retries, kMaxThoughtRetries,
                 hop, raw.size(), msg.reasoning_content.size(), msg.content.size(),
                 tail, (int) tail, raw.c_str() + raw.size() - tail);
+            // Surface to streaming consumers (server SSE → webui
+            // Thinking panel) so the user sees the retries happen
+            // live instead of staring at silence. Reason string is
+            // distinct from the announce-only path so the operator
+            // can tell which failure mode we're recovering from.
+            if (p_->on_incomplete_retry) {
+                p_->on_incomplete_retry(
+                    thought_retries, kMaxThoughtRetries,
+                    "model produced reasoning but no visible reply (thought-only)");
+            }
             llama_memory_clear(llama_get_memory(p_->ctx()), true);
             if (p_->on_hop_reset) p_->on_hop_reset();
             continue;
@@ -1285,8 +1313,11 @@ std::string Engine::chat_continue() {
 
         // If we exhausted retries on a thought-only turn, fall back to
         // promoting reasoning_content into content so the user at least
-        // sees the model's thoughts instead of an empty bubble.
-        if (msg.tool_calls.empty() && msg.content.empty()
+        // sees the model's thoughts instead of an empty bubble. Same
+        // whitespace-tolerant check as thought_only above so a model
+        // that emits "\n" post-</think> still hits the promotion path.
+        if (msg.tool_calls.empty()
+                && (msg.content.empty() || is_blank(msg.content))
                 && !msg.reasoning_content.empty()) {
             msg.content = msg.reasoning_content;
             // Always log — actionable: the user is about to see
@@ -1299,6 +1330,16 @@ std::string Engine::chat_continue() {
                 "Engine::chat_continue thought-only retry budget exhausted\n"
                 "hop=%d budget=%d — promoting reasoning_content (%zu bytes) into content\n",
                 hop, kMaxThoughtRetries, msg.reasoning_content.size());
+            // Negative-attempt give-up signal — same convention as the
+            // announce-only path's exhaust branch. The webui renders
+            // this with a distinct cue ("⚠ ...") so the user knows
+            // we're falling back to thinking-as-answer rather than
+            // doing yet another retry.
+            if (p_->on_incomplete_retry) {
+                p_->on_incomplete_retry(
+                    -1, kMaxThoughtRetries,
+                    "thought-retry budget exhausted — showing reasoning as answer");
+            }
             // Also push the synthesized text through on_token so the
             // streaming HTTP layer (which builds its SSE diffs from the
             // token stream, not from history) emits a content delta.

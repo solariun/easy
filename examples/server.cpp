@@ -2001,6 +2001,20 @@ static void handle_chat_stream(ServerCtx & ctx,
             size_t      content_bytes_emitted = 0;   // raw delta.content cumulative
             std::string content_text_emitted;        // accumulated visible text
                                                       // (for announce-pattern check)
+            // Engine-dispatched tool count for THIS request. The local
+            // `tool_calls` vector below is only populated in client_tools
+            // mode; on the agentic path the engine runs tools internally
+            // and that vector stays empty — so we can't use it to gate
+            // the "incomplete response" warning. This counter is bumped
+            // by the on_tool callback (which the engine fires for every
+            // dispatch) and means "we did SOME useful work this request"
+            // even if the final visible reply was empty.
+            int         engine_tool_dispatches = 0;
+            // Per-retry incomplete events the engine fires (announce-
+            // only path or thought-only path). Counted so the final
+            // incomplete log can say "engine retried N times before
+            // giving up" instead of leaving the operator guessing.
+            int         engine_incomplete_retries = 0;
 
             auto emit_diff = [&](const common_chat_msg_diff & d) {
                 ordered_json delta = ordered_json::object();
@@ -2101,6 +2115,7 @@ static void handle_chat_stream(ServerCtx & ctx,
             // from scratch even though it shares the same on_token callback.
             ctx.engine.on_tool([&](const easyai::ToolCall & c, const easyai::ToolResult & r) {
                 ctx.n_tool_calls.fetch_add(1, std::memory_order_relaxed);
+                ++engine_tool_dispatches;
 
                 // The embedded webui's stream parser ignores the SSE
                 // `event:` field and inspects every `data:` line as if it
@@ -2211,6 +2226,7 @@ static void handle_chat_stream(ServerCtx & ctx,
             // for 10 silent retries before a final empty bubble appears.
             ctx.engine.on_incomplete_retry(
                 [&](int attempt, int max, const std::string & reason) {
+                    if (attempt > 0) ++engine_incomplete_retries;
                     std::ostringstream line;
                     if (attempt < 0) {
                         // Give-up signal — different visual cue.
@@ -2226,6 +2242,20 @@ static void handle_chat_stream(ServerCtx & ctx,
                         {"finish_reason", nullptr},
                     }});
                     emit_data(safe_dump(delta));
+                    // Stderr log so the operator sees retries in
+                    // journalctl. The engine itself logs at retry
+                    // time too; this line is the server-layer mirror
+                    // so journalctl filters on `[easyai-server]` see
+                    // the events without combing engine internals.
+                    if (attempt < 0) {
+                        std::fprintf(stderr,
+                            "[easyai-server] retry budget exhausted: %s\n",
+                            reason.c_str());
+                    } else {
+                        std::fprintf(stderr,
+                            "[easyai-server] retry %d/%d: %s\n",
+                            attempt, max, reason.c_str());
+                    }
                 });
 
             // ---- run the engine ----------------------------------------
@@ -2426,8 +2456,21 @@ static void handle_chat_stream(ServerCtx & ctx,
                 return false;
             };
 
+            // The local `tool_calls` vector is only populated in
+            // client_tools mode; on the agentic path the engine
+            // dispatches tools internally and that vector stays empty.
+            // Use `engine_tool_dispatches` to also exclude requests
+            // where the engine DID call tools — even an empty final
+            // visible reply is not "incomplete" if the model spent
+            // five web_fetches getting there. The user typically sees
+            // the tool dispatches in the Reasoning panel and the
+            // server's last-resort fallback also paints the bubble
+            // with the engine's promoted reasoning. Flagging that as
+            // "incomplete" with a "no tool_call" warning is just
+            // misleading.
             const bool incomplete =
                 tool_calls.empty()
+                && engine_tool_dispatches == 0
                 && (content_bytes_emitted < kAnnounceFloor
                     || (req_state->last_is_tool
                         && content_bytes_emitted < kPostToolFloor))
@@ -2435,11 +2478,15 @@ static void handle_chat_stream(ServerCtx & ctx,
             if (incomplete) {
                 std::fprintf(stderr,
                     "[easyai-server] WARN incomplete response (content_bytes=%zu, "
-                    "tool_calls=0, prompt_n=%d, predicted_n=%d, finish_reason=%s).  "
+                    "engine_tools=%d, engine_retries=%d, prompt_n=%d, "
+                    "predicted_n=%d, finish_reason=%s).  "
                     "Common causes: model announced a tool but didn't emit it, "
                     "tool-error chain (rate-limit), over-prescriptive system "
-                    "prompt, model exhausted on a niche question.\n",
-                    content_bytes_emitted, prompt_n, predicted_n,
+                    "prompt, model exhausted on a niche question. Bump "
+                    "--max-incomplete-retries (default 10) if the model needs "
+                    "more chances on every turn.\n",
+                    content_bytes_emitted, engine_tool_dispatches,
+                    engine_incomplete_retries, prompt_n, predicted_n,
                     finish_reason.c_str());
                 std::string content_snippet = content_text_emitted;
                 if (content_snippet.size() > 400)
