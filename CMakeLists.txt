@@ -232,6 +232,28 @@ if (EASYAI_BUILD_EXAMPLES)
         target_compile_definitions(easyai-server PRIVATE EASYAI_BUILD_WEBUI=1)
     endif()
 
+    # libatomic on 32-bit ARM. server.cpp uses std::atomic<uint64_t>
+    # for the /metrics counters; on aarch64 / x86_64 those compile down
+    # to native instructions, but on 32-bit ARM (`arm-linux-gnueabihf`,
+    # the default Raspberry Pi OS 32-bit toolchain) the compiler emits
+    # __atomic_load_8 / __atomic_fetch_add_8 calls that live in
+    # libatomic.so.1. The link check fails on those hosts; add the lib
+    # explicitly. On targets where atomics are inline the check passes
+    # and we add nothing — no spurious dependency on 64-bit hosts.
+    include(CheckCXXSourceCompiles)
+    check_cxx_source_compiles("
+        #include <atomic>
+        #include <cstdint>
+        int main() {
+            std::atomic<uint64_t> x{0};
+            return (int) x.fetch_add(1);
+        }
+    " EASYAI_HAVE_NATIVE_64BIT_ATOMICS)
+    if (NOT EASYAI_HAVE_NATIVE_64BIT_ATOMICS)
+        message(STATUS "easyai-server: linking libatomic for 64-bit std::atomic")
+        target_link_libraries(easyai-server PRIVATE atomic)
+    endif()
+
     # easyai-cli — agentic OpenAI-protocol client.  Talks to any
     # /v1/chat/completions endpoint (our easyai-server, llama-server, etc.).
     # No local model — pair with easyai-local when you want to run a GGUF
