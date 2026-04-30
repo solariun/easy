@@ -280,6 +280,131 @@ commit.  Re-run when adding a new tool or a new HTTP boundary.*
 
 ---
 
+## 18. THIRD PASS — 2026-04-30 (HIGH + MEDIUM batch)
+
+A deep static review of the post-refactor codebase (FlagDef table,
+INI overlay, MCP server, RAG, external-tools, builtin-tools). Three
+HIGH and seven MEDIUM findings — all fixed in this commit.
+
+### 18.1 HIGH-1 — `apply_ini_to_args` was dead code (FIXED)
+
+**File:** `examples/server.cpp` — function `apply_ini_to_args`,
+defined but **never called**.
+
+**Issue.** The CLI/INI overlay was supposed to merge the INI file
+into `ServerArgs` so flags declared INI-only (e.g. `[ENGINE]
+context = 16384`) take effect. But `main()` never invoked the
+merge function — the entire INI was silently ignored except for
+`[MCP_USER]` (which had its own special-case loop). Operators who
+configured logging, ctx, threads, sandbox, etc. via the INI saw
+the server start with the hardcoded defaults instead.
+
+**Fix.** Load `easyai::config::load_ini_file(args.config_path)`
+**at the top of main(), right after `parse_args`**, then call
+`apply_ini_to_args(ini_config, args)` before any downstream code
+reads `args.*`. The MCP user table (later in main()) reuses the
+already-loaded `ini_config` instead of loading a second time.
+
+### 18.2 HIGH-2 — `--no-mcp-auth` and `[SERVER] mcp_auth` ignored (FIXED)
+
+**File:** `examples/server.cpp` — function `check_mcp_auth`.
+
+**Issue.** The MCP auth gate consulted only `ctx.mcp_keys` (the
+`[MCP_USER]` table). The `--no-mcp-auth` CLI flag and the `[SERVER]
+mcp_auth = off` INI key were parsed into `ServerArgs` but never
+propagated to the gate, leaving operators no way to force-disable
+auth when `[MCP_USER]` had entries (the documented escape hatch
+for emergency / dev).
+
+**Fix.** After populating `ctx->mcp_keys` from `[MCP_USER]`, check
+`args.no_mcp_auth`; if set, log an explicit OVERRIDE message and
+clear the table so the gate falls through to open mode. Tied
+together with HIGH-1 because `[SERVER] mcp_auth = off` only takes
+effect via the now-wired INI overlay.
+
+### 18.3 HIGH-3 — Sandbox symlink-escape + bash hardening (FIXED)
+
+**File:** `src/builtin_tools.cpp`.
+
+**Issue 3a — symlink escape on file ops.** `Sandbox::resolve` was
+deliberately rewritten to mechanically anchor any input path under
+the sandbox root (no rejection — every path becomes a real path
+inside `root`). This closes path-traversal at the input but leaves
+a window: the `bash` tool can run `ln -s /etc/passwd
+/sandbox/leak`, after which `read_file("leak")` would follow the
+symlink out of the sandbox.
+
+**Fix 3a.** New `Sandbox::inside_sandbox()` that runs
+`fs::weakly_canonical()` on the resolved path AND on the root,
+then verifies path-component containment (every root component
+must appear at the start of the canonical path, in order — no
+string-prefix bug). Called from every fs_* handler after `resolve`
+but before any open(). `fs_read_file` and `fs_write_file` also
+open the leaf with `O_NOFOLLOW | O_CLOEXEC` so a TOCTOU race
+between the canonical check and the open() still cannot follow a
+last-second symlink swap. `fs_write_file` writes via `::write()`
+on the fd (mode 0600) instead of `std::ofstream` because ofstream
+doesn't take an fd.
+
+**Issue 3b — bash subprocess hardening.** The previous bash
+factory used `fork()` + `execl("/bin/sh", "-c", cmd)` without:
+- closing inherited fds (HTTP listener, log files, mmap'd model
+  weights all visible to the shell)
+- joining a process group (parent's `kill(pid, SIGTERM)` on
+  timeout missed grandchildren spawned via shell pipelines)
+- `PR_SET_PDEATHSIG` (orphan shells survived agent crashes)
+
+**Fix 3b.** Mirrored the hardening pattern already used by
+`external_tools.cpp`:
+- child runs `setpgid(0, 0)` then `prctl(PR_SET_PDEATHSIG, SIGKILL)`
+- child closes every fd ≥ 3, bounded by `kMaxFdScan = 65536` to
+  defeat `RLIMIT_NOFILE = unlimited` (which wraps to -1)
+- child re-routes stdin to `/dev/null` so a shell `cat` doesn't
+  inherit the parent's controlling terminal
+- parent calls `setpgid(pid, pid)` race-free
+- timeout path uses `kill(-pid, …)` (process-group kill) instead
+  of `kill(pid, …)` — covers grandchildren
+
+### 18.4 MEDIUM batch (FIXED in same commit)
+
+| # | File | Issue | Fix |
+| --- | --- | --- | --- |
+| M-1 | `src/builtin_tools.cpp` (`fs_grep`) | `glob_rx` constructed without try/catch — model-supplied `file_glob` with stray metachar throws uncaught `regex_error` | wrap in try/catch, return clean tool-error |
+| M-2 | `examples/server.cpp` (`/props`) | Endpoint exposed `model_path` + capability hints unauthenticated even when `--api-key` was set | gate behind `require_auth` |
+| M-3 | `examples/server.cpp` (`require_auth`, `check_mcp_auth`) | No cap on `Authorization` header size; hostile client could send multi-MB Bearer on every probe | reject any header > 4 KiB before string-comparing |
+| M-4 | `src/config.cpp` (`load_ini_file`) | No size/line cap; `--config /dev/zero` (or any pathological file) would parse forever | hard caps: 1 MiB total, 64 KiB / line, 100 000 lines |
+| M-5 | `examples/server.cpp` (`parse_chat_request`) | nlohmann's recursive descent stack-overflows on adversarial JSON like `{"a":{"a":...}}` 100k deep | iterative depth walk, reject anything past 64 levels |
+| M-6 | `src/rag_tools.cpp` (`save_locked`) | Saved entries inherited the process umask (0644 typical → world-readable); RAG content can be sensitive | `fs::permissions(tmp, owner_read|owner_write)` BEFORE rename |
+| M-7 | `src/mcp.cpp` (`handle_request`) | Same JSON depth issue as M-5 on the `/mcp` body | identical iterative depth walk, 64 levels |
+
+### 18.5 Defence-in-depth that already held up
+
+The third pass also looked at the following surfaces and found
+nothing actionable beyond what's already documented:
+
+- **`args::find_key`** has a structural-character guard (preceding
+  byte must be `{` or `,` modulo whitespace) that makes false
+  matches inside string values impossible in practice. The
+  recovery scanners (`recover_qwen_tool_calls` etc.) all live
+  inside try/catch.
+- **`web_search` regex** uses bounded windows (2 KiB tail per
+  match) so catastrophic backtracking is unreachable.
+- **`http_get` / `http_post_form`** still pin scheme + protocols
+  (no SSRF expansion to `file://`, `gopher://`, etc.) and the
+  `HttpSink` cap stays in force.
+- **External-tools** sanity-check warnings (shell wrapper, LD_*
+  passthrough, world-writable bins, world-writable manifests)
+  remain as audit signals; nothing changed there.
+
+### 18.6 Accepted residual risk (still)
+
+- **TOCTOU on external-tool binary replacement.** Same as §16.4.
+- **Argv injection via leading dash.** Same as §16.4.
+- **Worst-case regex on user-controlled patterns** (libstdc++
+  recursion). Same as §13.
+
+---
+
 ## 15. SECOND PASS — late-2026 additions
 
 ### 15.1 SSE pending-buffer growth (MEDIUM, FIXED)
@@ -580,7 +705,7 @@ persistent memory), `bash` when `--allow-bash` is set, `fs_*` when
 
 `/mcp` authenticates via the `[MCP_USER]` section of the central
 INI config (`/etc/easyai/easyai.ini` by default; configurable via
-`--config`). Full INI reference in [`INI.md`](INI.md). Each line `name = token` registers one Bearer token;
+`--config`). Full INI reference in [`INI_KFlags.md`](INI_KFlags.md). Each line `name = token` registers one Bearer token;
 the request's `Authorization: Bearer <token>` is matched against
 the table at request time.
 

@@ -70,12 +70,42 @@ Ini load_ini_file(const std::string & path, std::string & err_out) {
         return out;
     }
 
+    // Hard caps on what we'll accept from a config file. Any sane
+    // operator config is far below these — they only fire when the
+    // file is corrupt, swapped for a giant blob, or pointed at the
+    // wrong path (`/etc/passwd`, a runaway log file). The parser is
+    // O(file_size) so without a bound, a misconfigured `--config
+    // /dev/zero` would spin forever filling RAM.
+    constexpr std::size_t kMaxFileBytes = 1u * 1024u * 1024u;   // 1 MiB
+    constexpr std::size_t kMaxLineBytes = 64u * 1024u;          // 64 KiB
+    constexpr int         kMaxLines     = 100000;
+
     std::ostringstream errs;
     std::string current_section;
     std::string line;
     int line_no = 0;
+    std::size_t bytes_read = 0;
 
     while (std::getline(f, line)) {
+        bytes_read += line.size() + 1;
+        if (bytes_read > kMaxFileBytes) {
+            errs << "line " << (line_no + 1)
+                 << ": file exceeds " << kMaxFileBytes
+                 << " bytes; stopping parse\n";
+            break;
+        }
+        if (line.size() > kMaxLineBytes) {
+            errs << "line " << (line_no + 1)
+                 << ": line exceeds " << kMaxLineBytes
+                 << " bytes; skipping\n";
+            ++line_no;
+            continue;
+        }
+        if (line_no >= kMaxLines) {
+            errs << "stopped at " << kMaxLines
+                 << " lines; rest of file ignored\n";
+            break;
+        }
         ++line_no;
         // CRLF safety — getline strips \n, leaves \r.
         if (!line.empty() && line.back() == '\r') line.pop_back();

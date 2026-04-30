@@ -1451,6 +1451,32 @@ static bool parse_chat_request(const httplib::Request & req,
     json body;
     try {
         body = json::parse(req.body);
+        // Reject pathologically-deep JSON. nlohmann's recursive descent
+        // would otherwise stack-overflow on a hostile body like
+        // `{"a":{"a":...}}` 100 000 levels deep before we get to
+        // typecheck anything. 64 levels is far past any legitimate
+        // OpenAI / MCP / chat shape; iterative walk so the validator
+        // itself doesn't recurse.
+        constexpr int kMaxJsonDepth = 64;
+        struct Frame { const json * v; int d; };
+        std::vector<Frame> stk;
+        stk.push_back({ &body, 1 });
+        while (!stk.empty()) {
+            Frame f = stk.back(); stk.pop_back();
+            if (f.d > kMaxJsonDepth) {
+                throw std::runtime_error("JSON nesting exceeds "
+                    + std::to_string(kMaxJsonDepth) + " levels");
+            }
+            if (f.v->is_object()) {
+                for (auto it = f.v->begin(); it != f.v->end(); ++it) {
+                    stk.push_back({ &it.value(), f.d + 1 });
+                }
+            } else if (f.v->is_array()) {
+                for (const auto & e : *f.v) {
+                    stk.push_back({ &e, f.d + 1 });
+                }
+            }
+        }
     } catch (const std::exception & e) {
         res.status = 400;
         res.set_content(error_json(std::string("invalid JSON: ") + e.what()),
@@ -2701,6 +2727,21 @@ static bool check_mcp_auth(ServerCtx & ctx,
         return true;        // open mode
     }
     std::string auth = req.get_header_value("Authorization");
+    // Cap the header value before we hash it to defend against a hostile
+    // client sending a multi-megabyte Bearer to amortise CPU + RAM on
+    // every probe. A real Bearer token is ≤ a few hundred bytes; 4 KiB
+    // is more than generous and beneath any sensible threshold.
+    constexpr std::size_t kMaxAuthHeaderBytes = 4 * 1024;
+    if (auth.size() > kMaxAuthHeaderBytes) {
+        res.status = 401;
+        res.set_header("WWW-Authenticate", "Bearer realm=\"easyai-mcp\"");
+        res.set_content(
+            "{\"jsonrpc\":\"2.0\",\"id\":null,"
+            "\"error\":{\"code\":-32001,"
+            "\"message\":\"Authorization header too large\"}}",
+            "application/json");
+        return false;
+    }
     static constexpr char kPrefix[] = "Bearer ";
     constexpr std::size_t kPrefixLen = sizeof(kPrefix) - 1;
     if (auth.size() <= kPrefixLen ||
@@ -2861,6 +2902,18 @@ static bool require_auth(const ServerCtx & ctx, const httplib::Request & req,
                          httplib::Response & res) {
     if (ctx.api_key.empty()) return true;  // auth disabled
     auto it = req.headers.find("Authorization");
+    // Bound the header value before string-comparing against the expected
+    // token. Without this, a hostile client could send a multi-megabyte
+    // Authorization header on every probe and force a comparable-sized
+    // string allocation + scan per request.
+    constexpr std::size_t kMaxAuthHeaderBytes = 4 * 1024;
+    if (it != req.headers.end() && it->second.size() > kMaxAuthHeaderBytes) {
+        res.status = 401;
+        res.set_content(error_json("Authorization header too large",
+                                   "authentication_error"),
+                        "application/json");
+        return false;
+    }
     std::string expected = "Bearer " + ctx.api_key;
     if (it == req.headers.end() || it->second != expected) {
         res.status = 401;
@@ -3324,6 +3377,25 @@ static void on_signal(int) {
 int main(int argc, char ** argv) {
     ServerArgs args = parse_args(argc, argv);
 
+    // -------- INI overlay (CLI > INI > hardcoded) ------------------------
+    // Load early so EVERY downstream `args.*` read already has the merged
+    // value. The INI section/key declared in `kFlags()` is the contract:
+    // any flag present there picks up its INI default unless the operator
+    // also passed it on the command line. The merged `Ini` is preserved
+    // for use below (MCP auth user table) and for any future code that
+    // needs to introspect a non-flag-mapped section.
+    easyai::config::Ini ini_config;
+    {
+        std::string ini_err;
+        ini_config = easyai::config::load_ini_file(args.config_path, ini_err);
+        if (!ini_err.empty()) {
+            std::fprintf(stderr,
+                "easyai-server: %s warnings:\n%s\n",
+                args.config_path.c_str(), ini_err.c_str());
+        }
+        apply_ini_to_args(ini_config, args);
+    }
+
     // -------- resolve system prompt --------------------------------------
     // Precedence: --system inline > -s file > built-in default. The default
     // exists because a *small* model with NO system prompt and a tool list
@@ -3562,22 +3634,21 @@ int main(int argc, char ** argv) {
     ctx->no_think = args.no_think;
     if (!args.alias.empty()) ctx->model_id = args.alias;
 
-    // -------- INI config (central operator-tunable file) -------------------
-    // Default path: /etc/easyai/easyai.ini. Missing file is fine (no
-    // sections, all features at their code defaults). Today only
-    // [MCP_USER] is consumed; reserved-for-future sections that the
-    // operator populated are silently ignored until code wires them.
+    // -------- MCP auth user table from already-loaded INI -----------------
+    // The INI itself was loaded at the top of main() (so apply_ini_to_args
+    // can overlay defaults BEFORE every `args.*` read). Here we only need
+    // to pull the [MCP_USER] section into a fast token→username map and
+    // log the resulting auth posture for the operator.
+    //
+    // Three-way precedence on the gate:
+    //   * `--no-mcp-auth` on the CLI (or `[SERVER] mcp_auth = off`) →
+    //     force open; clear the table even if [MCP_USER] had entries.
+    //     The operator explicitly asked.
+    //   * [MCP_USER] populated → Bearer required.
+    //   * [MCP_USER] empty/missing → open by data (zero-friction
+    //     local-dev default).
     {
-        std::string ini_err;
-        ctx->ini_config = easyai::config::load_ini_file(args.config_path, ini_err);
-        if (!ini_err.empty()) {
-            std::fprintf(stderr,
-                "easyai-server: %s warnings:\n%s\n",
-                args.config_path.c_str(), ini_err.c_str());
-        }
-        // Build the MCP auth lookup. Each entry under [MCP_USER] is
-        // `username = bearer_token`. We invert to `token -> username`
-        // so the request-time check is an O(log N) map lookup.
+        ctx->ini_config = ini_config;
         ctx->mcp_keys.clear();
         for (const auto & [user, token] :
                 ctx->ini_config.section_or_empty("MCP_USER")) {
@@ -3585,6 +3656,13 @@ int main(int argc, char ** argv) {
             // First mapping wins on duplicate-token (operator config
             // bug; we don't error, just take the first).
             ctx->mcp_keys.emplace(token, user);
+        }
+        if (args.no_mcp_auth && !ctx->mcp_keys.empty()) {
+            std::fprintf(stderr,
+                "easyai-server: MCP auth OVERRIDDEN OPEN — `--no-mcp-auth` "
+                "(or [SERVER] mcp_auth=off) discards %zu [MCP_USER] entry(ies)\n",
+                ctx->mcp_keys.size());
+            ctx->mcp_keys.clear();
         }
         if (!ctx->mcp_keys.empty()) {
             std::fprintf(stderr,
@@ -5292,7 +5370,12 @@ int main(int argc, char ** argv) {
         // We advertise thinking + tool calls so the webui's <think>...</think>
         // and tool-call renderers light up.  No image / audio modalities, no
         // model swapping, no slots.
-        svr.Get("/props", [&](const httplib::Request &, httplib::Response & res) {
+        //
+        // Gated behind require_auth: the response includes model_path and
+        // a few internal capability hints that an unauthenticated client
+        // shouldn't enumerate when --api-key is set.
+        svr.Get("/props", [&](const httplib::Request & q, httplib::Response & res) {
+            if (!require_auth(ctx_ref, q, res)) return;
             ordered_json p;
             p["model_alias"]   = ctx_ref.model_id;
             p["model_path"]    = ctx_ref.engine.model_path();

@@ -477,6 +477,17 @@ struct RagStore {
                 return false;
             }
         }
+        // Tighten permissions BEFORE rename so the new entry is never
+        // visible to other users on disk, even briefly. The process
+        // umask defaults to 022 on most systems → files end up 0644
+        // (world-readable). RAG entries can carry sensitive content
+        // the model was told to memorise; lock to owner-only.
+        {
+            std::error_code ec;
+            fs::permissions(tmp, fs::perms::owner_read | fs::perms::owner_write,
+                            fs::perm_options::replace, ec);
+            (void) ec;   // best-effort; rename below is the durable step
+        }
         std::error_code ec;
         fs::rename(tmp, target, ec);
         if (ec) {

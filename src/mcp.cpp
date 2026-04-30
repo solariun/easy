@@ -261,6 +261,31 @@ std::string handle_request(const std::string &       request_body,
     json req;
     try {
         req = json::parse(request_body);
+        // Cap JSON nesting depth so a hostile MCP client cannot send a
+        // 100k-deep `{"a":{"a":...}}` and exhaust the worker thread's
+        // stack. nlohmann is recursive on objects/arrays. 64 levels is
+        // far past any legitimate JSON-RPC / MCP shape.
+        constexpr int kMaxJsonDepth = 64;
+        struct Frame { const json * v; int d; };
+        std::vector<Frame> stk;
+        stk.push_back({ &req, 1 });
+        while (!stk.empty()) {
+            Frame f = stk.back(); stk.pop_back();
+            if (f.d > kMaxJsonDepth) {
+                throw std::runtime_error(
+                    "JSON nesting exceeds " + std::to_string(kMaxJsonDepth)
+                    + " levels");
+            }
+            if (f.v->is_object()) {
+                for (auto it = f.v->begin(); it != f.v->end(); ++it) {
+                    stk.push_back({ &it.value(), f.d + 1 });
+                }
+            } else if (f.v->is_array()) {
+                for (const auto & e : *f.v) {
+                    stk.push_back({ &e, f.d + 1 });
+                }
+            }
+        }
     } catch (const std::exception & e) {
         return make_error(json(nullptr), kErrParse,
                           std::string("parse error: ") + e.what()).dump();

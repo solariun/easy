@@ -22,8 +22,14 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
+#include <sys/resource.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+#if defined(__linux__)
+#include <sys/prctl.h>
+#endif
 
 #if defined(EASYAI_HAVE_CURL)
 #include <curl/curl.h>
@@ -790,6 +796,32 @@ struct Sandbox {
         if (s.front() != '/') s.insert(0, "/");
         return s;
     }
+    // Belt-and-braces containment check, called at file-access time.
+    // resolve() mechanically anchors the input under root; this method
+    // runs the canonical-resolution check once we hold the final path
+    // so a malicious symlink already inside the sandbox (e.g. planted
+    // by the bash tool) cannot redirect a follow-up open() outside.
+    //
+    // weakly_canonical resolves symlinks for the existing prefix and
+    // appends the trailing components verbatim — so it works for both
+    // existing files (read) and not-yet-existing files (write).
+    bool inside_sandbox(const fs::path & p) const {
+        std::error_code ec;
+        fs::path canon_p = fs::weakly_canonical(p, ec);
+        if (ec) return false;
+        fs::path canon_r = fs::weakly_canonical(root, ec);
+        if (ec) return false;
+        // Path-component prefix match: every component of canon_r must
+        // appear at the start of canon_p, in order. Avoids the
+        // string-prefix bug ("/srv/user" prefix-matches
+        // "/srv/userMALICIOUS/secret").
+        auto it_r = canon_r.begin();
+        auto it_p = canon_p.begin();
+        for (; it_r != canon_r.end(); ++it_r, ++it_p) {
+            if (it_p == canon_p.end() || *it_p != *it_r) return false;
+        }
+        return true;
+    }
 };
 
 }  // namespace
@@ -814,12 +846,35 @@ Tool fs_read_file(std::string root) {
 
             fs::path p; std::string err;
             if (!sb->resolve(path, p, err)) return ToolResult::error(err);
-            std::ifstream f(p, std::ios::binary);
-            if (!f) return ToolResult::error("cannot open: " + sb->virtual_path(p));
-            f.seekg(offset);
+            if (!sb->inside_sandbox(p)) {
+                return ToolResult::error("path escapes sandbox via symlink: "
+                                         + sb->virtual_path(p));
+            }
+            // Open with O_NOFOLLOW + O_CLOEXEC so a symlink at the leaf
+            // (e.g. one planted by the bash tool) cannot redirect us
+            // out of the sandbox between the containment check and the
+            // open(). The check above already canonicalises but a TOCTOU
+            // race on fast-changing filesystems would still escape it
+            // without O_NOFOLLOW.
+            int fd = ::open(p.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+            if (fd < 0) {
+                return ToolResult::error(std::string("cannot open: ")
+                                         + sb->virtual_path(p)
+                                         + " (" + std::strerror(errno) + ")");
+            }
+            if (offset > 0 && ::lseek(fd, offset, SEEK_SET) < 0) {
+                ::close(fd);
+                return ToolResult::error(std::string("seek failed: ")
+                                         + std::strerror(errno));
+            }
             std::string buf((size_t) limit, '\0');
-            f.read(buf.data(), limit);
-            buf.resize(f.gcount());
+            ssize_t n = ::read(fd, buf.data(), (size_t) limit);
+            ::close(fd);
+            if (n < 0) {
+                return ToolResult::error(std::string("read failed: ")
+                                         + std::strerror(errno));
+            }
+            buf.resize((size_t) n);
             return ToolResult::ok(std::move(buf));
         })
         .build();
@@ -843,12 +898,42 @@ Tool fs_write_file(std::string root) {
 
             fs::path p; std::string err;
             if (!sb->resolve(path, p, err)) return ToolResult::error(err);
+            if (!sb->inside_sandbox(p)) {
+                return ToolResult::error("path escapes sandbox via symlink: "
+                                         + sb->virtual_path(p));
+            }
 
             std::error_code ec;
             fs::create_directories(p.parent_path(), ec);
-            std::ofstream f(p, std::ios::binary | (append ? std::ios::app : std::ios::trunc));
-            if (!f) return ToolResult::error("cannot open for write: " + sb->virtual_path(p));
-            f.write(content.data(), content.size());
+
+            // Open with O_NOFOLLOW so a symlink at the leaf cannot
+            // redirect the write outside the sandbox. O_CLOEXEC keeps
+            // the fd off subsequently-spawned children. Mode 0600 —
+            // model-written files are private to the service user
+            // (containing potentially-sensitive content the model was
+            // told to save).
+            int flags = O_WRONLY | O_CREAT | O_NOFOLLOW | O_CLOEXEC
+                      | (append ? O_APPEND : O_TRUNC);
+            int fd = ::open(p.c_str(), flags, 0600);
+            if (fd < 0) {
+                return ToolResult::error(std::string("cannot open for write: ")
+                                         + sb->virtual_path(p)
+                                         + " (" + std::strerror(errno) + ")");
+            }
+            const char * data = content.data();
+            size_t       left = content.size();
+            while (left > 0) {
+                ssize_t n = ::write(fd, data, left);
+                if (n < 0) {
+                    if (errno == EINTR) continue;
+                    ::close(fd);
+                    return ToolResult::error(std::string("write failed: ")
+                                             + std::strerror(errno));
+                }
+                data += n;
+                left -= (size_t) n;
+            }
+            ::close(fd);
             return ToolResult::ok("wrote " + std::to_string(content.size())
                                   + " bytes to " + sb->virtual_path(p));
         })
@@ -868,6 +953,10 @@ Tool fs_list_dir(std::string root) {
 
             fs::path p; std::string err;
             if (!sb->resolve(path, p, err)) return ToolResult::error(err);
+            if (!sb->inside_sandbox(p)) {
+                return ToolResult::error("path escapes sandbox via symlink: "
+                                         + sb->virtual_path(p));
+            }
             if (!fs::is_directory(p))
                 return ToolResult::error("not a directory: " + sb->virtual_path(p));
 
@@ -903,6 +992,10 @@ Tool fs_glob(std::string root) {
             fs::path start = sb->root; std::string err;
             if (!sub.empty() && !sb->resolve(sub, start, err))
                 return ToolResult::error(err);
+            if (!sb->inside_sandbox(start)) {
+                return ToolResult::error("start dir escapes sandbox via symlink: "
+                                         + sb->virtual_path(start));
+            }
 
             // wildcard -> regex
             std::string re = "^";
@@ -972,6 +1065,10 @@ Tool fs_grep(std::string root) {
             fs::path start = sb->root; std::string err;
             if (!sub.empty() && !sb->resolve(sub, start, err))
                 return ToolResult::error(err);
+            if (!sb->inside_sandbox(start)) {
+                return ToolResult::error("start dir escapes sandbox via symlink: "
+                                         + sb->virtual_path(start));
+            }
 
             std::regex::flag_type rf = std::regex::ECMAScript;
             if (ci) rf |= std::regex::icase;
@@ -991,7 +1088,14 @@ Tool fs_grep(std::string root) {
                     else r += ch;
                 }
                 r += "$";
-                glob_rx = std::regex(r);
+                // Compile defensively — `file_glob` is model-supplied and
+                // a stray `[` (or any other regex metachar surviving the
+                // escape table) would otherwise throw an uncaught
+                // regex_error and tear down the request handler.
+                try { glob_rx = std::regex(r); }
+                catch (const std::regex_error & e) {
+                    return ToolResult::error(std::string("bad file_glob: ") + e.what());
+                }
             }
 
             std::ostringstream o;
@@ -1116,6 +1220,13 @@ Tool bash(std::string root) {
             if (::pipe(pipefd) < 0)
                 return ToolResult::error(std::string("pipe() failed: ") + std::strerror(errno));
 
+            // Cap on the inherited-fd close loop in the child. Mirrors
+            // external_tools.cpp's kMaxFdScan: RLIMIT_NOFILE = unlimited
+            // wraps to -1 and silently disables a naive loop, leaking
+            // every parent fd into the child. 65 536 is more than enough
+            // for any well-behaved process.
+            constexpr long kMaxFdScan = 65536;
+
             const std::string cwd = sb->root.string();
             pid_t pid = ::fork();
             if (pid < 0) {
@@ -1123,20 +1234,64 @@ Tool bash(std::string root) {
                 return ToolResult::error(std::string("fork() failed: ") + std::strerror(errno));
             }
             if (pid == 0) {
-                // child
+                // ---- CHILD ----
+                // Async-signal-safe operations only until execve.
+                ::setpgid(0, 0);   // own process group → kill(-pgid) reaches grandchildren
+#if defined(__linux__)
+                // Tie our lifetime to the parent: if the agent crashes
+                // (segfault, OOM-kill, kill -9) before we exec or while
+                // we run, the kernel sends us SIGKILL. Without this an
+                // orphaned shell would survive (reparented to PID 1)
+                // and keep running until its own timeout.
+                ::prctl(PR_SET_PDEATHSIG, SIGKILL);
+#endif
                 ::close(pipefd[0]);
                 ::dup2(pipefd[1], 1);
                 ::dup2(pipefd[1], 2);
                 ::close(pipefd[1]);
+
+                // stdin → /dev/null. The model has no way to feed
+                // bytes into the subprocess, but a shell that reads
+                // stdin (e.g. `cat`) would otherwise inherit our
+                // controlling-terminal stdin and block.
+                int devnull = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
+                if (devnull >= 0) {
+                    ::dup2(devnull, 0);
+                    ::close(devnull);
+                } else {
+                    ::close(0);
+                }
+
+                // Close every other inherited fd. The parent has the
+                // HTTP listener, log file, llama.cpp's mmap'd model,
+                // etc. None of those should be visible to a /bin/sh
+                // command.
+                struct rlimit rl{};
+                long maxfd = kMaxFdScan;
+                if (::getrlimit(RLIMIT_NOFILE, &rl) == 0
+                        && rl.rlim_cur != RLIM_INFINITY
+                        && rl.rlim_cur > 0
+                        && rl.rlim_cur < (rlim_t) kMaxFdScan) {
+                    maxfd = (long) rl.rlim_cur;
+                }
+                for (int fd = 3; fd < (int) maxfd; ++fd) {
+                    ::close(fd);
+                }
+
                 if (!cwd.empty() && ::chdir(cwd.c_str()) != 0) {
-                    std::fprintf(stderr, "chdir(%s) failed: %s\n",
-                                 cwd.c_str(), std::strerror(errno));
+                    const char m[] = "bash: chdir failed\n";
+                    ssize_t w = ::write(1, m, sizeof(m) - 1); (void) w;
                     ::_exit(126);
                 }
                 ::execl("/bin/sh", "sh", "-c", cmd.c_str(), (char *) nullptr);
+                const char m[] = "bash: execl failed\n";
+                ssize_t w = ::write(1, m, sizeof(m) - 1); (void) w;
                 ::_exit(127);
             }
-            // parent
+            // ---- PARENT ----
+            // Mirror the child's setpgid so kill(-pid) reaches the right
+            // group regardless of scheduling order.
+            ::setpgid(pid, pid);
             ::close(pipefd[1]);
             ::fcntl(pipefd[0], F_SETFL, O_NONBLOCK);
 
@@ -1166,12 +1321,17 @@ Tool bash(std::string root) {
                 auto now = std::chrono::steady_clock::now();
                 if (now >= deadline) {
                     if (!sent_term) {
-                        ::kill(pid, SIGTERM);
+                        // Negative pid in ::kill targets the whole
+                        // process group (we set setpgid above) so any
+                        // grandchildren the shell spawned receive the
+                        // signal too. A bare `kill(pid, …)` on the
+                        // shell leader leaves grandchildren behind.
+                        ::kill(-pid, SIGTERM);
                         sent_term          = true;
                         killed_for_timeout = true;   // we initiated it
                         deadline           = now + std::chrono::seconds(2); // grace
                     } else {
-                        ::kill(pid, SIGKILL);
+                        ::kill(-pid, SIGKILL);
                         break;
                     }
                 }
