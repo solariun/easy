@@ -623,11 +623,12 @@ void register_tools(easyai::Client & cli,
     // call. See RAG.md for the full guide.
     if (!o.rag_dir.empty()) {
         auto rag = easyai::tools::make_rag_tools(o.rag_dir);
-        if (o.tools_enabled.empty() || o.tools_enabled.count("rag_save"))   cli.add_tool(rag.save);
-        if (o.tools_enabled.empty() || o.tools_enabled.count("rag_search")) cli.add_tool(rag.search);
-        if (o.tools_enabled.empty() || o.tools_enabled.count("rag_load"))   cli.add_tool(rag.load);
-        if (o.tools_enabled.empty() || o.tools_enabled.count("rag_list"))   cli.add_tool(rag.list);
-        if (o.tools_enabled.empty() || o.tools_enabled.count("rag_delete")) cli.add_tool(rag.del);
+        if (o.tools_enabled.empty() || o.tools_enabled.count("rag_save"))     cli.add_tool(rag.save);
+        if (o.tools_enabled.empty() || o.tools_enabled.count("rag_search"))   cli.add_tool(rag.search);
+        if (o.tools_enabled.empty() || o.tools_enabled.count("rag_load"))     cli.add_tool(rag.load);
+        if (o.tools_enabled.empty() || o.tools_enabled.count("rag_list"))     cli.add_tool(rag.list);
+        if (o.tools_enabled.empty() || o.tools_enabled.count("rag_delete"))   cli.add_tool(rag.del);
+        if (o.tools_enabled.empty() || o.tools_enabled.count("rag_keywords")) cli.add_tool(rag.keywords);
     }
 
     // External tools directory (--external-tools DIR). Loads every

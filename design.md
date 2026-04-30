@@ -737,6 +737,76 @@ User-facing documentation: [`RAG.md`](RAG.md). Operator guide:
 [`LINUX_SERVER.md`](LINUX_SERVER.md). This section describes *why*
 the subsystem is shaped the way it is.
 
+### Architecture at a glance
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                            MODEL                                 │
+│              (sees 6 tools registered as a group)                │
+│                                                                  │
+│   rag_save  rag_search  rag_load  rag_list  rag_delete           │
+│                            rag_keywords                          │
+└─────────────────────────────────────────────────────────────────┘
+                                │
+                                │  tool_call(name, arguments_json)
+                                ▼
+┌─────────────────────────────────────────────────────────────────┐
+│             easyai::Engine  /  easyai::Client                    │
+│   dispatch by name → tools[name].handler(call) → ToolResult      │
+└─────────────────────────────────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                src/rag_tools.cpp — RagStore                      │
+│                                                                  │
+│   ┌──────────────────┐       ┌────────────────────────────────┐ │
+│   │   std::mutex mu  │ ◄───► │ std::map<title, EntryMeta>     │ │
+│   │  (one per store) │       │   keywords + mtime + bytes     │ │
+│   │                  │       │   lazy-loaded from disk on     │ │
+│   │                  │       │   first call, refreshed by     │ │
+│   │                  │       │   every save / delete           │ │
+│   └──────────────────┘       └────────────────────────────────┘ │
+│                                                                  │
+│   reads (search/list/keywords): index lookup, no disk read       │
+│   load:   one file read off disk (body ≤ 256 KiB)                │
+│   save:   atomic tempfile + rename(2), idempotent                │
+│   delete: unlink + index erase, idempotent                       │
+└─────────────────────────────────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────┐
+│             /var/lib/easyai/rag/    (filesystem)                 │
+│                                                                  │
+│   <title>.md           one file per entry, plain Markdown        │
+│   <title>.md.tmp.<pid> transient — only during rag_save          │
+│   README.md            operator-readable, no `keywords:` header  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+The flow has four invariants worth calling out:
+
+1. **The model is the only writer.** `rag_save` and `rag_delete`
+   are called from the model's tool-call loop; the operator may
+   hand-edit files but the runtime never auto-writes from the
+   server side. This makes "what's in RAG" a function of "what
+   the agent decided to remember", which is the part vector
+   stores get wrong.
+2. **The index is small.** Every search / list / keywords call
+   stays in memory — no disk read. The body is only read when the
+   model commits to one specific entry via `rag_load`. A 1000-entry
+   RAG with avg 200-byte body uses ~200 KiB on disk and a few
+   hundred bytes per entry in the index.
+3. **Atomic-rename writes.** The tempfile + rename pattern means a
+   concurrent reader (another rag_load while a save is in flight)
+   sees the OLD body or the NEW body but never a torn write. No
+   locking needed on the read path.
+4. **Path-safety by regex.** Title and keyword identifiers must
+   match `^[A-Za-z0-9_-]+$`. The title is concatenated with `.md`
+   to form the on-disk path — the regex closes path-traversal at
+   parse time. There is no other access-control layer; the
+   filesystem ACL on `/var/lib/easyai/rag/` is the deployment
+   boundary.
+
 ### Why a tag registry, not a vector store
 
 Vector stores assume you have a corpus that nobody classified. The

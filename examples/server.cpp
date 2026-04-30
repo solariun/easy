@@ -3132,6 +3132,7 @@ int main(int argc, char ** argv) {
         ctx->default_tools.push_back(std::move(rag.load));
         ctx->default_tools.push_back(std::move(rag.list));
         ctx->default_tools.push_back(std::move(rag.del));
+        ctx->default_tools.push_back(std::move(rag.keywords));
         std::fprintf(stderr,
             "easyai-server: RAG enabled, root = %s\n",
             args.rag_dir.c_str());

@@ -35,24 +35,113 @@ the whole system.
 
 ## 1. What RAG is, and why
 
-RAG is a **tag-keyed key/value store**, owned by the agent, persisted
-on disk, accessible to the agent via five tools:
+RAG is a **keyword-indexed key/value store**, owned by the agent,
+persisted on disk, accessible to the agent via six tools:
 
 ```
-rag_save(title, keywords[], content)   write / overwrite
-rag_search(keywords[], max_results=10)  find by 1+ keywords (≥2 matches when 2+ given)
-rag_load(titles[1..4])                 read up to 4 full bodies
-rag_list(prefix?, max=50)              browse titles
-rag_delete(title)                      remove a stale entry
+rag_save(title, keywords[], content)        write / overwrite
+rag_search(keywords[], page?, max_results?) find by 1+ keywords (≥2 matches when 2+ given), paginated
+rag_load(titles[1..4])                      read up to 4 full bodies
+rag_list(prefix?, max?)                     browse titles
+rag_delete(title)                           remove a stale entry
+rag_keywords(min_count?, max?)              vocabulary overview
 ```
 
 That is the whole API.
 
-The model decides what to remember and how to classify it. Tags ("keywords")
-are how it finds entries again later. The directory is the index. There
-is no embedding model, no similarity scoring, no neighbours. The model
-already has everything it needs to reason about its own memory; we just
-give it a place to put the bits it cared about.
+The model decides what to remember and how to classify it. Keywords
+are how it finds entries again later. The directory is the index.
+There is no embedding model, no similarity scoring, no neighbours.
+The model already has everything it needs to reason about its own
+memory; we just give it a place to put the bits it cared about.
+
+### How information flows
+
+```
+  ┌──────────────────────────────────────────────────────────────┐
+  │                         THE MODEL                             │
+  │              (sees the 6 tools in its toolbelt)               │
+  └──────────────────────────────────────────────────────────────┘
+           │           │           │           │           │           │
+           ▼           ▼           ▼           ▼           ▼           ▼
+        ┌──────┐   ┌────────┐  ┌────────┐  ┌──────┐  ┌────────┐  ┌──────────┐
+        │ save │   │ search │  │  load  │  │ list │  │ delete │  │ keywords │
+        │      │   │        │  │        │  │      │  │        │  │          │
+        │write │   │ find   │  │ read   │  │browse│  │ prune  │  │vocab     │
+        │ /    │   │ by     │  │ up to  │  │titles│  │ stale  │  │overview  │
+        │amend │   │keyword │  │  4     │  │      │  │        │  │ (counts) │
+        └──┬───┘   └───┬────┘  └───┬────┘  └──┬───┘  └───┬────┘  └────┬─────┘
+           │           │           │           │           │           │
+           ▼           ▼           ▼           ▼           ▼           ▼
+  ┌──────────────────────────────────────────────────────────────┐
+  │                        RagStore (in-process)                  │
+  │  ┌────────────────────────────────────────────────────────┐  │
+  │  │  in-memory index: title → { keywords, mtime, bytes }   │  │
+  │  │  lazy-loaded from disk on first call, kept fresh by    │  │
+  │  │  every save / delete; mutex-guarded                     │  │
+  │  └────────────────────────────────────────────────────────┘  │
+  │                                                               │
+  │   search / list / keywords  ─→  index lookup, no disk read    │
+  │   load                      ─→  one file read off disk        │
+  │   save                      ─→  atomic tempfile + rename(2)   │
+  │   delete                    ─→  unlink + index erase          │
+  └──────────────────────────────┬───────────────────────────────┘
+                                 │
+                                 ▼
+  ┌──────────────────────────────────────────────────────────────┐
+  │            /var/lib/easyai/rag/    (filesystem)               │
+  │                                                               │
+  │   gustavo-prefs.md      keywords: user-prefs, locale          │
+  │   easyai-build.md       keywords: easyai, build, recipe       │
+  │   mqtt-qos.md           keywords: mqtt, qos, protocol         │
+  │   README.md             (no keywords header — untagged)       │
+  └──────────────────────────────────────────────────────────────┘
+```
+
+The lifecycle of a piece of knowledge:
+
+```
+  SESSION 1 (Mon)
+  ───────────────
+  user:  "I prefer terse PT-BR responses."
+  model: rag_keywords()                      ← sees "user-prefs" already
+                                                exists in vocabulary
+         rag_save("user-prefs",              ← reuses existing keyword
+                  ["user-prefs","locale"],
+                  "Prefers PT-BR, terse...")
+                                              ← atomic write to disk
+  ────────────────────────────────────  end of session ─────────
+
+  SESSION 2 (Wed, fresh process)
+  ──────────────────────────────
+  user:  "build the project"
+  model: rag_search(["easyai","build"])      ← matches 2/2 → easyai-build.md
+         rag_load(["easyai-build"])          ← reads body
+         rag_search(["user-prefs"])          ← finds gustavo-prefs.md
+         rag_load(["user-prefs"])            ← reads body
+                                              ← model now answers
+                                                in PT-BR, terse, with
+                                                the right build command
+
+  ────────────────────────────────────  later that week ─────────
+
+  user:  "we dropped the X feature"
+  model: rag_search(["x-feature"])           ← finds 3 stale entries
+         rag_delete("x-feature-rationale")
+         rag_delete("x-feature-roadmap")     ← curation keeps the
+         rag_delete("x-feature-userflow")      vocabulary clean for
+                                                future searches
+```
+
+Three things make this loop work:
+
+1. **The model classifies its own memory.** It saw the conversation;
+   it picks a stable, descriptive title and 2–5 reusable keywords.
+2. **Keywords are the index.** No embeddings, no GPU, no opaque
+   ranking — exact-match lookup over a small in-memory map.
+3. **The model curates.** `rag_keywords` lets it see what vocabulary
+   it has built; `rag_delete` lets it prune. Without curation, the
+   index drifts and old entries become unreachable.
 
 ### Why no vector store / embeddings?
 
@@ -185,7 +274,7 @@ it on its first rag_search by `user-prefs`.
 
 ---
 
-## 4. The five tools
+## 4. The six tools
 
 Each tool description below is what the MODEL sees. The descriptions
 were written to actively encourage use — see §5.
@@ -269,6 +358,53 @@ rag_delete(title: string) -> ok
 Permanent. Removes the file from disk and the in-memory index.
 Idempotent: deleting a non-existent title is not an error. No trash,
 no recovery — be certain.
+
+### rag_keywords
+
+```
+rag_keywords(min_count: integer = 1, max: integer = 200)
+  -> { total_keywords, total_entries, showing, [keyword, count]* }
+```
+
+Vocabulary overview. Lists every distinct keyword used across the
+RAG with the number of entries that reference it. Sorted by
+frequency (most-used first), tie-broken alphabetically.
+
+**Why it matters.** Without rag_keywords, an agent that doesn't
+check its own vocabulary creates near-duplicates over time —
+`user-prefs` vs `user_pref` vs `preferences`, `cmd-recipe` vs
+`command-recipe`, etc. — and the index slowly fragments. Old
+entries become unreachable to new searches because the queries
+target slightly-different keywords. Calling rag_keywords before
+rag_save (or before rag_search when you don't know what's in the
+RAG) keeps the vocabulary stable and the index coherent.
+
+**Filters.** `min_count=2` hides one-off keywords (those used by a
+single entry), surfacing only the established vocabulary. `max`
+caps the result count; the long tail is dropped first.
+
+**Example output:**
+
+```
+total_keywords: 23
+total_entries: 47
+showing: 23
+
+user-prefs       12 entries
+project-easyai    9 entries
+cmd-recipe        7 entries
+fix-vulkan        5 entries
+mqtt              4 entries
+qos               3 entries
+…
+asyncio           1 entry
+django            1 entry
+```
+
+The first lines tell the model which dimensions of knowledge it
+has invested in; the long tail is candidates for either
+consolidation (rename to a more general keyword + rag_save) or
+deletion.
 
 ---
 
@@ -429,6 +565,18 @@ Model:  rag_search(["x-feature"])
 
 ### Body content
 
+- **Granularity matters more than anything else.** Save many small
+  focused entries; not a few sprawling ones. `easyai-build-mac`
+  and `easyai-build-linux` should be **two** entries, not one
+  combined `easyai-build`. Why: when rag_load returns an entry,
+  the FULL body lands in the model's prompt — a 200-line note
+  costs 1000+ tokens whether the model needed all of it or not.
+  The search-then-load flow is built around this: rag_search
+  ranks N candidates by overlap, the model picks up to 4 of the
+  best, and each loaded body is small enough that all four fit
+  comfortably. **It is always better to ask for two more loads
+  than to swallow one giant one.** Rule of thumb: bodies over
+  ~500 words are usually two or more entries pretending to be one.
 - **Be specific.** "Use q8_0 KV cache" is vague; "Use `-ctk q8_0 -ctv
   q8_0` to halve the KV cache footprint at no measurable quality
   loss on the 35B model" is useful.

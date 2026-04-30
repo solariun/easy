@@ -74,6 +74,7 @@ bool LocalBackend::init(std::string & err) {
         engine.add_tool(rag.load);
         engine.add_tool(rag.list);
         engine.add_tool(rag.del);
+        engine.add_tool(rag.keywords);
     }
 
     // External tools directory. Loaded after the built-in toolbelt so

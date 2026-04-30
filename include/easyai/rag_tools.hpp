@@ -56,18 +56,19 @@
 
 namespace easyai::tools {
 
-// The four tools that comprise the RAG surface. They share an
+// The six tools that comprise the RAG surface. They share an
 // internal store object that holds the in-memory index and
 // serialises disk writes.
 struct RagTools {
-    Tool save;     // rag_save(title, keywords[], content)
-    Tool search;   // rag_search(keywords[], max_results=10) — ≥2 matches when 2+ kw
-    Tool load;     // rag_load(titles[1..4])
-    Tool list;     // rag_list(prefix?, max=50)
-    Tool del;      // rag_delete(title)
+    Tool save;      // rag_save(title, keywords[], content)
+    Tool search;    // rag_search(keywords[], max_results=10) — ≥2 matches when 2+ kw
+    Tool load;      // rag_load(titles[1..4])
+    Tool list;      // rag_list(prefix?, max=50)
+    Tool del;       // rag_delete(title)
+    Tool keywords;  // rag_keywords(min_count=1, max=200) — vocabulary overview
 };
 
-// Build the five RAG tools rooted at `root_dir`. The directory is
+// Build the six RAG tools rooted at `root_dir`. The directory is
 // created on demand at first save; missing-directory at registration
 // time is NOT an error (operator may not have provisioned it yet).
 //

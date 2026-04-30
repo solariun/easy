@@ -95,6 +95,13 @@ constexpr std::size_t kSearchPreviewBytes = 240;
 constexpr std::size_t kListResultsMax     = 200;
 constexpr std::size_t kListResultsDflt    = 50;
 
+// rag_keywords cap. Vocabulary overview — the model uses this to
+// see which keywords it's already been using before saving a new
+// entry. A typical RAG converges to a few dozen stable keywords;
+// the higher cap is for power users with deep vocabularies.
+constexpr std::size_t kKeywordsResultsMax  = 500;
+constexpr std::size_t kKeywordsResultsDflt = 200;
+
 // On-disk file extension. `.md` keeps entries human-readable in
 // any text editor, lets the operator `cat` / `vim` / `grep`, and
 // renders nicely as markdown when the body uses it.
@@ -984,6 +991,111 @@ ToolHandler make_delete_handler(std::shared_ptr<RagStore> store) {
     };
 }
 
+// rag_keywords — vocabulary overview. Returns each distinct
+// keyword used across the RAG together with how many entries
+// reference it. The model uses this to:
+//
+//   - learn its own vocabulary before saving (avoid creating a
+//     new keyword like `user_pref` when `user-prefs` already
+//     exists)
+//   - discover dimensions of stored knowledge it forgot about
+//   - frame rag_search queries against keywords that actually
+//     return results
+//
+// Output: header lines (`total_keywords:`, `total_entries:`,
+// `showing:`) followed by sorted rows. Sort order: count
+// descending, then keyword name ascending so the response is
+// stable across calls.
+ToolHandler make_keywords_handler(std::shared_ptr<RagStore> store) {
+    return [store](const ToolCall & c) -> ToolResult {
+        long long min_count = 1;
+        args::get_int(c.arguments_json, "min_count", min_count);
+        if (min_count < 1) min_count = 1;
+
+        long long max = (long long) kKeywordsResultsDflt;
+        args::get_int(c.arguments_json, "max", max);
+        if (max < 1) max = 1;
+        if ((std::size_t) max > kKeywordsResultsMax) {
+            max = (long long) kKeywordsResultsMax;
+        }
+
+        // Phase 1: under lock, collect counts from the index.
+        std::map<std::string, std::size_t> counts;
+        std::size_t total_entries = 0;
+        {
+            std::lock_guard<std::mutex> lock(store->mu);
+            store->load_index_locked();
+            total_entries = store->index.size();
+            for (const auto & [_, m] : store->index) {
+                for (const auto & k : m.keywords) {
+                    counts[k] += 1;
+                }
+            }
+        }
+
+        // Phase 2: filter by min_count and sort by (count desc, name asc).
+        struct Row { std::string keyword; std::size_t count; };
+        std::vector<Row> rows;
+        rows.reserve(counts.size());
+        for (const auto & [k, n] : counts) {
+            if (n >= (std::size_t) min_count) {
+                rows.push_back({ k, n });
+            }
+        }
+        std::sort(rows.begin(), rows.end(), [](const Row & a, const Row & b) {
+            if (a.count != b.count) return a.count > b.count;
+            return a.keyword < b.keyword;
+        });
+        const std::size_t total_kw = rows.size();
+        if ((long long) rows.size() > max) {
+            rows.resize((std::size_t) max);
+        }
+
+        // Render.
+        std::ostringstream o;
+        o << "total_keywords: " << total_kw << "\n";
+        o << "total_entries: "  << total_entries << "\n";
+        o << "showing: "        << rows.size();
+        if (min_count > 1) {
+            o << "  (min_count=" << min_count << ")";
+        }
+        o << "\n\n";
+
+        if (rows.empty()) {
+            if (total_entries == 0) {
+                o << "RAG is empty. Use rag_save to add the first entry.";
+            } else if (min_count > 1) {
+                o << "no keywords reach min_count=" << min_count
+                  << ". The RAG has " << total_entries
+                  << " entr" << (total_entries == 1 ? "y" : "ies")
+                  << " but every keyword is below the threshold. "
+                  << "Try min_count=1 (default) to see the full list.";
+            } else {
+                o << "no keywords found. Some entries may be untagged "
+                  << "(no `keywords:` header) — those don't appear here. "
+                  << "Use rag_list to see them.";
+            }
+            return ToolResult::ok(o.str());
+        }
+
+        // Pad the keyword column for legibility. Cap at the longest
+        // keyword in the result so we don't waste tokens.
+        std::size_t pad = 0;
+        for (const auto & r : rows) pad = std::max(pad, r.keyword.size());
+        if (pad > kMaxKeywordBytes) pad = kMaxKeywordBytes;
+
+        for (const auto & r : rows) {
+            o << r.keyword;
+            for (std::size_t i = r.keyword.size(); i < pad + 2; ++i) {
+                o << ' ';
+            }
+            o << r.count
+              << " entr" << (r.count == 1 ? "y" : "ies") << "\n";
+        }
+        return ToolResult::ok(o.str());
+    };
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -1009,11 +1121,28 @@ RagTools make_rag_tools(std::string root_dir) {
             "Pick a short descriptive title (letters / digits / dash / underscore "
             "only — no spaces) and 2-5 short keywords so rag_search can find it later. "
             "Keywords should be stable and reusable: 'user-prefs', 'project-easyai', "
-            "'cmd-recipe', 'fix-vulkan-radv'. Overwrites if a title already exists "
-            "(useful for refining notes as you learn more). If an entry becomes "
-            "stale or wrong, use rag_delete to remove it — keeping the registry "
-            "tidy makes future searches sharper. Each entry is a small Markdown "
-            "file on disk (title.md) so the operator can hand-edit too."
+            "'cmd-recipe', 'fix-vulkan-radv'.\n"
+            "\n"
+            "GRANULARITY: prefer many small focused entries over one large one. "
+            "Save 'easyai-build-mac' and 'easyai-build-linux' as TWO entries, "
+            "not one combined 'easyai-build'. When rag_load returns an entry, "
+            "the FULL body becomes part of your prompt — a 200-line entry "
+            "burns 1000+ tokens you didn't ask for. The search-then-load flow "
+            "is designed so you can pick up to 4 small entries instead of "
+            "drowning in one giant one. Rule of thumb: if a body is over ~500 "
+            "words, it's probably two or more entries pretending to be one.\n"
+            "\n"
+            "BEFORE saving, consider calling rag_keywords to see what vocabulary "
+            "you've already been using — reusing existing keywords like "
+            "'user-prefs' instead of inventing 'preferences' or 'user_pref' "
+            "keeps the index coherent and future searches sharper. Drift in "
+            "keyword vocabulary is the #1 way an agent's RAG slowly becomes "
+            "useless.\n"
+            "\n"
+            "Overwrites if a title already exists (useful for refining notes as "
+            "you learn more). If an entry becomes stale or wrong, use rag_delete "
+            "to remove it. Each entry is a small Markdown file on disk "
+            "(title.md) so the operator can hand-edit too."
         )
         .param("title",   "string",
                "Identifier. 1..64 chars. Letters, digits, dash, underscore only. "
@@ -1036,6 +1165,10 @@ RagTools make_rag_tools(std::string root_dir) {
             "Search the RAG by one or more keywords. USE THIS BEFORE assuming "
             "you don't know something the user might have told you in a past "
             "session — your past self may have already saved the answer.\n\n"
+            "Not sure which keywords to try? Call rag_keywords first to see "
+            "the vocabulary you've actually been using; pick from THERE rather "
+            "than guessing. A search against keywords that don't exist in the "
+            "RAG just returns 0 entries.\n\n"
             "Pass an ARRAY of keywords. Threshold is adaptive:\n"
             "  - 1 keyword passed  → entries that have that keyword (broad sweep)\n"
             "  - 2+ keywords       → entries that match AT LEAST 2 of them\n"
@@ -1130,6 +1263,38 @@ RagTools make_rag_tools(std::string root_dir) {
                "Exact title to delete. Letters, digits, dash, underscore. "
                "1..64 chars.", true)
         .handle(make_delete_handler(store))
+        .build();
+
+    out.keywords = Tool::builder("rag_keywords")
+        .describe(
+            "Vocabulary overview: list every distinct keyword used across the "
+            "RAG, with the number of entries that reference it. CALL THIS "
+            "BEFORE rag_save when you're not sure which keywords to use, and "
+            "BEFORE rag_search when you're not sure what's even in the RAG.\n"
+            "\n"
+            "Why it matters: over time, an agent that doesn't check its own "
+            "vocabulary creates near-duplicates ('user-prefs' vs 'user_pref' "
+            "vs 'preferences') and the index fragments — old entries become "
+            "unreachable to new searches. Calling rag_keywords first lets you "
+            "reuse the vocabulary you've already established, keeping the "
+            "index coherent.\n"
+            "\n"
+            "Output is sorted by frequency (most-used keyword first) so the "
+            "first lines are the dimensions you've been investing in. The "
+            "long tail at the bottom is one-off keywords — candidates for "
+            "consolidation. Default cap is 200 keywords; set max=500 for the "
+            "full picture, or min_count=2 to hide the long tail and focus on "
+            "established vocabulary."
+        )
+        .param("min_count", "integer",
+               "Hide keywords used by fewer than this many entries (default 1 = "
+               "show all). Set min_count=2 to filter out one-offs and see only "
+               "your established vocabulary.", false)
+        .param("max",       "integer",
+               "Maximum keywords to return (default 200, max 500). The list "
+               "is sorted by frequency, so the cap drops the long tail "
+               "first.", false)
+        .handle(make_keywords_handler(store))
         .build();
 
     return out;
