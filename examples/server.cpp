@@ -3273,18 +3273,17 @@ int main(int argc, char ** argv) {
               "<script>(()=>{"
                 "console.log('[easyai-inject] block2 mcp-scrubber');"
                 "const NEEDLES=["
+                  // We do NOT use end-anchored MCP regexes
+                  // (e.g. `MCP Servers?$/i`) — those match the bundle's
+                  // "+" button whose accessible-name / sr-only span ends
+                  // with "...or MCP Servers", and hiding its closest
+                  // ancestor takes the whole popup with it. Use
+                  // start-anchored regexes against the actual MCP menu
+                  // ITEMS instead.
                   "/^MCP\\b/i,"
                   "/^MCP Server/i,"
-                  "/MCP Servers?$/i,"
                   "/^MCP Prompt/i,"
                   "/^MCP Resource/i,"
-                  // Don't hide the bundle's "+" button (whose tooltip /
-                  // aria-label is the full "Add files, system prompt or
-                  // configure MCP servers" string). The MCP MENU ITEMS
-                  // inside the popup are still caught by the other
-                  // regexes above (`^MCP Server`, `Configure MCP`, etc.),
-                  // so we lose the unwanted items but keep the button +
-                  // its file-attach functionality.
                   "/^Configure MCP/i,"
                   "/No MCP /i,"
                   "/All MCP server connections/i,"
