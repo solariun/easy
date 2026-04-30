@@ -272,6 +272,20 @@ if (EASYAI_BUILD_EXAMPLES)
     target_link_libraries(easyai-cli PRIVATE easyai_cli)
     target_include_directories(easyai-cli PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/../llama.cpp/vendor)
+
+    # easyai-mcp-server — standalone Model Context Protocol provider.
+    # Links libeasyai (for tools, RAG, external-tools, MCP dispatcher,
+    # INI parser) and cpp-httplib for HTTP transport.  Deliberately
+    # does NOT link llama-common: there is no engine, no chat template,
+    # no GGUF loader — the binary's job is to dispatch tool calls over
+    # /mcp, nothing else.  Designed for high-concurrency multi-client
+    # deployments (configurable cpp-httplib ThreadPool + per-tool
+    # concurrent-call cap inside the binary).
+    add_executable(easyai-mcp-server examples/mcp_server.cpp)
+    target_link_libraries(easyai-mcp-server PRIVATE easyai cpp-httplib)
+    target_include_directories(easyai-mcp-server PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../llama.cpp/vendor/cpp-httplib
+        ${CMAKE_CURRENT_SOURCE_DIR}/../llama.cpp/vendor)
 endif()
 
 # ============================================================================
@@ -310,6 +324,7 @@ if (EASYAI_INSTALL)
             easyai-local
             easyai-cli
             easyai-server
+            easyai-mcp-server
             easyai-chat
             easyai-agent)
         if (CURL_FOUND)
