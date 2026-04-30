@@ -1,6 +1,8 @@
 build/
 build-*/
-models/*.gguf
+bin/
+lib/
+models/
 *.o
 *.dylib
 *.so

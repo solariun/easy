@@ -727,10 +727,14 @@ max_body        = 8388608
 
 # /mcp authentication
 # ----------------------------------------------------------------
+# off     : open (anyone reaching /mcp can dispatch any tool) — DEFAULT
 # auto    : enabled iff [MCP_USER] below has at least one entry
-# off     : open (anyone reaching /mcp can dispatch any tool)
 # on      : require Bearer match — also overridable via --no-mcp-auth
-mcp_auth        = auto
+#
+# Default 'off' assumes a home-LAN appliance behind a router. If you
+# expose port 80 on a public IP, switch to 'on' and populate
+# [MCP_USER] below with a strong token (openssl rand -hex 32).
+mcp_auth        = off
 
 # ============================================================
 # [ENGINE] — model loading and inference tunables
