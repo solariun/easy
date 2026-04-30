@@ -801,7 +801,7 @@ ToolHandler make_list_handler(std::shared_ptr<RagStore> store) {
 
         if (rows.empty()) {
             return ToolResult::ok(prefix.empty()
-                ? "RAGistry is empty. Use rag_save to add entries."
+                ? "RAG is empty. Use rag_save to add entries."
                 : "no titles match prefix \"" + prefix + "\".");
         }
 
@@ -868,7 +868,7 @@ RagTools make_rag_tools(std::string root_dir) {
 
     out.save = Tool::builder("rag_save")
         .describe(
-            "Save a piece of knowledge to the persistent RAGistry — your long-term "
+            "Save a piece of knowledge to the persistent RAG — your long-term "
             "memory across sessions. USE THIS AGGRESSIVELY for anything worth "
             "remembering: the user's stated preferences and constraints, project "
             "structure and decisions you've learned, technical facts you had to look "
@@ -905,7 +905,7 @@ RagTools make_rag_tools(std::string root_dir) {
 
     out.search = Tool::builder("rag_search")
         .describe(
-            "Search the RAGistry by keyword. Returns up to 20 matching entries with "
+            "Search the RAG by keyword. Returns up to 20 matching entries with "
             "their title, keywords, modification time, and a short content preview. "
             "USE THIS BEFORE assuming you don't know something the user might "
             "have told you in a past session — your past self may have already "
@@ -924,7 +924,7 @@ RagTools make_rag_tools(std::string root_dir) {
 
     out.load = Tool::builder("rag_load")
         .describe(
-            "Load up to 4 entries from the RAGistry by exact title and return "
+            "Load up to 4 entries from the RAG by exact title and return "
             "their FULL content. Use this after rag_search to read the bodies "
             "of entries that looked promising in the preview. Pass exact titles "
             "from a previous rag_search result.\n\n"
@@ -940,7 +940,7 @@ RagTools make_rag_tools(std::string root_dir) {
 
     out.list = Tool::builder("rag_list")
         .describe(
-            "List RAGistry titles, optionally filtered by title prefix. Use to "
+            "List RAG titles, optionally filtered by title prefix. Use to "
             "browse what you've saved when you're not sure what keyword to search by, "
             "or to confirm whether you've saved a particular note. Returns title, "
             "keywords, content_bytes, and modified time — body NOT included (use "
@@ -957,7 +957,7 @@ RagTools make_rag_tools(std::string root_dir) {
 
     out.del = Tool::builder("rag_delete")
         .describe(
-            "Delete a RAGistry entry by exact title. Use this when an entry has "
+            "Delete a RAG entry by exact title. Use this when an entry has "
             "become stale, wrong, or just irrelevant — keeping the registry "
             "tidy makes future rag_search results sharper. Common reasons to "
             "delete:\n"

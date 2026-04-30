@@ -647,7 +647,7 @@ EXT_EXAMPLE
     sudo install -d -o "$service_user" -g "$service_group" -m 750 "$rag_dir"
 
     if [[ ! -f "$rag_dir/README.md" ]]; then
-        sudo bash -c "cat > '$rag_dir/README.md'" <<'REG_README'
+        sudo bash -c "cat > '$rag_dir/README.md'" <<'RAG_README'
 # RAG — easyai's persistent registry / long-term memory
 
 This directory holds the agent's RAG entries. Each `<title>.md` file
@@ -666,15 +666,13 @@ A file with no `keywords:` header is "untagged" — it shows in
 rag_list but not in rag_search. Drop a hand-authored note here and
 the agent will see it on next restart.
 
+This README itself has no `keywords:` header, so the agent will
+list it (under rag_list) but never surface it as RAG content.
+That's deliberate.
+
 Authoritative documentation: RAG.md and LINUX_SERVER.md in the
 easyai repo.
-
-This file (README.md) is ignored by the agent (no `.md` filename
-matches the title regex when it includes `_` followed by a `.` —
-wait, `README` IS valid. To be safe, the agent treats any file
-without a `keywords:` header as untagged but still listable, which
-is fine for a README.)
-REG_README
+RAG_README
         sudo chmod 640 "$rag_dir/README.md"
         sudo chown "$service_user":"$service_group" "$rag_dir/README.md"
     fi

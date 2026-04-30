@@ -6,15 +6,20 @@
 
 This document is the authoritative guide to easyai's RAG: a tag-
 indexed, file-backed long-term memory the model can use to remember
-things across sessions. It's not a vector store, not a RAG pipeline,
-not a database — it's a directory of small Markdown files that the
-agent reads and writes by itself.
+things across sessions.
+
+It's a deliberately minimal take on Retrieval-Augmented Generation:
+no embedding model, no vector store, no similarity index, no
+database — just a directory of small Markdown files the agent
+reads, writes, and curates by itself. The agent classifies its own
+memory with keywords; we keep the directory and the index. That's
+the whole system.
 
 ---
 
 ## Table of contents
 
-1. [What RAG is, and why](#1-what-reg-is-and-why)
+1. [What RAG is, and why](#1-what-rag-is-and-why)
 2. [Quickstart](#2-quickstart)
 3. [The file format on disk](#3-the-file-format-on-disk)
 4. [The five tools](#4-the-five-tools)
@@ -49,18 +54,24 @@ is no embedding model, no similarity scoring, no neighbours. The model
 already has everything it needs to reason about its own memory; we just
 give it a place to put the bits it cared about.
 
-### Why not a vector store?
+### Why no vector store / embeddings?
 
-Vector stores are the right answer when you have a HUGE corpus that no
-one classified by hand. RAG is the right answer when the agent IS the
-classifier — it just told you, in clear language, what the entry is
-about. Put that classification in the filename + a small header and
-you can find the entry again in O(1) per lookup, with no GPU, no
-embedding inference, no opaque ranking.
+The popular flavour of RAG plugs an embedding model + a vector store
+in front of the LLM and ranks chunks by cosine similarity. That's
+the right answer when you have a huge corpus that nobody
+classified.
 
-When easyai later grows progressive recall (load my N most-relevant
-entries on every session start), THAT layer can do similarity scoring
-on top of RAG. RAG itself stays simple: just files and tags.
+easyai's RAG flips the assumption: **the agent IS the classifier**.
+When the model decides to remember something, it tells you (in
+clear language, in the same call) what the entry is about. Put
+that classification in the filename + a small header and you can
+find the entry in O(1) per lookup, with no GPU, no embedding
+inference, no opaque ranking, no schema migrations.
+
+When easyai later grows progressive recall (auto-inject the N
+most-relevant entries on every session start), THAT layer can add
+similarity scoring on top of RAG without changing what's on disk.
+RAG itself stays simple: files and keywords.
 
 ### Why files, not a database?
 
@@ -313,7 +324,7 @@ Model:  [reads the PDF via fs_read_file or web_fetch]
 ```
 
 Now the next session, when you ask about MQTT, the model
-reg_searches, finds those 6 titles, loads up to 4, and answers from
+rag_searches, finds those 6 titles, loads up to 4, and answers from
 the saved knowledge — no re-reading.
 
 This is the **positive cycle**: feed knowledge, saved knowledge,
@@ -396,8 +407,8 @@ Model:  rag_search("x-feature")
 
 ### When NOT to save
 
-- Anything the user said only in passing ("I'm tired today" — not RAG
-  material).
+- Anything the user said only in passing ("I'm tired today" — not
+  worth keeping).
 - Anything that's already in the codebase (the model can `git grep`).
 - Per-conversation scratch state — that's what conversation history
   is for.
@@ -430,7 +441,7 @@ Model:  rag_search("x-feature")
 | Filename with spaces / dots / slashes | Skipped at index time (doesn't match the title regex). |
 | Filename without `.md` extension | Skipped. The agent only sees `.md` files in the dir. |
 | Subdirectory inside the RAG dir | Ignored — only top-level scanned. |
-| Empty RAG dir | Normal state. rag_list returns "RAGistry is empty". |
+| Empty RAG dir | Normal state. rag_list returns "RAG is empty". |
 | `rag_delete` on a non-existent title | Returns ok with "nothing to delete". Idempotent. |
 
 ---
