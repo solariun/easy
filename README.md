@@ -36,6 +36,145 @@ against, plus six ready-to-run binaries:
 
 ---
 
+## What's new
+
+A running log of user-facing changes. Latest first — keep this list
+current as features land so anyone returning to the repo (or
+landing on it for the first time) sees what shipped recently.
+
+### 2026-04-30 — Bonsai 8B Q1_0 onboarding + security pass
+
+* **One-shot installers for macOS and Raspberry Pi 4/5.**
+  `scripts/install_easyai_macos.sh` builds with Metal/AMX, drops the
+  model, prints the run command. `scripts/install_easyai_pi.sh` does
+  the full Pi appliance: systemd unit, mDNS so the box answers as
+  **`pi-ai.local`** on your LAN, port 80 with
+  `CAP_NET_BIND_SERVICE`. Both clone the **PrismML fork** of
+  llama.cpp (the only one with the Q1_0 kernel — upstream loads the
+  GGUF then fails at decode).
+* **Security third-pass audit** — 3 HIGH and 7 MEDIUM findings fixed.
+  The INI overlay used to be silently ignored (every `[ENGINE]` /
+  `[SERVER]` key was a no-op); `--no-mcp-auth` was disconnected from
+  the gate; the sandbox could be escaped by a symlink planted via
+  `bash`. All closed. The `bash` tool now gets the same
+  fork-hardening as external tools — `PR_SET_PDEATHSIG`, fd
+  close-loop bounded against `RLIMIT_NOFILE = unlimited`, process-
+  group kill on timeout. Plus JSON-depth caps on every parser, a
+  bounded INI parser, mode 0600 on RAG entries, and a
+  body-size-bounded auth header. See [`SECURITY_AUDIT.md`](SECURITY_AUDIT.md) §18.
+* **MCP server.** `easyai-server` is now a Model Context Protocol
+  provider on `POST /mcp` (protocol 2024-11-05). Claude Desktop,
+  Cursor, Continue list and dispatch every registered tool — your
+  built-ins, your RAG, your `--external-tools` manifests — over a
+  single endpoint. Bearer auth via `[MCP_USER]` in the INI; a
+  Python stdio bridge ships at `scripts/mcp-stdio-bridge.py` for
+  Claude Desktop. See [`MCP.md`](MCP.md).
+* **Single INI config — `/etc/easyai/easyai.ini`.** Every CLI flag
+  has an INI key (FlagDef table refactor); precedence is CLI > INI
+  > hardcoded default. Edit the file, `systemctl restart`, done.
+  Full reference in [`INI_KFlags.md`](INI_KFlags.md).
+* **RAG: persistent memory.** Six tools (`rag_save`, `rag_search`,
+  `rag_load`, `rag_list`, `rag_delete`, `rag_keywords`).
+  Multi-keyword search with adaptive threshold + pagination. One
+  Markdown file per entry — operator-readable, hand-editable. See
+  [`RAG.md`](RAG.md).
+
+### 2026-04-29 — External tools v2
+
+* **Operator-defined tool packs** via `EASYAI-<name>.tools` JSON
+  manifests dropped in `/etc/easyai/external-tools/`. Per-file
+  fault isolation, sanity warnings (shell-wrapper detection,
+  world-writable binaries, `LD_*` env passthrough), full
+  `fork`+`execve` hardening — never a shell. Give the model
+  focused powers without flipping `--allow-bash`. See
+  [`EXTERNAL_TOOLS.md`](EXTERNAL_TOOLS.md).
+* **`get_current_dir` builtin** — the model can ask where it is,
+  so relative paths in `bash` / `fs_*` calls land where you expect.
+* **Cancel-on-disconnect on the server** — closing the browser
+  tab actually stops the decode loop. No more zombie generation
+  eating tokens after the user walked away.
+* **Tolerant tool output** — non-UTF-8 bytes in tool results no
+  longer abort the SSE stream; the bytes get a U+FFFD substitute
+  and the stream stays alive.
+
+---
+
+## Why try it
+
+**Your assistant. Your tools. Your hardware. No cloud subscription,
+no API bill, no data leaving the box.**
+
+* **Runs on a Raspberry Pi.** Bonsai 8B Q1_0 weighs in at ~1.2 GB
+  resident. A Pi 4 (8 GB) or any Pi 5 holds it with a 4 K context
+  comfortably — and one install script puts a chat server at
+  `http://pi-ai.local` for everyone on your home network.
+
+* **Runs on your Mac.** Same one-script flow, Metal on Apple
+  Silicon, full webui at `http://localhost:8080`. No Docker, no
+  Conda, no Python venv. Uninstall is `rm -rf` of the checkout.
+
+* **Plugs into the AI apps you already use.** OpenAI-compatible
+  (`/v1/chat/completions`) — Claude Code, the OpenAI SDK,
+  LiteLLM, LangChain, LobeChat, OpenWebUI all point at it without
+  any easyai-specific configuration. Ollama-compat shims
+  (`/api/tags`, `/api/show`) cover clients that prefer that shape.
+
+* **Speaks MCP.** Claude Desktop, Cursor, Continue and any other
+  Model Context Protocol client auto-discovers the tool catalogue.
+  **Write one tool — every AI app on your machine can call it.**
+
+* **Long-term memory built in.** RAG: six tools the agent uses to
+  save, search, load, list, delete, and inventory its own
+  knowledge. One human-readable Markdown file per entry — `cat`,
+  `vim`, `grep` it. No vector DB to babysit.
+
+* **Operator-defined tool packs.** Drop a JSON manifest in
+  `/etc/easyai/external-tools/`, the agent picks it up at startup.
+  Give the model exactly the powers it needs (a database probe, a
+  deploy command, a metrics query) without ever flipping
+  `--allow-bash`.
+
+* **Safe defaults.** No filesystem, no shell, no writes — until
+  you opt in. Every privileged opt-in is logged at startup with
+  sanity warnings (shell wrappers, world-writable binaries,
+  dynamic-linker env passthrough). Three rounds of security
+  audits in [`SECURITY_AUDIT.md`](SECURITY_AUDIT.md).
+
+* **A C++17 framework, not a wrapper.** Three lines wrap
+  llama.cpp into a real agent. Fluent builder for tools, full
+  sampling control, streaming callbacks, plan tool, named
+  sampling presets. Link `libeasyai`, ship one binary.
+
+* **Ops-ready.** Prometheus `/metrics`, Bearer auth, systemd unit
+  with `mlock` + `LimitMEMLOCK=infinity`, flash-attn, KV-cache
+  quantisation (`q8_0` / `q4_0` / `iq4_nl`), per-request body
+  cap, slow-loris timeouts. The Linux installer handles the whole
+  Debian/Ubuntu deploy in one command.
+
+### Get going in 60 seconds
+
+```sh
+# Raspberry Pi 4 / Pi 5 (Pi OS 64-bit) — your LAN's AI appliance:
+git clone https://github.com/solariun/easy && cd easy
+sudo ./scripts/install_easyai_pi.sh
+# → http://pi-ai.local on every device on your network
+
+# Mac (Apple Silicon or Intel):
+git clone https://github.com/solariun/easy && cd easy
+./scripts/install_easyai_macos.sh
+# → http://localhost:8080
+
+# Linux server (Debian / Ubuntu):
+git clone https://github.com/solariun/easy && cd easy
+sudo ./scripts/install_easyai_server.sh --model /path/to/your.gguf
+# → http://0.0.0.0:80 with full systemd + auth + Prometheus metrics
+```
+
+Then open the URL in any browser, or point your favourite OpenAI
+client at the same address. That's it.
+
+---
+
 ## At a glance
 
 The pitch in three lines:
