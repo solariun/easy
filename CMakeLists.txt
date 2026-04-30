@@ -28,6 +28,35 @@ option(EASYAI_WITH_CURL      "Build web_fetch / web_search"            ON)
 option(EASYAI_BUILD_WEBUI    "Embed the llama-server-style webui"      ON)
 option(EASYAI_INSTALL        "Generate install + find_package targets" ON)
 
+# ----- 64-bit std::atomic probe ---------------------------------------------
+# Some example binaries declare `std::atomic<int64_t>` /
+# `std::atomic<uint64_t>` (server.cpp's /metrics counters,
+# local.cpp's signal-debounce timestamp). On aarch64 / x86_64 those
+# compile to native instructions and need no extra link; on 32-bit
+# ARM (`arm-linux-gnueabihf`, the default Pi OS 32-bit toolchain
+# AND any aarch64 host whose default compiler still defaults to
+# armhf) the compiler emits __atomic_load_8 / __atomic_fetch_add_8
+# calls that live in libatomic.so.1.
+#
+# Probe once here; targets that use 64-bit atomics link `atomic` iff
+# the probe failed. Variable is cached so reconfigures don't re-run
+# the test.
+include(CheckCXXSourceCompiles)
+check_cxx_source_compiles("
+    #include <atomic>
+    #include <cstdint>
+    int main() {
+        std::atomic<uint64_t> x{0};
+        return (int) x.fetch_add(1);
+    }
+" EASYAI_HAVE_NATIVE_64BIT_ATOMICS)
+if (NOT EASYAI_HAVE_NATIVE_64BIT_ATOMICS)
+    set(EASYAI_ATOMIC_LIBS atomic)
+    message(STATUS "easyai: 32-bit-ARM-style 64-bit atomics — linking libatomic on server + local")
+else()
+    set(EASYAI_ATOMIC_LIBS "")
+endif()
+
 # ------------------------------------------------------------------ llama.cpp
 # Pulled in as a sibling directory; we disable its own apps so the build
 # is fast and we only get the libraries we need.
@@ -187,7 +216,10 @@ if (EASYAI_BUILD_EXAMPLES)
     # easyai::Engine.  No HTTP transport here.  For talking to a remote
     # OpenAI-compatible endpoint, see easyai-cli below.
     add_executable(easyai-local examples/local.cpp)
-    target_link_libraries(easyai-local PRIVATE easyai)
+    # local.cpp uses std::atomic<int64_t> for the SIGINT debounce
+    # timestamp; same 32-bit-ARM caveat as server.cpp — link
+    # libatomic when the probe failed.
+    target_link_libraries(easyai-local PRIVATE easyai ${EASYAI_ATOMIC_LIBS})
     target_include_directories(easyai-local PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/../llama.cpp/vendor)
 
@@ -223,35 +255,13 @@ if (EASYAI_BUILD_EXAMPLES)
     set_source_files_properties(${_brand_out} PROPERTIES GENERATED TRUE)
 
     add_executable(easyai-server examples/server.cpp ${EASYAI_WEBUI_HEADERS})
-    target_link_libraries(easyai-server PRIVATE easyai cpp-httplib llama-common)
+    target_link_libraries(easyai-server PRIVATE easyai cpp-httplib llama-common ${EASYAI_ATOMIC_LIBS})
     target_include_directories(easyai-server PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/../llama.cpp/vendor/cpp-httplib
         ${CMAKE_CURRENT_SOURCE_DIR}/../llama.cpp/vendor
         ${CMAKE_CURRENT_BINARY_DIR})
     if (EASYAI_BUILD_WEBUI)
         target_compile_definitions(easyai-server PRIVATE EASYAI_BUILD_WEBUI=1)
-    endif()
-
-    # libatomic on 32-bit ARM. server.cpp uses std::atomic<uint64_t>
-    # for the /metrics counters; on aarch64 / x86_64 those compile down
-    # to native instructions, but on 32-bit ARM (`arm-linux-gnueabihf`,
-    # the default Raspberry Pi OS 32-bit toolchain) the compiler emits
-    # __atomic_load_8 / __atomic_fetch_add_8 calls that live in
-    # libatomic.so.1. The link check fails on those hosts; add the lib
-    # explicitly. On targets where atomics are inline the check passes
-    # and we add nothing — no spurious dependency on 64-bit hosts.
-    include(CheckCXXSourceCompiles)
-    check_cxx_source_compiles("
-        #include <atomic>
-        #include <cstdint>
-        int main() {
-            std::atomic<uint64_t> x{0};
-            return (int) x.fetch_add(1);
-        }
-    " EASYAI_HAVE_NATIVE_64BIT_ATOMICS)
-    if (NOT EASYAI_HAVE_NATIVE_64BIT_ATOMICS)
-        message(STATUS "easyai-server: linking libatomic for 64-bit std::atomic")
-        target_link_libraries(easyai-server PRIVATE atomic)
     endif()
 
     # easyai-cli — agentic OpenAI-protocol client.  Talks to any
