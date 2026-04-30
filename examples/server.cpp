@@ -3277,7 +3277,14 @@ int main(int argc, char ** argv) {
                   "/MCP Servers?$/i,"
                   "/^MCP Prompt/i,"
                   "/^MCP Resource/i,"
-                  "/Add (files, )?(system prompt or )?(configure )?MCP/i,"
+                  // Don't hide the bundle's "+" button (whose tooltip /
+                  // aria-label is the full "Add files, system prompt or
+                  // configure MCP servers" string). The MCP MENU ITEMS
+                  // inside the popup are still caught by the other
+                  // regexes above (`^MCP Server`, `Configure MCP`, etc.),
+                  // so we lose the unwanted items but keep the button +
+                  // its file-attach functionality.
+                  "/^Configure MCP/i,"
                   "/No MCP /i,"
                   "/All MCP server connections/i,"
                   "/^Sign in/i,/^Log in$/i,/^Login$/i,"
