@@ -907,6 +907,50 @@ CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 WantedBy=multi-user.target
 UNIT
 
+    # ---- legacy drop-in cleanup --------------------------------------------
+    # Earlier versions of this script wrote SOME flags into separate drop-in
+    # files under .service.d/ (e.g. verbose.conf carried `--verbose` via its
+    # own ExecStart=). Those files survive an upgrade and silently MASK the
+    # main unit's ExecStart, dropping every new flag the operator was meant
+    # to inherit (--external-tools, --REG, …). Concrete failure: REG enabled
+    # in the main unit, but reg_* tools never registered because the
+    # legacy drop-in's ExecStart wins.
+    #
+    # We do TWO things every install:
+    #
+    #   1. Delete drop-ins that THIS script used to create. Those files are
+    #      ours, we know what's in them, removing is safe. Any flag they
+    #      carried (--verbose) is now baked into the main unit.
+    #
+    #   2. WARN about any other drop-in that contains `ExecStart=` —
+    #      typically an operator-authored override.conf (`systemctl edit
+    #      easyai-server`). We do NOT delete those; the operator chose to
+    #      add them. The warning surfaces the silent-masking risk so they
+    #      can either remove the override or merge our new flags into it.
+    dropin_dir="/etc/systemd/system/$service_name.d"
+    if [[ -d "$dropin_dir" ]]; then
+        # Known-legacy files created by previous versions of THIS script.
+        # Add new entries here when we deprecate a drop-in.
+        legacy_dropins=(
+            "verbose.conf"          # superseded by `args+=( --verbose )` in main unit
+        )
+        for f in "${legacy_dropins[@]}"; do
+            if [[ -f "$dropin_dir/$f" ]]; then
+                log "removing legacy drop-in $dropin_dir/$f (its content is now in the main unit)"
+                sudo rm -f "$dropin_dir/$f"
+            fi
+        done
+
+        # Warn about any remaining drop-in that carries ExecStart= — those
+        # would override the main unit's command and silently drop our flags.
+        # `find` instead of glob so an empty dir doesn't trip nullglob.
+        while IFS= read -r f; do
+            warn "drop-in '$f' contains ExecStart= and will OVERRIDE the main unit's ExecStart."
+            warn "  This silently strips --external-tools / --REG / … from the running server."
+            warn "  Either remove it (sudo rm '$f') or merge the new flags into it manually."
+        done < <(sudo grep -lE '^[[:space:]]*ExecStart=' "$dropin_dir"/*.conf 2>/dev/null || true)
+    fi
+
     sudo systemctl daemon-reload
 
     if [[ $do_enable_now -eq 1 ]]; then
