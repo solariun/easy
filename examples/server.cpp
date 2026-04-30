@@ -3076,209 +3076,241 @@ struct ServerArgs {
     std::set<std::string>      cli_set;
 };
 
+// =============================================================================
+// FlagDef — single source of truth shared by the CLI parser and the INI
+// overlay. Each entry declares ONE setting: its CLI aliases, its INI
+// section/key, the canonical name used for cli_set tracking, whether
+// it takes a value on the command line, and a setter lambda that
+// applies a string value to the right field of `ServerArgs`.
+//
+// Adding a new setting = ONE entry in the kFlags() table, period.
+// The CLI parser and the INI overlay both walk this table; they never
+// hold flag-specific knowledge.
+// =============================================================================
+struct FlagDef {
+    std::vector<std::string> cli;       // {"--port"} or {"-c","--ctx"}; empty = INI-only
+    std::string ini_section;            // "SERVER" / "ENGINE" / "" for INI-skip
+    std::string ini_key;
+    std::string canonical;              // entry in cli_set when CLI sets this
+    bool        takes_value = true;     // false → no-value boolean flag
+    // Setter: parses `v` and writes the right field in `a`. For no-value
+    // CLI flags, `v` is empty; the setter must handle that as "set true".
+    std::function<void(ServerArgs &, const std::string & v)> set;
+};
+
+// ---- typed setter helpers ---------------------------------------------------
+//
+// Bind a member-pointer to a setter that parses a string and assigns
+// the right type. Each helper handles ITS OWN parsing — INI values
+// arrive as strings, CLI values arrive as strings, all flow through
+// the same path.
+namespace {
+
+bool str_to_bool(const std::string & s_raw, bool def) {
+    std::string s = s_raw;
+    for (auto & c : s) c = (char) std::tolower((unsigned char) c);
+    if (s.empty()) return true;   // CLI no-value → true
+    if (s == "on" || s == "true" || s == "yes" || s == "1" ||
+        s == "enable" || s == "enabled") return true;
+    if (s == "off" || s == "false" || s == "no" || s == "0" ||
+        s == "disable" || s == "disabled") return false;
+    return def;
+}
+
+auto SET_STR(std::string ServerArgs::* f) {
+    return [f](ServerArgs & a, const std::string & v) { if (!v.empty()) a.*f = v; };
+}
+auto SET_INT(int ServerArgs::* f) {
+    return [f](ServerArgs & a, const std::string & v) {
+        if (v.empty()) return;
+        try { a.*f = std::stoi(v); } catch (...) {}
+    };
+}
+auto SET_UINT32(uint32_t ServerArgs::* f) {
+    return [f](ServerArgs & a, const std::string & v) {
+        if (v.empty()) return;
+        try { a.*f = (uint32_t) std::stoul(v); } catch (...) {}
+    };
+}
+auto SET_SIZE(size_t ServerArgs::* f) {
+    return [f](ServerArgs & a, const std::string & v) {
+        if (v.empty()) return;
+        try { a.*f = (size_t) std::stoll(v); } catch (...) {}
+    };
+}
+auto SET_FLOAT(float ServerArgs::* f) {
+    return [f](ServerArgs & a, const std::string & v) {
+        if (v.empty()) return;
+        try { a.*f = std::stof(v); } catch (...) {}
+    };
+}
+// SET_BOOL_TRUE: CLI no-value → field=true; INI/value → parse string.
+// Used for the typical flag-only bool (--metrics, --mlock, -fa, …).
+auto SET_BOOL_TRUE(bool ServerArgs::* f) {
+    return [f](ServerArgs & a, const std::string & v) {
+        a.*f = str_to_bool(v, a.*f);
+    };
+}
+// SET_BOOL_FALSE: CLI no-value → field=false; INI/value → parse string.
+// Used for negative-polarity flag (--no-tools sets load_tools=false).
+// INI key in this case is the POSITIVE name; INI parses normally.
+auto SET_BOOL_FALSE(bool ServerArgs::* f) {
+    return [f](ServerArgs & a, const std::string & v) {
+        // CLI no-value: empty string → field=false.
+        if (v.empty()) { a.*f = false; return; }
+        a.*f = str_to_bool(v, a.*f);
+    };
+}
+// SET_LIST_APPEND: each invocation appends to a vector<string>.
+// INI side: comma-separated value, split + append.
+auto SET_LIST_APPEND(std::vector<std::string> ServerArgs::* f) {
+    return [f](ServerArgs & a, const std::string & v) {
+        if (v.empty()) return;
+        // Split on commas to support INI like `key = a,b,c`. CLI
+        // typically sends one value per --override-kv; multi-value
+        // INI form is a convenience.
+        std::size_t start = 0;
+        while (start <= v.size()) {
+            std::size_t comma = v.find(',', start);
+            std::string piece = v.substr(start, comma - start);
+            // trim
+            while (!piece.empty() && std::isspace((unsigned char) piece.front())) piece.erase(piece.begin());
+            while (!piece.empty() && std::isspace((unsigned char) piece.back()))  piece.pop_back();
+            if (!piece.empty()) (a.*f).push_back(std::move(piece));
+            if (comma == std::string::npos) break;
+            start = comma + 1;
+        }
+    };
+}
+
+}  // namespace
+
+// ---- The flag table ---------------------------------------------------------
+//
+// One table, two consumers (parse_args + apply_ini_to_args). Adding a
+// new flag is one row. Order matters only cosmetically — the CLI
+// parser does linear search per argv token (negligible at ~50 entries
+// × small N).
+static const std::vector<FlagDef> & kFlags() {
+    static const std::vector<FlagDef> table = {
+        // ----- core paths / identity (SERVER) -----
+        { {"-m","--model"},        "SERVER", "model",          "model",          true,  SET_STR(&ServerArgs::model_path) },
+        { {"--config"},            "",       "",               "config",         true,  SET_STR(&ServerArgs::config_path) },
+        { {"--host"},              "SERVER", "host",           "host",           true,  SET_STR(&ServerArgs::host) },
+        { {"--port"},              "SERVER", "port",           "port",           true,  SET_INT(&ServerArgs::port) },
+        { {"-a","--alias"},        "SERVER", "alias",          "alias",          true,  SET_STR(&ServerArgs::alias) },
+        { {"--sandbox"},           "SERVER", "sandbox",        "sandbox",        true,  SET_STR(&ServerArgs::sandbox) },
+        { {"-s","--system-file"},  "SERVER", "system_file",    "system_file",    true,  SET_STR(&ServerArgs::system_path) },
+        { {"--system"},            "SERVER", "system_inline",  "system_inline",  true,  SET_STR(&ServerArgs::system_inline) },
+        { {"--external-tools"},    "SERVER", "external_tools", "external_tools", true,  SET_STR(&ServerArgs::external_tools_dir) },
+        { {"--RAG"},               "SERVER", "rag",            "rag",            true,  SET_STR(&ServerArgs::rag_dir) },
+        { {"--api-key"},           "SERVER", "api_key",        "api_key",        true,  SET_STR(&ServerArgs::api_key) },
+        { {"--max-body"},          "SERVER", "max_body",       "max_body",       true,  SET_SIZE(&ServerArgs::max_body) },
+        // ----- toggles (SERVER) -----
+        { {"--metrics"},           "SERVER", "metrics",        "metrics",        false, SET_BOOL_TRUE(&ServerArgs::metrics) },
+        { {"-v","--verbose"},      "SERVER", "verbose",        "verbose",        false, SET_BOOL_TRUE(&ServerArgs::verbose) },
+        { {"--allow-fs"},          "SERVER", "allow_fs",       "allow_fs",       false, SET_BOOL_TRUE(&ServerArgs::allow_fs) },
+        { {"--allow-bash"},        "SERVER", "allow_bash",     "allow_bash",     false, SET_BOOL_TRUE(&ServerArgs::allow_bash) },
+        { {"--no-tools"},          "SERVER", "load_tools",     "load_tools",     false, SET_BOOL_FALSE(&ServerArgs::load_tools) },
+        { {"--no-think"},          "SERVER", "no_think",       "no_think",       false, SET_BOOL_TRUE(&ServerArgs::no_think) },
+        { {"--inject-datetime"},   "SERVER", "inject_datetime","inject_datetime",true,  SET_BOOL_TRUE(&ServerArgs::inject_datetime) },
+        { {"--knowledge-cutoff"},  "SERVER", "knowledge_cutoff","knowledge_cutoff",true, SET_STR(&ServerArgs::knowledge_cutoff) },
+        { {"--reasoning"},         "SERVER", "reasoning",      "reasoning",      true,  SET_BOOL_TRUE(&ServerArgs::reasoning) },
+        { {"--no-mcp-auth"},       "",       "",               "no_mcp_auth",    false, SET_BOOL_TRUE(&ServerArgs::no_mcp_auth) },
+        // mcp_auth has NO CLI alias — INI-only; the override path is --no-mcp-auth above.
+        { {},                      "SERVER", "mcp_auth",       "mcp_auth",       true,
+          [](ServerArgs & a, const std::string & v) {
+              std::string s = v;
+              for (auto & c : s) c = (char) std::tolower((unsigned char) c);
+              if (s == "off" || s == "open" || s == "disabled" || s == "disable" ||
+                  s == "false" || s == "no" || s == "0") {
+                  a.no_mcp_auth = true;
+              } else if (s == "on" || s == "required" || s == "enabled" ||
+                         s == "enable" || s == "true" || s == "yes" || s == "1") {
+                  a.no_mcp_auth = false;
+              }
+          } },
+        // ----- webui (SERVER) -----
+        { {"--webui-title"},       "SERVER", "webui_title",    "webui_title",    true,  SET_STR(&ServerArgs::webui_title) },
+        { {"--webui-icon"},        "SERVER", "webui_icon",     "webui_icon",     true,  SET_STR(&ServerArgs::webui_icon) },
+        { {"--webui-placeholder"}, "SERVER", "webui_placeholder","webui_placeholder",true, SET_STR(&ServerArgs::webui_placeholder) },
+        { {"--webui"},             "SERVER", "webui_mode",     "webui_mode",     true,  SET_STR(&ServerArgs::webui_mode) },
+
+        // ----- ENGINE -----
+        { {"-c","--ctx"},          "ENGINE", "context",        "context",        true,  SET_INT(&ServerArgs::n_ctx) },
+        { {"--ngl"},               "ENGINE", "ngl",            "ngl",            true,  SET_INT(&ServerArgs::ngl) },
+        { {"-t","--threads"},      "ENGINE", "threads",        "threads",        true,  SET_INT(&ServerArgs::n_threads) },
+        { {"-tb","--threads-batch"},"ENGINE","threads_batch",  "threads_batch",  true,  SET_INT(&ServerArgs::threads_batch) },
+        { {"--batch"},             "ENGINE", "batch",          "batch",          true,  SET_INT(&ServerArgs::n_batch) },
+        { {"-np","--parallel"},    "ENGINE", "parallel",       "parallel",       true,  SET_INT(&ServerArgs::parallel) },
+        { {"--preset"},            "ENGINE", "preset",         "preset",         true,  SET_STR(&ServerArgs::preset) },
+        { {"-fa","--flash-attn"},  "ENGINE", "flash_attn",     "flash_attn",     false, SET_BOOL_TRUE(&ServerArgs::flash_attn) },
+        { {"--mlock"},             "ENGINE", "mlock",          "mlock",          false, SET_BOOL_TRUE(&ServerArgs::mlock) },
+        { {"--no-mmap"},           "ENGINE", "no_mmap",        "no_mmap",        false, SET_BOOL_TRUE(&ServerArgs::no_mmap) },
+        { {"-nkvo","--no-kv-offload"},"ENGINE","no_kv_offload","no_kv_offload",  false, SET_BOOL_TRUE(&ServerArgs::no_kv_offload) },
+        { {"--kv-unified"},        "ENGINE", "kv_unified",     "kv_unified",     false, SET_BOOL_TRUE(&ServerArgs::kv_unified) },
+        { {"-ctk","--cache-type-k"},"ENGINE","cache_type_k",   "cache_type_k",   true,  SET_STR(&ServerArgs::cache_type_k) },
+        { {"-ctv","--cache-type-v"},"ENGINE","cache_type_v",   "cache_type_v",   true,  SET_STR(&ServerArgs::cache_type_v) },
+        { {"--numa"},              "ENGINE", "numa",           "numa",           true,  SET_STR(&ServerArgs::numa) },
+        { {"--override-kv"},       "ENGINE", "override_kv",    "override_kv",    true,  SET_LIST_APPEND(&ServerArgs::kv_overrides) },
+        // sampling
+        { {"--temperature","--temp"},"ENGINE","temperature",   "temperature",    true,  SET_FLOAT(&ServerArgs::temperature) },
+        { {"--top-p"},             "ENGINE", "top_p",          "top_p",          true,  SET_FLOAT(&ServerArgs::top_p) },
+        { {"--top-k"},             "ENGINE", "top_k",          "top_k",          true,  SET_INT(&ServerArgs::top_k) },
+        { {"--min-p"},             "ENGINE", "min_p",          "min_p",          true,  SET_FLOAT(&ServerArgs::min_p) },
+        { {"--repeat-penalty"},    "ENGINE", "repeat_penalty", "repeat_penalty", true,  SET_FLOAT(&ServerArgs::repeat_penalty) },
+        { {"--max-tokens"},        "ENGINE", "max_tokens",     "max_tokens",     true,  SET_INT(&ServerArgs::max_tokens) },
+        { {"--seed"},              "ENGINE", "seed",           "seed",           true,  SET_UINT32(&ServerArgs::seed) },
+    };
+    return table;
+}
+
+// ---- CLI parser — iterates kFlags() ----------------------------------------
 static ServerArgs parse_args(int argc, char ** argv) {
     ServerArgs a;
-    auto need = [&](int & i, const char * flag) -> const char * {
-        if (i + 1 >= argc) { std::fprintf(stderr, "missing value for %s\n", flag); die_usage(argv[0]); }
-        return argv[++i];
-    };
-    // SET("name") is the single source of truth for "this CLI flag was
-    // explicitly passed". apply_ini_to_args() consults the set and only
-    // overlays INI values for fields that AREN'T in it. Keep names
-    // canonical (one entry per logical field — short alias and long
-    // alias both insert the same name) so the overlay mapping stays
-    // simple.
-    auto SET = [&](const char * canonical) { a.cli_set.insert(canonical); };
+    const auto & flags = kFlags();
     for (int i = 1; i < argc; ++i) {
         std::string s = argv[i];
-        if      (s == "-m" || s == "--model")        { a.model_path     = need(i, "-m");                  SET("model"); }
-        else if (s == "-s" || s == "--system-file")  { a.system_path    = need(i, "-s");                  SET("system_file"); }
-        else if (s == "--config")                    { a.config_path    = need(i, "--config");            SET("config"); }
-        else if (s == "--system")                    { a.system_inline  = need(i, "--system");            SET("system_inline"); }
-        else if (s == "--host")                      { a.host           = need(i, "--host");              SET("host"); }
-        else if (s == "--port")                      { a.port           = std::atoi(need(i, "--port"));   SET("port"); }
-        else if (s == "-c" || s == "--ctx")          { a.n_ctx          = std::atoi(need(i, "-c"));       SET("context"); }
-        else if (s == "--ngl")                       { a.ngl            = std::atoi(need(i, "--ngl"));    SET("ngl"); }
-        else if (s == "-t" || s == "--threads")      { a.n_threads      = std::atoi(need(i, "-t"));       SET("threads"); }
-        else if (s == "--no-tools")                  { a.load_tools     = false;                          SET("load_tools"); }
-        else if (s == "--sandbox")                   { a.sandbox        = need(i, "--sandbox");           SET("sandbox"); }
-        else if (s == "--allow-fs")                  { a.allow_fs       = true;                           SET("allow_fs"); }
-        else if (s == "--allow-bash")                { a.allow_bash     = true;                           SET("allow_bash"); }
-        else if (s == "--external-tools")            { a.external_tools_dir = need(i, "--external-tools"); SET("external_tools"); }
-        else if (s == "--RAG")                       { a.rag_dir            = need(i, "--RAG");           SET("rag"); }
-        else if (s == "--preset")                    { a.preset         = need(i, "--preset");            SET("preset"); }
-        else if (s == "--max-body")                  { a.max_body       = (size_t) std::atoll(need(i, "--max-body")); SET("max_body"); }
-        else if (s == "--batch")                     { a.n_batch        = std::atoi(need(i, "--batch"));  SET("batch"); }
-        // sampling overrides
-        else if (s == "--temperature" || s == "--temp") { a.temperature = std::atof(need(i, "--temperature")); SET("temperature"); }
-        else if (s == "--top-p")                     { a.top_p          = std::atof(need(i, "--top-p"));  SET("top_p"); }
-        else if (s == "--top-k")                     { a.top_k          = std::atoi(need(i, "--top-k"));  SET("top_k"); }
-        else if (s == "--min-p")                     { a.min_p          = std::atof(need(i, "--min-p"));  SET("min_p"); }
-        else if (s == "--repeat-penalty")            { a.repeat_penalty = std::atof(need(i, "--repeat-penalty")); SET("repeat_penalty"); }
-        else if (s == "--max-tokens")                { a.max_tokens     = std::atoi(need(i, "--max-tokens")); SET("max_tokens"); }
-        else if (s == "--seed")                      { a.seed           = (uint32_t) std::strtoul(need(i, "--seed"), nullptr, 10); SET("seed"); }
-        // KV cache
-        else if (s == "-ctk" || s == "--cache-type-k") { a.cache_type_k = need(i, "-ctk");                SET("cache_type_k"); }
-        else if (s == "-ctv" || s == "--cache-type-v") { a.cache_type_v = need(i, "-ctv");                SET("cache_type_v"); }
-        else if (s == "-nkvo" || s == "--no-kv-offload") { a.no_kv_offload = true;                        SET("no_kv_offload"); }
-        else if (s == "--kv-unified")                { a.kv_unified     = true;                           SET("kv_unified"); }
-        else if (s == "--override-kv")               { a.kv_overrides.push_back(need(i, "--override-kv")); SET("override_kv"); }
-        // llama-server compat
-        else if (s == "-a"  || s == "--alias")       { a.alias          = need(i, "-a");                  SET("alias"); }
-        else if (s == "--api-key")                   { a.api_key        = need(i, "--api-key");           SET("api_key"); }
-        else if (s == "--numa")                      { a.numa           = need(i, "--numa");              SET("numa"); }
-        else if (s == "-tb" || s == "--threads-batch") { a.threads_batch = std::atoi(need(i, "-tb"));     SET("threads_batch"); }
-        else if (s == "-np" || s == "--parallel")    { a.parallel       = std::atoi(need(i, "-np"));      SET("parallel"); }
-        else if (s == "-fa" || s == "--flash-attn")  { a.flash_attn     = true;                           SET("flash_attn"); }
-        else if (s == "--mlock")                     { a.mlock          = true;                           SET("mlock"); }
-        else if (s == "--no-mmap")                   { a.no_mmap        = true;                           SET("no_mmap"); }
-        else if (s == "--metrics")                   { a.metrics        = true;                           SET("metrics"); }
-        else if (s == "--reasoning") {
-            std::string v = need(i, "--reasoning");
-            a.reasoning = (v == "on" || v == "1" || v == "true" || v == "yes");
-            SET("reasoning");
+        if (s == "-h" || s == "--help") die_usage(argv[0]);
+
+        const FlagDef * matched = nullptr;
+        for (const auto & f : flags) {
+            for (const auto & alias : f.cli) {
+                if (alias == s) { matched = &f; break; }
+            }
+            if (matched) break;
         }
-        else if (s == "--no-think")                  { a.no_think       = true;                           SET("no_think"); }
-        else if (s == "--inject-datetime") {
-            std::string v = need(i, "--inject-datetime");
-            a.inject_datetime = (v == "on" || v == "1" || v == "true" || v == "yes");
-            SET("inject_datetime");
+        if (!matched) {
+            std::fprintf(stderr, "unknown arg: %s\n", s.c_str());
+            die_usage(argv[0]);
         }
-        else if (s == "--knowledge-cutoff")          { a.knowledge_cutoff = need(i, "--knowledge-cutoff"); SET("knowledge_cutoff"); }
-        else if (s == "-v" || s == "--verbose")      { a.verbose        = true;                           SET("verbose"); }
-        else if (s == "--webui-title")               { a.webui_title    = need(i, "--webui-title");       SET("webui_title"); }
-        else if (s == "--webui-icon")                { a.webui_icon     = need(i, "--webui-icon");        SET("webui_icon"); }
-        else if (s == "--webui-placeholder")         { a.webui_placeholder = need(i, "--webui-placeholder"); SET("webui_placeholder"); }
-        else if (s == "--webui")                     { a.webui_mode     = need(i, "--webui");             SET("webui_mode"); }
-        else if (s == "--no-mcp-auth")               { a.no_mcp_auth    = true;                           SET("no_mcp_auth"); }
-        else if (s == "-h" || s == "--help")         die_usage(argv[0]);
-        else { std::fprintf(stderr, "unknown arg: %s\n", s.c_str()); die_usage(argv[0]); }
+        std::string value;
+        if (matched->takes_value) {
+            if (i + 1 >= argc) {
+                std::fprintf(stderr, "missing value for %s\n", s.c_str());
+                die_usage(argv[0]);
+            }
+            value = argv[++i];
+        }
+        matched->set(a, value);
+        a.cli_set.insert(matched->canonical);
     }
     return a;
 }
 
-// Apply the INI as defaults — for every setting NOT in `cli_set`, if
-// the INI has a value, use it. Order: CLI > INI > hardcoded default
-// (already in `args` from struct initialisation). Any INI value that
-// fails to parse (e.g. "abc" for an integer) is silently ignored —
-// the field keeps its hardcoded default. The INI parser already
-// surfaced the malformed line as a warning at file-load time.
+// ---- INI overlay — iterates the SAME kFlags() table -------------------------
+//
+// For every entry that has an INI section/key declared AND was NOT passed
+// on the command line, fetch the INI value and feed it to the same setter
+// the CLI uses. Empty INI values are skipped — the field keeps its
+// hardcoded default.
 static void apply_ini_to_args(const easyai::config::Ini & ini, ServerArgs & a) {
-    auto have = [&](const char * name) { return a.cli_set.count(name) > 0; };
-
-    auto get_str = [&](const char * sec, const char * key) {
-        return ini.get(sec, key);
-    };
-    auto get_bool_or = [&](const char * sec, const char * key, bool def) {
-        std::string v = ini.get(sec, key);
-        if (v.empty()) return def;
-        for (auto & c : v) c = (char) std::tolower((unsigned char) c);
-        if (v == "on" || v == "true" || v == "yes" || v == "1" ||
-            v == "enable" || v == "enabled") return true;
-        if (v == "off" || v == "false" || v == "no" || v == "0" ||
-            v == "disable" || v == "disabled") return false;
-        return def;
-    };
-    auto get_int_or = [&](const char * sec, const char * key, int def) {
-        std::string v = ini.get(sec, key);
-        if (v.empty()) return def;
-        try { return std::stoi(v); } catch (...) { return def; }
-    };
-    auto get_long_or = [&](const char * sec, const char * key, long def) {
-        std::string v = ini.get(sec, key);
-        if (v.empty()) return def;
-        try { return std::stol(v); } catch (...) { return def; }
-    };
-    auto get_float_or = [&](const char * sec, const char * key, float def) {
-        std::string v = ini.get(sec, key);
-        if (v.empty()) return def;
-        try { return std::stof(v); } catch (...) { return def; }
-    };
-
-    // ----- [SERVER] -------------------------------------------------------
-    if (!have("model"))           { auto v = get_str("SERVER", "model");
-                                    if (!v.empty()) a.model_path = v; }
-    if (!have("host"))            { auto v = get_str("SERVER", "host");
-                                    if (!v.empty()) a.host = v; }
-    if (!have("port"))            a.port    = get_int_or("SERVER", "port",    a.port);
-    if (!have("alias"))           { auto v = get_str("SERVER", "alias");
-                                    if (!v.empty()) a.alias = v; }
-    if (!have("sandbox"))         { auto v = get_str("SERVER", "sandbox");
-                                    if (!v.empty()) a.sandbox = v; }
-    if (!have("system_file"))     { auto v = get_str("SERVER", "system_file");
-                                    if (!v.empty()) a.system_path = v; }
-    if (!have("external_tools"))  { auto v = get_str("SERVER", "external_tools");
-                                    if (!v.empty()) a.external_tools_dir = v; }
-    if (!have("rag"))             { auto v = get_str("SERVER", "rag");
-                                    if (!v.empty()) a.rag_dir = v; }
-    if (!have("api_key"))         { auto v = get_str("SERVER", "api_key");
-                                    if (!v.empty()) a.api_key = v; }
-    if (!have("webui_title"))     { auto v = get_str("SERVER", "webui_title");
-                                    if (!v.empty()) a.webui_title = v; }
-    if (!have("webui_icon"))      { auto v = get_str("SERVER", "webui_icon");
-                                    if (!v.empty()) a.webui_icon = v; }
-    if (!have("webui_mode"))      { auto v = get_str("SERVER", "webui_mode");
-                                    if (!v.empty()) a.webui_mode = v; }
-    if (!have("metrics"))         a.metrics  = get_bool_or("SERVER", "metrics",  a.metrics);
-    if (!have("verbose"))         a.verbose  = get_bool_or("SERVER", "verbose",  a.verbose);
-    if (!have("allow_fs"))        a.allow_fs = get_bool_or("SERVER", "allow_fs", a.allow_fs);
-    if (!have("allow_bash"))      a.allow_bash = get_bool_or("SERVER", "allow_bash", a.allow_bash);
-    if (!have("max_body"))        a.max_body = (size_t) get_long_or("SERVER", "max_body", (long) a.max_body);
-    if (!have("no_think"))        a.no_think = get_bool_or("SERVER", "no_think", a.no_think);
-    if (!have("inject_datetime")) a.inject_datetime = get_bool_or("SERVER", "inject_datetime", a.inject_datetime);
-    if (!have("knowledge_cutoff")){ auto v = get_str("SERVER", "knowledge_cutoff");
-                                    if (!v.empty()) a.knowledge_cutoff = v; }
-    if (!have("reasoning"))       a.reasoning = get_bool_or("SERVER", "reasoning", a.reasoning);
-
-    // [SERVER] mcp_auth = on|off → equivalent to --no-mcp-auth (off) when set.
-    // "off" / "open" / "disabled" → no_mcp_auth=true; "on" / "required" → false.
-    // Unset / empty → leave the binary default (auto-detect from [MCP_USER]).
-    if (!have("no_mcp_auth")) {
-        std::string v = ini.get("SERVER", "mcp_auth");
-        for (auto & c : v) c = (char) std::tolower((unsigned char) c);
-        if (v == "off" || v == "open" || v == "disabled" || v == "disable" ||
-            v == "false" || v == "no" || v == "0") {
-            a.no_mcp_auth = true;
-        } else if (v == "on" || v == "required" || v == "enabled" ||
-                   v == "enable" || v == "true" || v == "yes" || v == "1") {
-            a.no_mcp_auth = false;
-        }
-        // anything else (including empty) → leave alone (default false)
-    }
-
-    // ----- [ENGINE] -------------------------------------------------------
-    if (!have("context"))         a.n_ctx     = get_int_or("ENGINE", "context",       a.n_ctx);
-    if (!have("ngl"))             a.ngl       = get_int_or("ENGINE", "ngl",           a.ngl);
-    if (!have("threads"))         a.n_threads = get_int_or("ENGINE", "threads",       a.n_threads);
-    if (!have("threads_batch"))   a.threads_batch = get_int_or("ENGINE", "threads_batch", a.threads_batch);
-    if (!have("batch"))           a.n_batch   = get_int_or("ENGINE", "batch",         a.n_batch);
-    if (!have("preset"))          { auto v = get_str("ENGINE", "preset");
-                                    if (!v.empty()) a.preset = v; }
-    if (!have("flash_attn"))      a.flash_attn = get_bool_or("ENGINE", "flash_attn",   a.flash_attn);
-    if (!have("mlock"))           a.mlock      = get_bool_or("ENGINE", "mlock",        a.mlock);
-    if (!have("no_mmap"))         a.no_mmap    = get_bool_or("ENGINE", "no_mmap",      a.no_mmap);
-    if (!have("no_kv_offload"))   a.no_kv_offload = get_bool_or("ENGINE", "no_kv_offload", a.no_kv_offload);
-    if (!have("kv_unified"))      a.kv_unified  = get_bool_or("ENGINE", "kv_unified",  a.kv_unified);
-    if (!have("cache_type_k"))    { auto v = get_str("ENGINE", "cache_type_k");
-                                    if (!v.empty()) a.cache_type_k = v; }
-    if (!have("cache_type_v"))    { auto v = get_str("ENGINE", "cache_type_v");
-                                    if (!v.empty()) a.cache_type_v = v; }
-    if (!have("numa"))            { auto v = get_str("ENGINE", "numa");
-                                    if (!v.empty()) a.numa = v; }
-    if (!have("parallel"))        a.parallel   = get_int_or("ENGINE", "parallel",     a.parallel);
-
-    // sampling
-    if (!have("temperature"))     a.temperature   = get_float_or("ENGINE", "temperature",     a.temperature);
-    if (!have("top_p"))           a.top_p         = get_float_or("ENGINE", "top_p",           a.top_p);
-    if (!have("top_k"))           a.top_k         = get_int_or  ("ENGINE", "top_k",           a.top_k);
-    if (!have("min_p"))           a.min_p         = get_float_or("ENGINE", "min_p",           a.min_p);
-    if (!have("repeat_penalty"))  a.repeat_penalty = get_float_or("ENGINE", "repeat_penalty", a.repeat_penalty);
-    if (!have("max_tokens"))      a.max_tokens    = get_int_or  ("ENGINE", "max_tokens",      a.max_tokens);
-    if (!have("seed")) {
-        std::string v = ini.get("ENGINE", "seed");
-        if (!v.empty()) {
-            try { a.seed = (uint32_t) std::stoul(v); } catch (...) {}
-        }
+    for (const auto & f : kFlags()) {
+        if (f.ini_section.empty() || f.ini_key.empty()) continue;
+        if (a.cli_set.count(f.canonical))               continue;
+        std::string v = ini.get(f.ini_section, f.ini_key);
+        if (v.empty()) continue;
+        f.set(a, v);
     }
 }
 
