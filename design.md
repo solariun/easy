@@ -730,6 +730,94 @@ let the model use it" without leaving JSON.
 These are deliberate non-goals — adding any of them would expand
 the trust surface in ways the operator didn't sign up for.
 
+## 5g. REG — persistent registry / long-term memory
+
+Lives in `src/reg_tools.cpp` and `include/easyai/reg_tools.hpp`.
+User-facing documentation: [`REG.md`](REG.md). Operator guide:
+[`LINUX_SERVER.md`](LINUX_SERVER.md). This section describes *why*
+the subsystem is shaped the way it is.
+
+### Why a tag registry, not a vector store
+
+Vector stores assume you have a corpus that nobody classified. The
+agent IS the classifier — when it saves something, it just told you
+in clear language what the entry is about. Putting that
+classification in the filename + a small `keywords:` header lets
+us look up entries in O(1) per lookup with zero embedding inference.
+
+When we later want progressive recall (auto-inject the K most
+relevant entries on session start), THAT layer can do similarity
+scoring on top. REG itself stays simple: just files and keywords.
+The composition order matters: vector store on top of REG works
+fine; REG on top of a vector store would be either redundant or
+fighting the index.
+
+### Why one Markdown file per entry, not a database
+
+The dir is human-inspectable. Operator can `cat`, `vim`, `grep`,
+back up with `tar`, share with `scp`. There is no schema migration,
+no SQLite version drift, no "the agent's memory is a black box."
+The agent's mistakes are visible; the agent's good calls are
+visible; the operator can curate either by hand.
+
+A database would buy us atomicity and indexing. We get atomicity
+from `rename(2)`. We get indexing from a 200-line in-memory map
+that's rebuilt on first use (cost: parse N small files once per
+process — fast).
+
+### Why five tools, not one
+
+A single `reg(action, ...)` tool would shorten the schema but
+collapse the model's intent. Separate tools encode the intent in
+the tool name, which is the strongest signal the model has when
+choosing. `reg_save` calls and `reg_search` calls show up
+distinctly in audit logs / hooks; coarse `reg(action="save", ...)`
+calls would all blur together.
+
+Five also matches the natural workflow: save (write), search +
+load (read in two steps because previewing keeps the prompt
+slim), list (browse), delete (curate).
+
+### Why max 4 entries per `reg_load`
+
+Past 4, the model is almost always trying to drown the prompt in
+stale content. The cap forces "preview first, narrow second" —
+which is the right ergonomics for the agent loop.
+
+### Why operator-encouraging language in the descriptions
+
+The tool descriptions are the model's incentive layer. Generic
+"saves a note" descriptions produce a model that occasionally
+remembers things. Explicit "USE THIS AGGRESSIVELY for the user's
+preferences, project facts, recipes you found, things the user
+might re-ask" produces a model that builds a useful registry over
+time.
+
+This is the same lever the system prompt uses, but at finer
+granularity — one tool's behaviour at a time. As we accumulate
+operational experience we'll tune the descriptions further.
+
+### Where REG fits in the four-tier API rule
+
+| Tier | Audience | REG surface |
+| --- | --- | --- |
+| 1 — façade | beginner | `easyai::Agent` could opt into REG with a single setter (future). |
+| 2 — fluent | intermediate | Already exposed as `make_reg_tools(dir)` returning a `RegTools` struct of five `Tool` values that you `add_tool`. |
+| 3 — operator | deployment | `--REG <dir>` flag on all three CLIs; systemd unit passes it for free. |
+| 4 — escape hatch | extension | The `RegStore` private class is replaceable: a future variant could swap files for SQLite or vector store while keeping the same 5-tool surface. |
+
+### What REG is not
+
+- **Not a knowledge base.** The agent decides what goes in. Stale
+  entries persist until the agent (or operator) deletes them.
+- **Not a search engine.** Keyword exact match, no semantic search,
+  no fuzzy match. We ship the simple thing.
+- **Not multi-tenant.** One process, one REG dir. Per-user
+  namespaces are on the roadmap.
+- **Not transactional across calls.** Each tool call commits its
+  own state. There's no `BEGIN ... COMMIT`. The model is the
+  consistency layer.
+
 ---
 
 ## 6. The HTTP server

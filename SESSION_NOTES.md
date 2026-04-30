@@ -305,7 +305,28 @@ Webui title default also flips to `"Deep"`.
 ## 5. Recent commits (most recent first)
 
 ```
-2026-04-30 — External tools v2: directory loader + sanity-check warnings.
+2026-04-30 (afternoon) — REG: agent's persistent registry / long-term memory.
+
+(pending commit) REG: a tag-keyed file-backed long-term memory the
+                 model writes to via 5 tools (reg_save, reg_search,
+                 reg_load, reg_list, reg_delete). Directory of
+                 .md files <title>.md, format `keywords: a, b, c\n
+                 \n<body>` — hand-editable, grep-able, scp-able. Title
+                 regex closes path traversal. Bounded sizes (title 64,
+                 keyword 32, max 8/entry, body 256 KiB, max 4 loads/call).
+                 Atomic writes (tempfile + rename). In-memory index
+                 lazy-built. New `--REG <dir>` flag on easyai-server,
+                 easyai-cli, easyai-local; install script creates
+                 /var/lib/easyai/reg (owned by service user, 750) and
+                 systemd unit always passes the flag. Tool descriptions
+                 actively encourage save-aggressively /
+                 search-before-assuming / delete-stale. New top-level
+                 docs: REG.md (full guide w/ workflows, document
+                 ingestion cycle, roadmap) and LINUX_SERVER.md (operator
+                 guide for the systemd-installed server, file layout,
+                 perf tips, gotchas, API examples, backup/upgrade).
+
+2026-04-30 (morning) — External tools v2: directory loader + sanity-check warnings.
 
 (pending commit) External tools: rename --tools-json PATH to
                  --external-tools DIR, scanning EASYAI-*.tools files in
@@ -554,6 +575,15 @@ c6a09d6  Single combined bar above the textarea (tone + ctx + last)
 - **(B) Qwen3-thinking model stops after `</think>`** —
   ✅ **FIXED via thought-only retry path** (see "Bug B root cause" above).
   Validated via curl in this session.  Pending user webui validation.
+
+- **REG (`--REG DIR`)** — agent's persistent registry / long-term memory.
+  Five tools (reg_save / reg_search / reg_load / reg_list / reg_delete)
+  share a directory of `.md` files with `keywords: a,b,c` headers and
+  free-form bodies. Server enables by default
+  (`/var/lib/easyai/reg`, systemd unit always passes `--REG`); CLI
+  variants opt in. End-to-end smoke test passed (round-trip save →
+  list → search → load → delete). Authoritative doc: `REG.md`.
+  Operator guide: `LINUX_SERVER.md`.
 
 - **External tools (`--external-tools DIR`)** — landed in `d0f7965`,
   hardened in `e966cf1`, evolved to dir loader + sanity warnings in

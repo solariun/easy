@@ -2,10 +2,12 @@
 // RemoteBackend (wraps Client) lives in src/cli_client.cpp / libeasyai-cli.
 #include "easyai/backend.hpp"
 
+#include "easyai/builtin_tools.hpp"
 #include "easyai/cli.hpp"
 #include "easyai/engine.hpp"
 #include "easyai/external_tools.hpp"
 #include "easyai/presets.hpp"
+#include "easyai/reg_tools.hpp"
 #include "easyai/tool.hpp"
 
 #include <cstdio>
@@ -58,6 +60,20 @@ bool LocalBackend::init(std::string & err) {
             .sandbox   (cfg.sandbox)
             .allow_bash(cfg.allow_bash)
             .apply     (engine);
+    }
+
+    // REG — the agent's persistent registry (long-term memory).
+    // Registered when the operator gives us a directory. The
+    // directory does NOT have to exist yet; the tools create it on
+    // first save. Five tools: reg_save / reg_search / reg_load /
+    // reg_list / reg_delete. See REG.md for the full guide.
+    if (!cfg.reg_dir.empty()) {
+        auto reg = tools::make_reg_tools(cfg.reg_dir);
+        engine.add_tool(reg.save);
+        engine.add_tool(reg.search);
+        engine.add_tool(reg.load);
+        engine.add_tool(reg.list);
+        engine.add_tool(reg.del);
     }
 
     // External tools directory. Loaded after the built-in toolbelt so

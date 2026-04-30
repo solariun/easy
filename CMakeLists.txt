@@ -61,6 +61,7 @@ set(EASYAI_SOURCES
     src/tool.cpp
     src/builtin_tools.cpp
     src/external_tools.cpp
+    src/reg_tools.cpp
     src/presets.cpp
     src/plan.cpp
     src/ui.cpp

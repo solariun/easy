@@ -183,6 +183,35 @@ no shell.
 | `--sandbox <dir>`     | `fs_read_file / fs_write_file / fs_list_dir / fs_glob / fs_grep` plus `get_current_dir`, ALL scoped to `<dir>`. The CLIs `chdir` into `<dir>` so `get_current_dir` reports the sandbox path back to the model. |
 | `--allow-bash`        | `bash` (run `/bin/sh -c`). cwd = `--sandbox <dir>` if given, otherwise the binary's CWD. NOT a hardened sandbox — runs with your user privileges. Also bumps the agentic-loop `max_tool_hops` to 99999 (bash flows naturally span many turns). |
 | `--external-tools <dir>` | Load every `EASYAI-<name>.tools` file in `<dir>` as an operator-defined tool pack. Per-file fault isolation (a bad file is logged + skipped, the agent still starts). Spawns via `fork`+`execve` — never a shell. **This is the supported way to give the model focused powers without flipping `--allow-bash`.** See [`EXTERNAL_TOOLS.md`](EXTERNAL_TOOLS.md). |
+| `--REG <dir>`         | Enable REG, the agent's persistent registry / long-term memory. Five tools (`reg_save`, `reg_search`, `reg_load`, `reg_list`, `reg_delete`) so the model can remember things across sessions. Each entry is one Markdown file in `<dir>` — operator-readable and hand-editable. The systemd-installed server passes this by default (`/var/lib/easyai/reg`). See [`REG.md`](REG.md). |
+
+#### Why `--REG` makes the agent useful
+
+Without long-term memory, every session starts from zero: the model
+re-derives your preferences, re-learns your project, re-asks the same
+questions. With `--REG`, the model decides what's worth remembering
+and writes it to a directory of small Markdown files. Next session,
+it `reg_search`es by keyword, finds what its past self saved, and
+picks up where you left off.
+
+```
+> "I prefer terse responses in PT-BR."
+[model: reg_save("user-prefs", ["user","prefs","locale"], "...")]
+
+[next session]
+> "build easyai on the AI box"
+[model: reg_search("easyai") → finds your saved build recipe]
+[model loads it and answers in your style]
+```
+
+The dir is at `/var/lib/easyai/reg/` on the installed server. You
+can `cat`, `vim`, `grep`, hand-author entries, back it up with `tar`
+— it's a directory of plain text files. The model is the curator;
+you, the operator, can read and edit anything it decided to keep.
+
+Future evolution (see `REG.md`): progressive recall on session start,
+automatic document ingestion, per-user namespaces. The on-disk format
+won't change.
 
 #### Why `--external-tools` is the answer to "give the model more power"
 

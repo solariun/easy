@@ -100,6 +100,12 @@ external_tools_dir="$config_dir/external-tools"
 # normal state (no extra tools); operators add EASYAI-*.tools files
 # without touching the systemd unit.
 
+# REG — the agent's persistent registry / long-term memory.
+# Lives under /var/lib (mutable state) rather than /etc (config),
+# because the AGENT writes here at runtime — operator config goes
+# in /etc, agent-generated state goes in /var/lib (FHS).
+reg_dir="/var/lib/easyai/reg"
+
 ctx_size=128000
 # --ngl: -1 = auto-fit (llama.cpp picks how many layers fit), 0 = CPU only,
 # 99 = force all layers on GPU (will OOM if it doesn't fit; auto-fit refuses
@@ -632,6 +638,47 @@ EXT_EXAMPLE
         sudo chown root:"$service_group" "$example_disabled"
     fi
 
+    # ---- REG: agent's persistent registry / long-term memory ----------
+    # Owned by the SERVICE user (not root) because the AGENT writes here
+    # at runtime. mode 750 — the agent reads/writes; nobody else.
+    log "creating $reg_dir (REG / long-term memory, owned by $service_user)"
+    sudo install -d -o "$service_user" -g "$service_group" -m 750 \
+        "$(dirname "$reg_dir")"
+    sudo install -d -o "$service_user" -g "$service_group" -m 750 "$reg_dir"
+
+    if [[ ! -f "$reg_dir/README.md" ]]; then
+        sudo bash -c "cat > '$reg_dir/README.md'" <<'REG_README'
+# REG — easyai's persistent registry / long-term memory
+
+This directory holds the agent's REG entries. Each `<title>.md` file
+is one piece of knowledge the agent decided to remember. The agent
+reads / writes these files via the reg_save / reg_search / reg_load /
+reg_list / reg_delete tools.
+
+The format is intentionally trivial so you can `cat`, `vim`, `grep`,
+or hand-author a file:
+
+    keywords: tag1, tag2, tag3
+
+    Body content. Free-form Markdown / prose / code, up to 256 KB.
+
+A file with no `keywords:` header is "untagged" — it shows in
+reg_list but not in reg_search. Drop a hand-authored note here and
+the agent will see it on next restart.
+
+Authoritative documentation: REG.md and LINUX_SERVER.md in the
+easyai repo.
+
+This file (README.md) is ignored by the agent (no `.md` filename
+matches the title regex when it includes `_` followed by a `.` —
+wait, `README` IS valid. To be safe, the agent treats any file
+without a `keywords:` header as untagged but still listable, which
+is fine for a README.)
+REG_README
+        sudo chmod 640 "$reg_dir/README.md"
+        sudo chown "$service_user":"$service_group" "$reg_dir/README.md"
+    fi
+
     # ---- favicon: copy operator-supplied icon to /etc/easyai/favicon
     #              and let the unit point easyai-server at it -----------
     if [[ -n "$webui_icon" ]]; then
@@ -756,6 +803,7 @@ if [[ $do_service -eq 1 ]]; then
     args+=( --sandbox "$service_workspace" )
     args+=( --system-file "$system_file" )
     args+=( --external-tools "$external_tools_dir" )
+    args+=( --REG "$reg_dir" )
     [[ -n "$webui_title"     ]] && args+=( --webui-title "$webui_title" )
     [[ -n "$webui_icon_dest" ]] && args+=( --webui-icon  "$webui_icon_dest" )
     [[ "$enable_flash_attn" -eq 1 ]] && args+=( -fa )

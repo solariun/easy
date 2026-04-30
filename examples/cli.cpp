@@ -42,6 +42,7 @@
 #include "easyai/external_tools.hpp"
 #include "easyai/log.hpp"
 #include "easyai/plan.hpp"
+#include "easyai/reg_tools.hpp"
 #include "easyai/text.hpp"
 #include "easyai/tool.hpp"
 #include "easyai/ui.hpp"
@@ -282,6 +283,7 @@ struct Options {
     bool        allow_bash      = false;       // opt-in: register `bash` tool
     std::set<std::string> tools_enabled;       // empty = all defaults
     std::string external_tools_dir;            // dir of EASYAI-*.tools files
+    std::string reg_dir;                        // optional REG persistent-registry dir
     std::string prompt;                        // -p one-shot
     // Sampling / penalty knobs — -1 / -2 / empty == server default.
     float                    temperature       = -1.0f;
@@ -373,6 +375,13 @@ void usage(const char * argv0) {
 "                                 still load. -q hides security sanity-check\n"
 "                                 warnings (errors are always shown).\n"
 "                                 See EXTERNAL_TOOLS.md.\n"
+"    --REG DIR                  enable REG (the agent's persistent registry)\n"
+"                                 rooted at DIR. Registers reg_save /\n"
+"                                 reg_search / reg_load / reg_list /\n"
+"                                 reg_delete tools so the model can keep\n"
+"                                 long-term memory across sessions. Each\n"
+"                                 entry is a small Markdown file in DIR.\n"
+"                                 See REG.md.\n"
 "    --no-plan                  don't auto-register the planning tool\n"
 "\n"
 "  Behaviour:\n"
@@ -459,6 +468,7 @@ bool parse_args(int argc, char ** argv, Options & o) {
         else if (a == "--sandbox")        o.sandbox       = need(i, "--sandbox");
         else if (a == "--allow-bash")     o.allow_bash    = true;
         else if (a == "--external-tools") o.external_tools_dir = need(i, "--external-tools");
+        else if (a == "--REG")            o.reg_dir            = need(i, "--REG");
         else if (a == "--temperature")    o.temperature       = std::stof(need(i, "--temperature"));
         else if (a == "--top-p")          o.top_p             = std::stof(need(i, "--top-p"));
         else if (a == "--top-k")          o.top_k             = std::stoi(need(i, "--top-k"));
@@ -605,6 +615,20 @@ void register_tools(easyai::Client & cli,
     if (wants("system_loadavg"))   cli.add_tool(systools::make_system_loadavg());
     if (wants("system_cpu_usage")) cli.add_tool(systools::make_system_cpu_usage());
     if (wants("system_swaps"))     cli.add_tool(systools::make_system_swaps());
+
+    // REG — the agent's persistent registry / long-term memory.
+    // Five tools (reg_save / reg_search / reg_load / reg_list /
+    // reg_delete) registered when --REG <dir> is given. The dir
+    // does not need to exist yet; reg_save creates it on first
+    // call. See REG.md for the full guide.
+    if (!o.reg_dir.empty()) {
+        auto reg = easyai::tools::make_reg_tools(o.reg_dir);
+        if (o.tools_enabled.empty() || o.tools_enabled.count("reg_save"))   cli.add_tool(reg.save);
+        if (o.tools_enabled.empty() || o.tools_enabled.count("reg_search")) cli.add_tool(reg.search);
+        if (o.tools_enabled.empty() || o.tools_enabled.count("reg_load"))   cli.add_tool(reg.load);
+        if (o.tools_enabled.empty() || o.tools_enabled.count("reg_list"))   cli.add_tool(reg.list);
+        if (o.tools_enabled.empty() || o.tools_enabled.count("reg_delete")) cli.add_tool(reg.del);
+    }
 
     // External tools directory (--external-tools DIR). Loads every
     // EASYAI-*.tools file in DIR. Per-file fault isolation: a bad

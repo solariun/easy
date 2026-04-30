@@ -498,6 +498,50 @@ loads each one independently. Security-relevant behaviour:
   zero tools from a dir that exists is the design — operators can
   enable `--external-tools` in advance and add tools later.
 
+### 16.6b REG — persistent registry surface
+
+Lives in `src/reg_tools.cpp`. Five tools (`reg_save`, `reg_search`,
+`reg_load`, `reg_list`, `reg_delete`) the agent uses to write to
+and read from a directory of small Markdown files. Path-traversal
+is the only security-relevant primitive; the rest is correctness.
+
+- **Path-traversal closed at the regex.** Title and keyword
+  identifiers must match `^[A-Za-z0-9_-]{1,64}$` /
+  `^[A-Za-z0-9_-]{1,32}$`. Slashes, dots, NULs, spaces are
+  rejected at validation. The validated title is concatenated as
+  `<title>.md` to the configured root and passed to `std::ofstream`
+  / `std::ifstream`. There is no path-traversal surface — `..`,
+  `/etc/passwd`, `/proc/self/mem` etc. are all blocked at parse.
+- **Atomic writes.** Tempfile + `rename(2)`. Concurrent readers
+  always see either the old or new full content, never partial.
+- **Bounded reads.** Slurp is capped at 256 KiB + 4 KiB header
+  slack. A symlink-based attempt to read `/dev/zero` or a giant
+  file via the title is impossible (title regex), but the cap is
+  defence-in-depth for hand-edited dirs.
+- **No JSON parser involvement.** The on-disk format is plain text
+  with one `keywords:` header. Corrupt files are silently skipped
+  at index time; the index doesn't crash the agent.
+- **Mutex-guarded index.** All five tools share an in-memory
+  `std::map<title, EntryMeta>` guarded by a `std::mutex`. The
+  body is read off-disk per `reg_load`, never cached, so memory
+  doesn't grow with entry count beyond the metadata.
+- **Filesystem permissions are the access boundary.** The installer
+  creates `/var/lib/easyai/reg/` mode 750 owned by the `easyai`
+  service user. The agent is the only thing that can read or
+  write. Sharing across processes / users is an OS-level concern;
+  REG inherits whatever ACLs the operator put on the dir.
+
+Not in scope:
+
+- **No encryption at rest.** Operator decides whether to encrypt
+  the underlying filesystem. Roadmap: optional symmetric
+  encryption with a key from env var (`REG.md` §10).
+- **No audit log of writes.** The mtime is the only signal. A
+  future "history" tool could keep a log; not implemented.
+- **No multi-tenant namespacing.** One process, one REG dir.
+  Multi-user requires the operator to run multiple servers or
+  wait for the roadmap item.
+
 ### 16.7 Security sanity-check warnings (new audit pass)
 
 Beyond the load-time hard rejections (§16.1), the loader runs a
