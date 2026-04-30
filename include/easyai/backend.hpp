@@ -73,7 +73,7 @@ public:
         bool        allow_bash = false; // explicit opt-in for the bash tool
         std::string external_tools_dir; // optional external-tools dir (EASYAI-*.tools)
         bool        quiet           = false; // suppress sanity warnings (errors still emitted)
-        std::string reg_dir;            // optional REG (long-term registry) dir; empty = REG off
+        std::string rag_dir;            // optional RAG (long-term registry) dir; empty = RAG off
         int         n_ctx      = 4096;
         int         n_batch    = 0;     // 0 = follow ctx
         int         ngl        = -1;

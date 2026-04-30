@@ -1,10 +1,10 @@
-# REG — the agent's persistent registry
+# RAG — the agent's persistent registry
 
 > *"A model that forgets between sessions is an expensive autocomplete.
-> A model that remembers is a colleague. REG is the cheapest path
+> A model that remembers is a colleague. RAG is the cheapest path
 > from the first to the second."*
 
-This document is the authoritative guide to easyai's REG: a tag-
+This document is the authoritative guide to easyai's RAG: a tag-
 indexed, file-backed long-term memory the model can use to remember
 things across sessions. It's not a vector store, not a RAG pipeline,
 not a database — it's a directory of small Markdown files that the
@@ -14,7 +14,7 @@ agent reads and writes by itself.
 
 ## Table of contents
 
-1. [What REG is, and why](#1-what-reg-is-and-why)
+1. [What RAG is, and why](#1-what-reg-is-and-why)
 2. [Quickstart](#2-quickstart)
 3. [The file format on disk](#3-the-file-format-on-disk)
 4. [The five tools](#4-the-five-tools)
@@ -28,17 +28,17 @@ agent reads and writes by itself.
 
 ---
 
-## 1. What REG is, and why
+## 1. What RAG is, and why
 
-REG is a **tag-keyed key/value store**, owned by the agent, persisted
+RAG is a **tag-keyed key/value store**, owned by the agent, persisted
 on disk, accessible to the agent via five tools:
 
 ```
-reg_save(title, keywords[], content)   write / overwrite
-reg_search(keyword, max_results=10)    find by keyword
-reg_load(titles[1..4])                 read up to 4 full bodies
-reg_list(prefix?, max=50)              browse titles
-reg_delete(title)                      remove a stale entry
+rag_save(title, keywords[], content)   write / overwrite
+rag_search(keyword, max_results=10)    find by keyword
+rag_load(titles[1..4])                 read up to 4 full bodies
+rag_list(prefix?, max=50)              browse titles
+rag_delete(title)                      remove a stale entry
 ```
 
 That is the whole API.
@@ -52,7 +52,7 @@ give it a place to put the bits it cared about.
 ### Why not a vector store?
 
 Vector stores are the right answer when you have a HUGE corpus that no
-one classified by hand. REG is the right answer when the agent IS the
+one classified by hand. RAG is the right answer when the agent IS the
 classifier — it just told you, in clear language, what the entry is
 about. Put that classification in the filename + a small header and
 you can find the entry again in O(1) per lookup, with no GPU, no
@@ -60,7 +60,7 @@ embedding inference, no opaque ranking.
 
 When easyai later grows progressive recall (load my N most-relevant
 entries on every session start), THAT layer can do similarity scoring
-on top of REG. REG itself stays simple: just files and tags.
+on top of RAG. RAG itself stays simple: just files and tags.
 
 ### Why files, not a database?
 
@@ -73,36 +73,36 @@ human-inspectable at all times.
 
 ## 2. Quickstart
 
-### On the installed server (REG is on by default)
+### On the installed server (RAG is on by default)
 
-The systemd-installed easyai-server already passes `--REG
-/var/lib/easyai/reg` for you. Verify:
+The systemd-installed easyai-server already passes `--RAG
+/var/lib/easyai/rag` for you. Verify:
 
 ```bash
-sudo journalctl -u easyai-server | grep "REG enabled"
-# easyai-server: REG enabled, root = /var/lib/easyai/reg
+sudo journalctl -u easyai-server | grep "RAG enabled"
+# easyai-server: RAG enabled, root = /var/lib/easyai/rag
 
-ls -la /var/lib/easyai/reg/
+ls -la /var/lib/easyai/rag/
 # -rw-r----- root easyai 0 README.md   (empty initially)
 ```
 
-Open the webui or hit the API. The model now has reg_save / reg_search
-/ reg_load / reg_list / reg_delete in its tool list. Tell it
+Open the webui or hit the API. The model now has rag_save / rag_search
+/ rag_load / rag_list / rag_delete in its tool list. Tell it
 something memorable and it will save it without further prompting.
 
 ### From easyai-cli (remote model, local memory)
 
 ```bash
 mkdir -p ~/easyai-reg
-easyai-cli --url http://127.0.0.1:8080 --REG ~/easyai-reg
+easyai-cli --url http://127.0.0.1:8080 --RAG ~/easyai-reg
 ```
 
 Same five tools, but the memory lives in your home directory.
 
-### From easyai-local (single-process REPL with REG)
+### From easyai-local (single-process REPL with RAG)
 
 ```bash
-easyai-local -m model.gguf --REG ~/easyai-reg
+easyai-local -m model.gguf --RAG ~/easyai-reg
 ```
 
 ### Verifying it works
@@ -110,14 +110,14 @@ easyai-local -m model.gguf --REG ~/easyai-reg
 After a chat that should have triggered a save:
 
 ```bash
-ls /var/lib/easyai/reg/
-cat /var/lib/easyai/reg/<title>.md
+ls /var/lib/easyai/rag/
+cat /var/lib/easyai/rag/<title>.md
 ```
 
 Or from the model:
 
 ```
-> reg_list everything I know
+> rag_list everything I know
 ```
 
 ---
@@ -142,7 +142,7 @@ The grammar:
 4. Everything after is the body.
 
 A file with NO header (no `keywords:` line) is treated as
-**untagged**. It shows up in `reg_list` but never in `reg_search`.
+**untagged**. It shows up in `rag_list` but never in `rag_search`.
 This is by design — operators can drop hand-written notes into the
 dir and the model will list them as available context, but won't
 consider them "tagged knowledge" until the operator (or the model)
@@ -151,7 +151,7 @@ adds keywords.
 ### Hand-authoring an entry
 
 ```bash
-sudo -u easyai bash -c 'cat > /var/lib/easyai/reg/welcome.md' <<'EOF'
+sudo -u easyai bash -c 'cat > /var/lib/easyai/rag/welcome.md' <<'EOF'
 keywords: user-prefs, language, locale
 
 The user prefers responses in Brazilian Portuguese (PT-BR). Technical
@@ -162,13 +162,13 @@ EOF
 ```
 
 Restart the server (or wait for the next session) and the model has
-it on its first reg_search by `user-prefs`.
+it on its first rag_search by `user-prefs`.
 
 ### Constraints
 
 - Title (= filename stem): `^[A-Za-z0-9_-]{1,64}$`. No spaces, no
   slashes, no dots. The strict regex closes path-traversal — there is
-  no way for the model to write outside the REG dir.
+  no way for the model to write outside the RAG dir.
 - Keyword: same character set, ≤ 32 bytes, ≤ 8 keywords per entry.
 - Content body: ≤ 256 KiB.
 
@@ -179,51 +179,51 @@ it on its first reg_search by `user-prefs`.
 Each tool description below is what the MODEL sees. The descriptions
 were written to actively encourage use — see §5.
 
-### reg_save
+### rag_save
 
 ```
-reg_save(title: string, keywords: string[], content: string) -> ok
+rag_save(title: string, keywords: string[], content: string) -> ok
 ```
 
 Writes `<root>/<title>.md`. Overwrites if it already exists. Atomic
 on POSIX (tempfile + rename). Refuses invalid title or keywords with
 a clear error.
 
-### reg_search
+### rag_search
 
 ```
-reg_search(keyword: string, max_results: integer = 10) -> list of {title, keywords, preview}
+rag_search(keyword: string, max_results: integer = 10) -> list of {title, keywords, preview}
 ```
 
 Returns up to 20 entries that have `keyword` in their keyword list,
 newest-first by mtime. Each result includes a preview (first ~240
 bytes of body). The model picks the most relevant 1–4 titles and
-calls reg_load.
+calls rag_load.
 
-### reg_load
+### rag_load
 
 ```
-reg_load(titles: string[1..4]) -> entries with full body
+rag_load(titles: string[1..4]) -> entries with full body
 ```
 
 Reads up to 4 full entries off disk. Cap is deliberate: more than 4
 means the model is drowning the prompt. Missing titles surface as
 per-entry errors in the response, the others still load.
 
-### reg_list
+### rag_list
 
 ```
-reg_list(prefix: string?, max: integer = 50) -> list of titles
+rag_list(prefix: string?, max: integer = 50) -> list of titles
 ```
 
 Browse mode. Returns title, keywords, content_bytes, modified_unix
 for every entry (or every entry whose title starts with `prefix`).
-Body NOT included — use reg_load for that.
+Body NOT included — use rag_load for that.
 
-### reg_delete
+### rag_delete
 
 ```
-reg_delete(title: string) -> ok
+rag_delete(title: string) -> ok
 ```
 
 Permanent. Removes the file from disk and the in-memory index.
@@ -238,9 +238,9 @@ Tool descriptions are not boilerplate. They are the most direct
 incentive structure we have: the model reads them on every turn and
 they shape its behaviour.
 
-REG's descriptions push three behaviours:
+RAG's descriptions push three behaviours:
 
-1. **Save aggressively.** `reg_save`'s description literally says "USE
+1. **Save aggressively.** `rag_save`'s description literally says "USE
    THIS AGGRESSIVELY for: the user's stated preferences and
    constraints, project structure and decisions you've learned,
    technical facts you had to look up, recipes / commands that
@@ -248,15 +248,15 @@ REG's descriptions push three behaviours:
    documents the user fed you. The more carefully you populate the
    registry, the smarter you become over time."
 
-2. **Search before assuming.** `reg_search`'s description says "USE
+2. **Search before assuming.** `rag_search`'s description says "USE
    THIS BEFORE assuming you don't know something the user might have
    told you in a past session — your past self may have already
    saved the answer."
 
-3. **Tidy up.** `reg_delete`'s description encourages removing stale
+3. **Tidy up.** `rag_delete`'s description encourages removing stale
    entries: "keeping the registry tidy makes future searches sharper."
 
-The more often the model exercises these, the more useful REG
+The more often the model exercises these, the more useful RAG
 becomes. Future versions can add automatic injection of
 high-relevance entries into the system prompt, but the manual loop
 already works.
@@ -270,8 +270,8 @@ already works.
 ```
 [user opens chat]
   ↓
-model: reg_search("user-prefs") → finds "gustavo-prefs"
-model: reg_load(["gustavo-prefs"])  → reads the body
+model: rag_search("user-prefs") → finds "gustavo-prefs"
+model: rag_load(["gustavo-prefs"])  → reads the body
 model: now knows the user prefers PT-BR, terse style, ...
 
 [user asks a question]
@@ -280,36 +280,36 @@ model answers in PT-BR, terse.
 
 [user shares a new fact]
   ↓
-model: reg_save("project-foo-bar", ["project", "foo"], "...")
+model: rag_save("project-foo-bar", ["project", "foo"], "...")
 
 [user corrects something]
   ↓
-model: reg_search("foo") → finds the old note
-model: reg_save(SAME title, ...)   ← overwrites with corrected version
+model: rag_search("foo") → finds the old note
+model: rag_save(SAME title, ...)   ← overwrites with corrected version
                                      OR
-model: reg_delete("foo-old")
-model: reg_save("foo-new", ...)
+model: rag_delete("foo-old")
+model: rag_save("foo-new", ...)
 ```
 
 ### B. Document ingestion (the positive cycle)
 
 You feed the model a long document — a manual, a runbook, a paper.
-The model summarises it, then **chunks the summary into REG entries**:
+The model summarises it, then **chunks the summary into RAG entries**:
 
 ```
 You:    "Read this MQTT spec PDF. The link is /sandbox/mqtt-v5.pdf.
-         Save the important parts to REG so future me doesn't have
+         Save the important parts to RAG so future me doesn't have
          to re-read it."
 
 Model:  [reads the PDF via fs_read_file or web_fetch]
         [identifies 6 key topics: connect, publish, subscribe,
          retained messages, will, qos]
-        reg_save("mqtt-connect",   ["mqtt", "protocol"], "...")
-        reg_save("mqtt-publish",   ["mqtt", "protocol"], "...")
-        reg_save("mqtt-qos",       ["mqtt", "protocol"], "...")
+        rag_save("mqtt-connect",   ["mqtt", "protocol"], "...")
+        rag_save("mqtt-publish",   ["mqtt", "protocol"], "...")
+        rag_save("mqtt-qos",       ["mqtt", "protocol"], "...")
         ...
         "Saved 6 entries under keyword 'mqtt'. Future you will
-         reg_search('mqtt') to find any of them."
+         rag_search('mqtt') to find any of them."
 ```
 
 Now the next session, when you ask about MQTT, the model
@@ -327,7 +327,7 @@ You:    "Whenever I ask about easyai builds on the AI box,
          the answer is: cmake -B build -DCMAKE_BUILD_TYPE=Release
          && cmake --build build -j. Remember this."
 
-Model:  reg_save("easyai-build-aibox",
+Model:  rag_save("easyai-build-aibox",
                  ["easyai", "build", "ai-box"],
                  "On the AI box (Linux/Vulkan), build easyai with:
                   cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j")
@@ -338,8 +338,8 @@ Next session:
 
 ```
 You:    "build easyai on ai box"
-Model:  reg_search("easyai")  →  finds easyai-build-aibox
-        reg_load(["easyai-build-aibox"])
+Model:  rag_search("easyai")  →  finds easyai-build-aibox
+        rag_load(["easyai-build-aibox"])
         "Use: cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j"
 ```
 
@@ -349,11 +349,11 @@ Model:  reg_search("easyai")  →  finds easyai-build-aibox
 You:    "We dropped the X feature. Remove anything about it from your
          memory."
 
-Model:  reg_search("x-feature")
+Model:  rag_search("x-feature")
         [3 entries match]
-        reg_delete("x-feature-rationale")
-        reg_delete("x-feature-roadmap")
-        reg_delete("x-feature-userflow")
+        rag_delete("x-feature-rationale")
+        rag_delete("x-feature-roadmap")
+        rag_delete("x-feature-userflow")
         "Deleted 3 entries about the dropped X feature."
 ```
 
@@ -364,7 +364,7 @@ Model:  reg_search("x-feature")
 ### Choosing titles
 
 - **Domain-prefix the title.** `easyai-build-recipe`, not `build-recipe`.
-  Prefixes group entries when you `reg_list prefix:"easyai-"`.
+  Prefixes group entries when you `rag_list prefix:"easyai-"`.
 - **Keep titles unique by purpose.** If you have ten build recipes for
   ten projects, the title carries the disambiguator
   (`easyai-build-recipe`, `nginx-build-recipe`).
@@ -396,7 +396,7 @@ Model:  reg_search("x-feature")
 
 ### When NOT to save
 
-- Anything the user said only in passing ("I'm tired today" — not REG
+- Anything the user said only in passing ("I'm tired today" — not RAG
   material).
 - Anything that's already in the codebase (the model can `git grep`).
 - Per-conversation scratch state — that's what conversation history
@@ -408,7 +408,7 @@ Model:  reg_search("x-feature")
 - The user corrects a fact and the old entry is now wrong.
 - A project ends, dies, or pivots.
 - You realise you saved something at the wrong granularity (delete +
-  reg_save with new title / keywords).
+  rag_save with new title / keywords).
 
 ---
 
@@ -416,31 +416,31 @@ Model:  reg_search("x-feature")
 
 | Situation | What happens |
 | --- | --- |
-| `--REG` not given to the CLI | The five reg_* tools aren't registered. Model has no long-term memory. |
-| `--REG` points to a non-existent dir | Created on first reg_save. No error at startup. |
-| `--REG` points to a file (not a dir) | First reg_save returns "REG root is not a directory". Other tools also error. |
-| Two processes share the same REG dir | Reads work; the in-memory index of one process won't see writes from the other until that process restarts. Single-process is the supported model. |
-| Title matches an existing entry | reg_save overwrites (atomic). Useful for refining notes. |
-| Keyword used by no entry | reg_search returns "no entries match" (not an error). |
-| reg_load asks for 5 titles | Rejected: "max 4 per call". |
-| reg_load asks for a missing title | The OTHER titles still load; the missing one shows up as `--- title ---\nERROR: no REG entry titled "title"\n` in the response. |
-| Hand-authored file with no `keywords:` header | Loaded as untagged. Shows in reg_list, never in reg_search. The body is fully accessible via reg_load. |
-| Hand-authored file with garbage in the body | Loaded fine. The body is opaque to REG. |
-| File > 256 KB | Skipped at index time; reg_load returns "entry exceeds 262144 bytes". Operator should split. |
+| `--RAG` not given to the CLI | The five reg_* tools aren't registered. Model has no long-term memory. |
+| `--RAG` points to a non-existent dir | Created on first rag_save. No error at startup. |
+| `--RAG` points to a file (not a dir) | First rag_save returns "RAG root is not a directory". Other tools also error. |
+| Two processes share the same RAG dir | Reads work; the in-memory index of one process won't see writes from the other until that process restarts. Single-process is the supported model. |
+| Title matches an existing entry | rag_save overwrites (atomic). Useful for refining notes. |
+| Keyword used by no entry | rag_search returns "no entries match" (not an error). |
+| rag_load asks for 5 titles | Rejected: "max 4 per call". |
+| rag_load asks for a missing title | The OTHER titles still load; the missing one shows up as `--- title ---\nERROR: no RAG entry titled "title"\n` in the response. |
+| Hand-authored file with no `keywords:` header | Loaded as untagged. Shows in rag_list, never in rag_search. The body is fully accessible via rag_load. |
+| Hand-authored file with garbage in the body | Loaded fine. The body is opaque to RAG. |
+| File > 256 KB | Skipped at index time; rag_load returns "entry exceeds 262144 bytes". Operator should split. |
 | Filename with spaces / dots / slashes | Skipped at index time (doesn't match the title regex). |
 | Filename without `.md` extension | Skipped. The agent only sees `.md` files in the dir. |
-| Subdirectory inside the REG dir | Ignored — only top-level scanned. |
-| Empty REG dir | Normal state. reg_list returns "REGistry is empty". |
-| `reg_delete` on a non-existent title | Returns ok with "nothing to delete". Idempotent. |
+| Subdirectory inside the RAG dir | Ignored — only top-level scanned. |
+| Empty RAG dir | Normal state. rag_list returns "RAGistry is empty". |
+| `rag_delete` on a non-existent title | Returns ok with "nothing to delete". Idempotent. |
 
 ---
 
 ## 9. Operator workflows
 
-### Backing up REG
+### Backing up RAG
 
 ```bash
-tar -czf reg-backup-$(date +%Y%m%d).tar.gz /var/lib/easyai/reg/
+tar -czf reg-backup-$(date +%Y%m%d).tar.gz /var/lib/easyai/rag/
 ```
 
 The dir is tiny (KB-scale typically). Toss it in your normal backup.
@@ -448,28 +448,28 @@ The dir is tiny (KB-scale typically). Toss it in your normal backup.
 ### Sharing an entry between machines
 
 ```bash
-scp /var/lib/easyai/reg/important.md other-host:/var/lib/easyai/reg/
+scp /var/lib/easyai/rag/important.md other-host:/var/lib/easyai/rag/
 sudo systemctl restart easyai-server  # on the other host (picks up new file)
 ```
 
 ### Auditing what the agent has saved
 
 ```bash
-ls -lt /var/lib/easyai/reg/ | head -20      # newest first
-grep -l "user-prefs" /var/lib/easyai/reg/*.md
-cat /var/lib/easyai/reg/<entry>.md
+ls -lt /var/lib/easyai/rag/ | head -20      # newest first
+grep -l "user-prefs" /var/lib/easyai/rag/*.md
+cat /var/lib/easyai/rag/<entry>.md
 ```
 
 ### Pruning old entries
 
 ```bash
 # entries not modified in 6 months
-find /var/lib/easyai/reg/ -name "*.md" -mtime +180 -ls
+find /var/lib/easyai/rag/ -name "*.md" -mtime +180 -ls
 # delete after review
-find /var/lib/easyai/reg/ -name "*.md" -mtime +180 -delete
+find /var/lib/easyai/rag/ -name "*.md" -mtime +180 -delete
 ```
 
-(Or use the model: tell it to reg_list and reg_delete things it
+(Or use the model: tell it to rag_list and rag_delete things it
 considers stale.)
 
 ### Bulk-importing notes
@@ -483,28 +483,28 @@ keywords: tag1, tag2
 body
 ```
 
-Restart the server. The model picks them up on next reg_search /
-reg_list.
+Restart the server. The model picks them up on next rag_search /
+rag_list.
 
 ---
 
 ## 10. Roadmap
 
-REG today is the simplest thing that could work. Future evolutions
+RAG today is the simplest thing that could work. Future evolutions
 that fit cleanly on top:
 
 ### Progressive recall on session start
 
-The system prompt currently doesn't include any REG content. Future:
+The system prompt currently doesn't include any RAG content. Future:
 on session start, automatically load the K most-relevant entries
 (by some heuristic — recency, keyword overlap with the current
 prompt, semantic similarity if we add embeddings). This makes the
 agent immediately aware of its own memory without needing a
-conscious reg_search.
+conscious rag_search.
 
 ### Document ingestion helper
 
-Today the model has to chunk a document into REG entries by hand.
+Today the model has to chunk a document into RAG entries by hand.
 Future: a `reg_ingest_document(path, base_keywords)` tool that takes
 a long text, segments it (semantic boundaries, fixed-size chunks,
 or model-driven topics), and saves each chunk as an entry —
@@ -514,7 +514,7 @@ returning a manifest of what was saved.
 
 Today entries are independent. Future: a soft reference syntax
 (e.g. `see-also: title1, title2` in the header) so the model can
-build small knowledge graphs and reg_load resolves them
+build small knowledge graphs and rag_load resolves them
 transitively.
 
 ### Entry expiry
@@ -524,7 +524,7 @@ seasonal / temporary knowledge auto-cleans without operator action.
 
 ### Multi-user / multi-namespace
 
-Today one process owns one REG dir. Future: a per-user namespace
+Today one process owns one RAG dir. Future: a per-user namespace
 (scope by client id, by API key, by something) so a multi-tenant
 server can give every user their own memory without leaking.
 
@@ -538,18 +538,18 @@ var, for sensitive deployments.
 
 ## 11. Troubleshooting
 
-### "REG enabled" never appears in the journal
+### "RAG enabled" never appears in the journal
 
-The systemd unit isn't passing `--REG`. Check:
+The systemd unit isn't passing `--RAG`. Check:
 
 ```bash
-systemctl cat easyai-server | grep -- --REG
+systemctl cat easyai-server | grep -- --RAG
 ```
 
 If missing, re-run `install_easyai_server.sh --upgrade --enable-now`
 to refresh the unit.
 
-### Model doesn't seem to use REG
+### Model doesn't seem to use RAG
 
 Two possible causes:
 
@@ -558,59 +558,59 @@ Two possible causes:
    curl http://127.0.0.1:8080/health | jq .tool_count
    # should include the 5 reg_* tools
    ```
-   If not, re-check the `--REG` flag is reaching the binary.
+   If not, re-check the `--RAG` flag is reaching the binary.
 
 2. **The model isn't being prompted to use it.** The descriptions
    already encourage it, but a strong system prompt overrides
    defaults. If your `system.txt` says "do not call tools", the
    model honours that. Edit `/etc/easyai/system.txt` to clarify
-   that REG is encouraged.
+   that RAG is encouraged.
 
-### "REG root is not a directory"
+### "RAG root is not a directory"
 
 A file exists at the path. Move it out of the way and recreate the
 dir:
 
 ```bash
-sudo mv /var/lib/easyai/reg /var/lib/easyai/reg.broken
-sudo install -d -o easyai -g easyai -m 750 /var/lib/easyai/reg
+sudo mv /var/lib/easyai/rag /var/lib/easyai/rag.broken
+sudo install -d -o easyai -g easyai -m 750 /var/lib/easyai/rag
 sudo systemctl restart easyai-server
 ```
 
-### "create REG dir failed: Permission denied"
+### "create RAG dir failed: Permission denied"
 
 The agent runs as `easyai`. Verify:
 
 ```bash
 ls -ld /var/lib/easyai/
 # drwxr-x--- root easyai
-ls -ld /var/lib/easyai/reg
+ls -ld /var/lib/easyai/rag
 # drwxr-x--- easyai easyai   (note: easyai, not root)
 ```
 
 If owner is wrong, fix:
 
 ```bash
-sudo chown -R easyai:easyai /var/lib/easyai/reg
-sudo chmod 750 /var/lib/easyai/reg
+sudo chown -R easyai:easyai /var/lib/easyai/rag
+sudo chmod 750 /var/lib/easyai/rag
 ```
 
 ### Entries vanish between sessions
 
-Likely the agent ran with the wrong `--REG` path (e.g. CLI vs server
+Likely the agent ran with the wrong `--RAG` path (e.g. CLI vs server
 disagree). Confirm both invocations point at the same dir.
 
-### Entry was saved but `reg_search` doesn't find it
+### Entry was saved but `rag_search` doesn't find it
 
 Check the on-disk file:
 
 ```bash
-cat /var/lib/easyai/reg/<title>.md
+cat /var/lib/easyai/rag/<title>.md
 ```
 
 The first line must be `keywords: <comma-separated>`. If the model
-forgot keywords, the entry is untagged — visible in reg_list, not
-reg_search.
+forgot keywords, the entry is untagged — visible in rag_list, not
+rag_search.
 
 ### `cat`-ing an entry shows weird characters
 

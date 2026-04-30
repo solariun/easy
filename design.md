@@ -730,10 +730,10 @@ let the model use it" without leaving JSON.
 These are deliberate non-goals — adding any of them would expand
 the trust surface in ways the operator didn't sign up for.
 
-## 5g. REG — persistent registry / long-term memory
+## 5g. RAG — persistent registry / long-term memory
 
-Lives in `src/reg_tools.cpp` and `include/easyai/reg_tools.hpp`.
-User-facing documentation: [`REG.md`](REG.md). Operator guide:
+Lives in `src/rag_tools.cpp` and `include/easyai/rag_tools.hpp`.
+User-facing documentation: [`RAG.md`](RAG.md). Operator guide:
 [`LINUX_SERVER.md`](LINUX_SERVER.md). This section describes *why*
 the subsystem is shaped the way it is.
 
@@ -747,9 +747,9 @@ us look up entries in O(1) per lookup with zero embedding inference.
 
 When we later want progressive recall (auto-inject the K most
 relevant entries on session start), THAT layer can do similarity
-scoring on top. REG itself stays simple: just files and keywords.
-The composition order matters: vector store on top of REG works
-fine; REG on top of a vector store would be either redundant or
+scoring on top. RAG itself stays simple: just files and keywords.
+The composition order matters: vector store on top of RAG works
+fine; RAG on top of a vector store would be either redundant or
 fighting the index.
 
 ### Why one Markdown file per entry, not a database
@@ -770,7 +770,7 @@ process — fast).
 A single `reg(action, ...)` tool would shorten the schema but
 collapse the model's intent. Separate tools encode the intent in
 the tool name, which is the strongest signal the model has when
-choosing. `reg_save` calls and `reg_search` calls show up
+choosing. `rag_save` calls and `rag_search` calls show up
 distinctly in audit logs / hooks; coarse `reg(action="save", ...)`
 calls would all blur together.
 
@@ -778,7 +778,7 @@ Five also matches the natural workflow: save (write), search +
 load (read in two steps because previewing keeps the prompt
 slim), list (browse), delete (curate).
 
-### Why max 4 entries per `reg_load`
+### Why max 4 entries per `rag_load`
 
 Past 4, the model is almost always trying to drown the prompt in
 stale content. The cap forces "preview first, narrow second" —
@@ -797,22 +797,22 @@ This is the same lever the system prompt uses, but at finer
 granularity — one tool's behaviour at a time. As we accumulate
 operational experience we'll tune the descriptions further.
 
-### Where REG fits in the four-tier API rule
+### Where RAG fits in the four-tier API rule
 
-| Tier | Audience | REG surface |
+| Tier | Audience | RAG surface |
 | --- | --- | --- |
-| 1 — façade | beginner | `easyai::Agent` could opt into REG with a single setter (future). |
-| 2 — fluent | intermediate | Already exposed as `make_reg_tools(dir)` returning a `RegTools` struct of five `Tool` values that you `add_tool`. |
-| 3 — operator | deployment | `--REG <dir>` flag on all three CLIs; systemd unit passes it for free. |
-| 4 — escape hatch | extension | The `RegStore` private class is replaceable: a future variant could swap files for SQLite or vector store while keeping the same 5-tool surface. |
+| 1 — façade | beginner | `easyai::Agent` could opt into RAG with a single setter (future). |
+| 2 — fluent | intermediate | Already exposed as `make_rag_tools(dir)` returning a `RagTools` struct of five `Tool` values that you `add_tool`. |
+| 3 — operator | deployment | `--RAG <dir>` flag on all three CLIs; systemd unit passes it for free. |
+| 4 — escape hatch | extension | The `RagStore` private class is replaceable: a future variant could swap files for SQLite or vector store while keeping the same 5-tool surface. |
 
-### What REG is not
+### What RAG is not
 
 - **Not a knowledge base.** The agent decides what goes in. Stale
   entries persist until the agent (or operator) deletes them.
 - **Not a search engine.** Keyword exact match, no semantic search,
   no fuzzy match. We ship the simple thing.
-- **Not multi-tenant.** One process, one REG dir. Per-user
+- **Not multi-tenant.** One process, one RAG dir. Per-user
   namespaces are on the roadmap.
 - **Not transactional across calls.** Each tool call commits its
   own state. There's no `BEGIN ... COMMIT`. The model is the

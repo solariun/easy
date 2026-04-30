@@ -954,25 +954,25 @@ for (const auto & t : loaded.tools) {
   state, write a C++ tool with a captured `std::shared_ptr` to a
   state object.
 
-### 3.3.6 REG — persistent registry / long-term memory
+### 3.3.6 RAG — persistent registry / long-term memory
 
-> The authoritative guide is [`REG.md`](REG.md). The summary below
+> The authoritative guide is [`RAG.md`](RAG.md). The summary below
 > is a quick reference.
 
-REG gives the agent five tools to remember things across sessions:
+RAG gives the agent five tools to remember things across sessions:
 
 ```cpp
-auto reg = easyai::tools::make_reg_tools("/var/lib/easyai/reg");
-engine.add_tool(reg.save);    // reg_save(title, keywords[], content)
-engine.add_tool(reg.search);  // reg_search(keyword, max_results=10)
-engine.add_tool(reg.load);    // reg_load(titles[1..4])
-engine.add_tool(reg.list);    // reg_list(prefix?, max=50)
-engine.add_tool(reg.del);     // reg_delete(title)
+auto rag = easyai::tools::make_rag_tools("/var/lib/easyai/rag");
+engine.add_tool(rag.save);    // rag_save(title, keywords[], content)
+engine.add_tool(rag.search);  // rag_search(keyword, max_results=10)
+engine.add_tool(rag.load);    // rag_load(titles[1..4])
+engine.add_tool(rag.list);    // rag_list(prefix?, max=50)
+engine.add_tool(rag.del);     // rag_delete(title)
 ```
 
-Or via the `--REG <dir>` flag in `easyai-server`, `easyai-cli`, and
+Or via the `--RAG <dir>` flag in `easyai-server`, `easyai-cli`, and
 `easyai-local`. The systemd-installed server passes
-`--REG /var/lib/easyai/reg` by default.
+`--RAG /var/lib/easyai/rag` by default.
 
 Each entry is one Markdown file `<title>.md` in the configured
 directory:
@@ -990,7 +990,7 @@ call.
 
 The model is encouraged (in the tool descriptions) to save
 aggressively, search before assuming it doesn't know something, and
-delete stale entries to keep the index sharp. See `REG.md` for the
+delete stale entries to keep the index sharp. See `RAG.md` for the
 full workflow including document ingestion, the positive cycle, and
 the operator's audit / backup recipes.
 

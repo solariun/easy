@@ -113,7 +113,7 @@ struct CliArgs {
     std::string sandbox;        // empty = fs_* tools NOT registered
     bool allow_bash = false;    // explicit opt-in for `bash`
     std::string external_tools_dir;     // optional external-tools dir (EASYAI-*.tools)
-    std::string reg_dir;                 // optional REG persistent-registry dir
+    std::string rag_dir;                 // optional RAG persistent-registry dir
 
     // KV cache controls
     std::string cache_type_k;      // empty = library default (f16)
@@ -171,13 +171,13 @@ struct CliArgs {
         "                                 other files still load. -q hides the\n"
         "                                 security sanity-check warnings (errors\n"
         "                                 are always shown). See EXTERNAL_TOOLS.md.\n"
-        "      --REG <dir>               Enable REG, the agent's persistent\n"
+        "      --RAG <dir>               Enable RAG, the agent's persistent\n"
         "                                 registry / long-term memory. Each\n"
         "                                 entry is one Markdown file in <dir>.\n"
-        "                                 Registers reg_save / reg_search /\n"
-        "                                 reg_load / reg_list / reg_delete tools\n"
+        "                                 Registers rag_save / rag_search /\n"
+        "                                 rag_load / rag_list / rag_delete tools\n"
         "                                 the model uses to remember things\n"
-        "                                 across sessions. See REG.md.\n"
+        "                                 across sessions. See RAG.md.\n"
         "\nKV cache (all optional):\n"
         " -ctk, --cache-type-k <type>    K-cache dtype (f32|f16|bf16|q8_0|q4_0|q4_1|q5_0|q5_1|iq4_nl)\n"
         " -ctv, --cache-type-v <type>    V-cache dtype (same options) — quantising V saves a lot of VRAM\n"
@@ -224,7 +224,7 @@ static CliArgs parse(int argc, char ** argv) {
         else if (s == "--sandbox")                    a.sandbox       = need(i, "--sandbox");
         else if (s == "--allow-bash")                 a.allow_bash    = true;
         else if (s == "--external-tools")             a.external_tools_dir = need(i, "--external-tools");
-        else if (s == "--REG")                        a.reg_dir            = need(i, "--REG");
+        else if (s == "--RAG")                        a.rag_dir            = need(i, "--RAG");
         // KV controls
         else if (s == "-ctk" || s == "--cache-type-k") a.cache_type_k = need(i, "-ctk");
         else if (s == "-ctv" || s == "--cache-type-v") a.cache_type_v = need(i, "-ctv");
@@ -315,7 +315,7 @@ int main(int argc, char ** argv) {
     lc.allow_bash     = args.allow_bash;
     lc.external_tools_dir = args.external_tools_dir;
     lc.quiet              = args.quiet;
-    lc.reg_dir            = args.reg_dir;
+    lc.rag_dir            = args.rag_dir;
     lc.n_ctx          = args.n_ctx;
     lc.n_batch        = args.n_batch;
     lc.ngl            = args.ngl;

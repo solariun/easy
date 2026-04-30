@@ -498,10 +498,10 @@ loads each one independently. Security-relevant behaviour:
   zero tools from a dir that exists is the design — operators can
   enable `--external-tools` in advance and add tools later.
 
-### 16.6b REG — persistent registry surface
+### 16.6b RAG — persistent registry surface
 
-Lives in `src/reg_tools.cpp`. Five tools (`reg_save`, `reg_search`,
-`reg_load`, `reg_list`, `reg_delete`) the agent uses to write to
+Lives in `src/rag_tools.cpp`. Five tools (`rag_save`, `rag_search`,
+`rag_load`, `rag_list`, `rag_delete`) the agent uses to write to
 and read from a directory of small Markdown files. Path-traversal
 is the only security-relevant primitive; the rest is correctness.
 
@@ -523,22 +523,22 @@ is the only security-relevant primitive; the rest is correctness.
   at index time; the index doesn't crash the agent.
 - **Mutex-guarded index.** All five tools share an in-memory
   `std::map<title, EntryMeta>` guarded by a `std::mutex`. The
-  body is read off-disk per `reg_load`, never cached, so memory
+  body is read off-disk per `rag_load`, never cached, so memory
   doesn't grow with entry count beyond the metadata.
 - **Filesystem permissions are the access boundary.** The installer
-  creates `/var/lib/easyai/reg/` mode 750 owned by the `easyai`
+  creates `/var/lib/easyai/rag/` mode 750 owned by the `easyai`
   service user. The agent is the only thing that can read or
   write. Sharing across processes / users is an OS-level concern;
-  REG inherits whatever ACLs the operator put on the dir.
+  RAG inherits whatever ACLs the operator put on the dir.
 
 Not in scope:
 
 - **No encryption at rest.** Operator decides whether to encrypt
   the underlying filesystem. Roadmap: optional symmetric
-  encryption with a key from env var (`REG.md` §10).
+  encryption with a key from env var (`RAG.md` §10).
 - **No audit log of writes.** The mtime is the only signal. A
   future "history" tool could keep a log; not implemented.
-- **No multi-tenant namespacing.** One process, one REG dir.
+- **No multi-tenant namespacing.** One process, one RAG dir.
   Multi-user requires the operator to run multiple servers or
   wait for the roadmap item.
 

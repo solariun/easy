@@ -100,11 +100,11 @@ external_tools_dir="$config_dir/external-tools"
 # normal state (no extra tools); operators add EASYAI-*.tools files
 # without touching the systemd unit.
 
-# REG — the agent's persistent registry / long-term memory.
+# RAG — the agent's persistent registry / long-term memory.
 # Lives under /var/lib (mutable state) rather than /etc (config),
 # because the AGENT writes here at runtime — operator config goes
 # in /etc, agent-generated state goes in /var/lib (FHS).
-reg_dir="/var/lib/easyai/reg"
+rag_dir="/var/lib/easyai/rag"
 
 ctx_size=128000
 # --ngl: -1 = auto-fit (llama.cpp picks how many layers fit), 0 = CPU only,
@@ -638,22 +638,34 @@ EXT_EXAMPLE
         sudo chown root:"$service_group" "$example_disabled"
     fi
 
-    # ---- REG: agent's persistent registry / long-term memory ----------
+    # ---- RAG: agent's persistent registry / long-term memory ----------
     # Owned by the SERVICE user (not root) because the AGENT writes here
     # at runtime. mode 750 — the agent reads/writes; nobody else.
-    log "creating $reg_dir (REG / long-term memory, owned by $service_user)"
+    #
+    # Migration: pre-rename installs put the registry at
+    # /var/lib/easyai/reg. If the directory exists and the new path
+    # doesn't, move it. We only do this when the destination does NOT
+    # exist, so an operator who has already started fresh on /rag
+    # doesn't lose data to the rename.
+    legacy_rag_dir="/var/lib/easyai/reg"
+    if [[ -d "$legacy_rag_dir" && ! -e "$rag_dir" ]]; then
+        log "migrating legacy $legacy_rag_dir → $rag_dir"
+        sudo mv "$legacy_rag_dir" "$rag_dir"
+    fi
+
+    log "creating $rag_dir (RAG / long-term memory, owned by $service_user)"
     sudo install -d -o "$service_user" -g "$service_group" -m 750 \
-        "$(dirname "$reg_dir")"
-    sudo install -d -o "$service_user" -g "$service_group" -m 750 "$reg_dir"
+        "$(dirname "$rag_dir")"
+    sudo install -d -o "$service_user" -g "$service_group" -m 750 "$rag_dir"
 
-    if [[ ! -f "$reg_dir/README.md" ]]; then
-        sudo bash -c "cat > '$reg_dir/README.md'" <<'REG_README'
-# REG — easyai's persistent registry / long-term memory
+    if [[ ! -f "$rag_dir/README.md" ]]; then
+        sudo bash -c "cat > '$rag_dir/README.md'" <<'REG_README'
+# RAG — easyai's persistent registry / long-term memory
 
-This directory holds the agent's REG entries. Each `<title>.md` file
+This directory holds the agent's RAG entries. Each `<title>.md` file
 is one piece of knowledge the agent decided to remember. The agent
-reads / writes these files via the reg_save / reg_search / reg_load /
-reg_list / reg_delete tools.
+reads / writes these files via the rag_save / rag_search / rag_load /
+rag_list / rag_delete tools.
 
 The format is intentionally trivial so you can `cat`, `vim`, `grep`,
 or hand-author a file:
@@ -663,10 +675,10 @@ or hand-author a file:
     Body content. Free-form Markdown / prose / code, up to 256 KB.
 
 A file with no `keywords:` header is "untagged" — it shows in
-reg_list but not in reg_search. Drop a hand-authored note here and
+rag_list but not in rag_search. Drop a hand-authored note here and
 the agent will see it on next restart.
 
-Authoritative documentation: REG.md and LINUX_SERVER.md in the
+Authoritative documentation: RAG.md and LINUX_SERVER.md in the
 easyai repo.
 
 This file (README.md) is ignored by the agent (no `.md` filename
@@ -675,8 +687,8 @@ wait, `README` IS valid. To be safe, the agent treats any file
 without a `keywords:` header as untagged but still listable, which
 is fine for a README.)
 REG_README
-        sudo chmod 640 "$reg_dir/README.md"
-        sudo chown "$service_user":"$service_group" "$reg_dir/README.md"
+        sudo chmod 640 "$rag_dir/README.md"
+        sudo chown "$service_user":"$service_group" "$rag_dir/README.md"
     fi
 
     # ---- favicon: copy operator-supplied icon to /etc/easyai/favicon
@@ -803,7 +815,7 @@ if [[ $do_service -eq 1 ]]; then
     args+=( --sandbox "$service_workspace" )
     args+=( --system-file "$system_file" )
     args+=( --external-tools "$external_tools_dir" )
-    args+=( --REG "$reg_dir" )
+    args+=( --RAG "$rag_dir" )
     [[ -n "$webui_title"     ]] && args+=( --webui-title "$webui_title" )
     [[ -n "$webui_icon_dest" ]] && args+=( --webui-icon  "$webui_icon_dest" )
     [[ "$enable_flash_attn" -eq 1 ]] && args+=( -fa )
@@ -912,7 +924,7 @@ UNIT
     # files under .service.d/ (e.g. verbose.conf carried `--verbose` via its
     # own ExecStart=). Those files survive an upgrade and silently MASK the
     # main unit's ExecStart, dropping every new flag the operator was meant
-    # to inherit (--external-tools, --REG, …). Concrete failure: REG enabled
+    # to inherit (--external-tools, --RAG, …). Concrete failure: RAG enabled
     # in the main unit, but reg_* tools never registered because the
     # legacy drop-in's ExecStart wins.
     #
@@ -946,7 +958,7 @@ UNIT
         # `find` instead of glob so an empty dir doesn't trip nullglob.
         while IFS= read -r f; do
             warn "drop-in '$f' contains ExecStart= and will OVERRIDE the main unit's ExecStart."
-            warn "  This silently strips --external-tools / --REG / … from the running server."
+            warn "  This silently strips --external-tools / --RAG / … from the running server."
             warn "  Either remove it (sudo rm '$f') or merge the new flags into it manually."
         done < <(sudo grep -lE '^[[:space:]]*ExecStart=' "$dropin_dir"/*.conf 2>/dev/null || true)
     fi

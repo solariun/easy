@@ -305,23 +305,23 @@ Webui title default also flips to `"Deep"`.
 ## 5. Recent commits (most recent first)
 
 ```
-2026-04-30 (afternoon) — REG: agent's persistent registry / long-term memory.
+2026-04-30 (afternoon) — RAG: agent's persistent registry / long-term memory.
 
-(pending commit) REG: a tag-keyed file-backed long-term memory the
-                 model writes to via 5 tools (reg_save, reg_search,
-                 reg_load, reg_list, reg_delete). Directory of
+(pending commit) RAG: a tag-keyed file-backed long-term memory the
+                 model writes to via 5 tools (rag_save, rag_search,
+                 rag_load, rag_list, rag_delete). Directory of
                  .md files <title>.md, format `keywords: a, b, c\n
                  \n<body>` — hand-editable, grep-able, scp-able. Title
                  regex closes path traversal. Bounded sizes (title 64,
                  keyword 32, max 8/entry, body 256 KiB, max 4 loads/call).
                  Atomic writes (tempfile + rename). In-memory index
-                 lazy-built. New `--REG <dir>` flag on easyai-server,
+                 lazy-built. New `--RAG <dir>` flag on easyai-server,
                  easyai-cli, easyai-local; install script creates
-                 /var/lib/easyai/reg (owned by service user, 750) and
+                 /var/lib/easyai/rag (owned by service user, 750) and
                  systemd unit always passes the flag. Tool descriptions
                  actively encourage save-aggressively /
                  search-before-assuming / delete-stale. New top-level
-                 docs: REG.md (full guide w/ workflows, document
+                 docs: RAG.md (full guide w/ workflows, document
                  ingestion cycle, roadmap) and LINUX_SERVER.md (operator
                  guide for the systemd-installed server, file layout,
                  perf tips, gotchas, API examples, backup/upgrade).
@@ -576,13 +576,13 @@ c6a09d6  Single combined bar above the textarea (tone + ctx + last)
   ✅ **FIXED via thought-only retry path** (see "Bug B root cause" above).
   Validated via curl in this session.  Pending user webui validation.
 
-- **REG (`--REG DIR`)** — agent's persistent registry / long-term memory.
-  Five tools (reg_save / reg_search / reg_load / reg_list / reg_delete)
+- **RAG (`--RAG DIR`)** — agent's persistent registry / long-term memory.
+  Five tools (rag_save / rag_search / rag_load / rag_list / rag_delete)
   share a directory of `.md` files with `keywords: a,b,c` headers and
   free-form bodies. Server enables by default
-  (`/var/lib/easyai/reg`, systemd unit always passes `--REG`); CLI
+  (`/var/lib/easyai/rag`, systemd unit always passes `--RAG`); CLI
   variants opt in. End-to-end smoke test passed (round-trip save →
-  list → search → load → delete). Authoritative doc: `REG.md`.
+  list → search → load → delete). Authoritative doc: `RAG.md`.
   Operator guide: `LINUX_SERVER.md`.
 
 - **External tools (`--external-tools DIR`)** — landed in `d0f7965`,

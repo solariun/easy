@@ -9,7 +9,7 @@
 #include "tool.hpp"
 #include "builtin_tools.hpp"
 #include "external_tools.hpp"
-#include "reg_tools.hpp"
+#include "rag_tools.hpp"
 #include "presets.hpp"
 #include "plan.hpp"
 #include "ui.hpp"

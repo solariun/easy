@@ -6,7 +6,7 @@ it, what to watch out for, and how to keep it healthy.
 
 If you're a developer, see `design.md` and `manual.md`. If you're
 writing tool manifests, see `EXTERNAL_TOOLS.md`. If you want to
-understand the agent's long-term memory, see `REG.md`.
+understand the agent's long-term memory, see `RAG.md`.
 
 ---
 
@@ -17,7 +17,7 @@ understand the agent's long-term memory, see `REG.md`.
 3. [Configuration files](#3-configuration-files)
 4. [The four mutable directories](#4-the-four-mutable-directories)
 5. [The `--external-tools` directory](#5-the---external-tools-directory)
-6. [The REG directory](#6-the-reg-directory)
+6. [The RAG directory](#6-the-reg-directory)
 7. [Performance tuning](#7-performance-tuning)
 8. [Common gotchas](#8-common-gotchas)
 9. [Hitting the API](#9-hitting-the-api)
@@ -46,7 +46,7 @@ roughly:
 | `/etc/easyai/external-tools/` | root:easyai | 750 | operator-defined tools (`EASYAI-*.tools`) |
 | `/etc/easyai/favicon[.ext]` | root:easyai | 644 | optional webui favicon |
 | `/var/lib/easyai/` | easyai:easyai | 750 | mutable agent state |
-| `/var/lib/easyai/reg/` | easyai:easyai | 750 | REG long-term memory |
+| `/var/lib/easyai/rag/` | easyai:easyai | 750 | RAG long-term memory |
 | `/var/lib/easyai/workspace/` | easyai:easyai | 750 | sandbox for fs_* and bash tools |
 | `/var/lib/easyai/models/` | easyai:easyai | 750 | the GGUF symlink target |
 | `/etc/systemd/system/easyai-server.service` | root:root | 644 | the unit file |
@@ -84,7 +84,7 @@ ExecStart=/bin/sh -c '...EASYAI_API_KEY=$(cat /etc/easyai/api_key) ...
                           --sandbox /var/lib/easyai/workspace \
                           --system-file /etc/easyai/system.txt \
                           --external-tools /etc/easyai/external-tools \
-                          --REG /var/lib/easyai/reg \
+                          --RAG /var/lib/easyai/rag \
                           ... '
 Restart=on-failure
 RestartSec=2
@@ -103,7 +103,7 @@ Important pieces:
   `get_current_dir` reports this path.
 - `--external-tools /etc/easyai/external-tools`. Operator-defined
   tools live here. Empty dir is a normal state.
-- `--REG /var/lib/easyai/reg`. The agent's persistent registry /
+- `--RAG /var/lib/easyai/rag`. The agent's persistent registry /
   long-term memory.
 - `LimitMEMLOCK=infinity` (in the drop-in) so `mlock` works.
 - `LimitCORE=infinity` (in the drop-in) so coredumps land for
@@ -145,12 +145,12 @@ sudo systemctl restart easyai-server
 
 The default the installer drops is short and tool-friendly. Customise
 to add domain context, persona, language preferences. If you want
-the model to use REG aggressively, mention it here:
+the model to use RAG aggressively, mention it here:
 
 ```
-You have a persistent registry called REG. Save important things
+You have a persistent registry called RAG. Save important things
 the user tells you (preferences, project facts, recipes that worked)
-with reg_save. Search REG with reg_search before assuming you don't
+with rag_save. Search RAG with rag_search before assuming you don't
 know something the user might have told you in a past session.
 ```
 
@@ -190,7 +190,7 @@ swap.
 | --- | --- | --- |
 | `/var/lib/easyai/models/` | GGUF symlink target. The unit's `-m` arg points here. | Big files. Easy to fill the disk. |
 | `/var/lib/easyai/workspace/` | The sandbox for `bash` / `fs_*` tools. | The agent reads / writes here. Keep it on a partition with room. |
-| `/var/lib/easyai/reg/` | REG long-term memory (one `.md` per entry). | Tiny. Backup-friendly. See `REG.md`. |
+| `/var/lib/easyai/rag/` | RAG long-term memory (one `.md` per entry). | Tiny. Backup-friendly. See `RAG.md`. |
 | `/etc/easyai/external-tools/` | Operator-defined tools (`EASYAI-*.tools`). | Operator-curated. See `EXTERNAL_TOOLS.md`. |
 
 ---
@@ -224,10 +224,10 @@ anti-patterns, troubleshooting, collaboration workflow.
 
 ---
 
-## 6. The REG directory
+## 6. The RAG directory
 
 Active by default. The systemd unit always passes
-`--REG /var/lib/easyai/reg`. The agent writes here at runtime — that
+`--RAG /var/lib/easyai/rag`. The agent writes here at runtime — that
 is why it's under `/var/lib` (mutable state) rather than `/etc`
 (operator config).
 
@@ -235,22 +235,22 @@ is why it's under `/var/lib` (mutable state) rather than `/etc`
 
 ```bash
 # How many entries does the agent have?
-ls /var/lib/easyai/reg/*.md 2>/dev/null | wc -l
+ls /var/lib/easyai/rag/*.md 2>/dev/null | wc -l
 
 # What did it save most recently?
-ls -lt /var/lib/easyai/reg/*.md | head -10
+ls -lt /var/lib/easyai/rag/*.md | head -10
 
 # What's in a specific entry?
-sudo -u easyai cat /var/lib/easyai/reg/<title>.md
+sudo -u easyai cat /var/lib/easyai/rag/<title>.md
 
 # Search across all entries
-sudo grep -l "user-prefs" /var/lib/easyai/reg/*.md
+sudo grep -l "user-prefs" /var/lib/easyai/rag/*.md
 ```
 
 **Hand-author an entry:**
 
 ```bash
-sudo -u easyai bash -c 'cat > /var/lib/easyai/reg/welcome.md' <<'EOF'
+sudo -u easyai bash -c 'cat > /var/lib/easyai/rag/welcome.md' <<'EOF'
 keywords: user-prefs, locale
 
 The user prefers PT-BR responses with technical jargon in English.
@@ -259,7 +259,7 @@ EOF
 sudo systemctl restart easyai-server
 ```
 
-**Full reference:** `REG.md`. File format, the five tools, workflows,
+**Full reference:** `RAG.md`. File format, the five tools, workflows,
 roadmap, troubleshooting.
 
 ---
@@ -398,13 +398,13 @@ sudo systemctl restart easyai-server
 
 ### Agent doesn't seem to remember anything
 
-Either REG isn't enabled or the dir is wrong:
+Either RAG isn't enabled or the dir is wrong:
 
 ```bash
-journalctl -u easyai-server | grep "REG enabled"
+journalctl -u easyai-server | grep "RAG enabled"
 ```
 
-If absent, re-run installer or check `systemctl cat` for `--REG`.
+If absent, re-run installer or check `systemctl cat` for `--RAG`.
 
 ---
 
@@ -466,7 +466,7 @@ for chunk in resp:
 ```
 
 The model dispatches whatever tools the operator declared on the
-server side (built-ins + `--external-tools` + REG).
+server side (built-ins + `--external-tools` + RAG).
 
 ### `X-Easyai-Inject: off` to skip date/time injection
 
@@ -505,16 +505,16 @@ curl -fsS http://localhost/health | jq .tool_count
 Expected (rough):
 
 - 4 (datetime, web_search, web_fetch, plan)
-- + 5 (REG: reg_save / search / load / list / delete)
+- + 5 (RAG: rag_save / search / load / list / delete)
 - + 6 (`--allow-fs`: read_file / write_file / list_dir / glob / grep / get_current_dir)
 - + 1 (`--allow-bash`: bash)
 - + N (your `--external-tools` packs)
 
-### REG working?
+### RAG working?
 
 ```bash
-ls /var/lib/easyai/reg/
-journalctl -u easyai-server | grep "REG enabled"
+ls /var/lib/easyai/rag/
+journalctl -u easyai-server | grep "RAG enabled"
 ```
 
 ### External tools loaded?
@@ -544,7 +544,7 @@ easyai-server: [external-tools] error: /etc/easyai/external-tools/EASYAI-foo.too
 | Path | Frequency | Why |
 | --- | --- | --- |
 | `/etc/easyai/` | on change | system prompt, api key, external tools |
-| `/var/lib/easyai/reg/` | regular | the agent's accumulated knowledge |
+| `/var/lib/easyai/rag/` | regular | the agent's accumulated knowledge |
 | `/var/lib/easyai/workspace/` | maybe | depends what you let the agent write here |
 | `/var/lib/easyai/models/` | usually no | GGUFs are big and re-downloadable |
 
@@ -553,7 +553,7 @@ easyai-server: [external-tools] error: /etc/easyai/external-tools/EASYAI-foo.too
 ```bash
 sudo tar -czf easyai-backup-$(date +%F).tar.gz \
     /etc/easyai \
-    /var/lib/easyai/reg \
+    /var/lib/easyai/rag \
     /var/lib/easyai/workspace \
     /etc/systemd/system/easyai-server.service.d
 ```
@@ -569,7 +569,7 @@ sudo tar -czf easyai-backup-$(date +%F).tar.gz \
    ```
 4. Fix ownership:
    ```bash
-   sudo chown -R easyai:easyai /var/lib/easyai/reg /var/lib/easyai/workspace
+   sudo chown -R easyai:easyai /var/lib/easyai/rag /var/lib/easyai/workspace
    ```
 5. `sudo systemctl start easyai-server`.
 
@@ -588,7 +588,7 @@ git pull
 - Refreshes `/usr/bin/easyai-*` and `/usr/lib/easyai/`
 - Re-renders the systemd unit (so flag changes propagate)
 - Does NOT touch `/etc/easyai/system.txt`, `/etc/easyai/api_key`,
-  `/var/lib/easyai/reg/*` — your data is safe
+  `/var/lib/easyai/rag/*` — your data is safe
 - Does NOT touch `/etc/easyai/external-tools/*` — your manifests
   are safe
 - WILL refresh the README in `external-tools/` and the
@@ -602,7 +602,7 @@ git pull
 After upgrading, sanity-check:
 
 ```bash
-journalctl -u easyai-server -n 50 --no-pager | grep -E "REG enabled|external-tools|loaded"
+journalctl -u easyai-server -n 50 --no-pager | grep -E "RAG enabled|external-tools|loaded"
 ```
 
 ---
@@ -678,7 +678,7 @@ proxy can override.
 The tool's `timeout_ms` is too high (cap is 5 min). Edit the
 `.tools` file, lower `timeout_ms`, restart the server.
 
-### REG entries appear duplicated
+### RAG entries appear duplicated
 
 Two things to check:
 
@@ -711,5 +711,5 @@ Then `daemon-reload && restart`. Drop the override when done.
 
 ---
 
-*See also:* `REG.md`, `EXTERNAL_TOOLS.md`, `manual.md`, `design.md`,
+*See also:* `RAG.md`, `EXTERNAL_TOOLS.md`, `manual.md`, `design.md`,
 `SECURITY_AUDIT.md`.

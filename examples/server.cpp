@@ -2740,14 +2740,14 @@ static bool require_auth(const ServerCtx & ctx, const httplib::Request & req,
         "                                security sanity-check warning to stderr.\n"
         "                                See EXTERNAL_TOOLS.md for the schema and\n"
         "                                collaboration workflow.\n"
-        "      --REG <dir>              Enable REG, the agent's persistent\n"
+        "      --RAG <dir>              Enable RAG, the agent's persistent\n"
         "                                registry / long-term memory. Each entry\n"
         "                                is one Markdown file in <dir>. Five\n"
-        "                                tools added: reg_save, reg_search,\n"
-        "                                reg_load, reg_list, reg_delete. The\n"
+        "                                tools added: rag_save, rag_search,\n"
+        "                                rag_load, rag_list, rag_delete. The\n"
         "                                installed systemd unit always passes\n"
         "                                this flag; manual invocations need it\n"
-        "                                explicitly. See REG.md.\n"
+        "                                explicitly. See RAG.md.\n"
         "\nModel tuning (apply on top of --preset):\n"
         "      --preset <name>          Ambient preset (default 'balanced')\n"
         "      --temperature <f>        Override temperature (0.0-2.0)\n"
@@ -2822,7 +2822,7 @@ struct ServerArgs {
     bool        allow_fs   = false; // explicit opt-in for the fs_* tools
     bool        allow_bash = false; // explicit opt-in for the `bash` tool
     std::string external_tools_dir; // optional: dir of EASYAI-*.tools files
-    std::string reg_dir;             // optional: REG persistent-registry dir
+    std::string rag_dir;             // optional: RAG persistent-registry dir
     std::string preset     = "balanced";
     size_t      max_body   = 8u * 1024u * 1024u;
 
@@ -2890,7 +2890,7 @@ static ServerArgs parse_args(int argc, char ** argv) {
         else if (s == "--allow-fs")                  a.allow_fs       = true;
         else if (s == "--allow-bash")                a.allow_bash     = true;
         else if (s == "--external-tools")            a.external_tools_dir = need(i, "--external-tools");
-        else if (s == "--REG")                       a.reg_dir            = need(i, "--REG");
+        else if (s == "--RAG")                       a.rag_dir            = need(i, "--RAG");
         else if (s == "--preset")                    a.preset         = need(i, "--preset");
         else if (s == "--max-body")                  a.max_body       = (size_t) std::atoll(need(i, "--max-body"));
         else if (s == "--batch")                     a.n_batch        = std::atoi(need(i, "--batch"));
@@ -3119,22 +3119,22 @@ int main(int argc, char ** argv) {
         for (auto & t : tb.tools()) ctx->default_tools.push_back(std::move(t));
     }
 
-    // REG — the agent's persistent registry / long-term memory.
-    // Five tools (reg_save / reg_search / reg_load / reg_list /
-    // reg_delete) registered when --REG <dir> is given. The dir
-    // does NOT have to exist yet; reg_save creates it on first
-    // call. The systemd-installed server passes --REG by default
-    // (see scripts/install_easyai_server.sh). See REG.md.
-    if (!args.reg_dir.empty()) {
-        auto reg = easyai::tools::make_reg_tools(args.reg_dir);
-        ctx->default_tools.push_back(std::move(reg.save));
-        ctx->default_tools.push_back(std::move(reg.search));
-        ctx->default_tools.push_back(std::move(reg.load));
-        ctx->default_tools.push_back(std::move(reg.list));
-        ctx->default_tools.push_back(std::move(reg.del));
+    // RAG — the agent's persistent registry / long-term memory.
+    // Five tools (rag_save / rag_search / rag_load / rag_list /
+    // rag_delete) registered when --RAG <dir> is given. The dir
+    // does NOT have to exist yet; rag_save creates it on first
+    // call. The systemd-installed server passes --RAG by default
+    // (see scripts/install_easyai_server.sh). See RAG.md.
+    if (!args.rag_dir.empty()) {
+        auto rag = easyai::tools::make_rag_tools(args.rag_dir);
+        ctx->default_tools.push_back(std::move(rag.save));
+        ctx->default_tools.push_back(std::move(rag.search));
+        ctx->default_tools.push_back(std::move(rag.load));
+        ctx->default_tools.push_back(std::move(rag.list));
+        ctx->default_tools.push_back(std::move(rag.del));
         std::fprintf(stderr,
-            "easyai-server: REG enabled, root = %s\n",
-            args.reg_dir.c_str());
+            "easyai-server: RAG enabled, root = %s\n",
+            args.rag_dir.c_str());
     }
 
     // External tools directory. Loaded AFTER the built-in toolbelt so

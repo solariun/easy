@@ -7,7 +7,7 @@
 #include "easyai/engine.hpp"
 #include "easyai/external_tools.hpp"
 #include "easyai/presets.hpp"
-#include "easyai/reg_tools.hpp"
+#include "easyai/rag_tools.hpp"
 #include "easyai/tool.hpp"
 
 #include <cstdio>
@@ -62,18 +62,18 @@ bool LocalBackend::init(std::string & err) {
             .apply     (engine);
     }
 
-    // REG — the agent's persistent registry (long-term memory).
+    // RAG — the agent's persistent registry (long-term memory).
     // Registered when the operator gives us a directory. The
     // directory does NOT have to exist yet; the tools create it on
-    // first save. Five tools: reg_save / reg_search / reg_load /
-    // reg_list / reg_delete. See REG.md for the full guide.
-    if (!cfg.reg_dir.empty()) {
-        auto reg = tools::make_reg_tools(cfg.reg_dir);
-        engine.add_tool(reg.save);
-        engine.add_tool(reg.search);
-        engine.add_tool(reg.load);
-        engine.add_tool(reg.list);
-        engine.add_tool(reg.del);
+    // first save. Five tools: rag_save / rag_search / rag_load /
+    // rag_list / rag_delete. See RAG.md for the full guide.
+    if (!cfg.rag_dir.empty()) {
+        auto rag = tools::make_rag_tools(cfg.rag_dir);
+        engine.add_tool(rag.save);
+        engine.add_tool(rag.search);
+        engine.add_tool(rag.load);
+        engine.add_tool(rag.list);
+        engine.add_tool(rag.del);
     }
 
     // External tools directory. Loaded after the built-in toolbelt so

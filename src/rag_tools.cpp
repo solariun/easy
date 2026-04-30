@@ -1,4 +1,4 @@
-// src/reg_tools.cpp — implementation of the REG persistent registry.
+// src/rag_tools.cpp — implementation of the RAG persistent registry.
 //
 // On-disk format and constraints are documented in the public
 // header. This file enforces those contracts plus the four tool
@@ -22,7 +22,7 @@
 //
 //   * Listing/searching never reads the body from disk — only
 //     the title (= filename) and the cached keywords from the index.
-//     `reg_load` does the single read for the body when the
+//     `rag_load` does the single read for the body when the
 //     model picks an entry.
 //
 //   * The title is the filesystem name. Validating it with a
@@ -30,7 +30,7 @@
 //     closes the path-traversal door — there is no way for the
 //     model to write `..`, slashes, NUL bytes, etc.
 
-#include "easyai/reg_tools.hpp"
+#include "easyai/rag_tools.hpp"
 #include "easyai/tool.hpp"
 
 #include <nlohmann/json.hpp>
@@ -74,14 +74,14 @@ constexpr std::size_t kMaxKeywordsPerEntry    = 8;
 // enough that 1 000 entries fit comfortably on disk and in memory.
 constexpr std::size_t kMaxContentBytes    = 256u * 1024u;
 
-// reg_load can fan out to up to 4 entries per call. The cap is
+// rag_load can fan out to up to 4 entries per call. The cap is
 // deliberate: more than 4 means the model is probably about to
 // drown the prompt in stale content rather than focusing on what
 // matters, and the agent loop stays cheaper too.
 constexpr std::size_t kMaxLoadAtOnce      = 4;
 
 // Search result cap. The model gets a list of (title, keywords,
-// preview) and picks 1..4 to reg_load — so we don't need a huge
+// preview) and picks 1..4 to rag_load — so we don't need a huge
 // list, just enough to cover obvious keyword clusters.
 constexpr std::size_t kSearchResultsMax   = 20;
 constexpr std::size_t kSearchResultsDflt  = 10;
@@ -91,7 +91,7 @@ constexpr std::size_t kSearchResultsDflt  = 10;
 // short enough to keep the prompt slim.
 constexpr std::size_t kSearchPreviewBytes = 240;
 
-// reg_list cap. Browsing-only; no body read.
+// rag_list cap. Browsing-only; no body read.
 constexpr std::size_t kListResultsMax     = 200;
 constexpr std::size_t kListResultsDflt    = 50;
 
@@ -184,7 +184,7 @@ bool slurp_capped(const fs::path & p, std::size_t max_bytes,
 //     just a free-form note dropped here by the operator
 //
 // is loaded as `keywords = []`, `body = "<entire content>"`.
-// `reg_search` won't find it (no keywords) but `reg_list` will.
+// `rag_search` won't find it (no keywords) but `rag_list` will.
 struct ParsedEntry {
     std::vector<std::string> keywords;
     std::string              body;
@@ -298,15 +298,15 @@ struct EntryMeta {
 };
 
 // ---------------------------------------------------------------------------
-// RegStore — the shared state for all four tools.
+// RagStore — the shared state for all four tools.
 // ---------------------------------------------------------------------------
-struct RegStore {
+struct RagStore {
     fs::path                            root;
     std::mutex                          mu;
     std::map<std::string, EntryMeta>    index;
     bool                                index_loaded = false;
 
-    explicit RegStore(std::string r) {
+    explicit RagStore(std::string r) {
         if (!r.empty()) {
             std::error_code ec;
             root = fs::absolute(r, ec);
@@ -320,18 +320,18 @@ struct RegStore {
     // that wants to write; reads tolerate a missing dir (returns
     // empty list).
     bool ensure_dir(std::string & err) {
-        if (!root_set()) { err = "REG root path is empty"; return false; }
+        if (!root_set()) { err = "RAG root path is empty"; return false; }
         std::error_code ec;
         if (fs::exists(root, ec)) {
             if (!fs::is_directory(root, ec)) {
-                err = "REG root is not a directory: " + root.string();
+                err = "RAG root is not a directory: " + root.string();
                 return false;
             }
             return true;
         }
         fs::create_directories(root, ec);
         if (ec) {
-            err = "create REG dir failed: " + ec.message();
+            err = "create RAG dir failed: " + ec.message();
             return false;
         }
         return true;
@@ -411,13 +411,13 @@ struct RegStore {
         {
             std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
             if (!out) {
-                err = "cannot open REG tempfile in " + root.string();
+                err = "cannot open RAG tempfile in " + root.string();
                 return false;
             }
             out.write(text.data(), (std::streamsize) text.size());
             out.flush();
             if (!out) {
-                err = "write to REG tempfile failed";
+                err = "write to RAG tempfile failed";
                 std::error_code ec;
                 fs::remove(tmp, ec);
                 return false;
@@ -458,11 +458,11 @@ struct RegStore {
                   std::string & body_out,
                   std::int64_t & modified_unix_out,
                   std::string & err) {
-        if (!root_set()) { err = "REG root path is empty"; return false; }
+        if (!root_set()) { err = "RAG root path is empty"; return false; }
         const auto target = root / (title + kEntrySuffix);
         std::error_code ec;
         if (!fs::exists(target, ec)) {
-            err = "no REG entry titled \"" + title + "\"";
+            err = "no RAG entry titled \"" + title + "\"";
             return false;
         }
         std::string raw;
@@ -495,7 +495,7 @@ struct RegStore {
     bool delete_locked(const std::string & title, bool & existed,
                        std::string & err) {
         existed = false;
-        if (!root_set()) { err = "REG root path is empty"; return false; }
+        if (!root_set()) { err = "RAG root path is empty"; return false; }
         const auto target = root / (title + kEntrySuffix);
         std::error_code ec;
         if (!fs::exists(target, ec)) {
@@ -570,7 +570,7 @@ std::string make_preview(const std::string & content, std::size_t max_bytes) {
 // Tool handler factories
 // ---------------------------------------------------------------------------
 
-ToolHandler make_save_handler(std::shared_ptr<RegStore> store) {
+ToolHandler make_save_handler(std::shared_ptr<RagStore> store) {
     return [store](const ToolCall & c) -> ToolResult {
         std::string title;
         if (!args::get_string(c.arguments_json, "title", title) || title.empty()) {
@@ -591,9 +591,9 @@ ToolHandler make_save_handler(std::shared_ptr<RegStore> store) {
             return ToolResult::error(
                 "keywords must be a non-empty array (1.."
                 + std::to_string(kMaxKeywordsPerEntry)
-                + " short keywords). Why: keywords are how reg_search finds this "
+                + " short keywords). Why: keywords are how rag_search finds this "
                   "entry later — an entry with no keywords is unreachable by keyword "
-                  "search (only reg_list can find it).");
+                  "search (only rag_list can find it).");
         }
         if (keywords.size() > kMaxKeywordsPerEntry) {
             return ToolResult::error(
@@ -630,7 +630,7 @@ ToolHandler make_save_handler(std::shared_ptr<RegStore> store) {
     };
 }
 
-ToolHandler make_search_handler(std::shared_ptr<RegStore> store) {
+ToolHandler make_search_handler(std::shared_ptr<RagStore> store) {
     return [store](const ToolCall & c) -> ToolResult {
         std::string keyword;
         if (!args::get_string(c.arguments_json, "keyword", keyword) || keyword.empty()) {
@@ -672,7 +672,7 @@ ToolHandler make_search_handler(std::shared_ptr<RegStore> store) {
         if (hits.empty()) {
             return ToolResult::ok(
                 "no entries match keyword \"" + keyword + "\". "
-                "Use reg_list to browse all titles, or reg_save to add new ones.");
+                "Use rag_list to browse all titles, or rag_save to add new ones.");
         }
 
         // Render plain-text + structured (markdown-friendly) output.
@@ -710,13 +710,13 @@ ToolHandler make_search_handler(std::shared_ptr<RegStore> store) {
             }
             o << "   " << preview_in << "\n\n";
         }
-        o << "Use reg_load with up to " << kMaxLoadAtOnce
+        o << "Use rag_load with up to " << kMaxLoadAtOnce
           << " of these titles for full content.\n";
         return ToolResult::ok(o.str());
     };
 }
 
-ToolHandler make_load_handler(std::shared_ptr<RegStore> store) {
+ToolHandler make_load_handler(std::shared_ptr<RagStore> store) {
     return [store](const ToolCall & c) -> ToolResult {
         std::vector<std::string> titles;
         std::string err;
@@ -731,7 +731,7 @@ ToolHandler make_load_handler(std::shared_ptr<RegStore> store) {
             return ToolResult::error(
                 "too many titles requested (max "
                 + std::to_string(kMaxLoadAtOnce)
-                + " per call); narrow your reg_search first");
+                + " per call); narrow your rag_search first");
         }
         for (const auto & t : titles) {
             if (!is_valid_id(t, kMaxTitleBytes)) {
@@ -769,7 +769,7 @@ ToolHandler make_load_handler(std::shared_ptr<RegStore> store) {
     };
 }
 
-ToolHandler make_list_handler(std::shared_ptr<RegStore> store) {
+ToolHandler make_list_handler(std::shared_ptr<RagStore> store) {
     return [store](const ToolCall & c) -> ToolResult {
         std::string prefix;
         args::get_string(c.arguments_json, "prefix", prefix);
@@ -801,7 +801,7 @@ ToolHandler make_list_handler(std::shared_ptr<RegStore> store) {
 
         if (rows.empty()) {
             return ToolResult::ok(prefix.empty()
-                ? "REGistry is empty. Use reg_save to add entries."
+                ? "RAGistry is empty. Use rag_save to add entries."
                 : "no titles match prefix \"" + prefix + "\".");
         }
 
@@ -829,7 +829,7 @@ ToolHandler make_list_handler(std::shared_ptr<RegStore> store) {
     };
 }
 
-ToolHandler make_delete_handler(std::shared_ptr<RegStore> store) {
+ToolHandler make_delete_handler(std::shared_ptr<RagStore> store) {
     return [store](const ToolCall & c) -> ToolResult {
         std::string title;
         if (!args::get_string(c.arguments_json, "title", title) || title.empty()) {
@@ -861,29 +861,29 @@ ToolHandler make_delete_handler(std::shared_ptr<RegStore> store) {
 // ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
-RegTools make_reg_tools(std::string root_dir) {
-    auto store = std::make_shared<RegStore>(std::move(root_dir));
+RagTools make_rag_tools(std::string root_dir) {
+    auto store = std::make_shared<RagStore>(std::move(root_dir));
 
-    RegTools out;
+    RagTools out;
 
-    out.save = Tool::builder("reg_save")
+    out.save = Tool::builder("rag_save")
         .describe(
-            "Save a piece of knowledge to the persistent REGistry — your long-term "
+            "Save a piece of knowledge to the persistent RAGistry — your long-term "
             "memory across sessions. USE THIS AGGRESSIVELY for anything worth "
             "remembering: the user's stated preferences and constraints, project "
             "structure and decisions you've learned, technical facts you had to look "
             "up, recipes / commands that worked, error patterns and their fixes, "
             "domain knowledge from documents the user fed you. The more carefully "
             "you populate the registry, the smarter you become over time — future "
-            "conversations will reg_search and find what THIS conversation taught "
+            "conversations will rag_search and find what THIS conversation taught "
             "you.\n"
             "\n"
             "Pick a short descriptive title (letters / digits / dash / underscore "
-            "only — no spaces) and 2-5 short keywords so reg_search can find it later. "
+            "only — no spaces) and 2-5 short keywords so rag_search can find it later. "
             "Keywords should be stable and reusable: 'user-prefs', 'project-easyai', "
             "'cmd-recipe', 'fix-vulkan-radv'. Overwrites if a title already exists "
             "(useful for refining notes as you learn more). If an entry becomes "
-            "stale or wrong, use reg_delete to remove it — keeping the registry "
+            "stale or wrong, use rag_delete to remove it — keeping the registry "
             "tidy makes future searches sharper. Each entry is a small Markdown "
             "file on disk (title.md) so the operator can hand-edit too."
         )
@@ -893,7 +893,7 @@ RegTools make_reg_tools(std::string root_dir) {
                "'easyai-build-recipe', 'qwen3-thinking-fix'.", true)
         .param("keywords",    "array",
                "1..8 short keywords classifying this entry. Same character set as "
-               "title. Use stable reusable keywords so future reg_search calls find "
+               "title. Use stable reusable keywords so future rag_search calls find "
                "this entry. Example: [\"user-prefs\", \"hardware\", \"radv\"].",
                true)
         .param("content", "string",
@@ -903,16 +903,16 @@ RegTools make_reg_tools(std::string root_dir) {
         .handle(make_save_handler(store))
         .build();
 
-    out.search = Tool::builder("reg_search")
+    out.search = Tool::builder("rag_search")
         .describe(
-            "Search the REGistry by keyword. Returns up to 20 matching entries with "
+            "Search the RAGistry by keyword. Returns up to 20 matching entries with "
             "their title, keywords, modification time, and a short content preview. "
             "USE THIS BEFORE assuming you don't know something the user might "
             "have told you in a past session — your past self may have already "
             "saved the answer. After this returns, pick the 1-4 most relevant "
-            "titles and use reg_load to read their full content.\n\n"
+            "titles and use rag_load to read their full content.\n\n"
             "Returns newest-first. If no entries match, the result tells you so "
-            "(not an error) — try a different keyword, or use reg_list to browse."
+            "(not an error) — try a different keyword, or use rag_list to browse."
         )
         .param("keyword",         "string",
                "Keyword to search for. Single keyword, exact match (case-sensitive). "
@@ -922,12 +922,12 @@ RegTools make_reg_tools(std::string root_dir) {
         .handle(make_search_handler(store))
         .build();
 
-    out.load = Tool::builder("reg_load")
+    out.load = Tool::builder("rag_load")
         .describe(
-            "Load up to 4 entries from the REGistry by exact title and return "
-            "their FULL content. Use this after reg_search to read the bodies "
+            "Load up to 4 entries from the RAGistry by exact title and return "
+            "their FULL content. Use this after rag_search to read the bodies "
             "of entries that looked promising in the preview. Pass exact titles "
-            "from a previous reg_search result.\n\n"
+            "from a previous rag_search result.\n\n"
             "Cap is 4 per call. If you need more than 4, you're probably "
             "trying to drown the prompt in stale content; narrow your search "
             "first."
@@ -938,14 +938,14 @@ RegTools make_reg_tools(std::string root_dir) {
         .handle(make_load_handler(store))
         .build();
 
-    out.list = Tool::builder("reg_list")
+    out.list = Tool::builder("rag_list")
         .describe(
-            "List REGistry titles, optionally filtered by title prefix. Use to "
+            "List RAGistry titles, optionally filtered by title prefix. Use to "
             "browse what you've saved when you're not sure what keyword to search by, "
             "or to confirm whether you've saved a particular note. Returns title, "
             "keywords, content_bytes, and modified time — body NOT included (use "
-            "reg_load for that). Untagged entries (operator-dropped notes with "
-            "no keywords: header) show here but don't appear in reg_search."
+            "rag_load for that). Untagged entries (operator-dropped notes with "
+            "no keywords: header) show here but don't appear in rag_search."
         )
         .param("prefix", "string",
                "Optional prefix to filter titles by. Empty = list all. "
@@ -955,16 +955,16 @@ RegTools make_reg_tools(std::string root_dir) {
         .handle(make_list_handler(store))
         .build();
 
-    out.del = Tool::builder("reg_delete")
+    out.del = Tool::builder("rag_delete")
         .describe(
-            "Delete a REGistry entry by exact title. Use this when an entry has "
+            "Delete a RAGistry entry by exact title. Use this when an entry has "
             "become stale, wrong, or just irrelevant — keeping the registry "
-            "tidy makes future reg_search results sharper. Common reasons to "
+            "tidy makes future rag_search results sharper. Common reasons to "
             "delete:\n"
             "  - the user corrected something and the old note is now wrong\n"
             "  - a project / preference / fact has changed\n"
-            "  - you want to refine a note: delete + reg_save replaces it\n"
-            "    cleanly (reg_save also overwrites, but delete-first is\n"
+            "  - you want to refine a note: delete + rag_save replaces it\n"
+            "    cleanly (rag_save also overwrites, but delete-first is\n"
             "    appropriate when the title or keywords need to change too)\n"
             "  - the entry was a one-off scratch note that's no longer needed\n"
             "\n"

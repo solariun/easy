@@ -1,6 +1,6 @@
-// easyai/reg_tools.hpp — REG: the agent's persistent registry.
+// easyai/rag_tools.hpp — RAG: the agent's persistent registry.
 //
-// REG is a keyword-indexed, file-backed long-term memory for an
+// RAG is a keyword-indexed, file-backed long-term memory for an
 // agent. The model writes notes (title + keywords + free-form
 // content), searches by keyword, and loads up to 4 entries at a time
 // to read back their content.
@@ -17,19 +17,19 @@
 //
 // First line is the header (`keywords: <comma-separated list>`),
 // then a blank line, then the body. A file with no header is
-// treated as "untagged" — it shows in `reg_list` but never in
-// `reg_search`. `created` / `modified` come from the filesystem's
+// treated as "untagged" — it shows in `rag_list` but never in
+// `rag_search`. `created` / `modified` come from the filesystem's
 // own mtime; we don't store them redundantly.
 //
 // Why a keyword registry, not a vector store?
 // ---------------------------------------
 // A vector store needs an embedding model, a similarity index,
-// and a notion of "neighbours". REG needs zero of those: it's
+// and a notion of "neighbours". RAG needs zero of those: it's
 // a keyword-keyed key/value store with tiny indexing cost. The model
 // is the one deciding what to remember and how to classify it,
 // which is the part vector stores get wrong anyway. When we
 // later want progressive recall ("load my last 5 most-relevant
-// entries on session start"), that layer can sit on top — REG
+// entries on session start"), that layer can sit on top — RAG
 // itself stays simple and cheap.
 //
 // Constraints
@@ -56,23 +56,23 @@
 
 namespace easyai::tools {
 
-// The four tools that comprise the REG surface. They share an
+// The four tools that comprise the RAG surface. They share an
 // internal store object that holds the in-memory index and
 // serialises disk writes.
-struct RegTools {
-    Tool save;     // reg_save(title, keywords[], content)
-    Tool search;   // reg_search(keyword, max_results=10)
-    Tool load;     // reg_load(titles[1..4])
-    Tool list;     // reg_list(prefix?, max=50)
-    Tool del;      // reg_delete(title)
+struct RagTools {
+    Tool save;     // rag_save(title, keywords[], content)
+    Tool search;   // rag_search(keyword, max_results=10)
+    Tool load;     // rag_load(titles[1..4])
+    Tool list;     // rag_list(prefix?, max=50)
+    Tool del;      // rag_delete(title)
 };
 
-// Build the five REG tools rooted at `root_dir`. The directory is
+// Build the five RAG tools rooted at `root_dir`. The directory is
 // created on demand at first save; missing-directory at registration
 // time is NOT an error (operator may not have provisioned it yet).
 //
 // `root_dir` must not be empty; an empty path is a programmer error
 // and the tools will reject every call with a clear message.
-RegTools make_reg_tools(std::string root_dir);
+RagTools make_rag_tools(std::string root_dir);
 
 }  // namespace easyai::tools
