@@ -801,7 +801,7 @@ The flow has four invariants worth calling out:
    sees the OLD body or the NEW body but never a torn write. No
    locking needed on the read path.
 4. **Path-safety by regex.** Title and keyword identifiers must
-   match `^[A-Za-z0-9_-]+$`. The title is concatenated with `.md`
+   match `^[A-Za-z0-9._+-]+$`. The title is concatenated with `.md`
    to form the on-disk path — the regex closes path-traversal at
    parse time. There is no other access-control layer; the
    filesystem ACL on `/var/lib/easyai/rag/` is the deployment

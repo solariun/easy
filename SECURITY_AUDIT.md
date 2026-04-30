@@ -506,8 +506,8 @@ and read from a directory of small Markdown files. Path-traversal
 is the only security-relevant primitive; the rest is correctness.
 
 - **Path-traversal closed at the regex.** Title and keyword
-  identifiers must match `^[A-Za-z0-9_-]{1,64}$` /
-  `^[A-Za-z0-9_-]{1,32}$`. Slashes, dots, NULs, spaces are
+  identifiers must match `^[A-Za-z0-9._+-]{1,64}$` /
+  `^[A-Za-z0-9._+-]{1,32}$`. Slashes, dots, NULs, spaces are
   rejected at validation. The validated title is concatenated as
   `<title>.md` to the configured root and passed to `std::ofstream`
   / `std::ifstream`. There is no path-traversal surface — `..`,

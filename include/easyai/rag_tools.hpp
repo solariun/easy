@@ -34,7 +34,7 @@
 //
 // Constraints
 // -----------
-//   * Title and keywords match `^[A-Za-z0-9_-]+$`. No spaces, no
+//   * Title and keywords match `^[A-Za-z0-9._+-]+$`. No spaces, no
 //     slashes — the title is the filename component, so this
 //     also means there's no path-traversal surface.
 //   * Title  ≤ 64 bytes; keyword ≤ 32 bytes; up to 8 keywords per entry.

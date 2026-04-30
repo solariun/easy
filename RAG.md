@@ -266,11 +266,35 @@ it on its first rag_search by `user-prefs`.
 
 ### Constraints
 
-- Title (= filename stem): `^[A-Za-z0-9_-]{1,64}$`. No spaces, no
-  slashes, no dots. The strict regex closes path-traversal — there is
-  no way for the model to write outside the RAG dir.
-- Keyword: same character set, ≤ 32 bytes, ≤ 8 keywords per entry.
-- Content body: ≤ 256 KiB.
+Both titles and keywords share the character set
+`[A-Za-z0-9._+-]`. No spaces, no slashes, no shell metacharacters.
+The strict regex closes path-traversal at parse time — there is
+no way for the model to write outside the RAG dir.
+
+| Field | Char set | Length | Extras |
+| --- | --- | --- | --- |
+| Title | `[A-Za-z0-9._+-]` | 1..64 | Filesystem-safe: cannot be `.` or `..`, cannot start with `.`, must contain ≥1 alnum (so titles like `...` or `+-+` are rejected). |
+| Keyword | `[A-Za-z0-9._+-]` | 1..32 | Plain text in the file header. No filesystem concerns; the title-specific extras don't apply. Up to 8 keywords per entry. |
+| Body | UTF-8 | ≤ 256 KiB | Free-form. Markdown / code / prose / JSON — the model is the only reader. |
+
+Why each non-alnum character is allowed:
+
+- `-` `_`: classic word separators (`user-prefs`, `cmd_recipe`).
+- `.`: versions (`v1.0`), namespaces (`project.easyai`), file
+  references (`nginx.conf`).
+- `+`: niche but real — `c++`, `git+ssh`, `a+b`-style recipes.
+
+What's deliberately blocked:
+
+- Spaces — filesystem ambiguity, shell-quoting traps.
+- `/` `\` — path-component separators.
+- `:` — reserved on Windows, ADS-style abuse on NTFS.
+- Quotes, `$`, backticks, `#`, `&`, `|`, `;` — shell-metachar traps.
+
+If you find yourself wanting one of the blocked characters, that's
+usually a sign the title or keyword is trying to encode structure
+that should be its own field — split into multiple keywords, or
+use `.` for hierarchy.
 
 ---
 

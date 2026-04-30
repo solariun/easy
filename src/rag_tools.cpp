@@ -26,7 +26,7 @@
 //     model picks an entry.
 //
 //   * The title is the filesystem name. Validating it with a
-//     strict regex (`^[A-Za-z0-9_-]+$`, ≤ 64 bytes) is what
+//     strict regex (`^[A-Za-z0-9._+-]+$`, ≤ 64 bytes) is what
 //     closes the path-traversal door — there is no way for the
 //     model to write `..`, slashes, NUL bytes, etc.
 
@@ -111,7 +111,25 @@ constexpr std::size_t kEntrySuffixLen     = sizeof(kEntrySuffix) - 1;
 // ---------------------------------------------------------------------------
 // Validators — pure, no I/O, no allocation past the input.
 // ---------------------------------------------------------------------------
-
+//
+// Allowed character set for keywords AND titles:
+//   [a-zA-Z0-9._+-]
+//
+// Why each non-alnum is allowed (or not):
+//
+//   `-` `_`  classic word separators
+//   `.`      versions ("v1.0"), namespaces ("project.easyai"),
+//            file references ("nginx.conf"). REQUIRES extra title
+//            validation (see is_valid_title) so `.` / `..` /
+//            leading-dot can't sneak through to the filesystem.
+//   `+`      niche but real: "c++", "git+ssh", "a+b" recipes.
+//   space    NO — filesystem ambiguity, shell-quoting trap.
+//   `/` `\`  NO — path-component separators on every OS.
+//   `:`      NO — reserved on Windows + ADS-style abuse.
+//   anything else (quotes, $, `, etc.): NO — shell / display traps.
+//
+// Keywords use is_valid_id directly. Titles use is_valid_title,
+// which adds filesystem-specific rejections on top.
 bool is_valid_id(const std::string & s, std::size_t max_len) {
     if (s.empty() || s.size() > max_len) return false;
     for (char c : s) {
@@ -119,10 +137,39 @@ bool is_valid_id(const std::string & s, std::size_t max_len) {
             (c >= 'a' && c <= 'z') ||
             (c >= 'A' && c <= 'Z') ||
             (c >= '0' && c <= '9') ||
-            c == '-' || c == '_';
+            c == '-' || c == '_' || c == '.' || c == '+';
         if (!ok) return false;
     }
     return true;
+}
+
+// is_valid_title — id rules PLUS filesystem-safety constraints:
+//
+//   * exact "." and ".." are rejected (POSIX path-traversal aliases —
+//     even though our regex already blocks slashes, allowing ".."
+//     as a title means a hand-edited dir with `..md` is ambiguous
+//     and confuses operators).
+//   * leading "." is rejected — dotfiles are easy to miss in `ls`,
+//     and the agent's persistent memory shouldn't be hidden by
+//     accident.
+//   * the title must contain at least one alnum — purely-symbol
+//     titles like "...", "+--", "_._" are valid by character set
+//     but useless and confusing on disk.
+//
+// Returns false in all those cases; passes anything is_valid_id
+// would pass that doesn't trip the extras.
+bool is_valid_title(const std::string & s, std::size_t max_len) {
+    if (!is_valid_id(s, max_len)) return false;
+    if (s == "." || s == "..")    return false;
+    if (s.front() == '.')         return false;
+    for (char c : s) {
+        if ((c >= 'a' && c <= 'z') ||
+            (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9')) {
+            return true;   // contains alnum, all good
+        }
+    }
+    return false;          // no alnum → reject
 }
 
 // ---------------------------------------------------------------------------
@@ -367,7 +414,7 @@ struct RagStore {
             }
             const std::string title =
                 fname.substr(0, fname.size() - kEntrySuffixLen);
-            if (!is_valid_id(title, kMaxTitleBytes)) continue;
+            if (!is_valid_title(title, kMaxTitleBytes)) continue;
 
             std::string raw, err;
             if (!slurp_capped(e.path(),
@@ -583,10 +630,10 @@ ToolHandler make_save_handler(std::shared_ptr<RagStore> store) {
         if (!args::get_string(c.arguments_json, "title", title) || title.empty()) {
             return ToolResult::error("missing required argument: title");
         }
-        if (!is_valid_id(title, kMaxTitleBytes)) {
+        if (!is_valid_title(title, kMaxTitleBytes)) {
             return ToolResult::error(
                 "title \"" + title + "\" is invalid; must match "
-                "[A-Za-z0-9_-]{1," + std::to_string(kMaxTitleBytes) + "}");
+                "[A-Za-z0-9._+-]{1," + std::to_string(kMaxTitleBytes) + "}");
         }
 
         std::vector<std::string> keywords;
@@ -610,7 +657,7 @@ ToolHandler make_save_handler(std::shared_ptr<RagStore> store) {
             if (!is_valid_id(t, kMaxKeywordBytes)) {
                 return ToolResult::error(
                     "keyword \"" + t + "\" is invalid; must match "
-                    "[A-Za-z0-9_-]{1," + std::to_string(kMaxKeywordBytes) + "}");
+                    "[A-Za-z0-9._+-]{1," + std::to_string(kMaxKeywordBytes) + "}");
             }
         }
 
@@ -670,7 +717,7 @@ ToolHandler make_search_handler(std::shared_ptr<RagStore> store) {
             if (!is_valid_id(k, kMaxKeywordBytes)) {
                 return ToolResult::error(
                     "keyword \"" + k + "\" is invalid; must match "
-                    "[A-Za-z0-9_-]{1," + std::to_string(kMaxKeywordBytes) + "}");
+                    "[A-Za-z0-9._+-]{1," + std::to_string(kMaxKeywordBytes) + "}");
             }
         }
         // Deduplicate the query — repeated keywords would otherwise
@@ -869,10 +916,11 @@ ToolHandler make_load_handler(std::shared_ptr<RagStore> store) {
                 + " per call); narrow your rag_search first");
         }
         for (const auto & t : titles) {
-            if (!is_valid_id(t, kMaxTitleBytes)) {
+            if (!is_valid_title(t, kMaxTitleBytes)) {
                 return ToolResult::error(
                     "title \"" + t + "\" is invalid; must match "
-                    "[A-Za-z0-9_-]{1," + std::to_string(kMaxTitleBytes) + "}");
+                    "[A-Za-z0-9._+-]{1," + std::to_string(kMaxTitleBytes) + "} "
+                    "(no leading dot, not '.' or '..', must contain alnum)");
             }
         }
 
@@ -908,10 +956,10 @@ ToolHandler make_list_handler(std::shared_ptr<RagStore> store) {
     return [store](const ToolCall & c) -> ToolResult {
         std::string prefix;
         args::get_string(c.arguments_json, "prefix", prefix);
-        if (!prefix.empty() && !is_valid_id(prefix, kMaxTitleBytes)) {
+        if (!prefix.empty() && !is_valid_title(prefix, kMaxTitleBytes)) {
             return ToolResult::error(
                 "prefix \"" + prefix + "\" is invalid; must match "
-                "[A-Za-z0-9_-]{1," + std::to_string(kMaxTitleBytes) + "}");
+                "[A-Za-z0-9._+-]{1," + std::to_string(kMaxTitleBytes) + "}");
         }
         long long max = (long long) kListResultsDflt;
         args::get_int(c.arguments_json, "max", max);
@@ -970,10 +1018,10 @@ ToolHandler make_delete_handler(std::shared_ptr<RagStore> store) {
         if (!args::get_string(c.arguments_json, "title", title) || title.empty()) {
             return ToolResult::error("missing required argument: title");
         }
-        if (!is_valid_id(title, kMaxTitleBytes)) {
+        if (!is_valid_title(title, kMaxTitleBytes)) {
             return ToolResult::error(
                 "title \"" + title + "\" is invalid; must match "
-                "[A-Za-z0-9_-]{1," + std::to_string(kMaxTitleBytes) + "}");
+                "[A-Za-z0-9._+-]{1," + std::to_string(kMaxTitleBytes) + "}");
         }
         std::lock_guard<std::mutex> lock(store->mu);
         store->load_index_locked();
@@ -1193,7 +1241,7 @@ RagTools make_rag_tools(std::string root_dir) {
             "or use rag_list to browse."
         )
         .param("keywords",    "array",
-               "1..8 keywords to search for. Each: 1..32 chars, [A-Za-z0-9_-]. "
+               "1..8 keywords to search for. Each: 1..32 chars, [A-Za-z0-9._+-]. "
                "Example: [\"user-prefs\", \"hardware\"]. With one keyword the "
                "search is broad (any entry with it); with 2+, the search "
                "narrows (entries matching ≥2 of them, ranked by overlap).",

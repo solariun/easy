@@ -984,7 +984,7 @@ Body content here. Free-form UTF-8 up to 256 KB.
 Operator-readable, hand-editable, grep-able.
 ```
 
-Constraints: title and keywords match `^[A-Za-z0-9_-]+$` (≤ 64 / 32
+Constraints: title and keywords match `^[A-Za-z0-9._+-]+$` (≤ 64 / 32
 bytes), 1..8 keywords per entry, content ≤ 256 KiB, max 4 loads per
 call.
 
