@@ -282,7 +282,13 @@ if (EASYAI_BUILD_EXAMPLES)
     # deployments (configurable cpp-httplib ThreadPool + per-tool
     # concurrent-call cap inside the binary).
     add_executable(easyai-mcp-server examples/mcp_server.cpp)
-    target_link_libraries(easyai-mcp-server PRIVATE easyai cpp-httplib)
+    # mcp_server.cpp uses std::atomic<uint64_t> for the /metrics
+    # counters and std::atomic<int> for the in-flight limiter; the
+    # 64-bit case hits the same libatomic-missing error on 32-bit ARM
+    # toolchains as server.cpp / local.cpp, so link `${EASYAI_ATOMIC_LIBS}`
+    # (empty on hosts with native atomics — see the probe at the top
+    # of this file).
+    target_link_libraries(easyai-mcp-server PRIVATE easyai cpp-httplib ${EASYAI_ATOMIC_LIBS})
     target_include_directories(easyai-mcp-server PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/../llama.cpp/vendor/cpp-httplib
         ${CMAKE_CURRENT_SOURCE_DIR}/../llama.cpp/vendor)
