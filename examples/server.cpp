@@ -2598,6 +2598,103 @@ static void route_models(ServerCtx & ctx, const httplib::Request &,
 }
 
 // ---------------------------------------------------------------------------
+// GET /api/tags  →  Ollama-compat list-models response.
+// ---------------------------------------------------------------------------
+// Some clients (LobeChat, OpenWebUI in Ollama mode, Continue's
+// Ollama provider, custom integrations) discover available models
+// by hitting /api/tags. We expose the same single model that
+// /v1/models exposes — easyai-server is single-model — but
+// rendered in Ollama's shape so those clients work out of the box.
+//
+// Ollama's response is:
+//   { "models": [ { "name", "modified_at", "size", "digest", "details": {...} } ] }
+//
+// We don't compute a real digest / size from the GGUF (would
+// require a stat at startup); placeholders are fine — the field is
+// only used by Ollama clients to decide whether to re-pull, which
+// doesn't apply to us.
+static void route_ollama_tags(ServerCtx & ctx, const httplib::Request &,
+                              httplib::Response & res) {
+    ordered_json m;
+    m["name"]        = ctx.model_id;
+    m["model"]       = ctx.model_id;       // newer Ollama clients prefer this
+    m["modified_at"] = "1970-01-01T00:00:00Z";
+    m["size"]        = 0;
+    m["digest"]      = "";
+    ordered_json details;
+    details["format"]              = "gguf";
+    details["family"]              = "easyai";
+    details["families"]            = json::array({"easyai"});
+    details["parameter_size"]      = "";
+    details["quantization_level"]  = "";
+    m["details"] = std::move(details);
+
+    ordered_json env;
+    env["models"] = json::array({m});
+    res.set_content(env.dump(), "application/json");
+}
+
+// GET /api/show  →  Ollama-compat single-model detail.
+// ---------------------------------------------------------------------------
+// Some clients post `{"name": "<id>"}` to /api/show to inspect a
+// model's metadata. We return the same details block /api/tags
+// emits, plus a `modelfile` placeholder.
+static void route_ollama_show(ServerCtx & ctx, const httplib::Request & req,
+                              httplib::Response & res) {
+    // The body may be {"name": "..."} or {"model": "..."}; we don't
+    // care which — we only ever serve the one model loaded.
+    (void) req;
+    ordered_json env;
+    env["modelfile"]   = "# easyai-server (single model loaded)";
+    env["parameters"]  = "";
+    env["template"]    = "";
+    ordered_json details;
+    details["format"]              = "gguf";
+    details["family"]              = "easyai";
+    details["families"]            = json::array({"easyai"});
+    details["parameter_size"]      = "";
+    details["quantization_level"]  = "";
+    env["details"] = std::move(details);
+    env["model_info"] = json::object();
+    res.set_content(env.dump(), "application/json");
+}
+
+// POST /mcp  →  Model Context Protocol (JSON-RPC 2.0).
+// ---------------------------------------------------------------------------
+// Stateless request/response. Other AI applications (Claude
+// Desktop via stdio bridge, Cursor / Continue over HTTP, custom
+// JSON-RPC clients) call here to enumerate easyai's tool catalogue
+// and dispatch tools by name. The protocol's full surface is
+// documented in MCP.md; this handler is just the JSON-RPC pipe.
+//
+// AUTH OPEN intentionally — operator-decided V1 default. The
+// endpoint exposes every tool registered, including bash / fs_*
+// when those are enabled. Operators on shared networks should
+// either firewall the port, drop a reverse proxy in front, or
+// (future PR) flip the auth-gate flag here.
+static void route_mcp(ServerCtx & ctx, const httplib::Request & req,
+                      httplib::Response & res) {
+    easyai::mcp::ServerInfo info;
+    info.name             = "easyai-server";
+    info.version          = "0.1.0";
+    info.protocol_version = "2024-11-05";
+
+    // Hold the engine mutex briefly only if a tool dispatch ends up
+    // touching engine state — we DON'T need the lock for the
+    // dispatcher itself (pure function over `default_tools`). Tool
+    // handlers serialise themselves where they need to.
+    std::string body = easyai::mcp::handle_request(
+        req.body, ctx.default_tools, info);
+
+    if (body.empty()) {
+        // Notification (request without `id`) per JSON-RPC 2.0:
+        // server MUST NOT respond. Use 204 No Content.
+        res.status = 204;
+        return;
+    }
+    res.set_content(body, "application/json");
+}
+
 // GET /v1/tools  →  tool catalog so the webui can render a popover with
 // {name, description} pairs.  Read-only; no auth needed when the rest of
 // /v1/* is open, gated by require_auth otherwise (wired at route mount).
@@ -2652,6 +2749,16 @@ static void route_health(ServerCtx & ctx, const httplib::Request &,
     j["backend"] = ctx.engine.backend_summary();
     j["tools"]   = ctx.default_tools.size();
     j["preset"]  = ctx.default_preset.name;
+
+    // Compatibility shims this server speaks. Lets clients
+    // auto-detect which API they can use without trial requests.
+    ordered_json compat;
+    compat["openai"]   = "/v1/chat/completions";
+    compat["ollama"]   = "/api/tags";
+    compat["mcp"]      = "/mcp";
+    compat["mcp_protocol"] = "2024-11-05";
+    j["compat"] = std::move(compat);
+
     res.set_content(j.dump(), "application/json");
 }
 
@@ -4960,6 +5067,38 @@ int main(int argc, char ** argv) {
     svr.Post("/v1/preset",            [&](const auto & q, auto & r){
         if (!require_auth(ctx_ref, q, r)) return;
         route_preset(ctx_ref, q, r);
+    });
+
+    // Ollama-compat list-models. Same auth posture as /v1/models.
+    svr.Get ("/api/tags",             [&](const auto & q, auto & r){
+        if (!require_auth(ctx_ref, q, r)) return;
+        route_ollama_tags(ctx_ref, q, r);
+    });
+    svr.Get ("/api/show",             [&](const auto & q, auto & r){
+        if (!require_auth(ctx_ref, q, r)) return;
+        route_ollama_show(ctx_ref, q, r);
+    });
+    svr.Post("/api/show",             [&](const auto & q, auto & r){
+        if (!require_auth(ctx_ref, q, r)) return;
+        route_ollama_show(ctx_ref, q, r);
+    });
+
+    // Model Context Protocol. AUTH OPEN by V1 design — see route_mcp
+    // comment. Both POST (request/response) and GET (placeholder for
+    // future SSE notification stream) are wired; GET currently
+    // returns 405 to be explicit.
+    svr.Post("/mcp",                  [&](const auto & q, auto & r){
+        route_mcp(ctx_ref, q, r);
+    });
+    svr.Get ("/mcp",                  [](const auto &, auto & r){
+        r.status = 405;
+        r.set_header("Allow", "POST");
+        r.set_content(
+            "{\"error\":\"GET /mcp is not yet implemented; "
+            "use POST with a JSON-RPC 2.0 request body. "
+            "Server-pushed notifications via SSE will land in a "
+            "future version.\"}",
+            "application/json");
     });
 
     // Last-chance error handler — never let a thrown exception propagate

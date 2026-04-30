@@ -305,6 +305,33 @@ Webui title default also flips to `"Deep"`.
 ## 5. Recent commits (most recent first)
 
 ```
+2026-04-30 (evening) — easyai-server speaks MCP + Ollama list-models.
+
+(pending commit) MCP server: POST /mcp endpoint exposes the full
+                 tool catalogue (built-ins + RAG + external-tools) as
+                 a JSON-RPC 2.0 MCP provider. Stateless request/
+                 response, methods: initialize / tools/list /
+                 tools/call / ping plus notification no-ops. Pure
+                 function dispatcher in src/mcp.cpp — no global
+                 state, never throws. Tool exceptions become MCP
+                 isError=true (not JSON-RPC errors).
+                 Auth: OPEN by V1 design (Bearer-gate planned for
+                 V2; SECURITY_AUDIT.md §17.1 documents accepted
+                 risk and compensating controls).
+                 Compatibility shims: GET /api/tags + /api/show
+                 (Ollama-shape list-models for LobeChat / OpenWebUI
+                 / Continue's Ollama provider). /v1/models was
+                 already there (OpenAI). /health gains a `compat`
+                 block listing all three protocol surfaces.
+                 Stdio bridge: scripts/mcp-stdio-bridge.py — Python,
+                 stdlib only — for Claude Desktop which only speaks
+                 stdio MCP. Cursor / Continue talk HTTP direct.
+                 NEW doc MCP.md with quickstart, per-client
+                 connection cookbook (Claude Desktop / Cursor /
+                 Continue / custom), auth roadmap, troubleshooting.
+                 README, design.md §6c, LINUX_SERVER.md, and
+                 SECURITY_AUDIT.md §17 all updated.
+
 2026-04-30 (afternoon) — RAG: agent's persistent registry / long-term memory.
 
 (pending commit) RAG: a tag-keyed file-backed long-term memory the

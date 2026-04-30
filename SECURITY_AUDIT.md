@@ -565,3 +565,75 @@ train the operator to ignore them. False negatives (a manifest
 the audit *fails* to flag but should) are a real risk; the audit
 is best-effort, not a substitute for code review.
 
+---
+
+## 17. MCP server endpoint — `src/mcp.cpp` + `route_mcp` (NEW SURFACE, AUTH OPEN)
+
+`POST /mcp` exposes the full tool catalogue (`ctx->default_tools`)
+via Model Context Protocol JSON-RPC 2.0. Other AI applications
+(Claude Desktop, Cursor, Continue) connect, list, and dispatch
+tools. The catalogue includes RAG (read/write the agent's
+persistent memory), `bash` when `--allow-bash` is set, `fs_*` when
+`--allow-fs` is set, and every operator-defined external tool.
+
+### 17.1 Auth posture (V1 — accepted risk)
+
+The `/mcp` endpoint **does not** go through the `require_auth`
+middleware that gates `/v1/*`. This is a deliberate V1 default
+chosen by the operator for friction-free smoke testing during
+roll-out. Implications:
+
+- Anyone who can reach the server's port can list and dispatch
+  every registered tool.
+- Tool dispatch runs as the `easyai` service user. `bash` (when
+  enabled) gives that user's full reachable surface.
+- The agent's RAG (long-term memory) is fully readable AND
+  writable by anyone hitting the endpoint.
+
+**Accepted with the following compensating controls expected of
+the operator:**
+
+1. Bind to localhost or LAN only (firewall, no public exposure).
+2. Reverse-proxy with auth in front (nginx + basic auth, mTLS, etc).
+3. Don't enable `--allow-bash` on a network-accessible deploy.
+4. Don't put credentials in `--external-tools` `env_passthrough`
+   until auth is wired.
+
+A planned PR will gate `/mcp` behind the same Bearer middleware
+as `/v1/*`. The flag name (provisional) is `--mcp-auth on|off|inherit`.
+
+### 17.2 Dispatcher safety
+
+`src/mcp.cpp::handle_request` is a pure function. No global state,
+no I/O, no allocation past the request body. Every error path
+(JSON parse, missing field, type mismatch, tool not found,
+handler exception) is caught and converted to a JSON-RPC error
+envelope; the function never throws.
+
+Tool exceptions are surfaced as `isError: true` in the MCP result
+shape rather than as JSON-RPC errors. The reasoning: a tool that
+reports a logical failure (missing argument, validation rejection,
+upstream service error) is still a successful protocol exchange —
+the client deserves to see the error text and the tool result
+shape, not a transport-level diagnostic.
+
+### 17.3 Body-size cap
+
+The shared httplib payload cap (`set_payload_max_length(args.max_body)`,
+default 8 MiB, configurable via `--max-body`) protects `/mcp`
+against multi-GB JSON-RPC bodies. JSON-RPC requests at this server
+should be tiny (a tool name + an arguments object); 8 MiB is
+generous. The tool handler itself enforces its OWN argument
+size caps (per `external_tools.cpp` §16.1.5 and `rag_tools.cpp`'s
+hard caps).
+
+### 17.4 Notification handling
+
+JSON-RPC 2.0 distinguishes "request" (has `id`) from "notification"
+(no `id`). Notifications must NOT generate a response. We accept
+the standard MCP notifications (`notifications/initialized`,
+`notifications/cancelled`, `notifications/progress`) as no-ops and
+return HTTP 204 No Content. This prevents a malformed client from
+forcing the server into a JSON-RPC error reply for a fire-and-forget
+event.
+

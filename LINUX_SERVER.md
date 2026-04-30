@@ -6,7 +6,9 @@ it, what to watch out for, and how to keep it healthy.
 
 If you're a developer, see `design.md` and `manual.md`. If you're
 writing tool manifests, see `EXTERNAL_TOOLS.md`. If you want to
-understand the agent's long-term memory, see `RAG.md`.
+understand the agent's long-term memory, see `RAG.md`. If you want
+to expose easyai's tools to other AI applications (Claude Desktop,
+Cursor, Continue), see `MCP.md`.
 
 ---
 
@@ -410,15 +412,21 @@ If absent, re-run installer or check `systemctl cat` for `--RAG`.
 
 ## 9. Hitting the API
 
-The server is OpenAI-compatible. Endpoints:
+The server speaks **three** API dialects so most AI clients work
+unchanged. Endpoints:
 
-| Verb | Path | Notes |
-| --- | --- | --- |
-| GET | `/` | embedded webui |
-| GET | `/health` | `{model, backend, tool_count, preset}` |
-| GET | `/v1/models` | model list |
-| POST | `/v1/chat/completions` | the workhorse |
-| POST | `/v1/preset` | swap the ambient preset |
+| Verb | Path | API | Notes |
+| --- | --- | --- | --- |
+| GET | `/` | webui | embedded webui |
+| GET | `/health` | easyai | `{model, backend, tools, preset, compat:{...}}` |
+| GET | `/v1/models` | OpenAI | OpenAI-shape list-models |
+| POST | `/v1/chat/completions` | OpenAI | the workhorse — streaming SSE, tools, sampling controls |
+| POST | `/v1/preset` | easyai | swap the ambient preset |
+| GET | `/v1/tools` | easyai | tool catalogue for the webui popover |
+| GET | `/api/tags` | Ollama | Ollama-shape list-models (LobeChat, OpenWebUI in Ollama mode, etc.) |
+| GET/POST | `/api/show` | Ollama | Ollama-shape model detail |
+| POST | `/mcp` | MCP | JSON-RPC 2.0 — the full tool catalogue exposed to other AI apps. See `MCP.md`. |
+| GET | `/mcp` | MCP | reserved for future SSE notifications; currently `405 Method Not Allowed`. |
 
 ### Bearer auth (if `/etc/easyai/api_key` present)
 

@@ -958,6 +958,113 @@ which causes `listen()` to return; main() returns 0. No threads, no engine
 calls happen in the signal handler — only `Server::stop()` is signal-safe-ish
 under cpp-httplib.
 
+## 6c. MCP server protocol layer
+
+Lives in `src/mcp.cpp` + `include/easyai/mcp.hpp`. User-facing
+documentation: [`MCP.md`](MCP.md). This section describes *why* the
+server exposes itself as an MCP provider.
+
+### What's the protocol payoff
+
+The agent loop has two consumers of the tool catalogue:
+1. The local model running inside easyai-server's `easyai::Engine`.
+2. Remote AI applications (Claude Desktop, Cursor, Continue,
+   OpenWebUI, custom clients) over MCP.
+
+Both consume the SAME `ctx->default_tools` vector. The work that
+went into wiring `Toolbelt` + RAG + external-tools is reused
+verbatim — no second serialiser, no second registry, no second
+auth surface. Adding a new tool means one C++ change (or one
+manifest file) and every consumer sees it on next restart.
+
+### Layered position
+
+```
+   ┌────────────────────────────────────────────────────────────┐
+   │                       MCP CLIENTS                           │
+   │  Claude Desktop (via stdio bridge) / Cursor / Continue /   │
+   │              OpenWebUI / custom JSON-RPC SDKs               │
+   └────────────────────────────────────────────────────────────┘
+                                │
+                       JSON-RPC 2.0 / HTTP
+                                ▼
+   ┌────────────────────────────────────────────────────────────┐
+   │  easyai-server   POST /mcp                                  │
+   │                                                              │
+   │   route_mcp(req) → easyai::mcp::handle_request(             │
+   │                       body, ctx->default_tools, info) →     │
+   │                       JSON-RPC response body                 │
+   └────────────────────────────────────────────────────────────┘
+                                │
+                                ▼
+   ┌────────────────────────────────────────────────────────────┐
+   │  src/mcp.cpp  (pure function — no global state)             │
+   │                                                              │
+   │     parse JSON-RPC envelope                                  │
+   │     route by method:                                         │
+   │       initialize       → return ServerInfo + capabilities    │
+   │       tools/list       → enumerate Tool descriptors          │
+   │       tools/call       → look up by name → handler(call) →   │
+   │                          map ToolResult → MCP content shape  │
+   │       ping             → empty result                        │
+   │     return JSON-RPC response (or error envelope)             │
+   └────────────────────────────────────────────────────────────┘
+                                │
+                                ▼
+                  ctx->default_tools (read-only)
+                  same vector the local engine uses
+```
+
+### Why stateless request/response (and not SSE)
+
+The MCP spec describes a "streamable HTTP" transport where the
+server can push notifications back via SSE. That matters when:
+
+- The tool list can change at runtime (server fires
+  `notifications/tools/list_changed`).
+- A long tool call wants to emit progress (`notifications/progress`).
+
+We have neither today. The tool catalogue is fixed at startup.
+Tool calls are short, synchronous, and capped by their own
+timeouts. So we ship the simpler half of the spec — POST request,
+JSON response, no session state — and reserve `GET /mcp` for the
+SSE notification stream a future PR will add.
+
+### Why `--external-tools` shows up here
+
+Operator-defined external tools (the `EASYAI-*.tools` manifests
+from `EXTERNAL_TOOLS.md`) are added to `ctx->default_tools` at
+startup just like built-ins. They become MCP tools automatically,
+with the same `inputSchema` declared in the manifest. An operator
+who declares `git_log` in `EASYAI-internal.tools` exposes it
+simultaneously to:
+
+- The local model (which rag_search'es and dispatches).
+- Cursor's chat (via MCP `tools/call`).
+- Claude Desktop (via the stdio bridge).
+
+This is the layering payoff in practice: one manifest, three
+consumers.
+
+### Compatibility shims (`/v1/models`, `/api/tags`)
+
+Adjacent to MCP we also implement two list-models endpoints so
+clients that don't yet speak MCP can still discover the loaded
+model:
+
+- **OpenAI**: `/v1/models` (already existed for `/v1/chat/completions`
+  consumers — Continue, LangChain, LiteLLM, every OpenAI SDK).
+- **Ollama**: `/api/tags` + `/api/show` (LobeChat, OpenWebUI in
+  Ollama mode, Continue's Ollama provider).
+
+These don't expose tools — they only expose the loaded model
+metadata. Clients that want tools either upgrade to MCP or use
+the OpenAI-compat `/v1/chat/completions` endpoint, which already
+forwards tools via the OpenAI tools/tool_calls format.
+
+`/health` includes a `compat` block so a client can sniff which
+APIs are live without round-tripping each.
+
 ---
 
 ## 7. The webui

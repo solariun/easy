@@ -183,7 +183,30 @@ no shell.
 | `--sandbox <dir>`     | `fs_read_file / fs_write_file / fs_list_dir / fs_glob / fs_grep` plus `get_current_dir`, ALL scoped to `<dir>`. The CLIs `chdir` into `<dir>` so `get_current_dir` reports the sandbox path back to the model. |
 | `--allow-bash`        | `bash` (run `/bin/sh -c`). cwd = `--sandbox <dir>` if given, otherwise the binary's CWD. NOT a hardened sandbox — runs with your user privileges. Also bumps the agentic-loop `max_tool_hops` to 99999 (bash flows naturally span many turns). |
 | `--external-tools <dir>` | Load every `EASYAI-<name>.tools` file in `<dir>` as an operator-defined tool pack. Per-file fault isolation (a bad file is logged + skipped, the agent still starts). Spawns via `fork`+`execve` — never a shell. **This is the supported way to give the model focused powers without flipping `--allow-bash`.** See [`EXTERNAL_TOOLS.md`](EXTERNAL_TOOLS.md). |
-| `--RAG <dir>`         | Enable RAG, the agent's persistent registry / long-term memory. Five tools (`rag_save`, `rag_search`, `rag_load`, `rag_list`, `rag_delete`) so the model can remember things across sessions. Each entry is one Markdown file in `<dir>` — operator-readable and hand-editable. The systemd-installed server passes this by default (`/var/lib/easyai/rag`). See [`RAG.md`](RAG.md). |
+| `--RAG <dir>`         | Enable RAG, the agent's persistent registry / long-term memory. Six tools (`rag_save`, `rag_search`, `rag_load`, `rag_list`, `rag_delete`, `rag_keywords`) so the model can remember things across sessions. Each entry is one Markdown file in `<dir>` — operator-readable and hand-editable. The systemd-installed server passes this by default (`/var/lib/easyai/rag`). See [`RAG.md`](RAG.md). |
+
+#### easyai-server speaks **MCP** — every tool also reachable from Claude Desktop / Cursor / Continue
+
+`easyai-server` exposes its full tool catalogue (built-ins + RAG + every operator-defined `--external-tools` pack) via the **Model Context Protocol** at `POST /mcp`. Other AI applications connect, list, and dispatch:
+
+```
+Claude Desktop ──► [stdio bridge] ──► POST /mcp ──┐
+Cursor          ─────────────────────► POST /mcp ──┤── easyai-server
+Continue        ─────────────────────► POST /mcp ──┘   (one tool catalogue,
+                                                        many consumers)
+```
+
+You build the tools once. Your RAG, your deploy CLI, your monitoring queries — written ONCE for your easyai-server — become available in every AI app you already use. No plugin per app.
+
+```sh
+# List tools the server is exposing right now
+curl -fsS http://localhost/mcp -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | jq '.result.tools[] | .name'
+```
+
+It also speaks the **OpenAI** (`/v1/chat/completions`, `/v1/models`) and **Ollama** (`/api/tags`, `/api/show`) list-models APIs so OpenAI-SDK, LangChain, LiteLLM, LobeChat, OpenWebUI, etc. auto-discover the loaded model and chat without any easyai-specific configuration.
+
+Full guide: [`MCP.md`](MCP.md). Bridge script for Claude Desktop: `scripts/mcp-stdio-bridge.py`.
 
 #### Why `--RAG` makes the agent useful
 
