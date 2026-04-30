@@ -641,18 +641,6 @@ EXT_EXAMPLE
     # ---- RAG: agent's persistent registry / long-term memory ----------
     # Owned by the SERVICE user (not root) because the AGENT writes here
     # at runtime. mode 750 — the agent reads/writes; nobody else.
-    #
-    # Migration: pre-rename installs put the registry at
-    # /var/lib/easyai/reg. If the directory exists and the new path
-    # doesn't, move it. We only do this when the destination does NOT
-    # exist, so an operator who has already started fresh on /rag
-    # doesn't lose data to the rename.
-    legacy_rag_dir="/var/lib/easyai/reg"
-    if [[ -d "$legacy_rag_dir" && ! -e "$rag_dir" ]]; then
-        log "migrating legacy $legacy_rag_dir → $rag_dir"
-        sudo mv "$legacy_rag_dir" "$rag_dir"
-    fi
-
     log "creating $rag_dir (RAG / long-term memory, owned by $service_user)"
     sudo install -d -o "$service_user" -g "$service_group" -m 750 \
         "$(dirname "$rag_dir")"
