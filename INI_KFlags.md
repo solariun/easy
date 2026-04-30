@@ -75,6 +75,7 @@ The HTTP layer, paths, tool gating, MCP auth.
 | `alias` | string | `-a`, `--alias` | basename of `model` | Public model id reported by `/v1/models` and `/api/tags`. |
 | `sandbox` | path | `--sandbox` | (none) | Root directory for `bash` and `fs_*` tools. |
 | `system_file` | path | `-s`, `--system-file` | (none — uses built-in default) | File containing the server-default system prompt. |
+| `system_inline` | string | `--system` | (none) | Inline system prompt. Beats `system_file` if both are set. |
 | `external_tools` | path | `--external-tools` | (none — feature off) | Directory of `EASYAI-*.tools` manifests. See `EXTERNAL_TOOLS.md`. |
 | `rag` | path | `--RAG` | (none — feature off) | Directory of RAG entries. See `RAG.md`. |
 | `webui_title` | string | `--webui-title` | `Deep` | Document title pinned in the embedded webui. |
@@ -85,6 +86,7 @@ The HTTP layer, paths, tool gating, MCP auth.
 | `verbose` | bool | `-v`, `--verbose` | `off` | Noisy logs. |
 | `allow_fs` | bool | `--allow-fs` | `off` | Register `fs_read_file / fs_write_file / fs_list_dir / fs_glob / fs_grep` (sandbox required). |
 | `allow_bash` | bool | `--allow-bash` | `off` | Register the `bash` tool. **Not** a hardened sandbox. |
+| `load_tools` | bool | `--no-tools` (negative) | `on` | Master switch for the built-in toolbelt. Set `off` (or pass `--no-tools`) to register zero default tools. `allow_fs` / `allow_bash` further opt in. |
 | `max_body` | int | `--max-body` | `8388608` (8 MiB) | Max HTTP request body size. |
 | `api_key` | string | `--api-key` | (none — `/v1/*` open) | Bearer token for `/v1/*`. Don't put real keys in INI directly — use `/etc/easyai/api_key` (file-based, the installer wires `${EASYAI_API_KEY}`). |
 | `mcp_auth` | enum | (no CLI; `--no-mcp-auth` overrides) | `auto` | `auto` (auth iff `[MCP_USER]` non-empty), `on` (force require), `off` (force open). |
@@ -116,6 +118,7 @@ Model loading and inference tunables.
 | `cache_type_k` | enum | `-ctk`, `--cache-type-k` | `f16` | `f32 / f16 / bf16 / q8_0 / q4_0 / q4_1 / q5_0 / q5_1 / iq4_nl`. |
 | `cache_type_v` | enum | `-ctv`, `--cache-type-v` | `f16` | Same options as K. Quantising V saves a lot of VRAM. |
 | `numa` | string | `--numa` | (none) | Llama-server compat. |
+| `override_kv` | list | `--override-kv` (repeat) | (empty) | GGUF metadata overrides. Comma-separated list of `key=type:value` triples (e.g. `tokenizer.ggml.eos_token_id=int:151645`). On the CLI, repeat `--override-kv` per entry; in INI, comma-separate. |
 | `temperature` | float | `--temperature`, `--temp` | (preset) | Sampling override. |
 | `top_p` | float | `--top-p` | (preset) | Sampling override. |
 | `top_k` | int | `--top-k` | (preset) | Sampling override. |

@@ -433,7 +433,7 @@ server speaks:
 
 The `/mcp` endpoint authenticates via Bearer tokens declared in
 the central INI config (`/etc/easyai/easyai.ini` by default).
-Full INI reference: [`INI.md`](INI.md).
+Full INI reference: [`INI_KFlags.md`](INI_KFlags.md).
 
 Auth is **opt-in by configuration**: if the INI's `[MCP_USER]`
 section is empty or missing, the endpoint accepts any request

@@ -211,7 +211,7 @@ cache_type_v = q8_0
 gustavo    = REPLACE-WITH-OPENSSL-RAND-HEX-32
 ```
 
-Full key reference + worked examples: [`INI.md`](INI.md).
+Full key reference + worked examples: [`INI_KFlags.md`](INI_KFlags.md).
 
 #### easyai-server speaks **MCP** — every tool also reachable from Claude Desktop / Cursor / Continue
 

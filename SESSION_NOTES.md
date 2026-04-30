@@ -328,7 +328,7 @@ Webui title default also flips to `"Deep"`.
                    easyai-server --config /etc/easyai/easyai.ini -m <model>
                  [+ --api-key '${EASYAI_API_KEY}' if /etc/easyai/api_key
                   exists; + --webui-icon if installer was given one].
-                 NEW doc INI.md — full key reference, every key with
+                 NEW doc INI_KFlags.md — full key reference, every key with
                  type / CLI equivalent / default / notes; worked
                  examples (minimal local-dev / production-with-auth /
                  CLI overrides); cross-refs from README, MCP.md,

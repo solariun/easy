@@ -138,7 +138,7 @@ sudo systemctl restart easyai-server
 
 ### `/etc/easyai/easyai.ini` — the central config
 
-> **Full reference:** [`INI.md`](INI.md) lists every key the binary
+> **Full reference:** [`INI_KFlags.md`](INI_KFlags.md) lists every key the binary
 > understands, what section it belongs to, what the CLI equivalent
 > is, and gives worked examples.
 
