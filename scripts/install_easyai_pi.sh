@@ -90,7 +90,7 @@ external_tools_dir="$config_dir/external-tools"
 # every interface by default. Override with --host 127.0.0.1 for
 # loopback-only.
 service_host="0.0.0.0"
-service_port=8080
+service_port=80
 
 # mDNS — make the Pi reachable on the LAN as `<name>.local` without
 # the operator having to look up an IP that DHCP may move around.
@@ -355,7 +355,16 @@ verbose         = off
 allow_fs        = off
 allow_bash      = off
 max_body        = 8388608
-mcp_auth        = auto
+
+# /mcp authentication
+# off     : open (anyone reaching /mcp can dispatch any tool) — DEFAULT
+# auto    : enabled iff [MCP_USER] below has at least one entry
+# on      : require Bearer match — also overridable via --no-mcp-auth
+#
+# Default 'off' assumes a home-LAN Pi behind a router. If you expose
+# port 80 on a public IP, switch to 'on' and populate [MCP_USER]
+# below with a strong token (openssl rand -hex 32).
+mcp_auth        = off
 
 [ENGINE]
 context         = $ctx_size

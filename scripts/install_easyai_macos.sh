@@ -334,7 +334,7 @@ cat <<EOF
   ${C_CYAN}# add easyai to PATH for this shell:${C_RESET}
   export PATH="$PREFIX/bin:\$PATH"
 
-  ${C_CYAN}# start the server (Bonsai-tuned defaults):${C_RESET}
+  ${C_CYAN}# start the server (Bonsai-tuned defaults, LAN-reachable):${C_RESET}
   $server_bin \\
       -m "$model_path" \\
       --ngl 99 \\
@@ -342,8 +342,12 @@ cat <<EOF
       --temperature 0.5 \\
       --top-p 0.85 \\
       --top-k 20 \\
-      --host 127.0.0.1 \\
+      --host 0.0.0.0 \\
       --port 8080
+  ${C_CYAN}# (host 0.0.0.0 matches the Linux/Pi installers' "appliance" posture.${C_RESET}
+  ${C_CYAN}#  Swap to --host 127.0.0.1 if this Mac is on a hostile network.${C_RESET}
+  ${C_CYAN}#  Port stays 8080 because <1024 needs sudo on macOS — the Linux/Pi${C_RESET}
+  ${C_CYAN}#  installers use 80 because their systemd unit has CAP_NET_BIND_SERVICE.)${C_RESET}
 
   ${C_CYAN}# if the model refuses tool calls or rambles, swap to the${C_RESET}
   ${C_CYAN}# README-recommended system prompt:${C_RESET}
