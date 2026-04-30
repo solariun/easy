@@ -45,6 +45,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -352,11 +353,22 @@ struct EntryMeta {
 };
 
 // ---------------------------------------------------------------------------
-// RagStore — the shared state for all four tools.
+// RagStore — the shared state for all six tools.
 // ---------------------------------------------------------------------------
+//
+// `mu` is a shared_mutex so high-concurrency MCP traffic (rag_search /
+// rag_list / rag_load / rag_keywords reads from many in-flight requests)
+// doesn't serialise on the write path (rag_save, rag_delete). Readers
+// take std::shared_lock; writers take std::unique_lock.
+//
+// The index is populated EAGERLY by `make_rag_tools()` under a unique
+// lock so every subsequent reader can rely on `index_loaded == true`
+// without the upgrade dance. Single-process is the supported model
+// (header §"Concurrency"), so we never re-scan the directory after
+// startup; save/delete keep the index in sync as the model edits.
 struct RagStore {
     fs::path                            root;
-    std::mutex                          mu;
+    std::shared_mutex                   mu;
     std::map<std::string, EntryMeta>    index;
     bool                                index_loaded = false;
 
@@ -682,7 +694,11 @@ ToolHandler make_save_handler(std::shared_ptr<RagStore> store) {
                 + " bytes; split into multiple entries");
         }
 
-        std::lock_guard<std::mutex> lock(store->mu);
+        // WRITE: takes unique_lock so concurrent readers can't observe a
+        // half-updated index. The on-disk write inside save_locked is
+        // already atomic (tempfile + rename) so reads through the
+        // FILESYSTEM are tear-free regardless of this lock.
+        std::unique_lock<std::shared_mutex> lock(store->mu);
         if (!store->save_locked(title, keywords, content, err)) {
             return ToolResult::error(err);
         }
@@ -755,8 +771,11 @@ ToolHandler make_search_handler(std::shared_ptr<RagStore> store) {
         };
         std::vector<Hit> hits;
         {
-            std::lock_guard<std::mutex> lock(store->mu);
-            store->load_index_locked();
+            // READ: shared_lock — many concurrent searches can iterate
+            // the index in parallel. The index was populated eagerly by
+            // make_rag_tools() under a unique lock, so we never need to
+            // upgrade here.
+            std::shared_lock<std::shared_mutex> lock(store->mu);
             for (const auto & [t, m] : store->index) {
                 Hit h;
                 h.title = t;
@@ -943,7 +962,11 @@ ToolHandler make_load_handler(std::shared_ptr<RagStore> store) {
             std::string body;
             std::int64_t mtime = 0;
             std::string e_err;
-            std::lock_guard<std::mutex> lock(store->mu);
+            // READ: shared_lock — load_one() reads the file off disk
+            // (atomic-rename guarantees a consistent view) and never
+            // touches the index. Multiple parallel rag_load calls run
+            // concurrently with no contention on the mutex itself.
+            std::shared_lock<std::shared_mutex> lock(store->mu);
             if (!store->load_one(title, keywords, body, mtime, e_err)) {
                 o << "\n--- " << title << " ---\n"
                   << "ERROR: " << e_err << "\n";
@@ -980,8 +1003,8 @@ ToolHandler make_list_handler(std::shared_ptr<RagStore> store) {
         struct Row { std::string title; EntryMeta meta; };
         std::vector<Row> rows;
         {
-            std::lock_guard<std::mutex> lock(store->mu);
-            store->load_index_locked();
+            // READ: shared_lock — same justification as rag_search.
+            std::shared_lock<std::shared_mutex> lock(store->mu);
             for (const auto & [t, m] : store->index) {
                 if (!prefix.empty() &&
                     (t.size() < prefix.size() ||
@@ -1034,8 +1057,11 @@ ToolHandler make_delete_handler(std::shared_ptr<RagStore> store) {
                 "title \"" + title + "\" is invalid; must match "
                 "[A-Za-z0-9._+-]{1," + std::to_string(kMaxTitleBytes) + "}");
         }
-        std::lock_guard<std::mutex> lock(store->mu);
-        store->load_index_locked();
+        // WRITE: unique_lock — delete_locked mutates the index AND
+        // removes the on-disk file. fs::remove is itself atomic, so
+        // parallel readers either see the entry or don't, never a
+        // half-deleted state.
+        std::unique_lock<std::shared_mutex> lock(store->mu);
         bool existed = false;
         std::string err;
         if (!store->delete_locked(title, existed, err)) {
@@ -1078,12 +1104,13 @@ ToolHandler make_keywords_handler(std::shared_ptr<RagStore> store) {
             max = (long long) kKeywordsResultsMax;
         }
 
-        // Phase 1: under lock, collect counts from the index.
+        // Phase 1: under shared_lock, collect counts from the index.
+        // READ — same justification as rag_search; many concurrent
+        // rag_keywords calls run in parallel without serialising.
         std::map<std::string, std::size_t> counts;
         std::size_t total_entries = 0;
         {
-            std::lock_guard<std::mutex> lock(store->mu);
-            store->load_index_locked();
+            std::shared_lock<std::shared_mutex> lock(store->mu);
             total_entries = store->index.size();
             for (const auto & [_, m] : store->index) {
                 for (const auto & k : m.keywords) {
@@ -1162,6 +1189,18 @@ ToolHandler make_keywords_handler(std::shared_ptr<RagStore> store) {
 // ---------------------------------------------------------------------------
 RagTools make_rag_tools(std::string root_dir) {
     auto store = std::make_shared<RagStore>(std::move(root_dir));
+
+    // Eager index load under unique_lock. After this, every read path
+    // (rag_search / rag_load / rag_list / rag_keywords) can take a
+    // std::shared_lock and observe `index_loaded == true` without
+    // racing other readers. Single-process is the supported model
+    // (header §"Concurrency"), so the directory is not re-scanned
+    // after startup; the index is kept in sync by save_locked /
+    // delete_locked.
+    {
+        std::unique_lock<std::shared_mutex> init_lock(store->mu);
+        store->load_index_locked();
+    }
 
     RagTools out;
 
