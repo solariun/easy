@@ -126,6 +126,7 @@ Model loading and inference tunables.
 | `repeat_penalty` | float | `--repeat-penalty` | (preset) | Sampling override. |
 | `max_tokens` | int | `--max-tokens` | `-1` (until EOS / ctx full) | Per-turn cap. |
 | `seed` | uint32 | `--seed` | `0` (random) | RNG seed. |
+| `max_incomplete_retries` | int | `--max-incomplete-retries` | `10` | How many times the engine discards + nudges + retries when the model finishes a turn with no tool_call and only an "announce" snippet ("Let me…", "I'll…"). `0` disables retries (equivalent to `retry_on_incomplete = off`). Bump to 15-20 for weak / 1-bit-quant models that keep announcing-without-acting. Each retry surfaces in the webui Thinking panel as `↻ Retry N/max`. |
 
 ---
 

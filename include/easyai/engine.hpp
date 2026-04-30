@@ -43,6 +43,19 @@ using ToolCallback     = std::function<void(const ToolCall &, const ToolResult &
 // follow-ups) don't bleed state across turns.
 using HopResetCallback = std::function<void()>;
 
+// Fires every time chat_continue discards a turn that announced an
+// action without emitting a tool_call ("Let me search…", "I'll do
+// that now") and is about to nudge + retry. Streaming layers
+// register this to surface the retry to the user — e.g. push a
+// reasoning_content delta into the SSE stream so the webui's
+// Thinking panel shows "↻ Retry 3/10: model announced without
+// calling a tool — nudging" while it happens, instead of leaving
+// the user staring at a frozen UI for 10 silent retries.
+//
+// Args: (attempt, max, reason) — attempt is 1-based.
+using IncompleteRetryCallback =
+    std::function<void(int attempt, int max, const std::string & reason)>;
+
 class Engine {
    public:
     Engine();
@@ -85,11 +98,21 @@ class Engine {
     // pattern).  When enabled (default ON) chat_continue discards the bad
     // assistant turn, appends a corrective synthetic user message
     // ("don't announce, execute"), fires on_hop_reset so streaming
-    // consumers can drop their accumulated parse state, and retries once.
-    // Mirrors libeasyai-cli's Client::retry_on_incomplete behaviour at the
-    // engine layer so every consumer (server, agent, recipes) gets the
-    // same recovery without each app rolling its own.
+    // consumers can drop their accumulated parse state, and retries up to
+    // `max_incomplete_retries()` times before giving up. Mirrors
+    // libeasyai-cli's Client::retry_on_incomplete behaviour at the engine
+    // layer so every consumer (server, agent, recipes) gets the same
+    // recovery without each app rolling its own.
     Engine & retry_on_incomplete (bool on = true);
+
+    // How many times chat_continue will discard + nudge + retry an
+    // "announce-only" turn before bailing out and returning whatever
+    // the last attempt produced. Default 10. Set to 0 to disable
+    // retries (equivalent to retry_on_incomplete(false)). Higher
+    // values cost tokens but give weak / over-cautious models more
+    // chances to actually call a tool — useful for 1-bit quants
+    // (Bonsai, BitNet) where the first few replies are noisy.
+    Engine & max_incomplete_retries (int n);
 
     // Hard ceiling on context fill — once the rendered prompt + KV
     // cache reach this percentage of n_ctx, chat_continue stops
@@ -151,9 +174,10 @@ class Engine {
     Engine & clear_tools();
 
     // ---------------- callbacks --------------------------------------------
-    Engine & on_token     (TokenCallback    cb);
-    Engine & on_tool      (ToolCallback     cb);
-    Engine & on_hop_reset (HopResetCallback cb);
+    Engine & on_token            (TokenCallback             cb);
+    Engine & on_tool             (ToolCallback              cb);
+    Engine & on_hop_reset        (HopResetCallback          cb);
+    Engine & on_incomplete_retry (IncompleteRetryCallback   cb);
 
     // ---------------- lifecycle --------------------------------------------
     bool load();              // loads gguf + builds context. returns true on success.

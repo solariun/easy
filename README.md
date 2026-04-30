@@ -42,6 +42,26 @@ A running log of user-facing changes. Latest first — keep this list
 current as features land so anyone returning to the repo (or
 landing on it for the first time) sees what shipped recently.
 
+### 2026-04-30 — Tunable incomplete-retry budget + live retry visibility
+
+* **`--max-incomplete-retries N` (also `[ENGINE] max_incomplete_retries`).**
+  Default 10 — how many times the engine discards + nudges + retries
+  when the model finishes a turn announcing an action ("Let me…",
+  "I'll…") without actually emitting the tool_call. Bump to 15-20
+  for weak / 1-bit-quant models (Bonsai-8B-Q1_0 frequently needs
+  the extra budget); set to 0 to disable retries entirely.
+* **Retries now visible in the Thinking panel.** Engine fires a new
+  `on_incomplete_retry(attempt, max, reason)` callback per retry,
+  the server pipes it into the SSE `reasoning_content` channel, and
+  the webui renders `↻ Retry 3/10: model said: "Let me search…" (no
+  tool_call) — nudging.` while it happens. No more frozen UI for 10
+  silent retries followed by a blank bubble.
+* **Engine warnings always log** (regardless of `--verbose`):
+  cancellation, thought-only retry, reasoning→content fallback,
+  incomplete-retry, empty final content. `--verbose` is for raw
+  per-token / per-hop diagnostic noise; actionable warnings stay on
+  so operators see them in `journalctl` without flipping a flag.
+
 ### 2026-04-30 — Bonsai 8B Q1_0 onboarding + security pass
 
 * **One-shot installers for macOS and Raspberry Pi 4/5.**

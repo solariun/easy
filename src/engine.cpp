@@ -574,13 +574,15 @@ struct Engine::Impl {
     bool         parallel_tool_calls    = false;
     int          max_tool_hops          = 8;     // default agentic safety cap
     bool         retry_on_incomplete    = true;  // see Engine::retry_on_incomplete
+    int          max_incomplete_retries = 10;    // see Engine::max_incomplete_retries
     int          stop_at_ctx_pct        = 100;   // 0 disables; otherwise abort
                                                   // chat_continue when KV >= this %
     bool         last_was_ctx_full      = false;
 
     TokenCallback    on_token;
     ToolCallback     on_tool;
-    HopResetCallback on_hop_reset;
+    HopResetCallback         on_hop_reset;
+    IncompleteRetryCallback  on_incomplete_retry;
 
     // Cooperative cancel — flipped from another thread (typically the
     // server's SSE provider when the client drops) and polled by the
@@ -871,6 +873,10 @@ Engine & Engine::tool_choice_none()             { p_->tool_choice = COMMON_CHAT_
 Engine & Engine::parallel_tool_calls(bool e)    { p_->parallel_tool_calls = e; return *this; }
 Engine & Engine::max_tool_hops      (int  n)    { if (n > 0) p_->max_tool_hops = n; return *this; }
 Engine & Engine::retry_on_incomplete(bool on)   { p_->retry_on_incomplete = on; return *this; }
+Engine & Engine::max_incomplete_retries(int n)  {
+    p_->max_incomplete_retries = std::max(0, n);
+    return *this;
+}
 Engine & Engine::stop_at_ctx_pct    (int  pct)  {
     if (pct < 0)   pct = 0;
     if (pct > 100) pct = 100;
@@ -1027,6 +1033,9 @@ Engine & Engine::clear_tools()                  { p_->tools.clear(); return *thi
 Engine & Engine::on_token(TokenCallback cb)         { p_->on_token     = std::move(cb); return *this; }
 Engine & Engine::on_tool(ToolCallback cb)           { p_->on_tool      = std::move(cb); return *this; }
 Engine & Engine::on_hop_reset(HopResetCallback cb)  { p_->on_hop_reset = std::move(cb); return *this; }
+Engine & Engine::on_incomplete_retry(IncompleteRetryCallback cb) {
+    p_->on_incomplete_retry = std::move(cb); return *this;
+}
 
 bool Engine::load() {
     if (p_->loaded) return true;
@@ -1192,7 +1201,12 @@ std::string Engine::chat_continue() {
     // long tail without losing the "no infinite spiral" guarantee.  Set in
     // the lib so every server / CLI / agent inherits the same recovery.
     constexpr int kMaxThoughtRetries     = 10;  // thought-only retries
-    constexpr int kMaxIncompleteRetries  = 10;  // announce-without-action retries
+    // Operator-tunable via Engine::max_incomplete_retries (server flag
+    // --max-incomplete-retries / INI [ENGINE] max_incomplete_retries).
+    // Default 10; clamp to ≥0 since negative values would never enter
+    // the retry loop. Snapshotted into a const here so per-hop reads
+    // don't pay the indirection cost.
+    const int kMaxIncompleteRetries = std::max(0, p_->max_incomplete_retries);
     constexpr size_t kAnnounceFloor      = 80;  // bytes — sub-tweet replies
     int thought_retries    = 0;
     int incomplete_retries = 0;
@@ -1205,7 +1219,11 @@ std::string Engine::chat_continue() {
         // this catches aborts that arrive AFTER a hop returns (e.g.
         // during tool dispatch) and BEFORE the next hop starts.
         if (p_->cancel_requested.load(std::memory_order_relaxed)) {
-            if (p_->verbose) std::fprintf(stderr,
+            // Always log — operator wants cancellations visible in
+            // journalctl regardless of --verbose. Verbose is for
+            // per-token / per-hop diagnostic noise, not actionable
+            // events.
+            std::fprintf(stderr,
                 "[easyai] chat_continue cancelled at hop %d\n", hop);
             p_->last_error = "cancelled";
             break;
@@ -1243,7 +1261,10 @@ std::string Engine::chat_continue() {
         if (thought_only && thought_retries < kMaxThoughtRetries
                          && hop + 1 < kMaxToolHops) {
             ++thought_retries;
-            if (p_->verbose) std::fprintf(stderr,
+            // Always log — actionable warning. Operators tracking
+            // "why is the model giving empty replies?" need this in
+            // journalctl regardless of --verbose.
+            std::fprintf(stderr,
                 "[easyai] hop %d: thought-only turn — clearing KV and retrying (%d/%d)\n",
                 hop, thought_retries, kMaxThoughtRetries);
             // Mark the bad turn in the raw transaction log so an
@@ -1268,8 +1289,12 @@ std::string Engine::chat_continue() {
         if (msg.tool_calls.empty() && msg.content.empty()
                 && !msg.reasoning_content.empty()) {
             msg.content = msg.reasoning_content;
-            if (p_->verbose) std::fprintf(stderr,
-                "[easyai] hop %d: retry budget exhausted — promoting reasoning to content\n", hop);
+            // Always log — actionable: the user is about to see
+            // reasoning-text in their answer bubble instead of a
+            // proper reply. Operator may want to bump
+            // --max-incomplete-retries or rephrase the system prompt.
+            std::fprintf(stderr,
+                "[easyai] hop %d: thought-retry budget exhausted — promoting reasoning to content\n", hop);
             easyai::log::mark_problem(
                 "Engine::chat_continue thought-only retry budget exhausted\n"
                 "hop=%d budget=%d — promoting reasoning_content (%zu bytes) into content\n",
@@ -1375,7 +1400,10 @@ std::string Engine::chat_continue() {
                     && final_text.size() < kAnnounceFloor
                     && looks_like_announce(final_text)) {
                 ++incomplete_retries;
-                if (p_->verbose) std::fprintf(stderr,
+                // Always log — actionable. Each retry is one nudge
+                // round-trip; operator wants to know if a turn went
+                // through 10 retries before bailing.
+                std::fprintf(stderr,
                     "[easyai] hop %d: incomplete turn (%zu B content, no tool_call) "
                     "— discarding, nudging, retrying (%d/%d)\n",
                     hop, final_text.size(),
@@ -1388,6 +1416,25 @@ std::string Engine::chat_continue() {
                     hop, final_text.size(), msg.reasoning_content.size(),
                     (int) std::min<size_t>(400, final_text.size()),
                     final_text.c_str());
+                // Surface the retry to streaming consumers (server SSE
+                // → webui Thinking panel) so the user sees what the
+                // engine is doing instead of staring at silence.
+                // Snippet of what the model just emitted, escaped down
+                // to a single line so the panel stays scannable.
+                if (p_->on_incomplete_retry) {
+                    std::string snippet = final_text;
+                    if (snippet.size() > 100) {
+                        snippet.resize(100);
+                        snippet += "…";
+                    }
+                    for (auto & c : snippet) if (c == '\n' || c == '\r') c = ' ';
+                    p_->on_incomplete_retry(
+                        incomplete_retries,
+                        kMaxIncompleteRetries,
+                        snippet.empty()
+                            ? std::string("model emitted no visible reply")
+                            : ("model said: \"" + snippet + "\" (no tool_call)"));
+                }
                 if (!p_->history.empty()) p_->history.pop_back();
                 p_->history.push_back({
                     "user",
@@ -1403,6 +1450,24 @@ std::string Engine::chat_continue() {
                 final_text.clear();
                 continue;
             }
+            // Retry budget exhausted — model still announce-only after
+            // kMaxIncompleteRetries nudges. Tell streaming consumers
+            // explicitly so the webui can render a "gave up" note in
+            // the Thinking panel before the empty assistant bubble
+            // confuses the user. Distinct from the per-retry signal
+            // (negative attempt) so the consumer can style it as a
+            // give-up, not yet-another-retry.
+            if (p_->retry_on_incomplete
+                    && incomplete_retries >= kMaxIncompleteRetries
+                    && !p_->tools.empty()
+                    && final_text.size() < kAnnounceFloor
+                    && looks_like_announce(final_text)
+                    && p_->on_incomplete_retry) {
+                p_->on_incomplete_retry(
+                    -1, kMaxIncompleteRetries,
+                    "gave up after " + std::to_string(kMaxIncompleteRetries)
+                    + " retries — try rephrasing more specifically");
+            }
 
             // Highlight empty-content turns at hop end — usually means
             // the model thought, decided not to call a tool, and then
@@ -1413,7 +1478,11 @@ std::string Engine::chat_continue() {
             // bubble will be blank — surface it loudly so the operator
             // can correlate against journalctl.
             if (final_text.empty()) {
-                if (p_->verbose) std::fprintf(stderr,
+                // Always log — empty final content is the user-
+                // visible failure (blank assistant bubble). Operator
+                // looking at "why no reply?" needs this in journalctl
+                // regardless of --verbose.
+                std::fprintf(stderr,
                     "[easyai] hop %d: WARN final content is EMPTY after %d hop(s); "
                     "reasoning=%zu tool_calls=%zu — model gave up without an "
                     "answer.  Common causes: tool error chain (rate limits, "

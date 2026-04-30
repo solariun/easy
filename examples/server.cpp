@@ -2203,6 +2203,31 @@ static void handle_chat_stream(ServerCtx & ctx,
                 prev_msg.role = "assistant";
             });
 
+            // Engine fires this every time it discards an "announce-only"
+            // turn and is about to nudge + retry (and once more with
+            // attempt=-1 when the retry budget is exhausted). We push a
+            // reasoning_content delta so the webui's Thinking panel shows
+            // the retry attempts live — without it, the UI looks frozen
+            // for 10 silent retries before a final empty bubble appears.
+            ctx.engine.on_incomplete_retry(
+                [&](int attempt, int max, const std::string & reason) {
+                    std::ostringstream line;
+                    if (attempt < 0) {
+                        // Give-up signal — different visual cue.
+                        line << "\n⚠ " << reason << "\n";
+                    } else {
+                        line << "\n↻ Retry " << attempt << "/" << max
+                             << ": " << reason << " — nudging.\n";
+                    }
+                    ordered_json delta;
+                    delta["choices"] = json::array({{
+                        {"index", 0},
+                        {"delta", {{"reasoning_content", line.str()}}},
+                        {"finish_reason", nullptr},
+                    }});
+                    emit_data(safe_dump(delta));
+                });
+
             // ---- run the engine ----------------------------------------
             std::string finish_reason = "stop";
             std::vector<std::pair<std::string, std::string>> tool_calls;
@@ -3002,6 +3027,19 @@ static bool require_auth(const ServerCtx & ctx, const httplib::Request & req,
         "      --repeat-penalty <f>     Override repeat penalty\n"
         "      --max-tokens <n>         Cap tokens generated per request\n"
         "      --seed <u32>             RNG seed (0 = random)\n"
+        "      --max-incomplete-retries <n>\n"
+        "                               How many times the engine retries when\n"
+        "                                the model finishes a turn with no\n"
+        "                                tool_call and only an 'announce'\n"
+        "                                snippet ('Let me…', 'I'll…'). Each\n"
+        "                                retry discards the bad turn, appends\n"
+        "                                a corrective user message, and runs\n"
+        "                                the model again. Default 10 — sane\n"
+        "                                floor for 1-bit quants (Bonsai,\n"
+        "                                BitNet); 0 disables retries; bump to\n"
+        "                                15-20 for weak models that keep\n"
+        "                                announcing-without-acting. Each retry\n"
+        "                                surfaces in the webui Thinking panel.\n"
         "\nCompute / memory:\n"
         "  -c, --ctx <n>                Context size (default 8192)\n"
         "      --batch <n>              Logical batch size (default = ctx)\n"
@@ -3077,6 +3115,14 @@ struct ServerArgs {
     // trust the wall clock instead of guessing about "today".
     bool        inject_datetime  = true;
     std::string knowledge_cutoff = "2024-10";
+
+    // Auto-retry-with-nudge cap. When the model finishes a turn with no
+    // tool_call AND only an "announce" snippet ("Let me…", "I'll…"),
+    // the engine discards that turn, appends a corrective synthetic
+    // user message, and retries. Default 10 — high enough to recover
+    // a 1-bit quant (Bonsai, BitNet) that's struggling, low enough
+    // not to burn tokens on a hopeless prompt. Set 0 to disable.
+    int         max_incomplete_retries = 10;
 
     // sampling overrides (apply on top of preset)
     float       temperature    = -1.0f;
@@ -3313,6 +3359,7 @@ static const std::vector<FlagDef> & kFlags() {
         { {"--min-p"},             "ENGINE", "min_p",          "min_p",          true,  SET_FLOAT(&ServerArgs::min_p) },
         { {"--repeat-penalty"},    "ENGINE", "repeat_penalty", "repeat_penalty", true,  SET_FLOAT(&ServerArgs::repeat_penalty) },
         { {"--max-tokens"},        "ENGINE", "max_tokens",     "max_tokens",     true,  SET_INT(&ServerArgs::max_tokens) },
+        { {"--max-incomplete-retries"}, "ENGINE", "max_incomplete_retries", "max_incomplete_retries", true, SET_INT(&ServerArgs::max_incomplete_retries) },
         { {"--seed"},              "ENGINE", "seed",           "seed",           true,  SET_UINT32(&ServerArgs::seed) },
     };
     return table;
@@ -3628,6 +3675,11 @@ int main(int argc, char ** argv) {
     // model never finishes.  Setting it here makes the contract visible
     // in the server's startup config (see banner below).
     ctx->engine.retry_on_incomplete(true);
+    // Operator-tunable retry budget — see ServerArgs::max_incomplete_retries.
+    // Default 10 is a sane floor for weak / 1-bit quants; bump higher
+    // (--max-incomplete-retries 20) if your model frequently announces
+    // without acting, drop to 0 to disable the retry loop entirely.
+    ctx->engine.max_incomplete_retries(args.max_incomplete_retries);
 
     // -------- production knobs / auth --------------------------------------
     ctx->api_key  = args.api_key;
