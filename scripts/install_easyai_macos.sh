@@ -219,6 +219,29 @@ if [[ "$REBUILD" == "1" && -d "$BUILD_DIR" ]]; then
     rm -rf "$BUILD_DIR"
 fi
 
+# Guard against the classic "I ran this with sudo once and now nothing
+# works" pitfall: if anything inside $BUILD_DIR is owned by root (or
+# anyone other than $USER), `cmake --install` will hit Permission
+# denied on install_manifest.txt mid-run, leaving the install half-
+# applied. Detect early, tell the operator how to fix, exit before
+# cmake even starts.
+if [[ -d "$BUILD_DIR" ]]; then
+    foreign_owner="$(find "$BUILD_DIR" -maxdepth 2 ! -user "$USER" -print -quit 2>/dev/null || true)"
+    if [[ -n "$foreign_owner" ]]; then
+        warn "$BUILD_DIR contains files not owned by $USER:"
+        warn "  example: $foreign_owner"
+        warn "this happens when a previous run was invoked with sudo, leaving"
+        warn "root-owned artefacts behind. Pick one and rerun:"
+        warn ""
+        warn "  # keep the build cache, fix ownership:"
+        warn "  sudo chown -R $USER $BUILD_DIR"
+        warn ""
+        warn "  # nuke and start fresh:"
+        warn "  sudo rm -rf $BUILD_DIR"
+        die "ownership mismatch — refusing to continue"
+    fi
+fi
+
 # CMake flags. We let easyai's CMakeLists pick Metal vs CPU off the
 # host arch (it does: APPLE && CMAKE_SYSTEM_PROCESSOR=arm64 → Metal).
 # Explicit flags here would only fight that detection.
