@@ -225,6 +225,21 @@ some entries score `M/M` (full match), you've found exact hits; if
 the best is `2/4`, your space of related notes is sparser than you
 thought — widen your query (drop 1-2 keywords) or use rag_list.
 
+**Pagination.** Every response begins with three machine-readable
+header lines:
+
+```
+total_entries: 47
+page: 1 of 5
+showing: 10  (entries 1..10)
+has_more: true
+```
+
+When `has_more: true`, issue the SAME query with `page=P+1` to walk
+the rest. The first page is already best-first, so you usually
+don't need more — the model decides. Asking for `page=99` past the
+end gets a clear "past the last page" message, not an error.
+
 ### rag_load
 
 ```

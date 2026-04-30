@@ -715,9 +715,20 @@ ToolHandler make_search_handler(std::shared_ptr<RagStore> store) {
             if (a.matched != b.matched) return a.matched > b.matched;
             return a.meta.modified_unix > b.meta.modified_unix;
         });
-        if ((long long) hits.size() > max_results) {
-            hits.resize((std::size_t) max_results);
-        }
+
+        // Pagination — the model can ask for `page=N` to walk the rest
+        // of a large result set without re-issuing a different query.
+        // We compute totals on the FULL ranked list, then slice.
+        long long page = 1;
+        args::get_int(c.arguments_json, "page", page);
+        if (page < 1) page = 1;
+
+        const std::size_t total       = hits.size();
+        const std::size_t per_page    = (std::size_t) max_results;
+        const std::size_t total_pages =
+            total == 0 ? 0 : (total + per_page - 1) / per_page;
+        const std::size_t offset      =
+            (std::size_t)((page - 1) * (long long) per_page);
 
         // Build a "queried [a, b, c]" string once for the response prose.
         std::string queried_str;
@@ -728,6 +739,8 @@ ToolHandler make_search_handler(std::shared_ptr<RagStore> store) {
 
         if (hits.empty()) {
             std::ostringstream o;
+            o << "total_entries: 0\n";
+            o << "page: " << page << " of 0\n\n";
             o << "no entries match";
             if (keywords.size() == 1) {
                 o << " keyword \"" << queried_str << "\"";
@@ -739,20 +752,45 @@ ToolHandler make_search_handler(std::shared_ptr<RagStore> store) {
             return ToolResult::ok(o.str());
         }
 
+        if (offset >= total) {
+            std::ostringstream o;
+            o << "total_entries: " << total << "\n";
+            o << "page: " << page << " of " << total_pages
+              << "  (past the end)\n\n";
+            o << "page " << page << " is past the last page ("
+              << total_pages << "). The full result set is "
+              << total << " entr" << (total == 1 ? "y" : "ies")
+              << " — use page=1.." << total_pages << ".";
+            return ToolResult::ok(o.str());
+        }
+
+        const std::size_t slice_end = std::min(offset + per_page, total);
+        const std::size_t shown     = slice_end - offset;
+        const bool        has_more  = slice_end < total;
+
         // Render plain-text + structured (markdown-friendly) output.
         // The model parses this with no JSON dependency on its side
         // and the operator can `cat` it from a journal log.
+        //
+        // Header layout (machine-readable lines first, then prose) so
+        // the model can grep `total_entries:` / `page:` / `has_more:`
+        // without parsing the body.
         std::ostringstream o;
-        o << hits.size() << " entr" << (hits.size() == 1 ? "y" : "ies");
+        o << "total_entries: " << total << "\n";
+        o << "page: "          << page << " of " << total_pages << "\n";
+        o << "showing: "       << shown
+          << "  (entries " << (offset + 1) << ".." << slice_end << ")\n";
+        o << "has_more: "      << (has_more ? "true" : "false") << "\n\n";
+
         if (keywords.size() == 1) {
-            o << " match keyword \"" << queried_str
+            o << "match keyword \"" << queried_str
               << "\" (newest first):\n\n";
         } else {
-            o << " match ≥" << min_matches << " of ["
+            o << "match ≥" << min_matches << " of ["
               << queried_str
               << "] (best-overlap first, then newest):\n\n";
         }
-        for (std::size_t i = 0; i < hits.size(); ++i) {
+        for (std::size_t i = offset; i < slice_end; ++i) {
             const auto & h = hits[i];
             std::vector<std::string> body_keywords;
             std::string              body_text;
@@ -765,6 +803,8 @@ ToolHandler make_search_handler(std::shared_ptr<RagStore> store) {
                 preview = "(could not read body: " + load_err + ")";
             }
 
+            // Number entries by their absolute position in the ranked
+            // list so the model can correlate across pages.
             o << (i + 1) << ". " << h.title;
             if (keywords.size() > 1) {
                 o << "  [matched " << h.matched << "/" << keywords.size()
@@ -790,6 +830,13 @@ ToolHandler make_search_handler(std::shared_ptr<RagStore> store) {
                 if (ch == '\n') preview_in += "   ";
             }
             o << "   " << preview_in << "\n\n";
+        }
+        if (has_more) {
+            o << "Use rag_search with the same keywords + page="
+              << (page + 1) << " to see the next "
+              << std::min(per_page, total - slice_end)
+              << " result" << (total - slice_end == 1 ? "" : "s")
+              << " (page " << (page + 1) << " of " << total_pages << ").\n";
         }
         o << "Use rag_load with up to " << kMaxLoadAtOnce
           << " of these titles for full content.\n";
@@ -1000,10 +1047,17 @@ RagTools make_rag_tools(std::string root_dir) {
             "without an extra round-trip — start with 3-4 related keywords, "
             "see which entries score highest, then rag_load the 1-4 best.\n"
             "\n"
-            "Returns up to 20 entries (best-overlap first, ties broken by "
-            "recency). If no entries match the threshold, the result tells "
-            "you so (not an error) — try fewer keywords, or use rag_list to "
-            "browse."
+            "Pagination: the response always includes machine-readable header "
+            "lines `total_entries: T`, `page: P of N`, `has_more: true|false`. "
+            "When `has_more: true` you can issue the SAME query with `page=P+1` "
+            "to walk the rest of the result set. Don't paginate unless you "
+            "actually need more — the first page is already ranked best-first, "
+            "so the top entries are usually enough.\n"
+            "\n"
+            "Returns up to `max_results` entries per page (best-overlap first, "
+            "ties broken by recency). If no entries match the threshold, "
+            "`total_entries: 0` is returned (not an error) — try fewer keywords, "
+            "or use rag_list to browse."
         )
         .param("keywords",    "array",
                "1..8 keywords to search for. Each: 1..32 chars, [A-Za-z0-9_-]. "
@@ -1012,7 +1066,13 @@ RagTools make_rag_tools(std::string root_dir) {
                "narrows (entries matching ≥2 of them, ranked by overlap).",
                true)
         .param("max_results", "integer",
-               "Maximum entries to return (default 10, max 20).", false)
+               "Maximum entries to return PER PAGE (default 10, max 20). "
+               "This is the page size; total result count comes back in "
+               "`total_entries`.", false)
+        .param("page",        "integer",
+               "1-based page index to fetch (default 1). Use to walk a large "
+               "result set when the previous response had `has_more: true`.",
+               false)
         .handle(make_search_handler(store))
         .build();
 
