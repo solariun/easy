@@ -632,15 +632,49 @@ ToolHandler make_save_handler(std::shared_ptr<RagStore> store) {
 
 ToolHandler make_search_handler(std::shared_ptr<RagStore> store) {
     return [store](const ToolCall & c) -> ToolResult {
-        std::string keyword;
-        if (!args::get_string(c.arguments_json, "keyword", keyword) || keyword.empty()) {
-            return ToolResult::error("missing required argument: keyword");
+        // Multi-keyword search.
+        //   - 1 keyword passed:  match entries that have THAT keyword
+        //                        (require ≥1 match — same as the
+        //                        original single-keyword behaviour)
+        //   - 2+ keywords passed: match entries that have AT LEAST 2
+        //                        of the queried keywords (require ≥2)
+        //
+        // The threshold is adaptive on purpose: a single-keyword query
+        // is still a useful broad sweep, but the moment the model
+        // sends two or more it's clearly trying to narrow — and we
+        // reward that by demanding overlap. Each result reports how
+        // many of the queried keywords it matched, so the model can
+        // rank / pick.
+        std::vector<std::string> keywords;
+        std::string err;
+        if (!parse_string_array(c.arguments_json, "keywords", keywords, err)) {
+            return ToolResult::error(err);
         }
-        if (!is_valid_id(keyword, kMaxKeywordBytes)) {
+        if (keywords.empty()) {
             return ToolResult::error(
-                "keyword \"" + keyword + "\" is invalid; must match "
-                "[A-Za-z0-9_-]{1," + std::to_string(kMaxKeywordBytes) + "}");
+                "missing required argument: keywords (non-empty array)");
         }
+        if (keywords.size() > kMaxKeywordsPerEntry) {
+            return ToolResult::error(
+                "too many keywords (max "
+                + std::to_string(kMaxKeywordsPerEntry) + " per query)");
+        }
+        for (const auto & k : keywords) {
+            if (!is_valid_id(k, kMaxKeywordBytes)) {
+                return ToolResult::error(
+                    "keyword \"" + k + "\" is invalid; must match "
+                    "[A-Za-z0-9_-]{1," + std::to_string(kMaxKeywordBytes) + "}");
+            }
+        }
+        // Deduplicate the query — repeated keywords would otherwise
+        // distort the match count.
+        {
+            std::sort(keywords.begin(), keywords.end());
+            keywords.erase(std::unique(keywords.begin(), keywords.end()),
+                           keywords.end());
+        }
+        const std::size_t min_matches = (keywords.size() >= 2) ? 2 : 1;
+
         long long max_results = (long long) kSearchResultsDflt;
         args::get_int(c.arguments_json, "max_results", max_results);
         if (max_results < 1) max_results = 1;
@@ -648,39 +682,76 @@ ToolHandler make_search_handler(std::shared_ptr<RagStore> store) {
             max_results = (long long) kSearchResultsMax;
         }
 
-        struct Hit { std::string title; EntryMeta meta; };
+        struct Hit {
+            std::string title;
+            EntryMeta   meta;
+            std::size_t matched = 0;
+            std::vector<std::string> matched_keywords;
+        };
         std::vector<Hit> hits;
         {
             std::lock_guard<std::mutex> lock(store->mu);
             store->load_index_locked();
             for (const auto & [t, m] : store->index) {
-                for (const auto & et : m.keywords) {
-                    if (et == keyword) {
-                        hits.push_back({ t, m });
-                        break;
+                Hit h;
+                h.title = t;
+                h.meta  = m;
+                for (const auto & q : keywords) {
+                    for (const auto & et : m.keywords) {
+                        if (et == q) {
+                            h.matched_keywords.push_back(q);
+                            break;
+                        }
                     }
+                }
+                h.matched = h.matched_keywords.size();
+                if (h.matched >= min_matches) {
+                    hits.push_back(std::move(h));
                 }
             }
         }
+        // Rank: more overlap first, ties broken by recency.
         std::sort(hits.begin(), hits.end(), [](const Hit & a, const Hit & b) {
+            if (a.matched != b.matched) return a.matched > b.matched;
             return a.meta.modified_unix > b.meta.modified_unix;
         });
         if ((long long) hits.size() > max_results) {
             hits.resize((std::size_t) max_results);
         }
 
+        // Build a "queried [a, b, c]" string once for the response prose.
+        std::string queried_str;
+        for (std::size_t i = 0; i < keywords.size(); ++i) {
+            queried_str += (i ? ", " : "");
+            queried_str += keywords[i];
+        }
+
         if (hits.empty()) {
-            return ToolResult::ok(
-                "no entries match keyword \"" + keyword + "\". "
-                "Use rag_list to browse all titles, or rag_save to add new ones.");
+            std::ostringstream o;
+            o << "no entries match";
+            if (keywords.size() == 1) {
+                o << " keyword \"" << queried_str << "\"";
+            } else {
+                o << " at least " << min_matches
+                  << " of [" << queried_str << "]";
+            }
+            o << ". Use rag_list to browse, or rag_save to add new entries.";
+            return ToolResult::ok(o.str());
         }
 
         // Render plain-text + structured (markdown-friendly) output.
         // The model parses this with no JSON dependency on its side
         // and the operator can `cat` it from a journal log.
         std::ostringstream o;
-        o << hits.size() << " entr" << (hits.size() == 1 ? "y" : "ies")
-          << " match keyword \"" << keyword << "\" (newest first):\n\n";
+        o << hits.size() << " entr" << (hits.size() == 1 ? "y" : "ies");
+        if (keywords.size() == 1) {
+            o << " match keyword \"" << queried_str
+              << "\" (newest first):\n\n";
+        } else {
+            o << " match ≥" << min_matches << " of ["
+              << queried_str
+              << "] (best-overlap first, then newest):\n\n";
+        }
         for (std::size_t i = 0; i < hits.size(); ++i) {
             const auto & h = hits[i];
             std::vector<std::string> body_keywords;
@@ -694,7 +765,17 @@ ToolHandler make_search_handler(std::shared_ptr<RagStore> store) {
                 preview = "(could not read body: " + load_err + ")";
             }
 
-            o << (i + 1) << ". " << h.title << "\n";
+            o << (i + 1) << ". " << h.title;
+            if (keywords.size() > 1) {
+                o << "  [matched " << h.matched << "/" << keywords.size()
+                  << ": ";
+                for (std::size_t k = 0; k < h.matched_keywords.size(); ++k) {
+                    if (k) o << ", ";
+                    o << h.matched_keywords[k];
+                }
+                o << "]";
+            }
+            o << "\n";
             o << "   keywords: ";
             for (std::size_t k = 0; k < h.meta.keywords.size(); ++k) {
                 if (k) o << ", ";
@@ -905,18 +986,31 @@ RagTools make_rag_tools(std::string root_dir) {
 
     out.search = Tool::builder("rag_search")
         .describe(
-            "Search the RAG by keyword. Returns up to 20 matching entries with "
-            "their title, keywords, modification time, and a short content preview. "
-            "USE THIS BEFORE assuming you don't know something the user might "
-            "have told you in a past session — your past self may have already "
-            "saved the answer. After this returns, pick the 1-4 most relevant "
-            "titles and use rag_load to read their full content.\n\n"
-            "Returns newest-first. If no entries match, the result tells you so "
-            "(not an error) — try a different keyword, or use rag_list to browse."
+            "Search the RAG by one or more keywords. USE THIS BEFORE assuming "
+            "you don't know something the user might have told you in a past "
+            "session — your past self may have already saved the answer.\n\n"
+            "Pass an ARRAY of keywords. Threshold is adaptive:\n"
+            "  - 1 keyword passed  → entries that have that keyword (broad sweep)\n"
+            "  - 2+ keywords       → entries that match AT LEAST 2 of them\n"
+            "                        (narrow query, ranked by overlap)\n"
+            "\n"
+            "Each result reports `matched N/M` so you can rank: an entry that "
+            "matched 3 of your 4 queried keywords is more relevant than one "
+            "that matched only 2. Use this to widen or narrow your search "
+            "without an extra round-trip — start with 3-4 related keywords, "
+            "see which entries score highest, then rag_load the 1-4 best.\n"
+            "\n"
+            "Returns up to 20 entries (best-overlap first, ties broken by "
+            "recency). If no entries match the threshold, the result tells "
+            "you so (not an error) — try fewer keywords, or use rag_list to "
+            "browse."
         )
-        .param("keyword",         "string",
-               "Keyword to search for. Single keyword, exact match (case-sensitive). "
-               "1..32 chars, [A-Za-z0-9_-]. Example: 'user-prefs'.", true)
+        .param("keywords",    "array",
+               "1..8 keywords to search for. Each: 1..32 chars, [A-Za-z0-9_-]. "
+               "Example: [\"user-prefs\", \"hardware\"]. With one keyword the "
+               "search is broad (any entry with it); with 2+, the search "
+               "narrows (entries matching ≥2 of them, ranked by overlap).",
+               true)
         .param("max_results", "integer",
                "Maximum entries to return (default 10, max 20).", false)
         .handle(make_search_handler(store))

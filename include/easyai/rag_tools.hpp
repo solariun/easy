@@ -61,7 +61,7 @@ namespace easyai::tools {
 // serialises disk writes.
 struct RagTools {
     Tool save;     // rag_save(title, keywords[], content)
-    Tool search;   // rag_search(keyword, max_results=10)
+    Tool search;   // rag_search(keywords[], max_results=10) — ≥2 matches when 2+ kw
     Tool load;     // rag_load(titles[1..4])
     Tool list;     // rag_list(prefix?, max=50)
     Tool del;      // rag_delete(title)

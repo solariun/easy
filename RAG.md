@@ -40,7 +40,7 @@ on disk, accessible to the agent via five tools:
 
 ```
 rag_save(title, keywords[], content)   write / overwrite
-rag_search(keyword, max_results=10)    find by keyword
+rag_search(keywords[], max_results=10)  find by 1+ keywords (≥2 matches when 2+ given)
 rag_load(titles[1..4])                 read up to 4 full bodies
 rag_list(prefix?, max=50)              browse titles
 rag_delete(title)                      remove a stale entry
@@ -203,13 +203,27 @@ a clear error.
 ### rag_search
 
 ```
-rag_search(keyword: string, max_results: integer = 10) -> list of {title, keywords, preview}
+rag_search(keywords: string[], max_results: integer = 10) -> list of {title, keywords, preview, matched/total}
 ```
 
-Returns up to 20 entries that have `keyword` in their keyword list,
-newest-first by mtime. Each result includes a preview (first ~240
-bytes of body). The model picks the most relevant 1–4 titles and
-calls rag_load.
+Pass an array of 1..8 keywords. The threshold is **adaptive**:
+
+- **1 keyword** → returns entries that have that keyword (broad sweep).
+- **2+ keywords** → returns entries that match **at least 2** of them
+  (narrow query, ranked by overlap).
+
+Each result reports `matched N/M` so the model can rank: an entry
+that matched 3 of the 4 queried keywords is more relevant than one
+that matched only 2. Best-overlap first, ties broken by recency.
+
+Returns up to 20 entries (preview ≈ 240 bytes per entry). The model
+picks the most relevant 1–4 titles and calls rag_load to read their
+bodies.
+
+**Optimisation pattern:** start a query with 3-4 related keywords. If
+some entries score `M/M` (full match), you've found exact hits; if
+the best is `2/4`, your space of related notes is sparser than you
+thought — widen your query (drop 1-2 keywords) or use rag_list.
 
 ### rag_load
 
@@ -281,7 +295,7 @@ already works.
 ```
 [user opens chat]
   ↓
-model: rag_search("user-prefs") → finds "gustavo-prefs"
+model: rag_search(["user-prefs"]) → finds "gustavo-prefs"
 model: rag_load(["gustavo-prefs"])  → reads the body
 model: now knows the user prefers PT-BR, terse style, ...
 
@@ -295,7 +309,7 @@ model: rag_save("project-foo-bar", ["project", "foo"], "...")
 
 [user corrects something]
   ↓
-model: rag_search("foo") → finds the old note
+model: rag_search(["foo"]) → finds the old note
 model: rag_save(SAME title, ...)   ← overwrites with corrected version
                                      OR
 model: rag_delete("foo-old")
@@ -319,13 +333,17 @@ Model:  [reads the PDF via fs_read_file or web_fetch]
         rag_save("mqtt-publish",   ["mqtt", "protocol"], "...")
         rag_save("mqtt-qos",       ["mqtt", "protocol"], "...")
         ...
-        "Saved 6 entries under keyword 'mqtt'. Future you will
-         rag_search('mqtt') to find any of them."
+        "Saved 6 entries under keywords 'mqtt' + 'protocol'. Future you
+         can rag_search(['mqtt']) to find any of them, or narrow with
+         rag_search(['mqtt', 'qos']) to focus on QoS-related ones."
 ```
 
 Now the next session, when you ask about MQTT, the model
-rag_searches, finds those 6 titles, loads up to 4, and answers from
-the saved knowledge — no re-reading.
+rag_searches with `["mqtt"]`, finds the 6 titles, loads up to 4, and
+answers from the saved knowledge — no re-reading. If the question
+is more specific ("MQTT QoS levels"), the model uses
+`rag_search(["mqtt", "qos"])` and gets only the entries that score
+on both keywords, ranked by overlap.
 
 This is the **positive cycle**: feed knowledge, saved knowledge,
 searched knowledge, recalled knowledge. Each ingestion makes the
@@ -349,7 +367,7 @@ Next session:
 
 ```
 You:    "build easyai on ai box"
-Model:  rag_search("easyai")  →  finds easyai-build-aibox
+Model:  rag_search(["easyai", "build"])  →  finds easyai-build-aibox (matched 2/2)
         rag_load(["easyai-build-aibox"])
         "Use: cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j"
 ```
@@ -360,7 +378,7 @@ Model:  rag_search("easyai")  →  finds easyai-build-aibox
 You:    "We dropped the X feature. Remove anything about it from your
          memory."
 
-Model:  rag_search("x-feature")
+Model:  rag_search(["x-feature"])
         [3 entries match]
         rag_delete("x-feature-rationale")
         rag_delete("x-feature-roadmap")

@@ -200,7 +200,7 @@ picks up where you left off.
 
 [next session]
 > "build easyai on the AI box"
-[model: rag_search("easyai") → finds your saved build recipe]
+[model: rag_search(["easyai"]) → finds your saved build recipe]
 [model loads it and answers in your style]
 ```
 

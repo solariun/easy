@@ -964,7 +964,7 @@ RAG gives the agent five tools to remember things across sessions:
 ```cpp
 auto rag = easyai::tools::make_rag_tools("/var/lib/easyai/rag");
 engine.add_tool(rag.save);    // rag_save(title, keywords[], content)
-engine.add_tool(rag.search);  // rag_search(keyword, max_results=10)
+engine.add_tool(rag.search);  // rag_search(keywords[], max_results=10)
 engine.add_tool(rag.load);    // rag_load(titles[1..4])
 engine.add_tool(rag.list);    // rag_list(prefix?, max=50)
 engine.add_tool(rag.del);     // rag_delete(title)
