@@ -2790,59 +2790,27 @@ static void route_ollama_show(ServerCtx & ctx, const httplib::Request & req,
 // MCP auth is OPEN). On 401, fills `res` and returns false. On
 // success, sets `user_out` to the username from [MCP_USER] (or
 // empty when MCP is open).
-static bool check_mcp_auth(ServerCtx & ctx,
-                           const httplib::Request & req,
-                           std::string & user_out,
-                           httplib::Response & res) {
+//
+// Thin wrapper around easyai::mcp::check_bearer (in libeasyai) so
+// this binary and easyai-mcp-server share the same auth logic. The
+// transport-specific bits (header read, response write) stay here.
+static bool check_mcp_auth(ServerCtx &                ctx,
+                           const httplib::Request &   req,
+                           std::string &              user_out,
+                           httplib::Response &        res) {
+    auto verdict = easyai::mcp::check_bearer(
+        ctx.mcp_keys, req.get_header_value("Authorization"));
+    if (verdict.ok) {
+        user_out = std::move(verdict.user);
+        return true;
+    }
+    res.status = verdict.status;
+    if (!verdict.www_authenticate.empty()) {
+        res.set_header("WWW-Authenticate", verdict.www_authenticate);
+    }
+    res.set_content(verdict.body, "application/json");
     user_out.clear();
-    if (ctx.mcp_keys.empty()) {
-        return true;        // open mode
-    }
-    std::string auth = req.get_header_value("Authorization");
-    // Cap the header value before we hash it to defend against a hostile
-    // client sending a multi-megabyte Bearer to amortise CPU + RAM on
-    // every probe. A real Bearer token is ≤ a few hundred bytes; 4 KiB
-    // is more than generous and beneath any sensible threshold.
-    constexpr std::size_t kMaxAuthHeaderBytes = 4 * 1024;
-    if (auth.size() > kMaxAuthHeaderBytes) {
-        res.status = 401;
-        res.set_header("WWW-Authenticate", "Bearer realm=\"easyai-mcp\"");
-        res.set_content(
-            "{\"jsonrpc\":\"2.0\",\"id\":null,"
-            "\"error\":{\"code\":-32001,"
-            "\"message\":\"Authorization header too large\"}}",
-            "application/json");
-        return false;
-    }
-    static constexpr char kPrefix[] = "Bearer ";
-    constexpr std::size_t kPrefixLen = sizeof(kPrefix) - 1;
-    if (auth.size() <= kPrefixLen ||
-        auth.compare(0, kPrefixLen, kPrefix) != 0) {
-        res.status = 401;
-        res.set_header("WWW-Authenticate", "Bearer realm=\"easyai-mcp\"");
-        res.set_content(
-            "{\"jsonrpc\":\"2.0\",\"id\":null,"
-            "\"error\":{\"code\":-32001,"
-            "\"message\":\"missing or malformed Authorization header; "
-            "expected `Authorization: Bearer <token>`\"}}",
-            "application/json");
-        return false;
-    }
-    std::string token = auth.substr(kPrefixLen);
-    auto it = ctx.mcp_keys.find(token);
-    if (it == ctx.mcp_keys.end()) {
-        res.status = 401;
-        res.set_header("WWW-Authenticate", "Bearer realm=\"easyai-mcp\"");
-        res.set_content(
-            "{\"jsonrpc\":\"2.0\",\"id\":null,"
-            "\"error\":{\"code\":-32001,"
-            "\"message\":\"unknown bearer token; check the [MCP_USER] "
-            "section of easyai.ini on the server\"}}",
-            "application/json");
-        return false;
-    }
-    user_out = it->second;
-    return true;
+    return false;
 }
 
 static void route_mcp(ServerCtx & ctx, const httplib::Request & req,
@@ -2977,9 +2945,10 @@ static bool require_auth(const ServerCtx & ctx, const httplib::Request & req,
     // Bound the header value before string-comparing against the expected
     // token. Without this, a hostile client could send a multi-megabyte
     // Authorization header on every probe and force a comparable-sized
-    // string allocation + scan per request.
-    constexpr std::size_t kMaxAuthHeaderBytes = 4 * 1024;
-    if (it != req.headers.end() && it->second.size() > kMaxAuthHeaderBytes) {
+    // string allocation + scan per request. Same cap as easyai::mcp's
+    // /mcp gate uses.
+    if (it != req.headers.end() &&
+            it->second.size() > easyai::mcp::kMaxAuthHeaderBytes) {
         res.status = 401;
         res.set_content(error_json("Authorization header too large",
                                    "authentication_error"),
@@ -3748,14 +3717,8 @@ int main(int argc, char ** argv) {
     //     local-dev default).
     {
         ctx->ini_config = ini_config;
-        ctx->mcp_keys.clear();
-        for (const auto & [user, token] :
-                ctx->ini_config.section_or_empty("MCP_USER")) {
-            if (token.empty()) continue;
-            // First mapping wins on duplicate-token (operator config
-            // bug; we don't error, just take the first).
-            ctx->mcp_keys.emplace(token, user);
-        }
+        ctx->mcp_keys = easyai::mcp::load_mcp_users(
+            ctx->ini_config.section_or_empty("MCP_USER"));
         if (args.no_mcp_auth && !ctx->mcp_keys.empty()) {
             std::fprintf(stderr,
                 "easyai-server: MCP auth OVERRIDDEN OPEN — `--no-mcp-auth` "

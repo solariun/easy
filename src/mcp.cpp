@@ -367,4 +367,115 @@ std::string render_tool_catalog(const std::vector<Tool> & tools) {
     return arr.dump(2);
 }
 
+// ---------------------------------------------------------------------------
+// Bearer-auth helpers — shared by easyai-server and easyai-mcp-server
+// (and anyone else building an MCP server on top of libeasyai).
+//
+// These are deliberately transport-agnostic. The HTTP framework on
+// top is responsible for: (1) reading the Authorization header,
+// (2) writing back `status`, `body`, and the WWW-Authenticate
+// header on a 401. The matching logic — header-size cap, Bearer
+// prefix, table lookup, audit-friendly username surface — lives
+// here so the two server binaries stay in sync.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Build a JSON-RPC 2.0 error envelope as a plain string. Avoids
+// pulling nlohmann into the helper's signature; any consumer can
+// embed this directly in their response body.
+std::string make_jsonrpc_error(int code, const std::string & message) {
+    // Hand-escape the message to avoid pulling nlohmann::json::dump
+    // for a dozen-byte string. The set of characters that need
+    // escaping inside a JSON string literal is small and stable;
+    // we widen any control byte to space rather than emit \u00XX
+    // (these messages are operator-facing diagnostics, not arbitrary
+    // user data).
+    std::string out;
+    out.reserve(message.size() + 96);
+    out += "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":";
+    out += std::to_string(code);
+    out += ",\"message\":\"";
+    for (char c : message) {
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n";  break;
+            case '\r': out += "\\r";  break;
+            case '\t': out += "\\t";  break;
+            default:
+                if (static_cast<unsigned char>(c) < 0x20) out += ' ';
+                else                                     out += c;
+        }
+    }
+    out += "\"}}";
+    return out;
+}
+
+}  // namespace
+
+AuthResult check_bearer(
+    const std::map<std::string, std::string> & mcp_keys,
+    const std::string &                        authorization_header) {
+    AuthResult r;
+    if (mcp_keys.empty()) {
+        r.ok = true;            // open mode
+        return r;
+    }
+
+    if (authorization_header.size() > kMaxAuthHeaderBytes) {
+        r.ok               = false;
+        r.status           = 401;
+        r.www_authenticate = "Bearer realm=\"easyai-mcp\"";
+        r.body             = make_jsonrpc_error(
+            -32001, "Authorization header too large");
+        return r;
+    }
+
+    static constexpr char  kPrefix[]  = "Bearer ";
+    constexpr std::size_t  kPrefixLen = sizeof(kPrefix) - 1;
+    if (authorization_header.size() <= kPrefixLen ||
+        authorization_header.compare(0, kPrefixLen, kPrefix) != 0) {
+        r.ok               = false;
+        r.status           = 401;
+        r.www_authenticate = "Bearer realm=\"easyai-mcp\"";
+        r.body             = make_jsonrpc_error(
+            -32001,
+            "missing or malformed Authorization header; "
+            "expected `Authorization: Bearer <token>`");
+        return r;
+    }
+
+    const std::string token = authorization_header.substr(kPrefixLen);
+    auto it = mcp_keys.find(token);
+    if (it == mcp_keys.end()) {
+        r.ok               = false;
+        r.status           = 401;
+        r.www_authenticate = "Bearer realm=\"easyai-mcp\"";
+        r.body             = make_jsonrpc_error(
+            -32001,
+            "unknown bearer token; check the [MCP_USER] section "
+            "of the server's INI config");
+        return r;
+    }
+
+    r.ok   = true;
+    r.user = it->second;
+    return r;
+}
+
+std::map<std::string, std::string>
+load_mcp_users(const std::map<std::string, std::string> & ini_section) {
+    // Invert the INI's username→token shape into a token→username
+    // map for fast O(log n) lookup at request time. The std::map
+    // backing means duplicates are resolved alphabetically-earliest
+    // wins (operator config bug; no error, just deterministic).
+    std::map<std::string, std::string> out;
+    for (const auto & [user, token] : ini_section) {
+        if (token.empty()) continue;
+        out.emplace(token, user);
+    }
+    return out;
+}
+
 }  // namespace easyai::mcp
