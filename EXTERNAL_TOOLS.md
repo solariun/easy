@@ -1005,6 +1005,12 @@ investigate why the wrapped command is slow.
 
 ---
 
-*See also:* `manual.md` §3.3.4-3.3.5 (reference), `design.md` §5f
-(why the subsystem is shaped this way), `SECURITY_AUDIT.md` §16
-(audit detail), `AI_TOOLS.md` ch. 21 (vendor-neutral background).
+*See also:* [`easyai-server.md`](easyai-server.md) (full chat-server
+config; the `external_tools` INI key is wired identically there),
+[`easyai-mcp-server.md`](easyai-mcp-server.md) (standalone MCP
+daemon — `EASYAI-*.tools` packs are loaded the same way and
+expose the same fork+execve hardening to thousands of concurrent
+clients), [`manual.md`](manual.md) §3.3.4-3.3.5 (C++ API reference),
+[`design.md`](design.md) §5f (why the subsystem is shaped this way),
+[`SECURITY_AUDIT.md`](SECURITY_AUDIT.md) §16 (audit detail),
+[`AI_TOOLS.md`](AI_TOOLS.md) ch. 21 (vendor-neutral background).

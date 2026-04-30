@@ -705,7 +705,7 @@ persistent memory), `bash` when `--allow-bash` is set, `fs_*` when
 
 `/mcp` authenticates via the `[MCP_USER]` section of the central
 INI config (`/etc/easyai/easyai.ini` by default; configurable via
-`--config`). Full INI reference in [`INI_KFlags.md`](INI_KFlags.md). Each line `name = token` registers one Bearer token;
+`--config`). Full INI reference in [`easyai-server.md`](easyai-server.md) §1. Each line `name = token` registers one Bearer token;
 the request's `Authorization: Bearer <token>` is matched against
 the table at request time.
 

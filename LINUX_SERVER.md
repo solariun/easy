@@ -4,11 +4,17 @@ This document is for the person who runs `install_easyai_server.sh`
 on a Linux box and wants to know what landed where, how to configure
 it, what to watch out for, and how to keep it healthy.
 
-If you're a developer, see `design.md` and `manual.md`. If you're
-writing tool manifests, see `EXTERNAL_TOOLS.md`. If you want to
-understand the agent's long-term memory, see `RAG.md`. If you want
-to expose easyai's tools to other AI applications (Claude Desktop,
-Cursor, Continue), see `MCP.md`.
+If you want the binary's full INI / CLI / API reference (every flag
+and endpoint, with the INI section at the top), see
+[`easyai-server.md`](easyai-server.md). If you want a model-free,
+high-concurrency MCP daemon for thousands of parallel clients instead
+of (or alongside) the chat server, see
+[`easyai-mcp-server.md`](easyai-mcp-server.md). If you're a developer,
+see `design.md` and `manual.md`. If you're writing tool manifests,
+see `EXTERNAL_TOOLS.md`. If you want to understand the agent's
+long-term memory, see `RAG.md`. If you want to expose easyai's tools
+to other AI applications (Claude Desktop, Cursor, Continue), see
+`MCP.md`.
 
 ---
 
@@ -138,7 +144,7 @@ sudo systemctl restart easyai-server
 
 ### `/etc/easyai/easyai.ini` — the central config
 
-> **Full reference:** [`INI_KFlags.md`](INI_KFlags.md) lists every key the binary
+> **Full reference:** [`easyai-server.md`](easyai-server.md) §1 lists every key the binary
 > understands, what section it belongs to, what the CLI equivalent
 > is, and gives worked examples.
 

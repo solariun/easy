@@ -24,7 +24,7 @@ C++17 program". By the end you will know how to:
 | Part | Chapter | What you get |
 |------|---------|--------------|
 | **1** | Getting set up         | Prereqs, repo layout, building, GPUs, models |
-| **2** | Using the binaries     | `easyai-local`, `easyai-server`, `easyai-cli`, `easyai-agent`, `easyai-chat`, `easyai-recipes` |
+| **2** | Using the binaries     | `easyai-local`, `easyai-server`, `easyai-mcp-server`, `easyai-cli`, `easyai-agent`, `easyai-chat`, `easyai-recipes` |
 | **3** | Embedding `libeasyai`  | `Agent` (3-line hello), `Backend` (local↔remote), `Engine` API top-to-bottom, callbacks, presets, tools, escape hatches |
 | **4** | Embedding `libeasyai-cli` | `Client` API top-to-bottom — your code drives a remote model with local tools |
 | **5** | Authoring custom tools | Builder API, schemas, sandboxes, error handling, the `Plan` tool, `system_*` tools cookbook |
@@ -119,11 +119,14 @@ cmake --build build -j
 Outputs land in `build/`:
 
 ```
-build/easyai-local    # local-only REPL (loads a GGUF in-process)
-build/easyai-cli      # agentic REPL talking to a remote OpenAI-compat endpoint
-build/easyai-server   # HTTP server + webui
-build/easyai-agent    # demo agent (every tool + a custom one)
-build/easyai-chat     # bare REPL (no tools)
+build/easyai-local      # local-only REPL (loads a GGUF in-process)
+build/easyai-cli        # agentic REPL talking to a remote OpenAI-compat endpoint
+build/easyai-server     # HTTP server + webui  (full doc: easyai-server.md)
+build/easyai-mcp-server # standalone MCP-only HTTP daemon, no model loaded,
+                        #   sized for thousands of parallel clients
+                        #   (full doc: easyai-mcp-server.md)
+build/easyai-agent      # demo agent (every tool + a custom one)
+build/easyai-chat       # bare REPL (no tools)
 build/libeasyai.dylib # the library
 ```
 

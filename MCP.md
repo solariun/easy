@@ -9,6 +9,13 @@ exposed by `easyai-server`. Other AI applications (Claude Desktop,
 Cursor, Continue, OpenWebUI in MCP mode, custom JSON-RPC clients)
 connect to easyai-server and use its tools as if they were native.
 
+> **Looking for a model-free, high-concurrency MCP daemon?** See
+> [`easyai-mcp-server.md`](easyai-mcp-server.md) — same tool
+> catalogue, no GGUF loaded, sized for thousands of parallel clients.
+> The protocol surface, JSON-RPC methods, auth model, and per-client
+> connection guides in this document apply unchanged to that binary
+> (just point clients at port 8089 / whatever you configured).
+
 ---
 
 ## Table of contents
@@ -433,7 +440,7 @@ server speaks:
 
 The `/mcp` endpoint authenticates via Bearer tokens declared in
 the central INI config (`/etc/easyai/easyai.ini` by default).
-Full INI reference: [`INI_KFlags.md`](INI_KFlags.md).
+Full INI reference: [`easyai-server.md`](easyai-server.md) §1.
 
 Auth is **opt-in by configuration**: if the INI's `[MCP_USER]`
 section is empty or missing, the endpoint accepts any request

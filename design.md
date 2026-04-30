@@ -961,8 +961,18 @@ under cpp-httplib.
 ## 6c. MCP server protocol layer
 
 Lives in `src/mcp.cpp` + `include/easyai/mcp.hpp`. User-facing
-documentation: [`MCP.md`](MCP.md). This section describes *why* the
+documentation: [`MCP.md`](MCP.md) (protocol surface + per-client
+cookbook), [`easyai-mcp-server.md`](easyai-mcp-server.md) (the
+standalone MCP-only binary). This section describes *why* the
 server exposes itself as an MCP provider.
+
+> **The dispatcher (`easyai::mcp::handle_request`) is a pure function
+> over `tools` and a request body string.** Two binaries call it:
+> `easyai-server` (where `/mcp` is one of many endpoints alongside
+> `/v1/chat/completions` and the webui) and `easyai-mcp-server` (a
+> dedicated daemon with no engine). The pure-function shape is what
+> makes the second binary cheap to ship — no engine integration, no
+> chat-template hooks, no shared global state with the dispatcher.
 
 ### What's the protocol payoff
 

@@ -21,7 +21,8 @@ against, plus six ready-to-run binaries:
 |----------------------|----------------------------------------------------------------------------------------------------------------------------------------------------|
 | `easyai-local`       | Local-only REPL: loads a GGUF in-process via `easyai::Engine`. Drop-in `llama-cli` replacement — one-shot scripting (`-p`), tools, presets, optional `<think>` strip, sandboxed `fs_*` tools, opt-in `bash` tool. |
 | `easyai-cli`         | Agentic OpenAI-protocol client built on `libeasyai-cli` — no local model.  REPL or `-p`, full sampling control (`--temperature`, `--top-p`, `--top-k`, `--min-p`, `--repeat-penalty`, `--frequency-penalty`, `--presence-penalty`, `--seed`, `--max-tokens`, `--stop`), plan tool, server-management subcommands (`--list-models`, `--list-tools`, `--health`, `--props`, `--metrics`, `--set-preset`).  HTTPS via OpenSSL; `--insecure-tls` / `--ca-cert` for dev/internal CAs. |
-| `easyai-server`      | Drop-in `llama-server` replacement: OpenAI-compat HTTP **with full SSE streaming**, embedded SvelteKit webui, Bearer auth, Prometheus `/metrics`, KV-cache controls, flash-attn, mlock. |
+| `easyai-server`      | Drop-in `llama-server` replacement: OpenAI-compat HTTP **with full SSE streaming**, embedded SvelteKit webui, Bearer auth, Prometheus `/metrics`, KV-cache controls, flash-attn, mlock.  Speaks MCP, OpenAI, Ollama from one process.  Full doc: [`easyai-server.md`](easyai-server.md). |
+| `easyai-mcp-server`  | **Standalone Model Context Protocol provider — no model loaded.** Same tool catalogue as `easyai-server` (built-ins + RAG + external-tools), exposed over `POST /mcp` with a configurable cpp-httplib worker pool (`--threads`) and an in-flight `tools/call` cap (`--max-concurrent-calls`) for thousands-of-clients deployments.  Full doc: [`easyai-mcp-server.md`](easyai-mcp-server.md). |
 | `easyai-agent`       | A demo agent showing every built-in tool plus an inline custom tool.                                                                                |
 | `easyai-recipes`     | Tutorial agent paired with `manual.md` — implements `today_is` and `weather` (HTTP-calling) from scratch.                                          |
 | `easyai-chat`        | A bare-bones REPL with no tools — useful as a sanity check.                                                                                          |
@@ -41,6 +42,29 @@ against, plus six ready-to-run binaries:
 A running log of user-facing changes. Latest first — keep this list
 current as features land so anyone returning to the repo (or
 landing on it for the first time) sees what shipped recently.
+
+### 2026-04-30 — `easyai-mcp-server` (standalone MCP provider)
+
+* **New binary `easyai-mcp-server`.** Same tool catalogue as
+  `easyai-server` (built-ins + RAG + operator-defined external-tools)
+  exposed over `POST /mcp` with **no GGUF model loaded** — designed
+  for high-concurrency multi-client deployments. Configurable
+  cpp-httplib worker pool (`--threads`, default 256) and a separate
+  in-flight `tools/call` cap (`--max-concurrent-calls`, default 256)
+  that returns 503 + `Retry-After` on saturation instead of unbounded
+  queueing. Full doc: [`easyai-mcp-server.md`](easyai-mcp-server.md).
+* **RAG concurrency upgrade.** `RagStore::mu` is now
+  `std::shared_mutex`; `rag_search` / `rag_load` / `rag_list` /
+  `rag_keywords` take `std::shared_lock` so parallel readers don't
+  serialise on the write path. Benefits every consumer of libeasyai
+  — `easyai-server`, `easyai-cli` with `--RAG`, any third-party
+  program calling `make_rag_tools()`. Atomic-rename writes already
+  made on-disk reads tear-free; the lock relaxation is safe.
+* **Doc restructure.** `INI_KFlags.md` content has moved to the top
+  of the new [`easyai-server.md`](easyai-server.md) so the chat
+  server's INI / CLI / API / persona / hardening reference lives in
+  one file. `LINUX_SERVER.md` is unchanged — it remains the
+  systemd-installer-specific operator's guide.
 
 ### 2026-04-30 — Tunable incomplete-retry budget + live retry visibility
 
@@ -92,7 +116,7 @@ landing on it for the first time) sees what shipped recently.
 * **Single INI config — `/etc/easyai/easyai.ini`.** Every CLI flag
   has an INI key (FlagDef table refactor); precedence is CLI > INI
   > hardcoded default. Edit the file, `systemctl restart`, done.
-  Full reference in [`INI_KFlags.md`](INI_KFlags.md).
+  Full reference in [`easyai-server.md`](easyai-server.md) §1.
 * **RAG: persistent memory.** Six tools (`rag_save`, `rag_search`,
   `rag_load`, `rag_list`, `rag_delete`, `rag_keywords`).
   Multi-keyword search with adaptive threshold + pagination. One
@@ -370,7 +394,7 @@ cache_type_v = q8_0
 gustavo    = REPLACE-WITH-OPENSSL-RAND-HEX-32
 ```
 
-Full key reference + worked examples: [`INI_KFlags.md`](INI_KFlags.md).
+Full key reference + worked examples: [`easyai-server.md`](easyai-server.md) §1.
 
 #### easyai-server speaks **MCP** — every tool also reachable from Claude Desktop / Cursor / Continue
 

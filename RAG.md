@@ -836,7 +836,12 @@ newline. Edit the file by hand to fix it.
 
 ---
 
-*See also:* `LINUX_SERVER.md` (operator's guide for the systemd
-install), `manual.md` (general easyai reference), `EXTERNAL_TOOLS.md`
-(the operator-defined tools subsystem — different surface, similar
+*See also:* [`easyai-server.md`](easyai-server.md) (full chat-server
+config + INI + CLI), [`easyai-mcp-server.md`](easyai-mcp-server.md)
+(standalone MCP daemon — RAG works there too with the same
+`std::shared_mutex` index for parallel reads),
+[`LINUX_SERVER.md`](LINUX_SERVER.md) (operator's guide for the
+systemd-installed chat server), [`manual.md`](manual.md) (general
+easyai reference), [`EXTERNAL_TOOLS.md`](EXTERNAL_TOOLS.md) (the
+operator-defined tools subsystem — different surface, similar
 philosophy).
