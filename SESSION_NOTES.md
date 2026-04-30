@@ -305,6 +305,35 @@ Webui title default also flips to `"Deep"`.
 ## 5. Recent commits (most recent first)
 
 ```
+2026-04-30 (late evening) — Central INI config (/etc/easyai/easyai.ini).
+
+(pending commit) Single config file replaces ~17-flag systemd
+                 ExecStart. Sections: [SERVER], [ENGINE], [MCP_USER],
+                 [TOOLS] (reserved). Precedence: CLI > INI > hardcoded.
+                 New `--config <path>` flag (default
+                 /etc/easyai/easyai.ini); missing file = use defaults
+                 + open MCP. INI parser in src/config.cpp (no deps,
+                 ~80 lines, tolerates missing/malformed lines as
+                 warnings). cli_set tracks explicit CLI flags so
+                 INI applies only as defaults. New `--no-mcp-auth`
+                 force-opens /mcp even with [MCP_USER] populated.
+                 [SERVER] mcp_auth=on/off/auto INI-side equivalent.
+                 [MCP_USER] populates Bearer-token auth: each line
+                 `name = token`, audit log shows
+                 `[mcp] request from user 'name'`. Empty section
+                 = open. Install script writes a fully-populated
+                 easyai.ini on fresh install; leaves it alone on
+                 --upgrade (operator edits win). Systemd ExecStart
+                 shrunk from ~17 flags to:
+                   easyai-server --config /etc/easyai/easyai.ini -m <model>
+                 [+ --api-key '${EASYAI_API_KEY}' if /etc/easyai/api_key
+                  exists; + --webui-icon if installer was given one].
+                 NEW doc INI.md — full key reference, every key with
+                 type / CLI equivalent / default / notes; worked
+                 examples (minimal local-dev / production-with-auth /
+                 CLI overrides); cross-refs from README, MCP.md,
+                 LINUX_SERVER.md, SECURITY_AUDIT.md.
+
 2026-04-30 (evening) — easyai-server speaks MCP + Ollama list-models.
 
 (pending commit) MCP server: POST /mcp endpoint exposes the full

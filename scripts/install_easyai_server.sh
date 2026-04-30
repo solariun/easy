@@ -96,6 +96,10 @@ config_dir="/etc/easyai"
 system_file="$config_dir/system.txt"
 api_key_file="$config_dir/api_key"
 external_tools_dir="$config_dir/external-tools"
+ini_file="$config_dir/easyai.ini"
+# Central INI config — auth for /mcp ([MCP_USER]) plus reserved sections
+# for future server-wide config. Always passed to the server via
+# --config; missing-file = MCP open (default for fresh installs).
 # We always pass --external-tools to the server. An empty dir is a
 # normal state (no extra tools); operators add EASYAI-*.tools files
 # without touching the systemd unit.
@@ -677,6 +681,116 @@ RAG_README
         sudo chown "$service_user":"$service_group" "$rag_dir/README.md"
     fi
 
+    # ---- INI config (the central operator-tunable file) --------------
+    # We write a fully-populated easyai.ini reflecting the values the
+    # installer was told to use. Operators edit it later + restart the
+    # service to retune anything; CLI flags on the systemd unit
+    # override these (precedence: CLI > INI > hardcoded default).
+    #
+    # On --upgrade: if easyai.ini already exists, leave it alone — we
+    # don't overwrite operator edits. The operator has to manually
+    # incorporate any new keys we ship in subsequent versions (we
+    # may at some point grow a more polite "upsert" but for now,
+    # leave-alone is the safe default).
+    if [[ ! -f "$ini_file" ]]; then
+        log "writing $ini_file (central config)"
+        sudo bash -c "cat > '$ini_file'" <<INI_FILE
+# easyai-server central configuration — every flag the binary
+# understands has a corresponding entry here. Lines starting with
+# # or ; are comments. Restart the service after any change:
+#
+#     sudo systemctl restart easyai-server
+#
+# Precedence is: CLI flag (in the systemd unit) > value here >
+# hardcoded default in the binary. So tweaking this file is the
+# normal path; flipping a CLI flag is the exception (e.g.
+# emergency overrides, debug runs).
+
+# ============================================================
+# [SERVER] — HTTP layer + tool gating + paths
+# ============================================================
+[SERVER]
+model           = $service_model_dir/$service_model_link
+host            = $service_host
+port            = $service_port
+alias           = $service_alias
+sandbox         = $service_workspace
+system_file     = $system_file
+external_tools  = $external_tools_dir
+rag             = $rag_dir
+webui_title     = $webui_title
+metrics         = $([[ "$enable_metrics" -eq 1 ]] && echo on || echo off)
+verbose         = $([[ "$enable_verbose" -eq 1 ]] && echo on || echo off)
+allow_fs        = off
+allow_bash      = off
+max_body        = 8388608
+
+# /mcp authentication
+# ----------------------------------------------------------------
+# auto    : enabled iff [MCP_USER] below has at least one entry
+# off     : open (anyone reaching /mcp can dispatch any tool)
+# on      : require Bearer match — also overridable via --no-mcp-auth
+mcp_auth        = auto
+
+# ============================================================
+# [ENGINE] — model loading and inference tunables
+# ============================================================
+[ENGINE]
+context         = $ctx_size
+ngl             = $ngl
+threads         = $n_threads_default
+threads_batch   = $n_threads_batch_default
+preset          = $preset
+flash_attn      = $([[ "$enable_flash_attn" -eq 1 ]] && echo on || echo off)
+cache_type_k    = $cache_type_k
+cache_type_v    = $cache_type_v
+mlock           = $([[ "$mlock" -eq 1 ]] && echo on || echo off)
+no_mmap         = $([[ "$no_mmap" -eq 1 ]] && echo on || echo off)
+# Sampling overrides — leave commented for engine defaults.
+# temperature   = 0.7
+# top_p         = 0.95
+# top_k         = 40
+# min_p         = 0.05
+# repeat_penalty = 1.0
+# max_tokens    = -1
+
+# ============================================================
+# [MCP_USER] — Bearer-token auth for POST /mcp
+# ============================================================
+# Each line is \`username = bearer_token\`. The username appears in
+# the audit log per request; the token is what clients send as
+# \`Authorization: Bearer <token>\`. Generate strong tokens:
+#
+#     openssl rand -hex 32
+# or
+#     python3 -c 'import secrets; print(secrets.token_hex(32))'
+#
+# If this section is missing or empty (and SERVER.mcp_auth=auto),
+# /mcp is OPEN. Useful for local dev / smoke. Production: define
+# at least one user.
+[MCP_USER]
+# gustavo  = REPLACE-ME-WITH-OPENSSL-RAND-HEX-32
+# claude   = different-token-for-claude-desktop
+# ci       = different-token-for-the-ci-runner
+
+# ============================================================
+# [TOOLS] — per-tool ACL (RESERVED for a future release)
+# ============================================================
+# Will let the operator filter which tools the MCP catalogue
+# exposes. Today every registered tool is listed; a future
+# version will respect mcp_allowed / mcp_denied glob patterns
+# below. Keys are advisory and ignored by the current binary.
+#
+# [TOOLS]
+# mcp_allowed = rag_*, datetime, web_search, web_fetch
+# mcp_denied  = bash, fs_write_file
+INI_FILE
+        sudo chmod 640 "$ini_file"
+        sudo chown root:"$service_group" "$ini_file"
+    else
+        log "$ini_file exists — leaving operator edits in place"
+    fi
+
     # ---- favicon: copy operator-supplied icon to /etc/easyai/favicon
     #              and let the unit point easyai-server at it -----------
     if [[ -n "$webui_icon" ]]; then
@@ -789,39 +903,31 @@ if [[ $do_service -eq 1 ]]; then
         sudo rm -f "/etc/systemd/system/$service_name"
     fi
 
-    # Build the easyai-server arg list at template time so the unit is fully
-    # explicit and the operator can `systemctl cat easyai-server` to audit.
-    args=( -m "$service_model_dir/$service_model_link" )
-    args+=( --host "$service_host" --port "$service_port" )
-    args+=( --alias "$service_alias" )
-    args+=( -c "$ctx_size" )
-    args+=( --ngl "$ngl" )
-    args+=( -t "$n_threads_default" -tb "$n_threads_batch_default" )
-    args+=( --preset "$preset" )
-    args+=( --sandbox "$service_workspace" )
-    args+=( --system-file "$system_file" )
-    args+=( --external-tools "$external_tools_dir" )
-    args+=( --RAG "$rag_dir" )
-    [[ -n "$webui_title"     ]] && args+=( --webui-title "$webui_title" )
-    [[ -n "$webui_icon_dest" ]] && args+=( --webui-icon  "$webui_icon_dest" )
-    [[ "$enable_flash_attn" -eq 1 ]] && args+=( -fa )
-    [[ -n "$cache_type_k" ]]         && args+=( -ctk "$cache_type_k" )
-    [[ -n "$cache_type_v" ]]         && args+=( -ctv "$cache_type_v" )
-    [[ "$mlock"   -eq 1 ]]           && args+=( --mlock )
-    [[ "$no_mmap" -eq 1 ]]           && args+=( --no-mmap )
-    [[ "$enable_metrics" -eq 1 ]]    && args+=( --metrics )
-    [[ "$enable_verbose" -eq 1 ]]    && args+=( --verbose )
-    [[ "$thinking" == "off" ]]       && args+=( --reasoning off )
-
-    # api-key sourced from a file at runtime (so it's never visible in `ps`).
-    exec_pre=""
+    # ----- INI-FIRST: every flag below now lives in $ini_file by default.
+    # The systemd ExecStart only carries flags that CHANGE per-deploy
+    # OR that are operationally inconvenient to put in INI (the model
+    # path, the config path itself). Operator edits $ini_file + restart
+    # to tune anything else — no `systemctl edit` cadence required.
+    #
+    # CLI > INI > hardcoded default precedence is honoured by the
+    # binary. Operators who prefer the old all-flags-in-unit shape
+    # (e.g. for ansible's drift detection) can still pass everything
+    # explicitly — both CLI and INI converge on the same setting.
+    args=( --config "$ini_file" )
+    args+=( -m "$service_model_dir/$service_model_link" )
     if [[ -f "$api_key_file" ]]; then
-        # systemd `EnvironmentFile=` won't substitute into ExecStart, so we
-        # wrap with a tiny shell that reads the file and exports the key.
-        # We use --api-key "$EASYAI_API_KEY" inside the unit.
+        # api-key sourced from a separate file at runtime so it's never
+        # visible in `ps` (and the INI doesn't carry secrets either).
         args+=( --api-key '${EASYAI_API_KEY}' )
-        exec_pre="EnvironmentFile=$api_key_file_envfile_marker"
     fi
+    [[ -n "$webui_icon_dest" ]] && args+=( --webui-icon "$webui_icon_dest" )
+    [[ "$thinking" == "off" ]]  && args+=( --reasoning off )
+
+    # api-key file integration is wired upstream in the args[] block
+    # above (`--api-key '${EASYAI_API_KEY}'` is appended only when the
+    # api_key file exists). Nothing else to do here — env-file pickup
+    # is handled by the api-key block below.
+    exec_pre=""
 
     # Convert the args array to a single quoted line for ExecStart.
     arg_string=""

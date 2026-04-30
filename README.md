@@ -185,6 +185,34 @@ no shell.
 | `--external-tools <dir>` | Load every `EASYAI-<name>.tools` file in `<dir>` as an operator-defined tool pack. Per-file fault isolation (a bad file is logged + skipped, the agent still starts). Spawns via `fork`+`execve` — never a shell. **This is the supported way to give the model focused powers without flipping `--allow-bash`.** See [`EXTERNAL_TOOLS.md`](EXTERNAL_TOOLS.md). |
 | `--RAG <dir>`         | Enable RAG, the agent's persistent registry / long-term memory. Six tools (`rag_save`, `rag_search`, `rag_load`, `rag_list`, `rag_delete`, `rag_keywords`) so the model can remember things across sessions. Each entry is one Markdown file in `<dir>` — operator-readable and hand-editable. The systemd-installed server passes this by default (`/var/lib/easyai/rag`). See [`RAG.md`](RAG.md). |
 
+#### Single config file: `/etc/easyai/easyai.ini`
+
+The systemd-installed server reads every operator-tunable knob —
+host, port, alias, sandbox, RAG dir, KV cache types, mlock, flash-attn,
+threads, MCP auth, the works — from one INI file. **CLI flags on the
+unit override INI values; INI overrides hardcoded defaults.** So
+tweak the file + restart, no `systemctl edit` cadence:
+
+```ini
+[SERVER]
+host       = 0.0.0.0
+port       = 80
+alias      = EasyAi
+mcp_auth   = on              ; require Bearer on /mcp
+
+[ENGINE]
+ngl        = -1              ; auto-fit GPU
+flash_attn = on
+mlock      = on
+cache_type_k = q8_0
+cache_type_v = q8_0
+
+[MCP_USER]
+gustavo    = REPLACE-WITH-OPENSSL-RAND-HEX-32
+```
+
+Full key reference + worked examples: [`INI.md`](INI.md).
+
 #### easyai-server speaks **MCP** — every tool also reachable from Claude Desktop / Cursor / Continue
 
 `easyai-server` exposes its full tool catalogue (built-ins + RAG + every operator-defined `--external-tools` pack) via the **Model Context Protocol** at `POST /mcp`. Other AI applications connect, list, and dispatch:

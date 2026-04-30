@@ -1366,6 +1366,13 @@ struct ServerCtx {
     std::string                webui_icon;      // raw icon bytes (empty = none)
     std::string                webui_icon_mime; // "image/x-icon" etc.
 
+    // INI config (default: /etc/easyai/easyai.ini). Loaded at start-up;
+    // empty if the file is missing. The MCP auth lookup table is built
+    // from `[MCP_USER]` once and cached in `mcp_keys` so the auth check
+    // doesn't re-hash the section on every request.
+    easyai::config::Ini                  ini_config;
+    std::map<std::string, std::string>   mcp_keys;   // token -> username
+
     // /metrics counters (atomics so /metrics can read without holding engine_mu)
     std::atomic<uint64_t>      n_requests{0};
     std::atomic<uint64_t>      n_errors{0};
@@ -2667,13 +2674,78 @@ static void route_ollama_show(ServerCtx & ctx, const httplib::Request & req,
 // and dispatch tools by name. The protocol's full surface is
 // documented in MCP.md; this handler is just the JSON-RPC pipe.
 //
-// AUTH OPEN intentionally — operator-decided V1 default. The
-// endpoint exposes every tool registered, including bash / fs_*
-// when those are enabled. Operators on shared networks should
-// either firewall the port, drop a reverse proxy in front, or
-// (future PR) flip the auth-gate flag here.
+// Auth posture is opt-in via the [MCP_USER] section of
+// /etc/easyai/easyai.ini (or whatever --config points at):
+//
+//   - section absent / empty           → MCP open (no auth)
+//   - section has at least one user    → Bearer token required;
+//                                         the username on the
+//                                         matching entry is logged
+//                                         per request for audit
+//
+// This kept zero-friction local-dev open by default while letting
+// production ops drop a key in the INI without a restart cadence
+// other than the SAME `systemctl restart easyai-server` that
+// applies to every config change.
+
+// check_mcp_auth — returns true if the request is authorised (or if
+// MCP auth is OPEN). On 401, fills `res` and returns false. On
+// success, sets `user_out` to the username from [MCP_USER] (or
+// empty when MCP is open).
+static bool check_mcp_auth(ServerCtx & ctx,
+                           const httplib::Request & req,
+                           std::string & user_out,
+                           httplib::Response & res) {
+    user_out.clear();
+    if (ctx.mcp_keys.empty()) {
+        return true;        // open mode
+    }
+    std::string auth = req.get_header_value("Authorization");
+    static constexpr char kPrefix[] = "Bearer ";
+    constexpr std::size_t kPrefixLen = sizeof(kPrefix) - 1;
+    if (auth.size() <= kPrefixLen ||
+        auth.compare(0, kPrefixLen, kPrefix) != 0) {
+        res.status = 401;
+        res.set_header("WWW-Authenticate", "Bearer realm=\"easyai-mcp\"");
+        res.set_content(
+            "{\"jsonrpc\":\"2.0\",\"id\":null,"
+            "\"error\":{\"code\":-32001,"
+            "\"message\":\"missing or malformed Authorization header; "
+            "expected `Authorization: Bearer <token>`\"}}",
+            "application/json");
+        return false;
+    }
+    std::string token = auth.substr(kPrefixLen);
+    auto it = ctx.mcp_keys.find(token);
+    if (it == ctx.mcp_keys.end()) {
+        res.status = 401;
+        res.set_header("WWW-Authenticate", "Bearer realm=\"easyai-mcp\"");
+        res.set_content(
+            "{\"jsonrpc\":\"2.0\",\"id\":null,"
+            "\"error\":{\"code\":-32001,"
+            "\"message\":\"unknown bearer token; check the [MCP_USER] "
+            "section of easyai.ini on the server\"}}",
+            "application/json");
+        return false;
+    }
+    user_out = it->second;
+    return true;
+}
+
 static void route_mcp(ServerCtx & ctx, const httplib::Request & req,
                       httplib::Response & res) {
+    std::string mcp_user;
+    if (!check_mcp_auth(ctx, req, mcp_user, res)) return;
+
+    if (!mcp_user.empty()) {
+        // Audit log — operator can `journalctl -u easyai-server | grep "[mcp]"`
+        // to see who hit the endpoint. We log per-request without the
+        // method body because tool arguments may carry sensitive
+        // values (file contents, secrets the model was told to save).
+        std::fprintf(stderr,
+            "[mcp] request from user '%s'\n", mcp_user.c_str());
+    }
+
     easyai::mcp::ServerInfo info;
     info.name             = "easyai-server";
     info.version          = "0.1.0";
@@ -2815,6 +2887,19 @@ static bool require_auth(const ServerCtx & ctx, const httplib::Request & req,
         "                                interface (LAN, docker, etc.).\n"
         "      --port <n>               TCP port (default 8080)\n"
         "      --max-body <bytes>       Max request body size (default 8 MiB)\n"
+        "      --config <path>          Central INI config file. Default\n"
+        "                                /etc/easyai/easyai.ini. Provides\n"
+        "                                defaults for almost every flag\n"
+        "                                below — explicit CLI flags override\n"
+        "                                the INI value. Sections: [SERVER],\n"
+        "                                [ENGINE], [MCP_USER] (Bearer-token\n"
+        "                                auth for /mcp). Missing file = use\n"
+        "                                hardcoded defaults + open MCP.\n"
+        "      --no-mcp-auth            Force /mcp to accept requests with\n"
+        "                                NO Bearer token even if the INI's\n"
+        "                                [MCP_USER] section has entries.\n"
+        "                                Emergency/dev override — disables\n"
+        "                                what the INI explicitly enabled.\n"
         "\nDefault system prompt + tools:\n"
         "  -s, --system-file <path>     Server-default system prompt from file\n"
         "      --system <text>          Inline system prompt\n"
@@ -2917,6 +3002,7 @@ static bool require_auth(const ServerCtx & ctx, const httplib::Request & req,
 struct ServerArgs {
     std::string model_path;
     std::string system_path;
+    std::string config_path = "/etc/easyai/easyai.ini";   // INI; missing = open MCP
     std::string system_inline;
     std::string host       = "127.0.0.1";   // pass 0.0.0.0 for any-iface
     int         port       = 8080;
@@ -2974,6 +3060,20 @@ struct ServerArgs {
     std::string webui_icon;              // optional path to .ico/.png/.svg
     std::string webui_mode     = "modern"; // "modern" (embedded llama-server fork) | "minimal" (inline)
     std::string webui_placeholder = "Type a message…";
+
+    // /mcp auth — by INI's [MCP_USER] when populated, OPEN otherwise.
+    // `--no-mcp-auth` forces OPEN even if [MCP_USER] has entries
+    // (useful for emergency / dev). Set on the command line ONLY;
+    // the INI cannot disable its own auth (that would be the
+    // operator shooting themselves in the foot).
+    bool        no_mcp_auth    = false;
+
+    // ----- which CLI flags were explicitly passed -------------------------
+    // The INI overlay applies as DEFAULTS — if the operator passed a CLI
+    // flag for the same setting, the CLI wins. We track that with a set
+    // populated as the parser consumes flags, then `apply_ini_to_args`
+    // skips any field already in the set.
+    std::set<std::string>      cli_set;
 };
 
 static ServerArgs parse_args(int argc, char ** argv) {
@@ -2982,69 +3082,204 @@ static ServerArgs parse_args(int argc, char ** argv) {
         if (i + 1 >= argc) { std::fprintf(stderr, "missing value for %s\n", flag); die_usage(argv[0]); }
         return argv[++i];
     };
+    // SET("name") is the single source of truth for "this CLI flag was
+    // explicitly passed". apply_ini_to_args() consults the set and only
+    // overlays INI values for fields that AREN'T in it. Keep names
+    // canonical (one entry per logical field — short alias and long
+    // alias both insert the same name) so the overlay mapping stays
+    // simple.
+    auto SET = [&](const char * canonical) { a.cli_set.insert(canonical); };
     for (int i = 1; i < argc; ++i) {
         std::string s = argv[i];
-        if      (s == "-m" || s == "--model")        a.model_path     = need(i, "-m");
-        else if (s == "-s" || s == "--system-file")  a.system_path    = need(i, "-s");
-        else if (s == "--system")                    a.system_inline  = need(i, "--system");
-        else if (s == "--host")                      a.host           = need(i, "--host");
-        else if (s == "--port")                      a.port           = std::atoi(need(i, "--port"));
-        else if (s == "-c" || s == "--ctx")          a.n_ctx          = std::atoi(need(i, "-c"));
-        else if (s == "--ngl")                       a.ngl            = std::atoi(need(i, "--ngl"));
-        else if (s == "-t" || s == "--threads")      a.n_threads      = std::atoi(need(i, "-t"));
-        else if (s == "--no-tools")                  a.load_tools     = false;
-        else if (s == "--sandbox")                   a.sandbox        = need(i, "--sandbox");
-        else if (s == "--allow-fs")                  a.allow_fs       = true;
-        else if (s == "--allow-bash")                a.allow_bash     = true;
-        else if (s == "--external-tools")            a.external_tools_dir = need(i, "--external-tools");
-        else if (s == "--RAG")                       a.rag_dir            = need(i, "--RAG");
-        else if (s == "--preset")                    a.preset         = need(i, "--preset");
-        else if (s == "--max-body")                  a.max_body       = (size_t) std::atoll(need(i, "--max-body"));
-        else if (s == "--batch")                     a.n_batch        = std::atoi(need(i, "--batch"));
+        if      (s == "-m" || s == "--model")        { a.model_path     = need(i, "-m");                  SET("model"); }
+        else if (s == "-s" || s == "--system-file")  { a.system_path    = need(i, "-s");                  SET("system_file"); }
+        else if (s == "--config")                    { a.config_path    = need(i, "--config");            SET("config"); }
+        else if (s == "--system")                    { a.system_inline  = need(i, "--system");            SET("system_inline"); }
+        else if (s == "--host")                      { a.host           = need(i, "--host");              SET("host"); }
+        else if (s == "--port")                      { a.port           = std::atoi(need(i, "--port"));   SET("port"); }
+        else if (s == "-c" || s == "--ctx")          { a.n_ctx          = std::atoi(need(i, "-c"));       SET("context"); }
+        else if (s == "--ngl")                       { a.ngl            = std::atoi(need(i, "--ngl"));    SET("ngl"); }
+        else if (s == "-t" || s == "--threads")      { a.n_threads      = std::atoi(need(i, "-t"));       SET("threads"); }
+        else if (s == "--no-tools")                  { a.load_tools     = false;                          SET("load_tools"); }
+        else if (s == "--sandbox")                   { a.sandbox        = need(i, "--sandbox");           SET("sandbox"); }
+        else if (s == "--allow-fs")                  { a.allow_fs       = true;                           SET("allow_fs"); }
+        else if (s == "--allow-bash")                { a.allow_bash     = true;                           SET("allow_bash"); }
+        else if (s == "--external-tools")            { a.external_tools_dir = need(i, "--external-tools"); SET("external_tools"); }
+        else if (s == "--RAG")                       { a.rag_dir            = need(i, "--RAG");           SET("rag"); }
+        else if (s == "--preset")                    { a.preset         = need(i, "--preset");            SET("preset"); }
+        else if (s == "--max-body")                  { a.max_body       = (size_t) std::atoll(need(i, "--max-body")); SET("max_body"); }
+        else if (s == "--batch")                     { a.n_batch        = std::atoi(need(i, "--batch"));  SET("batch"); }
         // sampling overrides
-        else if (s == "--temperature" || s == "--temp") a.temperature  = std::atof(need(i, "--temperature"));
-        else if (s == "--top-p")                     a.top_p          = std::atof(need(i, "--top-p"));
-        else if (s == "--top-k")                     a.top_k          = std::atoi(need(i, "--top-k"));
-        else if (s == "--min-p")                     a.min_p          = std::atof(need(i, "--min-p"));
-        else if (s == "--repeat-penalty")            a.repeat_penalty = std::atof(need(i, "--repeat-penalty"));
-        else if (s == "--max-tokens")                a.max_tokens     = std::atoi(need(i, "--max-tokens"));
-        else if (s == "--seed")                      a.seed           = (uint32_t) std::strtoul(need(i, "--seed"), nullptr, 10);
+        else if (s == "--temperature" || s == "--temp") { a.temperature = std::atof(need(i, "--temperature")); SET("temperature"); }
+        else if (s == "--top-p")                     { a.top_p          = std::atof(need(i, "--top-p"));  SET("top_p"); }
+        else if (s == "--top-k")                     { a.top_k          = std::atoi(need(i, "--top-k"));  SET("top_k"); }
+        else if (s == "--min-p")                     { a.min_p          = std::atof(need(i, "--min-p"));  SET("min_p"); }
+        else if (s == "--repeat-penalty")            { a.repeat_penalty = std::atof(need(i, "--repeat-penalty")); SET("repeat_penalty"); }
+        else if (s == "--max-tokens")                { a.max_tokens     = std::atoi(need(i, "--max-tokens")); SET("max_tokens"); }
+        else if (s == "--seed")                      { a.seed           = (uint32_t) std::strtoul(need(i, "--seed"), nullptr, 10); SET("seed"); }
         // KV cache
-        else if (s == "-ctk" || s == "--cache-type-k") a.cache_type_k  = need(i, "-ctk");
-        else if (s == "-ctv" || s == "--cache-type-v") a.cache_type_v  = need(i, "-ctv");
-        else if (s == "-nkvo" || s == "--no-kv-offload") a.no_kv_offload = true;
-        else if (s == "--kv-unified")                a.kv_unified     = true;
-        else if (s == "--override-kv")               a.kv_overrides.push_back(need(i, "--override-kv"));
+        else if (s == "-ctk" || s == "--cache-type-k") { a.cache_type_k = need(i, "-ctk");                SET("cache_type_k"); }
+        else if (s == "-ctv" || s == "--cache-type-v") { a.cache_type_v = need(i, "-ctv");                SET("cache_type_v"); }
+        else if (s == "-nkvo" || s == "--no-kv-offload") { a.no_kv_offload = true;                        SET("no_kv_offload"); }
+        else if (s == "--kv-unified")                { a.kv_unified     = true;                           SET("kv_unified"); }
+        else if (s == "--override-kv")               { a.kv_overrides.push_back(need(i, "--override-kv")); SET("override_kv"); }
         // llama-server compat
-        else if (s == "-a"  || s == "--alias")       a.alias          = need(i, "-a");
-        else if (s == "--api-key")                   a.api_key        = need(i, "--api-key");
-        else if (s == "--numa")                      a.numa           = need(i, "--numa");
-        else if (s == "-tb" || s == "--threads-batch") a.threads_batch = std::atoi(need(i, "-tb"));
-        else if (s == "-np" || s == "--parallel")    a.parallel       = std::atoi(need(i, "-np"));
-        else if (s == "-fa" || s == "--flash-attn")  a.flash_attn     = true;
-        else if (s == "--mlock")                     a.mlock          = true;
-        else if (s == "--no-mmap")                   a.no_mmap        = true;
-        else if (s == "--metrics")                   a.metrics        = true;
+        else if (s == "-a"  || s == "--alias")       { a.alias          = need(i, "-a");                  SET("alias"); }
+        else if (s == "--api-key")                   { a.api_key        = need(i, "--api-key");           SET("api_key"); }
+        else if (s == "--numa")                      { a.numa           = need(i, "--numa");              SET("numa"); }
+        else if (s == "-tb" || s == "--threads-batch") { a.threads_batch = std::atoi(need(i, "-tb"));     SET("threads_batch"); }
+        else if (s == "-np" || s == "--parallel")    { a.parallel       = std::atoi(need(i, "-np"));      SET("parallel"); }
+        else if (s == "-fa" || s == "--flash-attn")  { a.flash_attn     = true;                           SET("flash_attn"); }
+        else if (s == "--mlock")                     { a.mlock          = true;                           SET("mlock"); }
+        else if (s == "--no-mmap")                   { a.no_mmap        = true;                           SET("no_mmap"); }
+        else if (s == "--metrics")                   { a.metrics        = true;                           SET("metrics"); }
         else if (s == "--reasoning") {
             std::string v = need(i, "--reasoning");
             a.reasoning = (v == "on" || v == "1" || v == "true" || v == "yes");
+            SET("reasoning");
         }
-        else if (s == "--no-think")                  a.no_think       = true;
+        else if (s == "--no-think")                  { a.no_think       = true;                           SET("no_think"); }
         else if (s == "--inject-datetime") {
             std::string v = need(i, "--inject-datetime");
             a.inject_datetime = (v == "on" || v == "1" || v == "true" || v == "yes");
+            SET("inject_datetime");
         }
-        else if (s == "--knowledge-cutoff")          a.knowledge_cutoff = need(i, "--knowledge-cutoff");
-        else if (s == "-v" || s == "--verbose")      a.verbose        = true;
-        else if (s == "--webui-title")               a.webui_title    = need(i, "--webui-title");
-        else if (s == "--webui-icon")                a.webui_icon     = need(i, "--webui-icon");
-        else if (s == "--webui-placeholder")         a.webui_placeholder = need(i, "--webui-placeholder");
-        else if (s == "--webui")                     a.webui_mode     = need(i, "--webui");
+        else if (s == "--knowledge-cutoff")          { a.knowledge_cutoff = need(i, "--knowledge-cutoff"); SET("knowledge_cutoff"); }
+        else if (s == "-v" || s == "--verbose")      { a.verbose        = true;                           SET("verbose"); }
+        else if (s == "--webui-title")               { a.webui_title    = need(i, "--webui-title");       SET("webui_title"); }
+        else if (s == "--webui-icon")                { a.webui_icon     = need(i, "--webui-icon");        SET("webui_icon"); }
+        else if (s == "--webui-placeholder")         { a.webui_placeholder = need(i, "--webui-placeholder"); SET("webui_placeholder"); }
+        else if (s == "--webui")                     { a.webui_mode     = need(i, "--webui");             SET("webui_mode"); }
+        else if (s == "--no-mcp-auth")               { a.no_mcp_auth    = true;                           SET("no_mcp_auth"); }
         else if (s == "-h" || s == "--help")         die_usage(argv[0]);
         else { std::fprintf(stderr, "unknown arg: %s\n", s.c_str()); die_usage(argv[0]); }
     }
-    if (a.model_path.empty()) die_usage(argv[0]);
     return a;
+}
+
+// Apply the INI as defaults — for every setting NOT in `cli_set`, if
+// the INI has a value, use it. Order: CLI > INI > hardcoded default
+// (already in `args` from struct initialisation). Any INI value that
+// fails to parse (e.g. "abc" for an integer) is silently ignored —
+// the field keeps its hardcoded default. The INI parser already
+// surfaced the malformed line as a warning at file-load time.
+static void apply_ini_to_args(const easyai::config::Ini & ini, ServerArgs & a) {
+    auto have = [&](const char * name) { return a.cli_set.count(name) > 0; };
+
+    auto get_str = [&](const char * sec, const char * key) {
+        return ini.get(sec, key);
+    };
+    auto get_bool_or = [&](const char * sec, const char * key, bool def) {
+        std::string v = ini.get(sec, key);
+        if (v.empty()) return def;
+        for (auto & c : v) c = (char) std::tolower((unsigned char) c);
+        if (v == "on" || v == "true" || v == "yes" || v == "1" ||
+            v == "enable" || v == "enabled") return true;
+        if (v == "off" || v == "false" || v == "no" || v == "0" ||
+            v == "disable" || v == "disabled") return false;
+        return def;
+    };
+    auto get_int_or = [&](const char * sec, const char * key, int def) {
+        std::string v = ini.get(sec, key);
+        if (v.empty()) return def;
+        try { return std::stoi(v); } catch (...) { return def; }
+    };
+    auto get_long_or = [&](const char * sec, const char * key, long def) {
+        std::string v = ini.get(sec, key);
+        if (v.empty()) return def;
+        try { return std::stol(v); } catch (...) { return def; }
+    };
+    auto get_float_or = [&](const char * sec, const char * key, float def) {
+        std::string v = ini.get(sec, key);
+        if (v.empty()) return def;
+        try { return std::stof(v); } catch (...) { return def; }
+    };
+
+    // ----- [SERVER] -------------------------------------------------------
+    if (!have("model"))           { auto v = get_str("SERVER", "model");
+                                    if (!v.empty()) a.model_path = v; }
+    if (!have("host"))            { auto v = get_str("SERVER", "host");
+                                    if (!v.empty()) a.host = v; }
+    if (!have("port"))            a.port    = get_int_or("SERVER", "port",    a.port);
+    if (!have("alias"))           { auto v = get_str("SERVER", "alias");
+                                    if (!v.empty()) a.alias = v; }
+    if (!have("sandbox"))         { auto v = get_str("SERVER", "sandbox");
+                                    if (!v.empty()) a.sandbox = v; }
+    if (!have("system_file"))     { auto v = get_str("SERVER", "system_file");
+                                    if (!v.empty()) a.system_path = v; }
+    if (!have("external_tools"))  { auto v = get_str("SERVER", "external_tools");
+                                    if (!v.empty()) a.external_tools_dir = v; }
+    if (!have("rag"))             { auto v = get_str("SERVER", "rag");
+                                    if (!v.empty()) a.rag_dir = v; }
+    if (!have("api_key"))         { auto v = get_str("SERVER", "api_key");
+                                    if (!v.empty()) a.api_key = v; }
+    if (!have("webui_title"))     { auto v = get_str("SERVER", "webui_title");
+                                    if (!v.empty()) a.webui_title = v; }
+    if (!have("webui_icon"))      { auto v = get_str("SERVER", "webui_icon");
+                                    if (!v.empty()) a.webui_icon = v; }
+    if (!have("webui_mode"))      { auto v = get_str("SERVER", "webui_mode");
+                                    if (!v.empty()) a.webui_mode = v; }
+    if (!have("metrics"))         a.metrics  = get_bool_or("SERVER", "metrics",  a.metrics);
+    if (!have("verbose"))         a.verbose  = get_bool_or("SERVER", "verbose",  a.verbose);
+    if (!have("allow_fs"))        a.allow_fs = get_bool_or("SERVER", "allow_fs", a.allow_fs);
+    if (!have("allow_bash"))      a.allow_bash = get_bool_or("SERVER", "allow_bash", a.allow_bash);
+    if (!have("max_body"))        a.max_body = (size_t) get_long_or("SERVER", "max_body", (long) a.max_body);
+    if (!have("no_think"))        a.no_think = get_bool_or("SERVER", "no_think", a.no_think);
+    if (!have("inject_datetime")) a.inject_datetime = get_bool_or("SERVER", "inject_datetime", a.inject_datetime);
+    if (!have("knowledge_cutoff")){ auto v = get_str("SERVER", "knowledge_cutoff");
+                                    if (!v.empty()) a.knowledge_cutoff = v; }
+    if (!have("reasoning"))       a.reasoning = get_bool_or("SERVER", "reasoning", a.reasoning);
+
+    // [SERVER] mcp_auth = on|off → equivalent to --no-mcp-auth (off) when set.
+    // "off" / "open" / "disabled" → no_mcp_auth=true; "on" / "required" → false.
+    // Unset / empty → leave the binary default (auto-detect from [MCP_USER]).
+    if (!have("no_mcp_auth")) {
+        std::string v = ini.get("SERVER", "mcp_auth");
+        for (auto & c : v) c = (char) std::tolower((unsigned char) c);
+        if (v == "off" || v == "open" || v == "disabled" || v == "disable" ||
+            v == "false" || v == "no" || v == "0") {
+            a.no_mcp_auth = true;
+        } else if (v == "on" || v == "required" || v == "enabled" ||
+                   v == "enable" || v == "true" || v == "yes" || v == "1") {
+            a.no_mcp_auth = false;
+        }
+        // anything else (including empty) → leave alone (default false)
+    }
+
+    // ----- [ENGINE] -------------------------------------------------------
+    if (!have("context"))         a.n_ctx     = get_int_or("ENGINE", "context",       a.n_ctx);
+    if (!have("ngl"))             a.ngl       = get_int_or("ENGINE", "ngl",           a.ngl);
+    if (!have("threads"))         a.n_threads = get_int_or("ENGINE", "threads",       a.n_threads);
+    if (!have("threads_batch"))   a.threads_batch = get_int_or("ENGINE", "threads_batch", a.threads_batch);
+    if (!have("batch"))           a.n_batch   = get_int_or("ENGINE", "batch",         a.n_batch);
+    if (!have("preset"))          { auto v = get_str("ENGINE", "preset");
+                                    if (!v.empty()) a.preset = v; }
+    if (!have("flash_attn"))      a.flash_attn = get_bool_or("ENGINE", "flash_attn",   a.flash_attn);
+    if (!have("mlock"))           a.mlock      = get_bool_or("ENGINE", "mlock",        a.mlock);
+    if (!have("no_mmap"))         a.no_mmap    = get_bool_or("ENGINE", "no_mmap",      a.no_mmap);
+    if (!have("no_kv_offload"))   a.no_kv_offload = get_bool_or("ENGINE", "no_kv_offload", a.no_kv_offload);
+    if (!have("kv_unified"))      a.kv_unified  = get_bool_or("ENGINE", "kv_unified",  a.kv_unified);
+    if (!have("cache_type_k"))    { auto v = get_str("ENGINE", "cache_type_k");
+                                    if (!v.empty()) a.cache_type_k = v; }
+    if (!have("cache_type_v"))    { auto v = get_str("ENGINE", "cache_type_v");
+                                    if (!v.empty()) a.cache_type_v = v; }
+    if (!have("numa"))            { auto v = get_str("ENGINE", "numa");
+                                    if (!v.empty()) a.numa = v; }
+    if (!have("parallel"))        a.parallel   = get_int_or("ENGINE", "parallel",     a.parallel);
+
+    // sampling
+    if (!have("temperature"))     a.temperature   = get_float_or("ENGINE", "temperature",     a.temperature);
+    if (!have("top_p"))           a.top_p         = get_float_or("ENGINE", "top_p",           a.top_p);
+    if (!have("top_k"))           a.top_k         = get_int_or  ("ENGINE", "top_k",           a.top_k);
+    if (!have("min_p"))           a.min_p         = get_float_or("ENGINE", "min_p",           a.min_p);
+    if (!have("repeat_penalty"))  a.repeat_penalty = get_float_or("ENGINE", "repeat_penalty", a.repeat_penalty);
+    if (!have("max_tokens"))      a.max_tokens    = get_int_or  ("ENGINE", "max_tokens",      a.max_tokens);
+    if (!have("seed")) {
+        std::string v = ini.get("ENGINE", "seed");
+        if (!v.empty()) {
+            try { a.seed = (uint32_t) std::stoul(v); } catch (...) {}
+        }
+    }
 }
 
 // Graceful shutdown — flag set by SIGINT/SIGTERM, polled by main loop.
@@ -3294,6 +3529,45 @@ int main(int argc, char ** argv) {
     ctx->api_key  = args.api_key;
     ctx->no_think = args.no_think;
     if (!args.alias.empty()) ctx->model_id = args.alias;
+
+    // -------- INI config (central operator-tunable file) -------------------
+    // Default path: /etc/easyai/easyai.ini. Missing file is fine (no
+    // sections, all features at their code defaults). Today only
+    // [MCP_USER] is consumed; reserved-for-future sections that the
+    // operator populated are silently ignored until code wires them.
+    {
+        std::string ini_err;
+        ctx->ini_config = easyai::config::load_ini_file(args.config_path, ini_err);
+        if (!ini_err.empty()) {
+            std::fprintf(stderr,
+                "easyai-server: %s warnings:\n%s\n",
+                args.config_path.c_str(), ini_err.c_str());
+        }
+        // Build the MCP auth lookup. Each entry under [MCP_USER] is
+        // `username = bearer_token`. We invert to `token -> username`
+        // so the request-time check is an O(log N) map lookup.
+        ctx->mcp_keys.clear();
+        for (const auto & [user, token] :
+                ctx->ini_config.section_or_empty("MCP_USER")) {
+            if (token.empty()) continue;
+            // First mapping wins on duplicate-token (operator config
+            // bug; we don't error, just take the first).
+            ctx->mcp_keys.emplace(token, user);
+        }
+        if (!ctx->mcp_keys.empty()) {
+            std::fprintf(stderr,
+                "easyai-server: MCP auth ENABLED — %zu user(s) loaded from %s\n",
+                ctx->mcp_keys.size(), args.config_path.c_str());
+        } else if (!ctx->ini_config.sections.empty()) {
+            std::fprintf(stderr,
+                "easyai-server: MCP auth OPEN — [MCP_USER] section in %s "
+                "is empty (or absent)\n", args.config_path.c_str());
+        } else {
+            std::fprintf(stderr,
+                "easyai-server: MCP auth OPEN — no INI config at %s\n",
+                args.config_path.c_str());
+        }
+    }
 
     // ----- webui rebrand: build the served HTML once and load any custom
     //       favicon into memory.

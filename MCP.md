@@ -431,45 +431,96 @@ server speaks:
 
 ## 9. Security model
 
-> ⚠️ **The `/mcp` endpoint currently runs WITHOUT Bearer auth, by
-> operator decision.** Every other `/v1/*` endpoint honours
-> `/etc/easyai/api_key`; `/mcp` does not.
+The `/mcp` endpoint authenticates via Bearer tokens declared in
+the central INI config (`/etc/easyai/easyai.ini` by default).
+Full INI reference: [`INI.md`](INI.md).
 
-What this means in practice:
+Auth is **opt-in by configuration**: if the INI's `[MCP_USER]`
+section is empty or missing, the endpoint accepts any request
+(handy for local dev). Populate at least one user to require
+auth in production.
 
-- Anyone who can reach the server's port can list and dispatch
-  every registered tool.
-- Tools include the RAG (read/write the agent's persistent memory),
-  any operator-defined commands in `--external-tools`, and — when
-  enabled — `bash`, `fs_*` (read/write files in the sandbox).
-- The `bash` tool runs as the `easyai` service user. It is not a
-  hardened sandbox; the agent user's privileges are the full
-  reachable surface.
+### `[MCP_USER]` — adding a user
 
-### Mitigations on a multi-user / public network
+Edit `/etc/easyai/easyai.ini`:
 
-Pick one or more:
+```ini
+[MCP_USER]
+gustavo = abcdef0123456789...   # generate: openssl rand -hex 32
+ci      = different-strong-token
+```
 
-1. **Firewall the port.** Bind easyai-server to localhost
-   (`--host 127.0.0.1`) and SSH-tunnel from clients. Simplest, most
-   effective.
-2. **Reverse-proxy with auth.** Put nginx / Caddy in front, require
-   client cert or HTTP basic auth there.
-3. **Drop a `deny` rule for `/mcp` in your reverse proxy** if you
-   want `/v1/*` accessible but `/mcp` locked down for now.
-4. **Disable `--allow-bash`** so the worst the MCP endpoint can
-   dispatch is RAG + read-only `web_*`.
-5. **Don't expose `--external-tools`** with sensitive credentials
-   in `env_passthrough` until auth is wired.
+Each line registers `username = bearer_token`. Restart the server
+to pick up changes:
 
-### Future hardening
+```bash
+sudo systemctl restart easyai-server
+```
 
-A planned PR (no ETA) will gate `/mcp` behind the same
-`require_auth` middleware as `/v1/*`, controlled by either:
+The username appears in the audit log per request — `journalctl
+-u easyai-server | grep "[mcp]"` shows e.g. `[mcp] request from
+user 'gustavo'`. The token never logs.
 
-- A new `--mcp-auth` flag (off by default in V1, on in V2).
-- Or by checking `/etc/easyai/api_key` existence and inheriting
-  the same gate.
+Generate strong tokens with `openssl rand -hex 32` (or
+`python3 -c 'import secrets; print(secrets.token_hex(32))'`).
+Treat them like sudoers passwords — they grant tool dispatch
+privilege.
+
+### Client side — sending the token
+
+```sh
+curl -fsS http://localhost/mcp \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer abcdef0123456789..." \
+  -d '{"jsonrpc":"2.0","id":1,"method":"ping"}'
+```
+
+In Cursor/Continue config:
+
+```json
+{
+  "mcpServers": {
+    "easyai": {
+      "url": "http://192.168.1.10/mcp",
+      "headers": { "Authorization": "Bearer abcdef..." }
+    }
+  }
+}
+```
+
+In the stdio bridge (Claude Desktop):
+
+```json
+{ "mcpServers": { "easyai": {
+    "command": "/usr/local/bin/easyai-mcp-bridge",
+    "args": ["--url", "http://192.168.1.10"],
+    "env": { "EASYAI_API_KEY": "abcdef..." } }}}
+```
+
+### Disabling auth temporarily
+
+Three ways:
+
+1. **Empty `[MCP_USER]`** — comment out every user line in the INI.
+2. **`[SERVER] mcp_auth = off`** — overrides the auto-detect.
+3. **`--no-mcp-auth` CLI flag** — overrides everything (the
+   binary opens /mcp regardless of INI, useful for one-off
+   debugging without editing the file).
+
+### Mitigations beyond Bearer auth
+
+For high-trust deployments stack:
+
+1. **Bind to LAN only** — `[SERVER] host = 127.0.0.1` and
+   SSH-tunnel from clients.
+2. **Reverse proxy with mTLS / IP allowlist** — nginx / Caddy in
+   front of easyai-server, require client cert or restrict by
+   source.
+3. **Token rotation** — change the values in `[MCP_USER]` and
+   restart; old tokens immediately invalid.
+4. **Don't enable `--allow-bash`** with auth-open mode — the
+   worst MCP can dispatch is RAG + read-only `web_*` and your
+   `--external-tools` allowlist.
 
 ---
 

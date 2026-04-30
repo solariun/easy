@@ -576,31 +576,63 @@ tools. The catalogue includes RAG (read/write the agent's
 persistent memory), `bash` when `--allow-bash` is set, `fs_*` when
 `--allow-fs` is set, and every operator-defined external tool.
 
-### 17.1 Auth posture (V1 — accepted risk)
+### 17.1 Auth posture — INI-driven Bearer gate
 
-The `/mcp` endpoint **does not** go through the `require_auth`
-middleware that gates `/v1/*`. This is a deliberate V1 default
-chosen by the operator for friction-free smoke testing during
-roll-out. Implications:
+`/mcp` authenticates via the `[MCP_USER]` section of the central
+INI config (`/etc/easyai/easyai.ini` by default; configurable via
+`--config`). Full INI reference in [`INI.md`](INI.md). Each line `name = token` registers one Bearer token;
+the request's `Authorization: Bearer <token>` is matched against
+the table at request time.
 
-- Anyone who can reach the server's port can list and dispatch
-  every registered tool.
-- Tool dispatch runs as the `easyai` service user. `bash` (when
-  enabled) gives that user's full reachable surface.
-- The agent's RAG (long-term memory) is fully readable AND
-  writable by anyone hitting the endpoint.
+**Modes:**
 
-**Accepted with the following compensating controls expected of
-the operator:**
+| `[MCP_USER]` content | `--no-mcp-auth` | `[SERVER] mcp_auth` | Effect |
+| --- | --- | --- | --- |
+| empty / missing | not set | unset / `auto` | Open (no auth required) |
+| empty / missing | `--no-mcp-auth` | any | Open |
+| 1+ users | not set | `auto` | Bearer required |
+| 1+ users | `--no-mcp-auth` | any | Open (CLI override) |
+| 1+ users | not set | `off` | Open (INI override) |
+| 1+ users | not set | `on` | Bearer required |
 
-1. Bind to localhost or LAN only (firewall, no public exposure).
-2. Reverse-proxy with auth in front (nginx + basic auth, mTLS, etc).
-3. Don't enable `--allow-bash` on a network-accessible deploy.
-4. Don't put credentials in `--external-tools` `env_passthrough`
-   until auth is wired.
+The "open by default if [MCP_USER] is empty" behaviour is the
+operator-friction trade-off: a fresh install accepts requests
+out-of-the-box for smoke-testing, but the moment the operator
+adds the first user the auth gate flips on. There is no separate
+"enable auth" flag — the data IS the switch.
 
-A planned PR will gate `/mcp` behind the same Bearer middleware
-as `/v1/*`. The flag name (provisional) is `--mcp-auth on|off|inherit`.
+**Audit log.** Every authenticated request logs to stderr (and
+journalctl) as `[mcp] request from user '<name>'`. The token is
+never logged. Filter with:
+
+```sh
+journalctl -u easyai-server | grep "\[mcp\]"
+```
+
+**Open-mode warnings.** When auth is open, the startup banner
+prints:
+
+```
+easyai-server: MCP auth OPEN — [MCP_USER] section in /etc/easyai/easyai.ini is empty (or absent)
+```
+
+This makes the posture visible at every start. Operators on
+multi-user / public networks should populate at least one user
+before exposing the port.
+
+### 17.1.1 Compensating controls
+
+Even with `[MCP_USER]` populated, defence-in-depth:
+
+1. **Bind to localhost or LAN only.** `host = 127.0.0.1` in
+   `[SERVER]`; tunnel via SSH from remote clients.
+2. **Reverse proxy with mTLS / IP allowlist.** nginx or Caddy
+   in front, require client certs or restrict by source net.
+3. **Token rotation.** Edit `[MCP_USER]`, restart — old tokens
+   immediately invalid.
+4. **Don't enable `--allow-bash` with auth open.** The worst MCP
+   can dispatch in open mode is then RAG + read-only `web_*` +
+   the operator's curated `--external-tools` allowlist.
 
 ### 17.2 Dispatcher safety
 

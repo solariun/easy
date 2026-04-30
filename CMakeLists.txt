@@ -60,6 +60,7 @@ set(EASYAI_SOURCES
     src/engine.cpp
     src/tool.cpp
     src/builtin_tools.cpp
+    src/config.cpp
     src/external_tools.cpp
     src/rag_tools.cpp
     src/mcp.cpp

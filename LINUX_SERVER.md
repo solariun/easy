@@ -136,6 +136,46 @@ sudo systemctl restart easyai-server
 
 ## 3. Configuration files
 
+### `/etc/easyai/easyai.ini` — the central config
+
+> **Full reference:** [`INI.md`](INI.md) lists every key the binary
+> understands, what section it belongs to, what the CLI equivalent
+> is, and gives worked examples.
+
+All operator-tunable knobs live in one INI file. The systemd unit's
+`ExecStart` is intentionally short — `--config /etc/easyai/easyai.ini`
+plus the model path and the api-key plumbing — and **everything else**
+(host, port, alias, sandbox, RAG dir, KV cache types, mlock, flash-attn,
+threads, MCP auth, …) lives in this file.
+
+Precedence: **CLI flag in the systemd unit > INI value > hardcoded
+default in the binary.** So tweak this file for the normal case;
+flip a CLI flag only for one-off overrides.
+
+Sections:
+
+| Section | Purpose | Status |
+| --- | --- | --- |
+| `[SERVER]` | HTTP layer + paths + tool gating + MCP auth posture | active |
+| `[ENGINE]` | Model loading + inference tunables (context, ngl, KV, mlock, flash-attn, sampling) | active |
+| `[MCP_USER]` | Bearer-token auth for `/mcp` (one user per line, `name = token`) | active |
+| `[TOOLS]` | Per-tool ACL (`mcp_allowed = …, mcp_denied = …`) | reserved for future |
+
+The installer drops a fully-populated `easyai.ini` (every key
+documented inline). On `--upgrade` we **leave it alone** — your edits
+win — so any keys we add in newer versions need to be merged
+manually. We may at some point grow a polite `upsert`; for now the
+release notes call out each new key.
+
+To enable MCP Bearer auth: edit `[MCP_USER]`, uncomment one of the
+example lines, replace the placeholder token with output from
+`openssl rand -hex 32`. Restart the server. See `MCP.md` §9 for the
+full guide and per-client config.
+
+To temporarily reopen `/mcp` without editing the INI: pass
+`--no-mcp-auth` on the systemd unit's `ExecStart` (or run the
+binary by hand). The flag always wins.
+
 ### `/etc/easyai/system.txt`
 
 The system prompt. Plain text. Edit with `sudo nano`. Restart the

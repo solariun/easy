@@ -11,6 +11,7 @@
 #include "external_tools.hpp"
 #include "rag_tools.hpp"
 #include "mcp.hpp"
+#include "config.hpp"
 #include "presets.hpp"
 #include "plan.hpp"
 #include "ui.hpp"
