@@ -2277,7 +2277,11 @@ state. To run `easyai-local` without any tools at all:
 ./build/easyai-local -m … --no-tools
 ```
 
-For the server: same flag, `--no-tools`.
+For the server: `--no-local-tools` (renamed from `--no-tools` so the
+flag's scope is unambiguous now that `easyai-server` can also be an
+MCP client — `--no-local-tools` skips the LOCAL toolbelt only,
+leaving RAG, external-tools, and any tools fetched via `--mcp`
+intact).
 
 ### 9.4 Production deployment — replacing `llama-server`
 

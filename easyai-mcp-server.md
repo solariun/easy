@@ -7,6 +7,15 @@
 > webui. Just `POST /mcp`, sized for high concurrency and fail-fast
 > backpressure when the host runs out of headroom.
 
+> **Stack it under an `easyai-server`.** As of the 2026-05-01 update,
+> `easyai-server` is also an MCP **client**: pass
+> `--mcp http://this-host:8089` (and `--mcp-token` if you've set
+> `[MCP_USER]`) on the chat server and the `easyai-mcp-server`'s
+> entire tool catalogue gets merged into the chat agent's toolbox.
+> Pattern: many lightweight chat servers, one shared
+> `easyai-mcp-server` exposing RAG + your operator-defined tool
+> packs centrally. See [`MCP.md`](MCP.md) §9.5.
+
 ---
 
 ## Table of contents

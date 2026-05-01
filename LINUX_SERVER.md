@@ -111,8 +111,29 @@ Important pieces:
   `get_current_dir` reports this path.
 - `--external-tools /etc/easyai/external-tools`. Operator-defined
   tools live here. Empty dir is a normal state.
-- `--RAG /var/lib/easyai/rag`. The agent's persistent registry /
-  long-term memory.
+- `--RAG /var/lib/easyai/rag`. The agent's persistent **memory**
+  (search / store / recall / update / forget). Memories whose title
+  starts with `fix-easyai-` are immutable — the model can't
+  overwrite or forget them, useful for seeding system designs and
+  hard rules. The optional `--experimental-rag` flag collapses the
+  six `rag_*` tools into one `rag(action=...)` dispatcher.
+
+Optional add-ons the systemd unit does NOT pass by default but the
+installer leaves room for in `/etc/easyai/easyai.ini`:
+
+- `[SERVER] mcp = http://upstream-host:port`. easyai-server connects
+  to that MCP server as a client and merges its tool catalogue into
+  this one. Pair with `mcp_token = …` if the upstream uses bearer
+  auth. Local tool names win on collision.
+- `[SERVER] use_google = true`. Registers `web_google` (Google
+  Custom Search JSON API). Needs `GOOGLE_API_KEY` and
+  `GOOGLE_CSE_ID` in `Environment=` lines of a drop-in. Counts
+  against your Google quota (free tier: 100 queries/day).
+- `[SERVER] local_tools = false` (or pass `--no-local-tools`).
+  Skips the LOCAL built-in toolbelt — the model only sees RAG,
+  external-tools, and any `--mcp` upstream. **Renamed from
+  `load_tools` / `--no-tools`** so the scope is unambiguous now
+  that the MCP client is its own concern.
 - `LimitMEMLOCK=infinity` (in the drop-in) so `mlock` works.
 - `LimitCORE=infinity` (in the drop-in) so coredumps land for
   forensics.
@@ -559,10 +580,14 @@ curl -fsS http://localhost/health | jq .tool_count
 Expected (rough):
 
 - 4 (datetime, web_search, web_fetch, plan)
-- + 5 (RAG: rag_save / search / load / list / delete)
+- + 1 (`--use-google`: web_google) — only when env vars set
+- + 6 (RAG: rag_save / search / load / list / delete / keywords)
 - + 6 (`--allow-fs`: read_file / write_file / list_dir / glob / grep / get_current_dir)
 - + 1 (`--allow-bash`: bash)
 - + N (your `--external-tools` packs)
+- + M (tools fetched via `--mcp` from an upstream MCP server)
+- The `--experimental-rag` flag replaces the 6 RAG tools with 1
+  unified `rag` tool — subtract 5 if you flip it on.
 
 ### RAG working?
 

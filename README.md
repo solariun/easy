@@ -43,6 +43,50 @@ A running log of user-facing changes. Latest first — keep this list
 current as features land so anyone returning to the repo (or
 landing on it for the first time) sees what shipped recently.
 
+### 2026-05-01 — MCP CLIENT, RAG memory framing, web_google, macOS installer fix
+
+* **`easyai-server` is now also an MCP client.** Pass `--mcp <url>`
+  (and `--mcp-token <token>` if needed) and at startup the server
+  connects to the upstream's `/mcp`, runs `tools/list`, and merges
+  the catalogue into its own. Each remote tool's handler proxies
+  `tools/call` over HTTP. Local tool names win on collision. The
+  implementation is `easyai::mcp::fetch_remote_tools()` in libeasyai
+  — public API, so anything built on the engine library can stack
+  remote MCP catalogues. See [`MCP.md`](MCP.md) §9.5.
+* **`--no-tools` renamed to `--no-local-tools` (server only).** Now
+  that the server can be both an MCP server AND an MCP client, the
+  flag's scope had to be unambiguous: it disables only the LOCAL
+  built-in toolbelt. RAG, external tools, and tools fetched via
+  `--mcp` are unaffected. INI key `load_tools` → `local_tools` to
+  match. The `easyai-local` and `easyai-mcp-server` binaries keep
+  their `--no-tools` spelling — they have no MCP client, so the
+  original name is still accurate.
+* **RAG reframed as memory + fixed memories.** Tool descriptions
+  rewritten in memory verbs (search / store / recall / update /
+  forget). New `fix=true` argument on `rag_save` mints an immutable
+  memory: title is auto-prefixed with `fix-easyai-`, and from then
+  on `rag_save` refuses to overwrite it and `rag_delete` refuses to
+  remove it. Use this to seed system designs, hard rules, ground-
+  truth definitions the model must not rewrite. Search / load /
+  list output gain a human-readable `modified` date and a `[FIXED]`
+  / `fixed: yes/no` marker. See [`RAG.md`](RAG.md).
+* **Experimental single-tool RAG via `--experimental-rag`.** Same
+  store, same handlers, same on-disk format — just one
+  `rag(action=...)` tool instead of six `rag_*` tools. Saves a few
+  hundred catalog tokens at the cost of accuracy on weak / 1-bit-
+  quant tool callers. Off by default; flip on for strong models.
+* **`web_google` builtin.** Google Custom Search JSON API. Gated by
+  `--use-google` (also `[SERVER] use_google`). Reads
+  `GOOGLE_API_KEY` and `GOOGLE_CSE_ID` from env at call time so a
+  rotation doesn't drop the tool. Free tier is 100 queries/day.
+* **macOS installer fix: OpenSSL via brew.** Modern macOS no longer
+  ships usable libssl in `/usr/lib`, so `find_package(OpenSSL)`
+  half-detected and broke configure for both `easyai_cli` and the
+  vendored `cpp-httplib`. The installer + `build_macos.sh` now pass
+  `-DOPENSSL_ROOT_DIR=$(brew --prefix openssl@3)` and the cmake
+  guards `TARGET OpenSSL::SSL` so a half-detected OpenSSL degrades
+  to "HTTPS not in this build" instead of erroring out.
+
 ### 2026-04-30 — `easyai-mcp-server` (standalone MCP provider)
 
 * **New binary `easyai-mcp-server`.** Same tool catalogue as

@@ -16,6 +16,17 @@ connect to easyai-server and use its tools as if they were native.
 > connection guides in this document apply unchanged to that binary
 > (just point clients at port 8089 / whatever you configured).
 
+> **Going the other direction — easyai-server as an MCP CLIENT?**
+> Pass `--mcp <url>` (and `--mcp-token <token>` if the upstream
+> requires bearer auth) to merge another MCP server's tool catalogue
+> into the agent's local toolbox. Local tools win on name collision;
+> remote dups are skipped with a warning. See
+> [easyai-server.md](easyai-server.md) §"Toolbelt opt-ins" and the
+> "MCP client" subsection in `[SERVER]` of the INI reference. The
+> implementation lives in `easyai::mcp::fetch_remote_tools()` —
+> public to libeasyai consumers, so anything built on top of the
+> engine library can stack remote MCP catalogues the same way.
+
 ---
 
 ## Table of contents
@@ -29,6 +40,7 @@ connect to easyai-server and use its tools as if they were native.
 7. [Connecting from a custom client](#7-connecting-from-a-custom-client)
 8. [Compatibility shims (`/v1/models`, `/api/tags`)](#8-compatibility-shims)
 9. [Security model](#9-security-model)
+9.5. [easyai-server as an MCP CLIENT](#95-easyai-server-as-an-mcp-client)
 10. [Roadmap](#10-roadmap)
 11. [Troubleshooting](#11-troubleshooting)
 
@@ -528,6 +540,58 @@ For high-trust deployments stack:
 4. **Don't enable `--allow-bash`** with auth-open mode — the
    worst MCP can dispatch is RAG + read-only `web_*` and your
    `--external-tools` allowlist.
+
+---
+
+## 9.5 easyai-server as an MCP CLIENT
+
+The same process that exposes `/mcp` can also **consume** another
+MCP server's catalogue. Pass `--mcp <url>` (and `--mcp-token` if the
+upstream needs bearer auth) and at startup easyai-server runs:
+
+```
+initialize          → claim protocolVersion 2024-11-05
+notifications/initialized
+tools/list          → enumerate the upstream's tools
+```
+
+Each remote tool is registered locally as a `Tool` whose handler
+proxies `tools/call` over HTTP. From the model's perspective there's
+no distinction — local and remote tools sit in the same catalogue.
+
+```
+                   easyai-server (this process)
+                         │
+            ┌────────────┼─────────────┬──────────────┐
+            │            │             │              │
+            ▼            ▼             ▼              ▼
+       local toolbelt  RAG       external-tools   ┌────────┐
+                                                  │  --mcp │
+                                                  │   ▼    │
+                                                  │  HTTP  │
+                                                  │   ▼    │
+                                                  │ remote │
+                                                  │  /mcp  │
+                                                  └────────┘
+```
+
+**Collision policy.** Local tool names take precedence. A remote
+tool whose name already exists locally is skipped with a startup
+warning so the operator can see what was dropped. Pass
+`--no-local-tools` if you want the remote catalogue unopposed.
+
+**Failure modes.** Connect failure, auth rejection, or a malformed
+upstream response logs a warning and lets the server start anyway.
+A transient outage at the upstream MCP server should not take down
+chat. Mid-session call failures surface as `ToolResult::error` with
+the curl error attached — same shape every other tool failure has.
+
+**API for downstream consumers.** `easyai::mcp::fetch_remote_tools(opts)`
+is public in libeasyai; any program built on top of the engine
+library can stack a remote MCP catalogue without writing a new
+client. The implementation is libcurl-based, gated on
+`EASYAI_HAVE_CURL` (the same flag that gates `web_fetch` /
+`web_search`).
 
 ---
 

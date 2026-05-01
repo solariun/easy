@@ -1075,6 +1075,70 @@ forwards tools via the OpenAI tools/tool_calls format.
 `/health` includes a `compat` block so a client can sniff which
 APIs are live without round-tripping each.
 
+## 6d. MCP client
+
+Lives in `src/mcp_client.cpp` + `include/easyai/mcp_client.hpp`.
+User-facing documentation: [`MCP.md`](MCP.md) §9.5. This section
+describes the architectural shape.
+
+> **`easyai::mcp::fetch_remote_tools(opts)` is a pure factory: it
+> takes a URL + token + timeout and returns `std::vector<Tool>`.**
+> Each emitted Tool's handler proxies `tools/call` to the same
+> upstream over libcurl. There's no class to instantiate, no
+> connection pool to wire — the connection state is captured in a
+> `shared_ptr<Conn>` held by the Tool handler closures, so the
+> connection lives exactly as long as any returned Tool is reachable.
+
+### Why libcurl
+
+cpp-httplib (the static lib we use elsewhere) requires us to thread
+OpenSSL into anything that wants HTTPS. libcurl is already the
+transport for `web_fetch` / `web_search`, and it brings TLS in for
+free at the system level. The MCP client gets HTTPS for free without
+adding a second crypto stack to libeasyai.
+
+### Handshake + lifecycle
+
+`fetch_remote_tools` is one-shot at startup:
+
+1. POST `initialize` — claim `protocolVersion 2024-11-05`. We don't
+   strictly check the server's response beyond shape; any sane peer
+   accepts our handshake.
+2. POST `notifications/initialized` (notification, no response
+   expected). Best-effort; servers that 204 / 200-empty-body are
+   fine.
+3. POST `tools/list` — enumerate the upstream's catalogue.
+
+For each remote tool, we build a `Tool` whose `handler` posts
+`tools/call` to the same `/mcp` endpoint when invoked. The
+`inputSchema` field from `tools/list` becomes the local Tool's
+`parameters_json` verbatim — no translation, no normalisation.
+
+### Lock granularity
+
+The libcurl easy handle is not reentrant. A single `std::mutex` in
+`Conn` guards every HTTP exchange. Held only across one perform()
+call, so concurrent agents hitting different remote tools serialise
+the wire-side work but not the dispatcher logic. For higher
+throughput we'd switch to a per-call easy handle pool; current usage
+patterns (a few tools/call per turn from one model) don't need it.
+
+### Failure modes
+
+* **Network down at startup** → `fetch_remote_tools` returns empty +
+  err; the caller logs and continues. Server still starts.
+* **Auth rejected at startup** → same.
+* **Mid-session call failure** (network, 4xx, 5xx, malformed JSON)
+  → handler returns `ToolResult::error` with the curl message. The
+  agent loop sees a normal tool error and reacts.
+* **Name collision with a local tool** → the tool wiring code in
+  the consumer (e.g. `examples/server.cpp`) skips the remote dup and
+  logs at startup. Local tools always win.
+
+The `Conn` handle and the libcurl resource get cleaned up when the
+last `Tool` referencing them goes out of scope, which is process
+shutdown for the typical server use case.
+
 ---
 
 ## 7. The webui
