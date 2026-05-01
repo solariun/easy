@@ -38,6 +38,7 @@
 #   ./scripts/install_easyai_macos.sh --skip-model          # build only
 #   ./scripts/install_easyai_macos.sh --rebuild             # wipe build/
 #   ./scripts/install_easyai_macos.sh --jobs 8              # explicit parallelism
+#   ./scripts/install_easyai_macos.sh --gemma4              # use Gemma 4 E4B + upstream llama.cpp
 #   ./scripts/install_easyai_macos.sh --no-install          # don't run cmake --install
 #
 # Verify the model URL before running on a slow link — Bonsai 8B Q1_0 is
@@ -101,6 +102,7 @@ JOBS="${JOBS:-$(sysctl -n hw.logicalcpu 2>/dev/null || echo 4)}"
 SKIP_MODEL=0
 SKIP_INSTALL=0
 REBUILD=0
+GEMMA4=0
 
 # ---------------------------------------------------------------------------
 # Pretty-printing helpers — `step` for major phases, `log` for substeps,
@@ -139,6 +141,7 @@ while [[ $# -gt 0 ]]; do
         --jobs)          JOBS="$2"; shift 2 ;;
         --skip-model)    SKIP_MODEL=1; shift ;;
         --no-install)    SKIP_INSTALL=1; shift ;;
+        --gemma4)        GEMMA4=1; shift ;;
         --rebuild)       REBUILD=1; shift ;;
         -h|--help)
             sed -n '/^# Usage:/,/^# ===/p' "$0" | sed 's/^# \{0,1\}//'
@@ -147,6 +150,16 @@ while [[ $# -gt 0 ]]; do
             die "unknown arg: $1 (try --help)" ;;
     esac
 done
+
+# ---------------------------------------------------------------------------
+# --gemma4: switch to upstream llama.cpp + Gemma 4 E4B Q4_K_M model.
+# ---------------------------------------------------------------------------
+if [[ "$GEMMA4" == "1" ]]; then
+    LLAMA_CPP_REPO="https://github.com/ggml-org/llama.cpp.git"
+    LLAMA_CPP_REF="master"
+    MODEL_URL="https://huggingface.co/unsloth/gemma-4-E4B-it-GGUF/resolve/main/gemma-4-E4B-it-Q4_K_M.gguf"
+    MODEL_FILE="gemma-4-E4B-it-Q4_K_M.gguf"
+fi
 
 # ---------------------------------------------------------------------------
 # Sanity — must be macOS.
@@ -179,19 +192,22 @@ if ! command -v brew >/dev/null 2>&1; then
 fi
 log "brew: $(brew --version | head -1)"
 
-# brew install on a fresh box; idempotent thanks to brew's check.
+# Only install via brew if the command isn't already on PATH (Xcode CLT
+# provides git and curl; cmake is the one that typically needs brew).
 brew_pkgs=(cmake git curl)
 need_install=()
 for p in "${brew_pkgs[@]}"; do
-    if ! brew list --formula "$p" >/dev/null 2>&1; then
+    if command -v "$p" >/dev/null 2>&1; then
+        log "$p: $(command -v "$p")"
+    elif ! brew list --formula "$p" >/dev/null 2>&1; then
         need_install+=("$p")
+    else
+        log "$p: installed via brew (not linked)"
     fi
 done
 if [[ ${#need_install[@]} -gt 0 ]]; then
     log "installing brew packages: ${need_install[*]}"
     brew install "${need_install[@]}"
-else
-    log "brew packages OK: ${brew_pkgs[*]}"
 fi
 
 # ---------------------------------------------------------------------------
@@ -302,11 +318,10 @@ elif [[ -f "$model_path" ]]; then
     log "size: $(du -h "$model_path" | awk '{print $1}')"
     log "(delete and rerun to force a fresh download)"
 else
-    step "Downloading Bonsai 8B Q1_0 to $model_path"
+    step "Downloading model to $model_path"
     mkdir -p "$MODEL_DIR"
     log "URL: $MODEL_URL"
-    log "this is a one-shot download (~1.7 GB); on a slow link expect"
-    log "this to take a while. Hit Ctrl+C to abort if you change your mind."
+    log "this may take a while on a slow link. Hit Ctrl+C to abort."
     # curl flags:
     #   -f  fail on HTTP 4xx/5xx (otherwise we'd save the error page as a .gguf)
     #   -L  follow redirects (HF returns 302 to a CDN host)
@@ -315,9 +330,8 @@ else
     #   --output-dir + --remote-name would lose the configured filename
     if ! curl -fL --retry 3 --retry-delay 4 -C - -o "$model_path.partial" "$MODEL_URL"; then
         rm -f "$model_path.partial"
-        die "download failed. If the URL is stale, find a current Bonsai 8B Q1_0 GGUF on
-       https://huggingface.co/models?search=bonsai+gguf
-       then re-run with: --model-url <url> --model-file <basename>"
+        die "download failed. Verify the URL is still valid, then
+       re-run with: --model-url <url> --model-file <basename>"
     fi
     mv "$model_path.partial" "$model_path"
     log "saved: $model_path  ($(du -h "$model_path" | awk '{print $1}'))"
@@ -328,30 +342,28 @@ fi
 # ---------------------------------------------------------------------------
 step "Done. Run easyai-server with:"
 
-# Bonsai-8B-Q1_0 defaults straight from the model's HuggingFace
-# README (prism-ml/Bonsai-8B-gguf):
-#
-#   sampling:   --temperature 0.5 --top-p 0.85 --top-k 20
-#               (the model was tuned on these; pushing temperature
-#                higher trades correctness for variety, especially
-#                bad on a 1.125-bit quant)
-#   context:    65 536 tokens supported by the model; we cap at
-#               8192 for the default startup so the KV cache fits
-#               comfortably on entry-level Macs. Bump `-c` if you
-#               have RAM to spare and want long-document recall.
-#   --ngl 99    offload every layer to Metal. Bonsai is 8B at
-#               1.125 bpw → ~1.2 GB resident on the GPU; fits any
-#               Apple Silicon with ≥8 GB unified memory.
-#   --inject-datetime on (default) keeps the model honest about "today".
-#
-# System prompt: easyai's built-in "Deep" prompt trains the model
-# for the full agentic loop (plan/execute/verify, tool calls).
-# Bonsai 8B Q1 was NOT specifically tuned for that flow — the HF
-# README only suggests "You are a helpful assistant". If you hit
-# odd refusals or skipped tool calls, override with
-# `--system "You are a helpful assistant"` for a closer match to
-# the model's training distribution.
+if [[ "$GEMMA4" == "1" ]]; then
+cat <<EOF
 
+  ${C_CYAN}# add easyai to PATH for this shell:${C_RESET}
+  export PATH="$PREFIX/bin:\$PATH"
+
+  ${C_CYAN}# start the server (Gemma 4 E4B defaults, LAN-reachable):${C_RESET}
+  $server_bin \\
+      -m "$model_path" \\
+      --ngl 99 \\
+      -c 8192 \\
+      --host 0.0.0.0 \\
+      --port 8080
+
+  ${C_CYAN}# in another terminal, smoke-test:${C_RESET}
+  curl -s http://127.0.0.1:8080/health | python3 -m json.tool
+
+  ${C_CYAN}# OR open the webui:${C_RESET}
+  open http://127.0.0.1:8080/
+
+EOF
+else
 cat <<EOF
 
   ${C_CYAN}# add easyai to PATH for this shell:${C_RESET}
@@ -367,14 +379,6 @@ cat <<EOF
       --top-k 20 \\
       --host 0.0.0.0 \\
       --port 8080
-  ${C_CYAN}# (host 0.0.0.0 matches the Linux/Pi installers' "appliance" posture.${C_RESET}
-  ${C_CYAN}#  Swap to --host 127.0.0.1 if this Mac is on a hostile network.${C_RESET}
-  ${C_CYAN}#  Port stays 8080 because <1024 needs sudo on macOS — the Linux/Pi${C_RESET}
-  ${C_CYAN}#  installers use 80 because their systemd unit has CAP_NET_BIND_SERVICE.)${C_RESET}
-
-  ${C_CYAN}# if the model refuses tool calls or rambles, swap to the${C_RESET}
-  ${C_CYAN}# README-recommended system prompt:${C_RESET}
-  #     --system "You are a helpful assistant"
 
   ${C_CYAN}# in another terminal, smoke-test:${C_RESET}
   curl -s http://127.0.0.1:8080/health | python3 -m json.tool
@@ -383,6 +387,7 @@ cat <<EOF
   open http://127.0.0.1:8080/
 
 EOF
+fi
 
 if [[ "$SKIP_MODEL" == "1" ]]; then
     warn "you skipped the model download. Provide -m <path-to.gguf> to start."

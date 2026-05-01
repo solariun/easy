@@ -744,7 +744,7 @@ struct Engine::Impl {
         if (!p.parser.empty()) {
             try { pp.parser.load(p.parser); }
             catch (const std::exception & e) {
-                if (verbose) std::fprintf(stderr,
+                std::fprintf(stderr,
                     "[easyai] failed to load chat parser arena: %s\n", e.what());
             }
         }
@@ -754,8 +754,12 @@ struct Engine::Impl {
         try {
             msg = common_chat_parse(raw, /*is_partial=*/false, pp);
         } catch (const std::exception & e) {
-            if (verbose) std::fprintf(stderr,
-                "[easyai] chat parser failed (%s) — attempting recovery\n", e.what());
+            const size_t tail = std::min<size_t>(600, raw.size());
+            std::fprintf(stderr,
+                "[easyai] chat parser failed (%s) — attempting recovery\n"
+                "[easyai] broken raw (%zu bytes, last %zu):\n%.*s\n",
+                e.what(), raw.size(), tail,
+                (int) tail, raw.c_str() + raw.size() - tail);
             parser_threw = true;
             msg.role    = "assistant";
             msg.content = raw;
@@ -779,7 +783,7 @@ struct Engine::Impl {
             std::string r = extract_think_block(msg.content);
             if (!r.empty()) {
                 msg.reasoning_content = std::move(r);
-                if (verbose) std::fprintf(stderr,
+                std::fprintf(stderr,
                     "[easyai] split <think> block from raw fallback (reasoning=%zu, "
                     "content=%zu)\n", msg.reasoning_content.size(), msg.content.size());
             }
@@ -800,9 +804,13 @@ struct Engine::Impl {
             if (!recovered.empty()) {
                 msg.tool_calls = std::move(recovered);
                 msg.content    = strip_tool_call_blocks(msg.content);
-                if (verbose) std::fprintf(stderr,
-                    "[easyai] recovered %zu tool call(s) from malformed output (%s)\n",
-                    msg.tool_calls.size(), recovery_kind);
+                const size_t tail = std::min<size_t>(600, raw.size());
+                std::fprintf(stderr,
+                    "[easyai] recovered %zu tool call(s) from malformed output (%s)\n"
+                    "[easyai] broken raw (%zu bytes, last %zu):\n%.*s\n",
+                    msg.tool_calls.size(), recovery_kind,
+                    raw.size(), tail,
+                    (int) tail, raw.c_str() + raw.size() - tail);
                 easyai::log::mark_problem(
                     "Engine::parse_assistant recovered %zu tool call(s) "
                     "from malformed %s output (PEG parser refused)\n"
@@ -826,10 +834,14 @@ struct Engine::Impl {
             if (!recovered.empty()) {
                 msg.tool_calls = std::move(recovered);
                 msg.content    = strip_marker_spans(msg.content, spans);
-                if (verbose) std::fprintf(stderr,
+                const size_t tail = std::min<size_t>(600, raw.size());
+                std::fprintf(stderr,
                     "[easyai] recovered %zu tool call(s) from markdown markers "
-                    "(model abandoned <tool_call> syntax — agentic loop continues)\n",
-                    msg.tool_calls.size());
+                    "(model abandoned <tool_call> syntax — agentic loop continues)\n"
+                    "[easyai] broken raw (%zu bytes, last %zu):\n%.*s\n",
+                    msg.tool_calls.size(),
+                    raw.size(), tail,
+                    (int) tail, raw.c_str() + raw.size() - tail);
                 easyai::log::mark_problem(
                     "Engine::parse_assistant recovered %zu tool call(s) "
                     "from markdown wrench markers (model abandoned <tool_call> XML)",
@@ -1353,6 +1365,8 @@ std::string Engine::chat_continue() {
             }
         }
 
+        thought_retries    = 0;
+        incomplete_retries = 0;
         p_->history.push_back(msg);
 
         // Hard ceiling on context fill — once the KV cache hits the
@@ -1547,6 +1561,12 @@ std::string Engine::chat_continue() {
             const Tool * tool = p_->find_tool(tc.name);
             ToolResult result;
             ToolCall   call{ tc.name, tc.arguments, tc.id };
+
+            std::fprintf(stderr, "[easyai] hop %d: tool_call '%s' (id=%s) args=%.*s\n",
+                hop, tc.name.c_str(),
+                tc.id.empty() ? "(none)" : tc.id.c_str(),
+                (int) std::min<size_t>(400, tc.arguments.size()),
+                tc.arguments.c_str());
 
             if (!tool) {
                 result = ToolResult::error("unknown tool: " + tc.name);
