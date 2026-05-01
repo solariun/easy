@@ -2997,7 +2997,23 @@ static bool require_auth(const ServerCtx & ctx, const httplib::Request & req,
         "\nDefault system prompt + tools:\n"
         "  -s, --system-file <path>     Server-default system prompt from file\n"
         "      --system <text>          Inline system prompt\n"
-        "      --no-tools               Don't expose the built-in toolbelt\n"
+        "      --no-local-tools         Don't expose the LOCAL built-in\n"
+        "                                toolbelt (datetime, web_*, fs_*,\n"
+        "                                bash, etc). Has no effect on RAG\n"
+        "                                (--RAG), external tools\n"
+        "                                (--external-tools), or remote\n"
+        "                                tools fetched via --mcp — those\n"
+        "                                are governed by their own flags.\n"
+        "      --mcp <url>              Connect to a remote MCP server as\n"
+        "                                a CLIENT and merge its tool\n"
+        "                                catalogue into ours. Format:\n"
+        "                                http(s)://host:port (the /mcp\n"
+        "                                endpoint is appended). Local-tool\n"
+        "                                names take precedence on collision.\n"
+        "      --mcp-token <token>      Bearer token for --mcp. Empty (the\n"
+        "                                default) sends no Authorization\n"
+        "                                header — use this when the\n"
+        "                                upstream is in open mode.\n"
         "      --sandbox <dir>          Restrict fs_* and bash to <dir>\n"
         "                                (when --allow-fs / --allow-bash\n"
         "                                register them).  Without --sandbox\n"
@@ -3134,7 +3150,16 @@ struct ServerArgs {
     int         n_batch    = 0;             // 0 = follow ctx
     int         ngl        = -1;
     int         n_threads  = 0;
-    bool        load_tools = true;
+    bool        local_tools = true;  // master switch for the LOCAL built-in
+                                     // toolbelt (datetime, web_*, fs_*, bash,
+                                     // RAG when --RAG is set, ...). Has no
+                                     // effect on remote tools fetched via
+                                     // --mcp; those are governed only by
+                                     // whether --mcp is set.
+    std::string mcp_url;             // optional MCP server URL to connect to
+                                     // as a CLIENT (consumes its tools).
+    std::string mcp_token;           // Bearer token for the upstream MCP
+                                     // server; empty → no auth header.
     std::string sandbox;            // optional: scope fs_* / bash to this dir
     bool        allow_fs   = false; // explicit opt-in for the fs_* tools
     bool        allow_bash = false; // explicit opt-in for the `bash` tool
@@ -3289,8 +3314,9 @@ auto SET_BOOL_TRUE(bool ServerArgs::* f) {
     };
 }
 // SET_BOOL_FALSE: CLI no-value → field=false; INI/value → parse string.
-// Used for negative-polarity flag (--no-tools sets load_tools=false).
-// INI key in this case is the POSITIVE name; INI parses normally.
+// Used for negative-polarity flags (e.g. --no-local-tools sets
+// local_tools=false). INI key in this case is the POSITIVE name; INI
+// parses normally.
 auto SET_BOOL_FALSE(bool ServerArgs::* f) {
     return [f](ServerArgs & a, const std::string & v) {
         // CLI no-value: empty string → field=false.
@@ -3350,7 +3376,13 @@ static const std::vector<FlagDef> & kFlags() {
         { {"--allow-bash"},        "SERVER", "allow_bash",     "allow_bash",     false, SET_BOOL_TRUE(&ServerArgs::allow_bash) },
         { {"--use-google"},        "SERVER", "use_google",     "use_google",     false, SET_BOOL_TRUE(&ServerArgs::use_google) },
         { {"--experimental-rag"},  "SERVER", "experimental_rag","experimental_rag",false, SET_BOOL_TRUE(&ServerArgs::experimental_rag) },
-        { {"--no-tools"},          "SERVER", "load_tools",     "load_tools",     false, SET_BOOL_FALSE(&ServerArgs::load_tools) },
+        // --no-local-tools (formerly --no-tools): disables only the
+        // LOCAL built-in toolbelt; remote tools fetched via --mcp are
+        // unaffected. The INI key was renamed accordingly so the YAML
+        // / INI form reads naturally with the MCP-client addition.
+        { {"--no-local-tools"},    "SERVER", "local_tools",    "local_tools",    false, SET_BOOL_FALSE(&ServerArgs::local_tools) },
+        { {"--mcp"},               "SERVER", "mcp",            "mcp",            true,  SET_STR(&ServerArgs::mcp_url) },
+        { {"--mcp-token"},         "SERVER", "mcp_token",      "mcp_token",      true,  SET_STR(&ServerArgs::mcp_token) },
         { {"--no-think"},          "SERVER", "no_think",       "no_think",       false, SET_BOOL_TRUE(&ServerArgs::no_think) },
         { {"--inject-datetime"},   "SERVER", "inject_datetime","inject_datetime",true,  SET_BOOL_TRUE(&ServerArgs::inject_datetime) },
         { {"--knowledge-cutoff"},  "SERVER", "knowledge_cutoff","knowledge_cutoff",true, SET_STR(&ServerArgs::knowledge_cutoff) },
@@ -3628,7 +3660,7 @@ int main(int argc, char ** argv) {
         ctx->apply_preset(base);
     }
 
-    // Default toolbelt — opt-out via --no-tools.
+    // Default toolbelt — opt-out via --no-local-tools.
     //
     // fs_* and bash are SHIPPED OFF by default: --allow-fs turns on the
     // filesystem read/write set, and --allow-bash turns on the shell
@@ -3637,7 +3669,7 @@ int main(int argc, char ** argv) {
     // and the webui's "tools" listing — never sees the corresponding
     // tools, so a fresh easyai-server install can't accidentally expose
     // write access or shell.
-    if (args.load_tools) {
+    if (args.local_tools) {
         // fs_* and bash share a root: --sandbox if given, else cwd.
         // We only pass that root through to Toolbelt when SOMETHING is
         // about to use it (allow_fs or allow_bash), so the engine
@@ -3682,6 +3714,61 @@ int main(int argc, char ** argv) {
             std::fprintf(stderr,
                 "easyai-server: RAG enabled, root = %s\n",
                 args.rag_dir.c_str());
+        }
+    }
+
+    // MCP client — connect to a remote MCP server and merge its tool
+    // catalogue into ours. Runs AFTER the local toolbelt + RAG so we
+    // can reject any remote tool whose name collides with one we've
+    // already registered. The collision rule is "first wins": local
+    // tools are authoritative, remote dups are skipped with a
+    // warning. Operators who want the remote tool to take precedence
+    // can pass --no-local-tools.
+    //
+    // Failure modes (network down, auth rejected, server returns a
+    // bad response) log a warning and continue with whatever local
+    // / RAG tools we have. We deliberately don't refuse to start —
+    // a transient outage at the upstream shouldn't take down a chat
+    // server, especially when the local tools alone are useful.
+    if (!args.mcp_url.empty()) {
+        easyai::mcp::ClientOptions opts;
+        opts.url             = args.mcp_url;
+        opts.bearer_token    = args.mcp_token;
+        opts.timeout_seconds = 20;
+
+        std::string err;
+        auto remote = easyai::mcp::fetch_remote_tools(opts, err);
+        if (!err.empty()) {
+            std::fprintf(stderr,
+                "easyai-server: MCP client failed against %s: %s\n",
+                args.mcp_url.c_str(), err.c_str());
+        } else {
+            std::size_t added = 0, skipped = 0;
+            for (auto & t : remote) {
+                bool collides = false;
+                for (const auto & local : ctx->default_tools) {
+                    if (local.name == t.name) { collides = true; break; }
+                }
+                if (collides) {
+                    std::fprintf(stderr,
+                        "easyai-server: MCP client: skipping remote "
+                        "tool \"%s\" (collides with local tool of "
+                        "the same name)\n", t.name.c_str());
+                    ++skipped;
+                    continue;
+                }
+                ctx->default_tools.push_back(std::move(t));
+                ++added;
+            }
+            std::fprintf(stderr,
+                "easyai-server: MCP client connected to %s "
+                "(%zu tool%s registered%s%s)\n",
+                args.mcp_url.c_str(),
+                added, added == 1 ? "" : "s",
+                skipped > 0 ? ", " : "",
+                skipped > 0
+                    ? (std::to_string(skipped) + " skipped").c_str()
+                    : "");
         }
     }
 
