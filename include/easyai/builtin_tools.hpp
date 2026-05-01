@@ -19,6 +19,20 @@ Tool web_fetch();
 // of title / url / snippet.
 Tool web_search();
 
+// web_google: search the web via Google's Custom Search JSON API. Returns
+// the same numbered title/url/snippet format as web_search. Requires two
+// environment variables — read at call time, not at registration:
+//
+//   GOOGLE_API_KEY  — your Google Cloud API key with Custom Search enabled.
+//   GOOGLE_CSE_ID   — the cx parameter of a Programmable Search Engine.
+//                     Configure it to "Search the entire web" for general use.
+//
+// Get both at https://programmablesearchengine.google.com (the CSE) and
+// https://console.cloud.google.com/apis/credentials (the key). Free tier:
+// 100 queries/day. When either env var is missing the tool returns a
+// clear error at call time so the model can fall back to web_search.
+Tool web_google();
+
 // ---------- filesystem --------------------------------------------------
 // All filesystem tools sandbox to a root directory you provide.
 // Pass "" or "." to allow the current working directory tree.

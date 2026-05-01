@@ -3017,6 +3017,23 @@ static bool require_auth(const ServerCtx & ctx, const httplib::Request & req,
         "                                NOT a hardened sandbox — the\n"
         "                                command runs with the server's\n"
         "                                user privileges.\n"
+        "      --use-google             Register the `web_google` tool\n"
+        "                                (Google Custom Search JSON API).\n"
+        "                                Requires GOOGLE_API_KEY and\n"
+        "                                GOOGLE_CSE_ID env vars; counts\n"
+        "                                against Google's quota (free tier:\n"
+        "                                100 queries/day per key).\n"
+        "      --experimental-rag       Collapse the six rag_* tools into a\n"
+        "                                single `rag` tool with an `action`\n"
+        "                                parameter (\"save\" / \"search\" /\n"
+        "                                \"load\" / \"list\" / \"delete\" /\n"
+        "                                \"keywords\"). On-disk format and\n"
+        "                                semantics are unchanged; the six\n"
+        "                                tools are NOT registered when this\n"
+        "                                is set. Smaller catalog at the cost\n"
+        "                                of accuracy on weak / 1-bit-quant\n"
+        "                                tool callers — leave off if you're\n"
+        "                                running Bonsai-class models.\n"
         "      --external-tools <dir>   Load every EASYAI-*.tools file in <dir>\n"
         "                                as an external-tools manifest. Empty\n"
         "                                directory is a normal state (no extra\n"
@@ -3121,6 +3138,11 @@ struct ServerArgs {
     std::string sandbox;            // optional: scope fs_* / bash to this dir
     bool        allow_fs   = false; // explicit opt-in for the fs_* tools
     bool        allow_bash = false; // explicit opt-in for the `bash` tool
+    bool        use_google = false; // explicit opt-in for the `web_google` tool
+                                    // (also requires GOOGLE_API_KEY + GOOGLE_CSE_ID)
+    bool        experimental_rag = false; // collapse the six rag_* tools into
+                                          // a single dispatched `rag(action=...)`
+                                          // tool. Disables the six-tool layout.
     std::string external_tools_dir; // optional: dir of EASYAI-*.tools files
     std::string rag_dir;             // optional: RAG persistent-registry dir
     std::string preset     = "balanced";
@@ -3326,6 +3348,8 @@ static const std::vector<FlagDef> & kFlags() {
         { {"-v","--verbose"},      "SERVER", "verbose",        "verbose",        false, SET_BOOL_TRUE(&ServerArgs::verbose) },
         { {"--allow-fs"},          "SERVER", "allow_fs",       "allow_fs",       false, SET_BOOL_TRUE(&ServerArgs::allow_fs) },
         { {"--allow-bash"},        "SERVER", "allow_bash",     "allow_bash",     false, SET_BOOL_TRUE(&ServerArgs::allow_bash) },
+        { {"--use-google"},        "SERVER", "use_google",     "use_google",     false, SET_BOOL_TRUE(&ServerArgs::use_google) },
+        { {"--experimental-rag"},  "SERVER", "experimental_rag","experimental_rag",false, SET_BOOL_TRUE(&ServerArgs::experimental_rag) },
         { {"--no-tools"},          "SERVER", "load_tools",     "load_tools",     false, SET_BOOL_FALSE(&ServerArgs::load_tools) },
         { {"--no-think"},          "SERVER", "no_think",       "no_think",       false, SET_BOOL_TRUE(&ServerArgs::no_think) },
         { {"--inject-datetime"},   "SERVER", "inject_datetime","inject_datetime",true,  SET_BOOL_TRUE(&ServerArgs::inject_datetime) },
@@ -3624,7 +3648,8 @@ int main(int argc, char ** argv) {
         auto tb = easyai::cli::Toolbelt()
                       .sandbox   (sb)
                       .allow_fs  (args.allow_fs)
-                      .allow_bash(args.allow_bash);
+                      .allow_bash(args.allow_bash)
+                      .use_google(args.use_google);
         for (auto & t : tb.tools()) ctx->default_tools.push_back(std::move(t));
     }
 
@@ -3635,16 +3660,29 @@ int main(int argc, char ** argv) {
     // call. The systemd-installed server passes --RAG by default
     // (see scripts/install_easyai_server.sh). See RAG.md.
     if (!args.rag_dir.empty()) {
-        auto rag = easyai::tools::make_rag_tools(args.rag_dir);
-        ctx->default_tools.push_back(std::move(rag.save));
-        ctx->default_tools.push_back(std::move(rag.search));
-        ctx->default_tools.push_back(std::move(rag.load));
-        ctx->default_tools.push_back(std::move(rag.list));
-        ctx->default_tools.push_back(std::move(rag.del));
-        ctx->default_tools.push_back(std::move(rag.keywords));
-        std::fprintf(stderr,
-            "easyai-server: RAG enabled, root = %s\n",
-            args.rag_dir.c_str());
+        if (args.experimental_rag) {
+            // Single-tool dispatcher: model sees one `rag` tool with an
+            // `action` parameter. Disables the six rag_* layout — they
+            // would just confuse the model with two paths to the same
+            // store.
+            ctx->default_tools.push_back(
+                easyai::tools::make_unified_rag_tool(args.rag_dir));
+            std::fprintf(stderr,
+                "easyai-server: RAG enabled (experimental: single "
+                "rag tool), root = %s\n",
+                args.rag_dir.c_str());
+        } else {
+            auto rag = easyai::tools::make_rag_tools(args.rag_dir);
+            ctx->default_tools.push_back(std::move(rag.save));
+            ctx->default_tools.push_back(std::move(rag.search));
+            ctx->default_tools.push_back(std::move(rag.load));
+            ctx->default_tools.push_back(std::move(rag.list));
+            ctx->default_tools.push_back(std::move(rag.del));
+            ctx->default_tools.push_back(std::move(rag.keywords));
+            std::fprintf(stderr,
+                "easyai-server: RAG enabled, root = %s\n",
+                args.rag_dir.c_str());
+        }
     }
 
     // External tools directory. Loaded AFTER the built-in toolbelt so

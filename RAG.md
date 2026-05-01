@@ -22,7 +22,7 @@ the whole system.
 1. [What RAG is, and why](#1-what-rag-is-and-why)
 2. [Quickstart](#2-quickstart)
 3. [The file format on disk](#3-the-file-format-on-disk)
-4. [The five tools](#4-the-five-tools)
+4. [The six tools (and the one-tool dispatcher)](#4-the-six-tools)
 5. [How the model is encouraged to use it](#5-how-the-model-is-encouraged-to-use-it)
 6. [Workflows](#6-workflows)
 7. [Best practices](#7-best-practices)
@@ -36,24 +36,59 @@ the whole system.
 ## 1. What RAG is, and why
 
 RAG is a **keyword-indexed key/value store**, owned by the agent,
-persisted on disk, accessible to the agent via six tools:
+persisted on disk, accessible to the agent as **its own memory** —
+something it can search, store, recall, update, and forget. Six tools
+expose those verbs:
 
 ```
-rag_save(title, keywords[], content)        write / overwrite
+rag_save(title, keywords[], content, fix?)  store / update; fix=true → immutable memory
 rag_search(keywords[], page?, max_results?) find by 1+ keywords (≥2 matches when 2+ given), paginated
-rag_load(titles[1..4])                      read up to 4 full bodies
+rag_load(titles[1..4])                      recall up to 4 full bodies
 rag_list(prefix?, max?)                     browse titles
-rag_delete(title)                           remove a stale entry
+rag_delete(title)                           forget a stale memory (fixed memories refused)
 rag_keywords(min_count?, max?)              vocabulary overview
 ```
 
 That is the whole API.
 
 The model decides what to remember and how to classify it. Keywords
-are how it finds entries again later. The directory is the index.
+are how it finds memories again later. The directory is the index.
 There is no embedding model, no similarity scoring, no neighbours.
 The model already has everything it needs to reason about its own
 memory; we just give it a place to put the bits it cared about.
+
+### Fixed memories — immutable knowledge the model can't forget
+
+Any memory whose title starts with `fix-easyai-` is **immutable**:
+
+* `rag_save` refuses to overwrite it.
+* `rag_delete` refuses to remove it.
+* `rag_search` and `rag_load` work normally — and tag the entry
+  `[FIXED]` / `fixed: yes` so the model knows it's looking at
+  ground-truth knowledge, not a working note.
+
+To mint one, the model passes `fix=true` to `rag_save`; the title
+is auto-prepended with `fix-easyai-` if not already present, and the
+file becomes read-only-via-tool from that point on. Use this when the
+user explicitly asks to "learn this as a rule", "remember this as the
+design", "this is the spec — memorise it". The only way to change a
+fixed memory is for the operator to remove the file from disk by hand.
+
+### The single-tool dispatcher (experimental)
+
+`--experimental-rag` (server / CLI flag, also in the INI) collapses
+the six tools into one:
+
+```
+rag(action="save"|"search"|"load"|"list"|"delete"|"keywords", ...)
+```
+
+Same on-disk format, same `RagStore`, same fix-memory rules. Just a
+different shape for the model's tool catalog. Exposes 1 tool entry
+instead of 6 (saves a few hundred tokens per turn) at the cost of
+accuracy on weak / 1-bit-quant tool callers — leave it off for
+Bonsai-class models. When this flag is on the six `rag_*` tools are
+NOT registered; only `rag(action=...)` is reachable.
 
 ### How information flows
 
@@ -197,7 +232,7 @@ mkdir -p ~/easyai-reg
 easyai-cli --url http://127.0.0.1:8080 --RAG ~/easyai-reg
 ```
 
-Same five tools, but the memory lives in your home directory.
+Same six tools, but the memory lives in your home directory.
 
 ### From easyai-local (single-process REPL with RAG)
 
@@ -306,12 +341,23 @@ were written to actively encourage use — see §5.
 ### rag_save
 
 ```
-rag_save(title: string, keywords: string[], content: string) -> ok
+rag_save(title: string, keywords: string[], content: string,
+         fix?: boolean) -> ok
 ```
 
-Writes `<root>/<title>.md`. Overwrites if it already exists. Atomic
-on POSIX (tempfile + rename). Refuses invalid title or keywords with
-a clear error.
+Writes `<root>/<title>.md`. Overwrites if it already exists (this is
+how the model **updates** a memory). Atomic on POSIX (tempfile +
+rename). Refuses invalid title or keywords with a clear error.
+
+Pass `fix=true` to mint a **fixed memory**: the title is auto-
+prepended with `fix-easyai-` if not already, and from then on the
+file is immutable through the tool surface — `rag_save` will refuse
+to overwrite it and `rag_delete` will refuse to remove it. Use this
+to seed system designs, hard rules, ground-truth definitions the
+model must not rewrite mid-conversation. The on-disk content is
+plain Markdown like any other memory; the immutability is enforced
+by the title prefix, so `ls fix-easyai-*` is the canonical "show me
+every fixed memory" listing.
 
 ### rag_search
 
@@ -359,9 +405,12 @@ end gets a clear "past the last page" message, not an error.
 rag_load(titles: string[1..4]) -> entries with full body
 ```
 
-Reads up to 4 full entries off disk. Cap is deliberate: more than 4
-means the model is drowning the prompt. Missing titles surface as
-per-entry errors in the response, the others still load.
+Recalls up to 4 full memories off disk. Each one comes back with
+keywords, a human-readable `modified` timestamp + unix epoch, and a
+`fixed: yes/no` line so the model knows whether the memory is
+immutable. Cap is 4 deliberately: more than that drowns the prompt.
+Missing titles surface as per-entry errors in the response, the
+others still load.
 
 ### rag_list
 
@@ -369,9 +418,11 @@ per-entry errors in the response, the others still load.
 rag_list(prefix: string?, max: integer = 50) -> list of titles
 ```
 
-Browse mode. Returns title, keywords, content_bytes, modified_unix
-for every entry (or every entry whose title starts with `prefix`).
-Body NOT included — use rag_load for that.
+Browse mode. Returns title, keywords, content_bytes, and a human-
+readable modified date for every memory (or every memory whose title
+starts with `prefix`). Memories whose title starts with `fix-easyai-`
+are tagged `[FIXED]`. Body NOT included — use rag_load for that.
+`prefix='fix-easyai-'` lists every fixed memory in one call.
 
 ### rag_delete
 
@@ -379,9 +430,11 @@ Body NOT included — use rag_load for that.
 rag_delete(title: string) -> ok
 ```
 
-Permanent. Removes the file from disk and the in-memory index.
-Idempotent: deleting a non-existent title is not an error. No trash,
-no recovery — be certain.
+Permanent forget. Removes the file from disk and the in-memory index.
+Idempotent on regular memories: forgetting a non-existent title is
+not an error. **Fixed memories are refused** — any title starting
+with `fix-easyai-` is rejected with a clear message; the operator
+must remove the file by hand if it really needs to go.
 
 ### rag_keywords
 
@@ -429,6 +482,45 @@ The first lines tell the model which dimensions of knowledge it
 has invested in; the long tail is candidates for either
 consolidation (rename to a more general keyword + rag_save) or
 deletion.
+
+### The single-tool dispatcher (experimental)
+
+Pass `--experimental-rag` (or `[SERVER] experimental_rag = on` in
+the INI) to collapse the six tools into one:
+
+```
+rag(action: "save" | "search" | "load" | "list" | "delete" | "keywords",
+    title?, titles?, keywords?, content?, fix?,
+    prefix?, max?, max_results?, page?, min_count?) -> same output
+```
+
+`action` is required; the rest are conditionally required by the
+chosen action (the legacy validation messages still apply, including
+the "missing required argument: keywords" / "title" / `…` you'd see
+from the six-tool layout). The dispatcher rewrites guidance text in
+its responses — references like `Use rag_load with…` come back as
+`Use rag(action="load") with…` so the model only sees the tool name
+it can actually call.
+
+**On-disk layout, locking discipline, fix-memory rules, error
+messages — all unchanged.** Internally the dispatcher captures the
+same six handler closures the legacy layout uses; switching shapes
+between sessions is safe because the directory is the source of
+truth and both shapes read/write the same files.
+
+When to flip the flag on:
+* You're running a strong tool-calling model (Llama 3.x 70B, Qwen
+  2.5 14B+, GPT-OSS-class) where the catalog savings genuinely help
+  context pressure.
+* You want a tighter `/v1/models` tool-list or a smaller MCP
+  catalogue exposed downstream.
+
+When to leave it off (the default):
+* You're running a 1-bit / heavily-quantised model where dispatched-
+  schema tool calls are noticeably less reliable than flat ones —
+  Bonsai-class targets, BitNet, anything below ~4 bits.
+* You have prompts / system messages that explicitly mention the
+  six tool names as instructions to the model.
 
 ---
 

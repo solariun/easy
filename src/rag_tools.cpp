@@ -109,6 +109,41 @@ constexpr std::size_t kKeywordsResultsDflt = 200;
 constexpr char        kEntrySuffix[]      = ".md";
 constexpr std::size_t kEntrySuffixLen     = sizeof(kEntrySuffix) - 1;
 
+// Title prefix that marks a memory as IMMUTABLE. Memories with a
+// title starting `fix-easyai-` cannot be overwritten by rag_save and
+// cannot be removed by rag_delete — they survive every session until
+// the operator deletes the file from disk by hand. Used to seed the
+// agent with system designs, hard rules, domain knowledge that must
+// not drift. The prefix is part of the title (so it shows in every
+// search/list/load result) and lives in the keyword namespace
+// `[A-Za-z0-9._+-]` so existing validation still applies.
+constexpr char        kFixedTitlePrefix[]    = "fix-easyai-";
+constexpr std::size_t kFixedTitlePrefixLen   = sizeof(kFixedTitlePrefix) - 1;
+
+bool title_is_fixed(const std::string & title) {
+    return title.size() > kFixedTitlePrefixLen
+        && title.compare(0, kFixedTitlePrefixLen, kFixedTitlePrefix) == 0;
+}
+
+// Render a unix timestamp as "YYYY-MM-DD HH:MM:SS" in local time. Used
+// in search/list/load output so the model can reason about recency
+// without doing the math on a raw integer. Local time matches what the
+// operator sees in `ls -l`. Returns "?" on a zero/negative epoch (e.g.
+// last_write_time failed) so output stays parseable either way.
+std::string format_local_time(std::int64_t unix_seconds) {
+    if (unix_seconds <= 0) return "?";
+    std::time_t t = static_cast<std::time_t>(unix_seconds);
+    std::tm tm{};
+#if defined(_WIN32)
+    localtime_s(&tm, &t);
+#else
+    localtime_r(&t, &tm);
+#endif
+    char buf[32];
+    std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tm);
+    return std::string(buf);
+}
+
 // ---------------------------------------------------------------------------
 // Validators — pure, no I/O, no allocation past the input.
 // ---------------------------------------------------------------------------
@@ -653,10 +688,27 @@ ToolHandler make_save_handler(std::shared_ptr<RagStore> store) {
         if (!args::get_string(c.arguments_json, "title", title) || title.empty()) {
             return ToolResult::error("missing required argument: title");
         }
+
+        // `fix=true` promotes the memory to immutable. Two ways to ask
+        // for it: (a) pass fix=true and any title — we auto-prepend the
+        // kFixedTitlePrefix so the immutability invariant lives in the
+        // filename itself. (b) pass a title that already starts with
+        // kFixedTitlePrefix — we honour that, fix=true is implied. The
+        // invariant we maintain: an entry is fixed IFF its title starts
+        // with kFixedTitlePrefix, so search / load / delete only need
+        // the title to know.
+        bool fix = false;
+        args::get_bool(c.arguments_json, "fix", fix);
+        if (fix && !title_is_fixed(title)) {
+            title = std::string(kFixedTitlePrefix) + title;
+        }
+
         if (!is_valid_title(title, kMaxTitleBytes)) {
             return ToolResult::error(
                 "title \"" + title + "\" is invalid; must match "
-                "[A-Za-z0-9._+-]{1," + std::to_string(kMaxTitleBytes) + "}");
+                "[A-Za-z0-9._+-]{1," + std::to_string(kMaxTitleBytes) + "} "
+                "(fix=true auto-prepends \"" + std::string(kFixedTitlePrefix)
+                + "\" — keep the rest under the title length cap)");
         }
 
         std::vector<std::string> keywords;
@@ -669,8 +721,8 @@ ToolHandler make_save_handler(std::shared_ptr<RagStore> store) {
                 "keywords must be a non-empty array (1.."
                 + std::to_string(kMaxKeywordsPerEntry)
                 + " short keywords). Why: keywords are how rag_search finds this "
-                  "entry later — an entry with no keywords is unreachable by keyword "
-                  "search (only rag_list can find it).");
+                  "memory later — a memory with no keywords is unreachable by "
+                  "keyword search (only rag_list can find it).");
         }
         if (keywords.size() > kMaxKeywordsPerEntry) {
             return ToolResult::error(
@@ -691,7 +743,7 @@ ToolHandler make_save_handler(std::shared_ptr<RagStore> store) {
         if (content.size() > kMaxContentBytes) {
             return ToolResult::error(
                 "content exceeds " + std::to_string(kMaxContentBytes)
-                + " bytes; split into multiple entries");
+                + " bytes; split into multiple memories");
         }
 
         // WRITE: takes unique_lock so concurrent readers can't observe a
@@ -699,6 +751,19 @@ ToolHandler make_save_handler(std::shared_ptr<RagStore> store) {
         // already atomic (tempfile + rename) so reads through the
         // FILESYSTEM are tear-free regardless of this lock.
         std::unique_lock<std::shared_mutex> lock(store->mu);
+
+        // Immutability gate: an existing fixed entry can never be
+        // overwritten — not even by another fix=true save. The check
+        // runs UNDER the unique_lock so the index is authoritative
+        // (load_index_locked ran at startup; saves keep it in sync).
+        if (title_is_fixed(title) && store->index.count(title) > 0) {
+            return ToolResult::error(
+                "memory \"" + title + "\" is fixed (immutable) — cannot "
+                "overwrite. To replace it, the operator must remove the "
+                "file from disk manually. Pick a different title for a "
+                "new memory.");
+        }
+
         if (!store->save_locked(title, keywords, content, err)) {
             return ToolResult::error(err);
         }
@@ -706,7 +771,9 @@ ToolHandler make_save_handler(std::shared_ptr<RagStore> store) {
         std::ostringstream o;
         o << "saved \"" << title << kEntrySuffix << "\" ("
           << content.size() << " bytes, "
-          << keywords.size() << " keyword" << (keywords.size() == 1 ? "" : "s") << ")";
+          << keywords.size() << " keyword" << (keywords.size() == 1 ? "" : "s")
+          << (title_is_fixed(title) ? ", FIXED — immutable from now on" : "")
+          << ")";
         return ToolResult::ok(o.str());
     };
 }
@@ -890,6 +957,7 @@ ToolHandler make_search_handler(std::shared_ptr<RagStore> store) {
             // Number entries by their absolute position in the ranked
             // list so the model can correlate across pages.
             o << (i + 1) << ". " << h.title;
+            if (title_is_fixed(h.title)) o << "  [FIXED]";
             if (keywords.size() > 1) {
                 o << "  [matched " << h.matched << "/" << keywords.size()
                   << ": ";
@@ -906,6 +974,8 @@ ToolHandler make_search_handler(std::shared_ptr<RagStore> store) {
                 o << h.meta.keywords[k];
             }
             o << "  (" << h.meta.content_bytes << " bytes)\n";
+            o << "   modified: " << format_local_time(h.meta.modified_unix)
+              << "  (unix=" << h.meta.modified_unix << ")\n";
             // Indent preview lines by 3 so it's easy to skim.
             std::string preview_in;
             preview_in.reserve(preview.size() + preview.size() / 60 * 3);
@@ -978,7 +1048,14 @@ ToolHandler make_load_handler(std::shared_ptr<RagStore> store) {
                 if (i) o << ", ";
                 o << keywords[i];
             }
-            o << "\nmodified_unix: " << mtime << "\n\n";
+            o << "\nmodified: " << format_local_time(mtime)
+              << "  (unix=" << mtime << ")\n";
+            o << "fixed: " << (title_is_fixed(title) ? "yes" : "no") << "\n";
+            if (title_is_fixed(title)) {
+                o << "note: this memory is immutable — rag_save and rag_delete "
+                     "will refuse to change or remove it.\n";
+            }
+            o << "\n";
             o << body;
             if (!body.empty() && body.back() != '\n') o << '\n';
         }
@@ -1029,6 +1106,7 @@ ToolHandler make_list_handler(std::shared_ptr<RagStore> store) {
         for (std::size_t i = 0; i < rows.size(); ++i) {
             const auto & r = rows[i];
             o << (i + 1) << ". " << r.title;
+            if (title_is_fixed(r.title)) o << "  [FIXED]";
             if (!r.meta.keywords.empty()) {
                 o << "  [";
                 for (std::size_t k = 0; k < r.meta.keywords.size(); ++k) {
@@ -1040,7 +1118,7 @@ ToolHandler make_list_handler(std::shared_ptr<RagStore> store) {
                 o << "  (no keywords)";
             }
             o << "  " << r.meta.content_bytes << " bytes";
-            o << "  modified_unix=" << r.meta.modified_unix << "\n";
+            o << "  modified=" << format_local_time(r.meta.modified_unix) << "\n";
         }
         return ToolResult::ok(o.str());
     };
@@ -1057,6 +1135,17 @@ ToolHandler make_delete_handler(std::shared_ptr<RagStore> store) {
                 "title \"" + title + "\" is invalid; must match "
                 "[A-Za-z0-9._+-]{1," + std::to_string(kMaxTitleBytes) + "}");
         }
+        // Fixed memories are immutable by design — refuse the delete
+        // before we even take the write lock. The operator can still
+        // remove the file from disk by hand if they truly need to;
+        // exposing that path through a tool defeats the whole point of
+        // the prefix.
+        if (title_is_fixed(title)) {
+            return ToolResult::error(
+                "memory \"" + title + "\" is fixed (immutable) — cannot "
+                "be forgotten through this tool. The operator can remove "
+                "the file from disk manually if it really needs to go.");
+        }
         // WRITE: unique_lock — delete_locked mutates the index AND
         // removes the on-disk file. fs::remove is itself atomic, so
         // parallel readers either see the entry or don't, never a
@@ -1069,10 +1158,10 @@ ToolHandler make_delete_handler(std::shared_ptr<RagStore> store) {
         }
         if (!existed) {
             return ToolResult::ok(
-                "no entry titled \"" + title + "\" — nothing to delete");
+                "no memory titled \"" + title + "\" — nothing to forget");
         }
         return ToolResult::ok(
-            "deleted \"" + title + kEntrySuffix + "\"");
+            "forgot \"" + title + kEntrySuffix + "\"");
     };
 }
 
@@ -1182,111 +1271,136 @@ ToolHandler make_keywords_handler(std::shared_ptr<RagStore> store) {
     };
 }
 
+// Build a RagStore at `root_dir` and eager-load its index. Shared
+// between the six-tool factory (make_rag_tools) and the experimental
+// single-tool factory (make_unified_rag_tool) so both shapes see the
+// same on-disk content and there's no chance of a divergent eager-
+// load policy. After this returns, every read path can take a
+// shared_lock and observe `index_loaded == true` without racing.
+std::shared_ptr<RagStore> build_rag_store(std::string root_dir) {
+    auto store = std::make_shared<RagStore>(std::move(root_dir));
+    {
+        std::unique_lock<std::shared_mutex> init_lock(store->mu);
+        store->load_index_locked();
+    }
+    return store;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
 RagTools make_rag_tools(std::string root_dir) {
-    auto store = std::make_shared<RagStore>(std::move(root_dir));
-
-    // Eager index load under unique_lock. After this, every read path
-    // (rag_search / rag_load / rag_list / rag_keywords) can take a
-    // std::shared_lock and observe `index_loaded == true` without
-    // racing other readers. Single-process is the supported model
-    // (header §"Concurrency"), so the directory is not re-scanned
-    // after startup; the index is kept in sync by save_locked /
-    // delete_locked.
-    {
-        std::unique_lock<std::shared_mutex> init_lock(store->mu);
-        store->load_index_locked();
-    }
+    auto store = build_rag_store(std::move(root_dir));
 
     RagTools out;
 
     out.save = Tool::builder("rag_save")
         .describe(
-            "Save a piece of knowledge to the persistent RAG — your long-term "
-            "memory across sessions. USE THIS AGGRESSIVELY for anything worth "
-            "remembering: the user's stated preferences and constraints, project "
-            "structure and decisions you've learned, technical facts you had to look "
-            "up, recipes / commands that worked, error patterns and their fixes, "
-            "domain knowledge from documents the user fed you. The more carefully "
-            "you populate the registry, the smarter you become over time — future "
-            "conversations will rag_search and find what THIS conversation taught "
-            "you.\n"
+            "Store a memory — your long-term memory across sessions. USE THIS "
+            "AGGRESSIVELY for anything worth remembering: the user's stated "
+            "preferences and constraints, project structure and decisions you've "
+            "learned, technical facts you had to look up, recipes / commands "
+            "that worked, error patterns and their fixes, domain knowledge from "
+            "documents the user fed you. The more carefully you populate your "
+            "memory, the smarter you become over time — future conversations "
+            "will rag_search and find what THIS conversation taught you.\n"
             "\n"
             "Pick a short descriptive title (letters / digits / dash / underscore "
-            "only — no spaces) and 2-5 short keywords so rag_search can find it later. "
-            "Keywords should be stable and reusable: 'user-prefs', 'project-easyai', "
-            "'cmd-recipe', 'fix-vulkan-radv'.\n"
+            "only — no spaces) and 2-5 short keywords so rag_search can recall it "
+            "later. Keywords should be stable and reusable: 'user-prefs', "
+            "'project-easyai', 'cmd-recipe', 'vulkan-radv'.\n"
             "\n"
-            "GRANULARITY: prefer many small focused entries over one large one. "
-            "Save 'easyai-build-mac' and 'easyai-build-linux' as TWO entries, "
-            "not one combined 'easyai-build'. When rag_load returns an entry, "
-            "the FULL body becomes part of your prompt — a 200-line entry "
-            "burns 1000+ tokens you didn't ask for. The search-then-load flow "
-            "is designed so you can pick up to 4 small entries instead of "
-            "drowning in one giant one. Rule of thumb: if a body is over ~500 "
-            "words, it's probably two or more entries pretending to be one.\n"
+            "GRANULARITY: prefer many small focused memories over one large one. "
+            "Store 'easyai-build-mac' and 'easyai-build-linux' as TWO memories, "
+            "not one combined 'easyai-build'. When rag_load returns a memory, "
+            "the FULL body becomes part of your prompt — a 200-line memory burns "
+            "1000+ tokens you didn't ask for. The search-then-recall flow is "
+            "designed so you can pick up to 4 small memories instead of drowning "
+            "in one giant one. Rule of thumb: if a body is over ~500 words, "
+            "it's probably two or more memories pretending to be one.\n"
             "\n"
-            "BEFORE saving, consider calling rag_keywords to see what vocabulary "
+            "BEFORE storing, consider calling rag_keywords to see what vocabulary "
             "you've already been using — reusing existing keywords like "
             "'user-prefs' instead of inventing 'preferences' or 'user_pref' "
-            "keeps the index coherent and future searches sharper. Drift in "
-            "keyword vocabulary is the #1 way an agent's RAG slowly becomes "
-            "useless.\n"
+            "keeps your memory coherent and future searches sharper. Drift in "
+            "keyword vocabulary is the #1 way memory slowly becomes useless.\n"
             "\n"
-            "Overwrites if a title already exists (useful for refining notes as "
-            "you learn more). If an entry becomes stale or wrong, use rag_delete "
-            "to remove it. Each entry is a small Markdown file on disk "
-            "(title.md) so the operator can hand-edit too."
+            "UPDATING: rag_save with the same title overwrites the previous "
+            "memory — that's how you refine a note as you learn more. To forget "
+            "a memory entirely use rag_delete. Each memory is a small Markdown "
+            "file on disk (title.md) so the operator can hand-edit too.\n"
+            "\n"
+            "FIXED MEMORIES (immutable): set fix=true to store a memory the "
+            "system MUST NOT alter or forget — system designs, hard rules, "
+            "domain definitions, anything the user told you to learn as ground "
+            "truth. Fixed memories are recorded with a 'fix-easyai-' title "
+            "prefix; rag_save will refuse to overwrite them and rag_delete will "
+            "refuse to forget them. Use this when the user says \"learn this "
+            "as fixed\", \"remember this as a rule\", \"this is the design — "
+            "memorise it\". Once stored as fixed, the only way to change a "
+            "memory is for the human operator to remove the file from disk."
         )
         .param("title",   "string",
                "Identifier. 1..64 chars. Letters, digits, dash, underscore only. "
                "Becomes the filename on disk. Examples: 'gustavo-ai-box', "
-               "'easyai-build-recipe', 'qwen3-thinking-fix'.", true)
+               "'easyai-build-recipe', 'qwen3-thinking'. With fix=true the "
+               "'fix-easyai-' prefix is auto-added if not present.", true)
         .param("keywords",    "array",
-               "1..8 short keywords classifying this entry. Same character set as "
-               "title. Use stable reusable keywords so future rag_search calls find "
-               "this entry. Example: [\"user-prefs\", \"hardware\", \"radv\"].",
+               "1..8 short keywords classifying this memory. Same character set "
+               "as title. Use stable reusable keywords so future rag_search "
+               "calls recall this memory. Example: [\"user-prefs\", \"hardware\", "
+               "\"radv\"].",
                true)
         .param("content", "string",
                "The actual content to remember. Free-form UTF-8 text up to 256 KB. "
                "Markdown is fine; structured snippets fine; prose fine. Be "
                "specific — vague notes won't help future-you.", true)
+        .param("fix", "boolean",
+               "If true, store as IMMUTABLE memory: the title is prefixed with "
+               "'fix-easyai-' (auto-added) and this memory cannot be overwritten "
+               "by future rag_save or removed by rag_delete. Use only when the "
+               "user explicitly asks to learn something as a fixed rule, system "
+               "design, or ground-truth definition. Default false.", false)
         .handle(make_save_handler(store))
         .build();
 
     out.search = Tool::builder("rag_search")
         .describe(
-            "Search the RAG by one or more keywords. USE THIS BEFORE assuming "
+            "Search your memory by one or more keywords. USE THIS BEFORE assuming "
             "you don't know something the user might have told you in a past "
-            "session — your past self may have already saved the answer.\n\n"
+            "session — your past self may have already remembered the answer.\n\n"
             "Not sure which keywords to try? Call rag_keywords first to see "
             "the vocabulary you've actually been using; pick from THERE rather "
-            "than guessing. A search against keywords that don't exist in the "
-            "RAG just returns 0 entries.\n\n"
+            "than guessing. A search against keywords you've never used just "
+            "returns 0 memories.\n\n"
             "Pass an ARRAY of keywords. Threshold is adaptive:\n"
-            "  - 1 keyword passed  → entries that have that keyword (broad sweep)\n"
-            "  - 2+ keywords       → entries that match AT LEAST 2 of them\n"
+            "  - 1 keyword passed  → memories that have that keyword (broad sweep)\n"
+            "  - 2+ keywords       → memories that match AT LEAST 2 of them\n"
             "                        (narrow query, ranked by overlap)\n"
             "\n"
-            "Each result reports `matched N/M` so you can rank: an entry that "
+            "Each result reports `matched N/M` so you can rank: a memory that "
             "matched 3 of your 4 queried keywords is more relevant than one "
             "that matched only 2. Use this to widen or narrow your search "
             "without an extra round-trip — start with 3-4 related keywords, "
-            "see which entries score highest, then rag_load the 1-4 best.\n"
+            "see which memories score highest, then rag_load the 1-4 best.\n"
+            "\n"
+            "Each result line shows the title, keywords, content size, and a "
+            "`modified:` date so you can tell fresh memories from stale ones. "
+            "Memories whose title starts with `fix-easyai-` are tagged "
+            "[FIXED] — they're immutable: you can recall them but cannot "
+            "overwrite or forget them.\n"
             "\n"
             "Pagination: the response always includes machine-readable header "
             "lines `total_entries: T`, `page: P of N`, `has_more: true|false`. "
             "When `has_more: true` you can issue the SAME query with `page=P+1` "
             "to walk the rest of the result set. Don't paginate unless you "
             "actually need more — the first page is already ranked best-first, "
-            "so the top entries are usually enough.\n"
+            "so the top memories are usually enough.\n"
             "\n"
-            "Returns up to `max_results` entries per page (best-overlap first, "
-            "ties broken by recency). If no entries match the threshold, "
+            "Returns up to `max_results` memories per page (best-overlap first, "
+            "ties broken by recency). If no memory matches the threshold, "
             "`total_entries: 0` is returned (not an error) — try fewer keywords, "
             "or use rag_list to browse."
         )
@@ -1309,73 +1423,90 @@ RagTools make_rag_tools(std::string root_dir) {
 
     out.load = Tool::builder("rag_load")
         .describe(
-            "Load up to 4 entries from the RAG by exact title and return "
-            "their FULL content. Use this after rag_search to read the bodies "
-            "of entries that looked promising in the preview. Pass exact titles "
-            "from a previous rag_search result.\n\n"
+            "Recall up to 4 memories by exact title and return their FULL "
+            "content. Use this after rag_search to read the bodies of memories "
+            "that looked promising in the preview. Pass exact titles from a "
+            "previous rag_search result.\n\n"
+            "Each recalled memory comes back with its keywords, `modified` "
+            "date (human-readable + unix), and a `fixed:` line indicating "
+            "whether the memory is immutable (yes when the title starts with "
+            "`fix-easyai-`).\n\n"
             "Cap is 4 per call. If you need more than 4, you're probably "
             "trying to drown the prompt in stale content; narrow your search "
             "first."
         )
         .param("titles", "array",
-               "Array of 1..4 exact entry titles to load. "
+               "Array of 1..4 exact memory titles to recall. "
                "Example: [\"gustavo-ai-box\", \"easyai-build-recipe\"].", true)
         .handle(make_load_handler(store))
         .build();
 
     out.list = Tool::builder("rag_list")
         .describe(
-            "List RAG titles, optionally filtered by title prefix. Use to "
-            "browse what you've saved when you're not sure what keyword to search by, "
-            "or to confirm whether you've saved a particular note. Returns title, "
-            "keywords, content_bytes, and modified time — body NOT included (use "
-            "rag_load for that). Untagged entries (operator-dropped notes with "
-            "no keywords: header) show here but don't appear in rag_search."
+            "Browse your memories — list titles, optionally filtered by title "
+            "prefix. Use this when you're not sure what keyword to search by, "
+            "or to confirm whether you remember a particular note. Returns "
+            "title, keywords, content_bytes, and modified date (human-"
+            "readable) — body NOT included (use rag_load for that). Memories "
+            "whose title starts with `fix-easyai-` are tagged [FIXED] —- "
+            "they're immutable. Untagged memories (operator-dropped notes "
+            "with no keywords: header) show here but don't appear in "
+            "rag_search.\n\n"
+            "Tip: `prefix='fix-easyai-'` lists every fixed memory in one "
+            "call, useful when you want to see all the ground-truth rules "
+            "the user has had you learn."
         )
         .param("prefix", "string",
                "Optional prefix to filter titles by. Empty = list all. "
-               "Same character set as title. Example: 'easyai-'.", false)
+               "Same character set as title. Example: 'easyai-' or "
+               "'fix-easyai-'.", false)
         .param("max",    "integer",
-               "Maximum entries to return (default 50, max 200).", false)
+               "Maximum memories to return (default 50, max 200).", false)
         .handle(make_list_handler(store))
         .build();
 
     out.del = Tool::builder("rag_delete")
         .describe(
-            "Delete a RAG entry by exact title. Use this when an entry has "
-            "become stale, wrong, or just irrelevant — keeping the registry "
-            "tidy makes future rag_search results sharper. Common reasons to "
-            "delete:\n"
-            "  - the user corrected something and the old note is now wrong\n"
+            "Forget a memory by exact title. Use this when a memory has "
+            "become stale, wrong, or just irrelevant — keeping memory tidy "
+            "makes future rag_search results sharper. Common reasons to forget:\n"
+            "  - the user corrected something and the old memory is now wrong\n"
             "  - a project / preference / fact has changed\n"
-            "  - you want to refine a note: delete + rag_save replaces it\n"
-            "    cleanly (rag_save also overwrites, but delete-first is\n"
+            "  - you want to refine a memory: forget + rag_save replaces it\n"
+            "    cleanly (rag_save also overwrites, but forget-first is\n"
             "    appropriate when the title or keywords need to change too)\n"
-            "  - the entry was a one-off scratch note that's no longer needed\n"
+            "  - the memory was a one-off scratch note no longer needed\n"
             "\n"
-            "Idempotent: deleting a non-existent title is not an error. The "
-            "deletion is permanent — there's no trash. Be certain before "
-            "calling."
+            "FIXED MEMORIES CANNOT BE FORGOTTEN: any title starting with "
+            "`fix-easyai-` is immutable — rag_delete will refuse the call "
+            "and tell you why. The operator can remove the file from disk by "
+            "hand if it really must go.\n"
+            "\n"
+            "Idempotent on non-fixed memories: forgetting a non-existent "
+            "title is not an error. The forget is permanent — there's no "
+            "trash. Be certain before calling."
         )
         .param("title", "string",
-               "Exact title to delete. Letters, digits, dash, underscore. "
-               "1..64 chars.", true)
+               "Exact title to forget. Letters, digits, dash, underscore. "
+               "1..64 chars. Titles starting with `fix-easyai-` are "
+               "immutable and will be rejected.", true)
         .handle(make_delete_handler(store))
         .build();
 
     out.keywords = Tool::builder("rag_keywords")
         .describe(
-            "Vocabulary overview: list every distinct keyword used across the "
-            "RAG, with the number of entries that reference it. CALL THIS "
-            "BEFORE rag_save when you're not sure which keywords to use, and "
-            "BEFORE rag_search when you're not sure what's even in the RAG.\n"
+            "Vocabulary overview of your memory: list every distinct keyword "
+            "you've used, with the number of memories that reference it. "
+            "CALL THIS BEFORE rag_save when you're not sure which keywords "
+            "to use, and BEFORE rag_search when you're not sure what's in "
+            "your memory.\n"
             "\n"
             "Why it matters: over time, an agent that doesn't check its own "
             "vocabulary creates near-duplicates ('user-prefs' vs 'user_pref' "
-            "vs 'preferences') and the index fragments — old entries become "
-            "unreachable to new searches. Calling rag_keywords first lets you "
-            "reuse the vocabulary you've already established, keeping the "
-            "index coherent.\n"
+            "vs 'preferences') and memory fragments — old memories become "
+            "unreachable to new searches. Calling rag_keywords first lets "
+            "you reuse the vocabulary you've already established, keeping "
+            "your memory coherent.\n"
             "\n"
             "Output is sorted by frequency (most-used keyword first) so the "
             "first lines are the dimensions you've been investing in. The "
@@ -1385,7 +1516,7 @@ RagTools make_rag_tools(std::string root_dir) {
             "established vocabulary."
         )
         .param("min_count", "integer",
-               "Hide keywords used by fewer than this many entries (default 1 = "
+               "Hide keywords used by fewer than this many memories (default 1 = "
                "show all). Set min_count=2 to filter out one-offs and see only "
                "your established vocabulary.", false)
         .param("max",       "integer",
@@ -1396,6 +1527,193 @@ RagTools make_rag_tools(std::string root_dir) {
         .build();
 
     return out;
+}
+
+// ---------------------------------------------------------------------------
+// Experimental: single-tool dispatcher
+// ---------------------------------------------------------------------------
+// Wraps the same six handlers behind one Tool that takes an `action`
+// parameter. The handler closures (make_save_handler / make_search_handler
+// / etc.) read every other parameter directly out of `arguments_json`,
+// so the dispatcher doesn't need to translate anything — it just picks
+// the right closure by `action` and forwards the original ToolCall.
+//
+// Schema is a kitchen sink (every parameter optional except `action`)
+// because JSON Schema's discriminated-union shapes (oneOf with a
+// discriminator) trip up smaller / quantised tool-callers far more
+// often than a flat "everything optional" schema does. Validation
+// stays runtime: each handler rejects calls missing its required
+// fields with the same crisp messages the legacy six-tool flow uses.
+//
+// The on-disk format and locking discipline are byte-identical to the
+// six-tool build — same RagStore, same load_index_locked() pre-warm,
+// same shared/unique mutex split.
+Tool make_unified_rag_tool(std::string root_dir) {
+    auto store = build_rag_store(std::move(root_dir));
+
+    // Capture each per-action handler once; the dispatcher closes
+    // over the resulting std::function set. Same store is shared, so
+    // index updates from `save` / `delete` are visible to subsequent
+    // `search` / `load` / `list` / `keywords` calls inside the same
+    // process.
+    auto h_save     = make_save_handler    (store);
+    auto h_search   = make_search_handler  (store);
+    auto h_load     = make_load_handler    (store);
+    auto h_list     = make_list_handler    (store);
+    auto h_delete   = make_delete_handler  (store);
+    auto h_keywords = make_keywords_handler(store);
+
+    return Tool::builder("rag")
+        .describe(
+            "EXPERIMENTAL — your memory, accessed through one tool. Pick an "
+            "action; the parameters needed depend on which action you choose. "
+            "Six actions are supported, each mapping 1:1 to a behaviour from "
+            "the legacy six-tool RAG layout:\n"
+            "\n"
+            "  action=\"save\"\n"
+            "    Store a memory. Required: title, keywords (array, 1..8), "
+            "    content. Optional: fix (boolean — when true, the title is "
+            "    auto-prepended with `fix-easyai-` and the memory becomes "
+            "    immutable: future save / delete on it are refused).\n"
+            "\n"
+            "  action=\"search\"\n"
+            "    Search memories by keyword(s). Required: keywords (array). "
+            "    With one keyword you get any memory carrying it; with two "
+            "    or more, only memories matching ≥2 of them, ranked by "
+            "    overlap. Optional: max_results (default 10, max 20), "
+            "    page (default 1; the response includes `total_entries`, "
+            "    `page: P of N`, `has_more` for pagination).\n"
+            "\n"
+            "  action=\"load\"\n"
+            "    Recall the FULL content of up to 4 memories by exact "
+            "    title. Required: titles (array of 1..4 exact titles from "
+            "    a previous search). Cap is 4 to keep the prompt slim — "
+            "    narrow your search if you need more.\n"
+            "\n"
+            "  action=\"list\"\n"
+            "    Browse memories without loading bodies. Optional: prefix "
+            "    (filter titles; pass `fix-easyai-` to see every immutable "
+            "    memory), max (default 50, max 200).\n"
+            "\n"
+            "  action=\"delete\"\n"
+            "    Forget a memory. Required: title (exact). Memories whose "
+            "    title starts with `fix-easyai-` are immutable and cannot "
+            "    be forgotten through this tool.\n"
+            "\n"
+            "  action=\"keywords\"\n"
+            "    Vocabulary overview: every distinct keyword you've used "
+            "    with how many memories carry it. CALL BEFORE save / search "
+            "    when you're not sure what vocabulary you've established. "
+            "    Optional: min_count (default 1), max (default 200, max 500).\n"
+            "\n"
+            "Search and list responses include a human-readable `modified` "
+            "date on every memory and tag immutable ones with [FIXED]. "
+            "Load responses include the same plus a `fixed: yes/no` line.\n"
+            "\n"
+            "USE THIS AGGRESSIVELY: anything worth remembering across "
+            "sessions — user preferences, project decisions, command "
+            "recipes, error fixes, domain knowledge — should land here. "
+            "Future conversations will rag(action=\"search\") and find "
+            "what THIS conversation taught you."
+        )
+        .param("action",      "string",
+               "Required. One of: \"save\", \"search\", \"load\", \"list\", "
+               "\"delete\", \"keywords\". Each action consumes a subset of "
+               "the other parameters; see the tool description for the "
+               "per-action requirements.", true)
+        .param("title",       "string",
+               "Used by save / delete. 1..64 chars [A-Za-z0-9._+-]. With "
+               "fix=true on a save the prefix `fix-easyai-` is auto-added "
+               "if not present.", false)
+        .param("titles",      "array",
+               "Used by load. Array of 1..4 exact memory titles to recall.",
+               false)
+        .param("keywords",    "array",
+               "Used by save / search. 1..8 short keywords [A-Za-z0-9._+-]. "
+               "On save: tags this memory; on search: the query.",
+               false)
+        .param("content",     "string",
+               "Used by save. The memory body, free-form UTF-8 up to 256 KB.",
+               false)
+        .param("fix",         "boolean",
+               "Used by save. When true, store as IMMUTABLE — title is "
+               "prefixed with `fix-easyai-` and future save / delete on "
+               "this memory are refused. Use only when the user explicitly "
+               "asks to learn something as a fixed rule / system design / "
+               "ground-truth definition. Default false.", false)
+        .param("prefix",      "string",
+               "Used by list. Filter titles starting with this prefix. "
+               "Pass `fix-easyai-` to see every immutable memory.", false)
+        .param("max",         "integer",
+               "Used by list / keywords. Result cap. List default 50 "
+               "(max 200); keywords default 200 (max 500).", false)
+        .param("max_results", "integer",
+               "Used by search. Page size (default 10, max 20).", false)
+        .param("page",        "integer",
+               "Used by search. 1-based page index (default 1). Use when "
+               "a previous search returned `has_more: true`.", false)
+        .param("min_count",   "integer",
+               "Used by keywords. Hide keywords used by fewer than this "
+               "many memories (default 1 = show all). Set min_count=2 to "
+               "filter out one-offs.", false)
+        .handle([h_save, h_search, h_load, h_list, h_delete, h_keywords]
+                (const ToolCall & c) -> ToolResult {
+            std::string action;
+            if (!args::get_string(c.arguments_json, "action", action)
+                    || action.empty()) {
+                return ToolResult::error(
+                    "missing required argument: action. Use one of "
+                    "\"save\", \"search\", \"load\", \"list\", \"delete\", "
+                    "\"keywords\".");
+            }
+            // Each branch forwards the original ToolCall — the per-
+            // action handlers parse their own params out of
+            // arguments_json with the same helpers (args::get_string,
+            // parse_string_array, etc.) the legacy six-tool flow uses,
+            // so error messages and validation stay byte-identical.
+            ToolResult r;
+            if      (action == "save")     r = h_save(c);
+            else if (action == "search")   r = h_search(c);
+            else if (action == "load")     r = h_load(c);
+            else if (action == "list")     r = h_list(c);
+            else if (action == "delete")   r = h_delete(c);
+            else if (action == "keywords") r = h_keywords(c);
+            else {
+                return ToolResult::error(
+                    "unknown action \"" + action + "\". Valid: \"save\", "
+                    "\"search\", \"load\", \"list\", \"delete\", "
+                    "\"keywords\".");
+            }
+
+            // The inner handlers still cite the six-tool names
+            // (rag_save, rag_search, ...) in their guidance prose.
+            // In unified mode the model has only `rag` in its
+            // catalog, so any literal `rag_<verb>` reference would
+            // be a dangling identifier. Rewrite each occurrence in
+            // place to the dispatch form the model can actually
+            // call. Cheap (O(n) over a small message); the set of
+            // substitutions is closed and stable.
+            struct Sub { const char * from; const char * to; };
+            static const Sub kSubs[] = {
+                { "rag_save",     "rag(action=\"save\")"     },
+                { "rag_search",   "rag(action=\"search\")"   },
+                { "rag_load",     "rag(action=\"load\")"     },
+                { "rag_list",     "rag(action=\"list\")"     },
+                { "rag_delete",   "rag(action=\"delete\")"   },
+                { "rag_keywords", "rag(action=\"keywords\")" },
+            };
+            for (const auto & s : kSubs) {
+                std::string from = s.from;
+                std::string to   = s.to;
+                size_t pos = 0;
+                while ((pos = r.content.find(from, pos)) != std::string::npos) {
+                    r.content.replace(pos, from.size(), to);
+                    pos += to.size();
+                }
+            }
+            return r;
+        })
+        .build();
 }
 
 }  // namespace easyai::tools

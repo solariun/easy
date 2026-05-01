@@ -128,9 +128,23 @@ EOF
     fi
 fi
 
+# brew openssl@3 is keg-only — find_package(OpenSSL) needs an explicit
+# hint or it half-detects the macOS system libs and fails to create the
+# imported OpenSSL::SSL target. Resolve once here and pass to CMake.
+# Empty string is harmless to CMake (it'll fall back to its own search).
+openssl_root=""
+if command -v brew >/dev/null 2>&1; then
+    openssl_root="$(brew --prefix openssl@3 2>/dev/null || true)"
+fi
+if [[ -z "$openssl_root" ]]; then
+    echo "==> brew openssl@3 not found — HTTPS in easyai-cli will be disabled."
+    echo "    install with: brew install openssl@3"
+fi
+
 echo "==> Configuring (Metal/AMX, $BUILD_TYPE, $BUILD_DIR)"
 cmake -S "$script_dir" -B "$BUILD_DIR" \
     -DCMAKE_BUILD_TYPE="$BUILD_TYPE" \
+    -DOPENSSL_ROOT_DIR="$openssl_root" \
     -DEASYAI_BUILD_EXAMPLES=ON \
     -DEASYAI_WITH_CURL=ON \
     -DEASYAI_BUILD_WEBUI=ON \

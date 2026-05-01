@@ -31,6 +31,7 @@ namespace easyai::cli {
 // Composes the canonical "agent flavour" of the built-in tools:
 //   - datetime           (always)
 //   - web_search/fetch   (unless no_web())
+//   - web_google         (when use_google() is called AND env vars set)
 //   - plan tool          (when with_plan(Plan&) is called)
 //   - fs_*               (when sandbox(<dir>) is called — scoped to <dir>)
 //   - bash               (when allow_bash() is called)
@@ -53,6 +54,13 @@ public:
     Toolbelt & with_plan    (Plan & plan);
     Toolbelt & no_web       (bool on = true);    // drop web_search/web_fetch
     Toolbelt & no_datetime  (bool on = true);    // drop datetime
+
+    // Opt-in: register web_google (Google Custom Search JSON API).
+    // Off by default — the API needs GOOGLE_API_KEY + GOOGLE_CSE_ID env
+    // vars and counts against a quota, so we don't expose it unless the
+    // caller asks. Even when on, the tool is only added to the catalog
+    // if both env vars are present at apply()-time.
+    Toolbelt & use_google   (bool on = true);
 
     // Materialise the configured tool list.  Order is the canonical
     // one shown above; callers can append their own tools after.
@@ -77,6 +85,7 @@ private:
     bool        allow_bash_  = false;
     bool        no_web_      = false;
     bool        no_datetime_ = false;
+    bool        use_google_  = false;
     Plan *      plan_        = nullptr;
 };
 

@@ -35,6 +35,11 @@
 #include <curl/curl.h>
 #endif
 
+// nlohmann/json reaches us transitively through llama-common's interface
+// includes (vendor copy at llama.cpp/vendor/nlohmann/json.hpp). Used by
+// web_google to parse the Custom Search JSON API response.
+#include <nlohmann/json.hpp>
+
 namespace easyai::tools {
 
 namespace fs = std::filesystem;
@@ -717,6 +722,153 @@ Tool web_search() {
                 return ToolResult::error(
                     "no results parsed (DuckDuckGo may have rate-limited the "
                     "request; try again in a minute)");
+            }
+            return ToolResult::ok(clip(out.str(), 8 * 1024));
+#endif
+        })
+        .build();
+}
+
+// ============================================================================
+// web_google — Google Custom Search JSON API client
+// ----------------------------------------------------------------------------
+// Why an API rather than a scraper: google.com/search aggressively gates
+// scripted clients (CAPTCHA, "unusual traffic", JS-only result panels) so
+// a scraper version is unreliable in seconds. The Custom Search JSON API
+// is the supported, stable interface — small JSON, predictable schema,
+// no UA games — at the cost of needing two env vars (GOOGLE_API_KEY +
+// GOOGLE_CSE_ID). Free tier is 100 queries/day; over that you pay per 1k.
+//
+// We read the env vars at CALL time (not registration) so:
+//   1. A long-running server picks up newly-rotated keys without restart.
+//   2. The tool can produce a clear actionable error when a key is
+//      missing instead of silently disappearing from the catalog.
+// The cli.cpp / Toolbelt registration still gates exposure on the env
+// being set, so the model only sees the tool when it would actually work
+// — but if it does see it and the keys vanish later, the error message
+// tells the user exactly which variable to set.
+// ============================================================================
+Tool web_google() {
+    return Tool::builder("web_google")
+        .describe("Search the web via Google's Custom Search JSON API. "
+                  "Returns a numbered list of title / url / snippet results "
+                  "— same shape as web_search but using Google's index. "
+                  "Snippets are 1-2 short sentences; NEVER summarize from "
+                  "them alone. After this call, you MUST call web_fetch on "
+                  "the top 1-3 most relevant URLs to read the actual page "
+                  "content, then base your answer on the fetched text.\n"
+                  "\n"
+                  "Requires GOOGLE_API_KEY and GOOGLE_CSE_ID environment "
+                  "variables. Free tier is capped at 100 queries/day "
+                  "across the whole API key.")
+        .param("query",       "string",  "Search query", true)
+        .param("max_results", "integer", "Maximum results to return "
+                                         "(default 5, max 10 — the per-call "
+                                         "ceiling of Google CSE)", false)
+        .handle([](const ToolCall & c) {
+#if !defined(EASYAI_HAVE_CURL)
+            (void) c;
+            return ToolResult::error(
+                "web_google unavailable: easyai built without libcurl");
+#else
+            std::string query;
+            if (!args::get_string(c.arguments_json, "query", query) || query.empty()) {
+                return ToolResult::error("missing required arg: query");
+            }
+            long long max_results = 5;
+            args::get_int(c.arguments_json, "max_results", max_results);
+            if (max_results < 1)  max_results = 1;
+            if (max_results > 10) max_results = 10;   // CSE per-call ceiling
+
+            const char * api_key = std::getenv("GOOGLE_API_KEY");
+            const char * cse_id  = std::getenv("GOOGLE_CSE_ID");
+            if (!api_key || !*api_key) {
+                return ToolResult::error(
+                    "GOOGLE_API_KEY env var not set — get one at "
+                    "https://console.cloud.google.com/apis/credentials "
+                    "(enable 'Custom Search API' first)");
+            }
+            if (!cse_id || !*cse_id) {
+                return ToolResult::error(
+                    "GOOGLE_CSE_ID env var not set — create a Programmable "
+                    "Search Engine at https://programmablesearchengine.google.com "
+                    "and copy the 'cx' value");
+            }
+
+            // Build the GET URL. The API ignores trailing whitespace but we
+            // url_encode every component so a query containing &, =, # or
+            // unicode is preserved verbatim.
+            std::string url = "https://www.googleapis.com/customsearch/v1?";
+            url += "key=" + url_encode(api_key);
+            url += "&cx=" + url_encode(cse_id);
+            url += "&q="  + url_encode(query);
+            url += "&num=" + std::to_string(max_results);
+            // Safe-search default — Google's "off" leaves NSFW in the
+            // mix, "active" filters explicit content. We pick "active"
+            // for the same reason web_search uses kl=us-en: predictable
+            // results in a tool the model is steering autonomously.
+            url += "&safe=active";
+
+            std::string body, err;
+            // 1 MiB cap is plenty — CSE responses are typically <50 KiB
+            // even at num=10. Default 20s timeout is fine for an API call.
+            if (!http_get(url, {}, body, err, 20, 1024 * 1024)) {
+                // Google returns 4xx with a JSON error body explaining
+                // what's wrong (bad key, quota, disabled API). http_get
+                // dropped the body on HTTP>=400, so we can only surface
+                // the status code — but the message is still actionable
+                // because the most common 4xx is "key invalid / quota".
+                return ToolResult::error("google search failed: " + err
+                    + " (verify GOOGLE_API_KEY, GOOGLE_CSE_ID, and that "
+                      "Custom Search API is enabled in your Cloud project)");
+            }
+
+            // ----- parse JSON -----------------------------------------------
+            // Schema:
+            //   { "items": [ { "title", "link", "snippet" }, ... ],
+            //     "searchInformation": { "totalResults": "..." } }
+            // Missing items = no results; we don't treat that as an error.
+            nlohmann::json j;
+            try {
+                j = nlohmann::json::parse(body);
+            } catch (const std::exception & e) {
+                return ToolResult::error(
+                    std::string("google search: malformed JSON response: ") + e.what());
+            }
+
+            // Some error conditions (e.g. malformed cx) return 200 with
+            // {"error": {"message": "..."}}. Surface that explicitly.
+            if (j.contains("error") && j["error"].is_object()) {
+                std::string msg = j["error"].value("message", "unknown error");
+                return ToolResult::error("google search rejected request: " + msg);
+            }
+
+            std::ostringstream out;
+            out << "Top web results for: " << query << "\n";
+            int count = 0;
+            if (j.contains("items") && j["items"].is_array()) {
+                for (const auto & item : j["items"]) {
+                    if (count >= max_results) break;
+                    std::string title = item.value("title",   std::string{});
+                    std::string link  = item.value("link",    std::string{});
+                    std::string snip  = item.value("snippet", std::string{});
+                    // Google's snippet field has literal "\n" sequences for
+                    // line wraps in the rendered card; flatten them so the
+                    // result list reads as a single line per snippet.
+                    std::replace(snip.begin(), snip.end(), '\n', ' ');
+                    if (link.empty() || title.empty()) continue;
+                    out << "\n" << (count + 1) << ". " << title
+                        << "\n   " << link
+                        << "\n   " << clip(snip, 300) << "\n";
+                    ++count;
+                }
+            }
+
+            if (count == 0) {
+                return ToolResult::error(
+                    "no results — try a broader query, or verify the CSE "
+                    "is configured to search the entire web (not just a "
+                    "single site) at https://programmablesearchengine.google.com");
             }
             return ToolResult::ok(clip(out.str(), 8 * 1024));
 #endif

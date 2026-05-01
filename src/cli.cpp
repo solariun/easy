@@ -27,6 +27,7 @@ Toolbelt & Toolbelt::allow_bash (bool on)         { allow_bash_  = on;          
 Toolbelt & Toolbelt::with_plan  (Plan & plan)     { plan_        = &plan;          return *this; }
 Toolbelt & Toolbelt::no_web     (bool on)         { no_web_      = on;             return *this; }
 Toolbelt & Toolbelt::no_datetime(bool on)         { no_datetime_ = on;             return *this; }
+Toolbelt & Toolbelt::use_google (bool on)         { use_google_  = on;             return *this; }
 
 std::vector<Tool> Toolbelt::tools() const {
     std::vector<Tool> out;
@@ -36,6 +37,19 @@ std::vector<Tool> Toolbelt::tools() const {
     if (!no_web_) {
         out.push_back(easyai::tools::web_search());
         out.push_back(easyai::tools::web_fetch());
+    }
+    // web_google requires explicit opt-in (--use-google in the CLI →
+    // Toolbelt::use_google()) AND the GOOGLE_API_KEY + GOOGLE_CSE_ID env
+    // vars present. Both gates are intentional: the API counts against a
+    // quota and may incur cost, so we never auto-expose it. The tool
+    // itself rechecks the env at call time, so a key rotation mid-
+    // session surfaces a clear error rather than silent disappearance.
+    if (use_google_) {
+        const char * gk = std::getenv("GOOGLE_API_KEY");
+        const char * gx = std::getenv("GOOGLE_CSE_ID");
+        if (gk && *gk && gx && *gx) {
+            out.push_back(easyai::tools::web_google());
+        }
     }
     if (allow_fs_ && !sandbox_.empty()) {
         out.push_back(easyai::tools::fs_list_dir  (sandbox_));

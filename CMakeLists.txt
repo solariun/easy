@@ -173,8 +173,17 @@ target_compile_features(easyai_cli PUBLIC cxx_std_17)
 # OpenSSL -> HTTPS support inside libeasyai-cli.  Optional: when libssl
 # isn't available we skip the define and Client returns a clear
 # "HTTPS not in this build" error at request time.
+#
+# We additionally guard on `TARGET OpenSSL::SSL` because on macOS without
+# brew openssl@3 (keg-only), FindOpenSSL can half-detect the system libs:
+# it sets OpenSSL_FOUND=TRUE but fails to create the imported targets,
+# which would then break the configure with "Target ... links to
+# OpenSSL::SSL but the target was not found". The guard makes that case
+# degrade to "HTTPS not in this build" instead of a hard error — point
+# the build at brew openssl via -DOPENSSL_ROOT_DIR=$(brew --prefix
+# openssl@3) (the install + build_macos scripts do this automatically).
 find_package(OpenSSL QUIET)
-if (OpenSSL_FOUND)
+if (OpenSSL_FOUND AND TARGET OpenSSL::SSL AND TARGET OpenSSL::Crypto)
     target_compile_definitions(easyai_cli PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT=1)
     target_link_libraries(easyai_cli PRIVATE OpenSSL::SSL OpenSSL::Crypto)
     # On macOS, cpp-httplib's SSL build calls CFArray* / SecCertificate* /
@@ -192,6 +201,11 @@ if (OpenSSL_FOUND)
         endif()
     endif()
     message(STATUS "easyai-cli: OpenSSL found — HTTPS endpoints enabled")
+elseif (OpenSSL_FOUND)
+    message(WARNING "easyai-cli: OpenSSL detected but imported targets "
+                    "OpenSSL::SSL/Crypto were not created — HTTPS disabled. "
+                    "On macOS, install brew openssl@3 and pass "
+                    "-DOPENSSL_ROOT_DIR=$(brew --prefix openssl@3).")
 else()
     message(STATUS "easyai-cli: OpenSSL NOT found — HTTPS endpoints will be rejected at runtime")
 endif()

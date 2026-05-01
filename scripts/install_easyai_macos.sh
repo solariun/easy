@@ -192,11 +192,17 @@ if ! command -v brew >/dev/null 2>&1; then
 fi
 log "brew: $(brew --version | head -1)"
 
-# Only install via brew if the command isn't already on PATH (Xcode CLT
-# provides git and curl; cmake is the one that typically needs brew).
-brew_pkgs=(cmake git curl)
+# git + curl ship with Xcode CLT, so we only brew-install them when the
+# command is missing entirely. cmake and openssl@3 are different — they
+# don't come with CLT and openssl@3 is keg-only (no PATH symlinks), so
+# we probe brew directly and install if absent regardless of any system
+# stubs. macOS' /usr/lib has no usable libssl anymore, so without brew
+# openssl, CMake's find_package(OpenSSL) half-detects something and
+# fails to create the imported OpenSSL::SSL target, breaking both
+# easyai_cli and the vendored cpp-httplib (LLAMA_OPENSSL=ON by default).
 need_install=()
-for p in "${brew_pkgs[@]}"; do
+
+for p in git curl; do
     if command -v "$p" >/dev/null 2>&1; then
         log "$p: $(command -v "$p")"
     elif ! brew list --formula "$p" >/dev/null 2>&1; then
@@ -205,10 +211,24 @@ for p in "${brew_pkgs[@]}"; do
         log "$p: installed via brew (not linked)"
     fi
 done
+
+for p in cmake openssl@3; do
+    if brew list --formula "$p" >/dev/null 2>&1; then
+        log "$p: installed via brew"
+    else
+        need_install+=("$p")
+    fi
+done
+
 if [[ ${#need_install[@]} -gt 0 ]]; then
     log "installing brew packages: ${need_install[*]}"
     brew install "${need_install[@]}"
 fi
+
+# Capture the brew openssl prefix for the cmake configure below. Brew's
+# openssl is keg-only, so we have to spoonfeed the path to find_package.
+OPENSSL_ROOT_DIR="$(brew --prefix openssl@3)"
+log "openssl root: $OPENSSL_ROOT_DIR"
 
 # ---------------------------------------------------------------------------
 # Step 2 — clone / refresh llama.cpp sibling.
@@ -266,6 +286,7 @@ cmake_args=(
     -B "$BUILD_DIR"
     -DCMAKE_BUILD_TYPE=Release
     -DCMAKE_INSTALL_PREFIX="$PREFIX"
+    -DOPENSSL_ROOT_DIR="$OPENSSL_ROOT_DIR"
     -DEASYAI_BUILD_EXAMPLES=ON
     -DEASYAI_WITH_CURL=ON
     -DEASYAI_BUILD_WEBUI=ON
