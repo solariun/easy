@@ -378,6 +378,25 @@ std::string render_entry(const std::vector<std::string> & keywords,
     return out;
 }
 
+// Filesystem mtime as Unix seconds. fs::file_time_type's epoch isn't
+// guaranteed by the standard, so we shift it onto system_clock via the
+// C++17 idiom (subtract the file_clock "now", add the system_clock
+// "now"). Returns 0 when the path can't be stat'd — every caller pairs
+// this with other index fields, so a "stat failed" zero keeps the
+// in-memory index self-consistent without forcing an error channel
+// through three otherwise-different read sites.
+inline std::int64_t file_mtime_unix(const fs::path & p) {
+    std::error_code ec;
+    const auto ftime = fs::last_write_time(p, ec);
+    if (ec) return 0;
+    const auto sctp = std::chrono::time_point_cast<
+        std::chrono::system_clock::duration>(
+        ftime - decltype(ftime)::clock::now()
+              + std::chrono::system_clock::now());
+    return std::chrono::duration_cast<std::chrono::seconds>(
+        sctp.time_since_epoch()).count();
+}
+
 // ---------------------------------------------------------------------------
 // EntryMeta — what the in-memory index stores per title.
 // ---------------------------------------------------------------------------
@@ -479,19 +498,7 @@ struct RagStore {
                 }
             }
             m.content_bytes = pe.body.size();
-            // Modified time from filesystem stat. fs::last_write_time
-            // returns a file_time_type whose epoch isn't guaranteed;
-            // convert to system_clock via a C++17 trick to get unix.
-            auto ftime = fs::last_write_time(e.path(), ec);
-            if (!ec) {
-                auto sctp = std::chrono::time_point_cast<
-                    std::chrono::system_clock::duration>(
-                    ftime - decltype(ftime)::clock::now()
-                          + std::chrono::system_clock::now());
-                m.modified_unix = std::chrono::duration_cast<
-                    std::chrono::seconds>(
-                    sctp.time_since_epoch()).count();
-            }
+            m.modified_unix = file_mtime_unix(e.path());
             index[title] = std::move(m);
         }
     }
@@ -547,15 +554,7 @@ struct RagStore {
         m.keywords = keywords;
         // Read mtime back from the file we just wrote so the index
         // matches what the FS will report.
-        auto ftime = fs::last_write_time(target, ec);
-        if (!ec) {
-            auto sctp = std::chrono::time_point_cast<
-                std::chrono::system_clock::duration>(
-                ftime - decltype(ftime)::clock::now()
-                      + std::chrono::system_clock::now());
-            m.modified_unix = std::chrono::duration_cast<
-                std::chrono::seconds>(sctp.time_since_epoch()).count();
-        }
+        m.modified_unix = file_mtime_unix(target);
         m.content_bytes = content.size();
         index[title] = std::move(m);
         return true;
@@ -587,16 +586,7 @@ struct RagStore {
             if (is_valid_id(t, kMaxKeywordBytes)) keywords_out.push_back(std::move(t));
         }
         body_out = std::move(pe.body);
-        modified_unix_out = 0;
-        auto ftime = fs::last_write_time(target, ec);
-        if (!ec) {
-            auto sctp = std::chrono::time_point_cast<
-                std::chrono::system_clock::duration>(
-                ftime - decltype(ftime)::clock::now()
-                      + std::chrono::system_clock::now());
-            modified_unix_out = std::chrono::duration_cast<
-                std::chrono::seconds>(sctp.time_since_epoch()).count();
-        }
+        modified_unix_out = file_mtime_unix(target);
         return true;
     }
 

@@ -976,6 +976,44 @@ struct Sandbox {
     }
 };
 
+// Regex metacharacters that need escaping when we lift a glob pattern
+// into a regex. Curly braces and brackets are included even though they
+// only become metachars in some POSIX dialects — std::regex (ECMAScript
+// by default) tolerates the over-escape and we'd rather be conservative
+// than leak a syntax error from a model-supplied pattern.
+constexpr const char * kGlobRegexMetachars = ".+()|^$\\{}[]";
+
+// Convert a shell-style glob into an anchored ECMAScript regex.
+//   *   -> [^/]*    (matches anything except a path separator)
+//   **  -> .*       (matches anything, including separators)
+//   ?   -> [^/]     (one char except a separator)
+//   regex metachars are escaped; everything else passes through.
+// The output is wrapped in ^...$ so std::regex_match treats it as a
+// whole-string predicate — same semantics as ::fnmatch(3) without the
+// platform's globbing edge cases.
+inline std::string glob_to_regex(const std::string & pattern) {
+    std::string re = "^";
+    re.reserve(pattern.size() * 2 + 2);
+    for (std::size_t i = 0; i < pattern.size(); ++i) {
+        const char ch = pattern[i];
+        if (ch == '*') {
+            const bool is_double_star =
+                (i + 1 < pattern.size() && pattern[i + 1] == '*');
+            if (is_double_star) { re += ".*"; ++i; }
+            else                { re += "[^/]*"; }
+        } else if (ch == '?') {
+            re += "[^/]";
+        } else if (std::strchr(kGlobRegexMetachars, ch)) {
+            re += '\\';
+            re += ch;
+        } else {
+            re += ch;
+        }
+    }
+    re += '$';
+    return re;
+}
+
 }  // namespace
 
 Tool fs_read_file(std::string root) {
@@ -1149,27 +1187,8 @@ Tool fs_glob(std::string root) {
                                          + sb->virtual_path(start));
             }
 
-            // wildcard -> regex
-            std::string re = "^";
-            for (size_t i = 0; i < pattern.size(); ++i) {
-                char ch = pattern[i];
-                if (ch == '*') {
-                    if (i + 1 < pattern.size() && pattern[i + 1] == '*') {
-                        re += ".*"; ++i;
-                    } else {
-                        re += "[^/]*";
-                    }
-                } else if (ch == '?') {
-                    re += "[^/]";
-                } else if (std::strchr(".+()|^$\\{}[]", ch)) {
-                    re += '\\'; re += ch;
-                } else {
-                    re += ch;
-                }
-            }
-            re += "$";
             std::regex rx;
-            try { rx = std::regex(re); }
+            try { rx = std::regex(glob_to_regex(pattern)); }
             catch (const std::regex_error & e) {
                 return ToolResult::error(std::string("bad glob pattern: ") + e.what());
             }

@@ -551,6 +551,45 @@ std::string strip_marker_spans(const std::string & s,
 
 }  // namespace (markdown-recovery helpers)
 
+// Heuristic: does this short reply look like an "announce-without-action"
+// turn — the model promising to do something ("Let me search…", "I'll
+// look that up…") but emitting no tool_call? Used by chat_continue's
+// retry-with-nudge path. We match a small library of leading phrases
+// against a lower-cased copy. False positives lose the user one nudge
+// round-trip; false negatives let an announce-only turn through. Empty
+// content also counts as announce — model finished early without saying
+// anything actionable, so a nudge is the safe move.
+bool looks_like_announce_phrase(const std::string & s) {
+    if (s.empty()) return true;
+    std::string lc;
+    lc.reserve(s.size());
+    for (char c : s) lc.push_back((char) std::tolower((unsigned char) c));
+    static const char * patterns[] = {
+        "let me ",
+        "i'll ",
+        "i will ",
+        "i'm going to ",
+        "i am going to ",
+        "let's ",
+        "one moment",
+        "hold on",
+        "give me a moment",
+        "give me a sec",
+        "searching ",
+        "looking up",
+        "looking that up",
+        "checking the",
+        "fetching ",
+        "i'll check",
+        "i'll look",
+        "i'll search",
+    };
+    for (const char * p : patterns) {
+        if (lc.find(p) != std::string::npos) return true;
+    }
+    return false;
+}
+
 }  // namespace (top-level helpers)
 
 // ===========================================================================
@@ -1417,43 +1456,13 @@ std::string Engine::chat_continue() {
             //   - tools are configured (otherwise nothing to call)
             //   - reply is short (otherwise it's not an announce)
             //   - reply EITHER is empty OR matches an announce phrase
-            auto looks_like_announce = [](const std::string & s) -> bool {
-                if (s.empty()) return true;
-                std::string lc;
-                lc.reserve(s.size());
-                for (char c : s) lc.push_back((char) std::tolower((unsigned char) c));
-                static const char * patterns[] = {
-                    "let me ",
-                    "i'll ",
-                    "i will ",
-                    "i'm going to ",
-                    "i am going to ",
-                    "let's ",
-                    "one moment",
-                    "hold on",
-                    "give me a moment",
-                    "give me a sec",
-                    "searching ",
-                    "looking up",
-                    "looking that up",
-                    "checking the",
-                    "fetching ",
-                    "i'll check",
-                    "i'll look",
-                    "i'll search",
-                };
-                for (const char * p : patterns) {
-                    if (lc.find(p) != std::string::npos) return true;
-                }
-                return false;
-            };
-
+            //     (see looks_like_announce_phrase at file top)
             if (p_->retry_on_incomplete
                     && incomplete_retries < kMaxIncompleteRetries
                     && hop + 1 < kMaxToolHops
                     && !p_->tools.empty()
                     && final_text.size() < kAnnounceFloor
-                    && looks_like_announce(final_text)) {
+                    && looks_like_announce_phrase(final_text)) {
                 ++incomplete_retries;
                 // Always log — actionable. Each retry is one nudge
                 // round-trip; operator wants to know if a turn went
@@ -1516,7 +1525,7 @@ std::string Engine::chat_continue() {
                     && incomplete_retries >= kMaxIncompleteRetries
                     && !p_->tools.empty()
                     && final_text.size() < kAnnounceFloor
-                    && looks_like_announce(final_text)
+                    && looks_like_announce_phrase(final_text)
                     && p_->on_incomplete_retry) {
                 p_->on_incomplete_retry(
                     -1, kMaxIncompleteRetries,
