@@ -794,3 +794,80 @@ return HTTP 204 No Content. This prevents a malformed client from
 forcing the server into a JSON-RPC error reply for a fire-and-forget
 event.
 
+---
+
+## 19. FOURTH PASS — 2026-05-02 (predictable /tmp log path)
+
+### 19.1 MEDIUM — `/tmp` log file race + symlink redirect (FIXED)
+
+**Files:** `src/log.cpp` (`auto_open`), `src/cli.cpp` (`open_log_tee`).
+
+**Issue.** Both functions created their auto-generated transaction log
+via `std::fopen("/tmp/<prefix>-<pid>-<epoch>.log", "w")`. The path is
+predictable: PID is 16 bits on Linux (~32 k values, often recycled
+within seconds) and the epoch component is correct to one second, so
+a local attacker on the same host can guess the exact path the next
+process will use. `fopen(..., "w")` follows symlinks, so the attacker
+plants a symlink at the predicted path pointing at any user-writable
+file (`~/.bashrc`, `~/.ssh/authorized_keys`, a crontab, …) and the
+agent process truncates and writes the log there on startup —
+arbitrary-write as the user running easyai. As a side effect the
+file was also created with the process umask (typically 0644 →
+world-readable), and logs include the prompt body which can contain
+API keys / PII.
+
+**Fix.** Replace `std::fopen` with
+`::open(path, O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC, 0600)`
+followed by `::fdopen(fd, "w")`:
+
+- `O_EXCL` makes the create atomic and refuses if the path already
+  exists (regular file OR symlink) — closes the predictable-name
+  race entirely. If a hostile entity pre-planted anything at the
+  path the log open fails cleanly (`auto_open` returns nullptr; the
+  process keeps running with stderr-only logging).
+- `O_NOFOLLOW` is belt-and-suspenders against any future code path
+  that drops `O_EXCL`.
+- `O_CLOEXEC` keeps the log fd out of subprocesses (bash tool,
+  external_tools children) — they shouldn't see or hold the log
+  handle.
+- Mode `0600` makes the log private to the user, so prompt content
+  isn't exposed to other accounts on the same host.
+
+`open_log_tee` has two branches: the auto-generated `/tmp` branch
+gets `O_EXCL`; the caller-supplied path branch keeps `O_TRUNC`
+(operators legitimately rely on overwrite semantics for log
+rotation) but still gains `O_NOFOLLOW | O_CLOEXEC | 0600`. A
+caller-supplied path that happens to be a symlink is suspicious
+either way, and refusing on it is the safer default — operators who
+need the symlink behaviour can resolve the symlink themselves
+before passing the path.
+
+**Verification.** A standalone smoke test (`test_symlink_block.cpp`,
+not committed) plants a symlink at the auto-generated path and
+calls the same `open()` invocation; the open returns -1 / EEXIST
+and the symlinked victim file is left untouched. The library still
+opens the log normally on a clean filesystem. All downstream
+binaries (`easyai-chat`, `easyai-cli`, `easyai-server`,
+`easyai-mcp-server`, `easyai-local`, `easyai-recipes`,
+`easyai-agent`) build clean.
+
+### 19.2 Findings re-validated, no action needed
+
+The third-party scanner that surfaced 19.1 also raised:
+
+- `bash` tool shell injection — by design, see §15.3.
+- `(size_t) limit` cast in `fs_read_file` — `limit` is clamped to
+  `[1, 1 MiB]` immediately before the cast (`builtin_tools.cpp`
+  ~line 996-997).
+- env-passthrough size overflow — `vlen` is checked against
+  `kMaxArgElementBytes` (4 KiB) before the `reserve` call.
+- `kPathMax` mismatch with system `PATH_MAX` — `kPathMax` resolves
+  to `PATH_MAX` when defined and to a 4 KiB fallback otherwise; this
+  is the standard pattern.
+- 32-byte `strftime` buffer — `%Y-%m-%dT%H:%M:%S` produces 19
+  bytes + NUL, ≥4× headroom remaining.
+- `directory_iterator` resource exhaustion — output is
+  `clip(o.str(), 16 KiB)` in `fs_list_dir`.
+- TOCTOU in `resolve_cwd` — load-time only and operator-controlled
+  (already documented as accepted risk in §16.4).
+

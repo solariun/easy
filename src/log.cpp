@@ -3,7 +3,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <fcntl.h>    // open, O_*
 #include <mutex>
+#include <sys/stat.h> // mode_t
 #include <unistd.h>   // getpid
 
 namespace easyai::log {
@@ -112,8 +114,18 @@ std::FILE * auto_open(const char * prefix, std::string * resolved_path) {
     char path[256];
     std::snprintf(path, sizeof(path), "/tmp/%s-%d-%ld.log",
                   prefix, (int) ::getpid(), (long) std::time(nullptr));
-    std::FILE * fp = std::fopen(path, "w");
-    if (!fp) return nullptr;
+    // O_EXCL refuses atomically if the path already exists (regular file
+    // OR symlink) — closes the predictable-name attack where a local
+    // attacker pre-creates `/tmp/easyai-<pid>-<epoch>.log` as a symlink to
+    // e.g. ~/.bashrc and tricks us into truncating and overwriting it.
+    // O_NOFOLLOW is belt-and-suspenders. Mode 0600 keeps logs (which may
+    // echo prompts containing secrets) out of other users' view.
+    const int fd = ::open(path,
+                          O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+                          0600);
+    if (fd < 0) return nullptr;
+    std::FILE * fp = ::fdopen(fd, "w");
+    if (!fp) { ::close(fd); return nullptr; }
 
     char ts[32] = {0};
     const auto t = std::time(nullptr);

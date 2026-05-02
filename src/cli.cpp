@@ -11,7 +11,9 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <fcntl.h>    // open, O_*
 #include <filesystem>
+#include <sys/stat.h> // mode_t
 #include <unistd.h>   // getpid
 
 namespace fs = std::filesystem;
@@ -87,7 +89,8 @@ std::FILE * open_log_tee(const std::string & path,
                          int argc, char ** argv,
                          std::string * resolved_path) {
     std::string resolved;
-    if (!path.empty()) {
+    const bool auto_path = path.empty();
+    if (!auto_path) {
         resolved = path;
     } else {
         char buf[64];
@@ -97,10 +100,23 @@ std::FILE * open_log_tee(const std::string & path,
                       (long) std::time(nullptr));
         resolved = buf;
     }
-
-    std::FILE * fp = std::fopen(resolved.c_str(), "w");
     if (resolved_path) *resolved_path = resolved;
-    if (!fp) return nullptr;
+
+    // Auto-generated /tmp paths are predictable (pid + epoch), so we
+    // refuse atomically if the path already exists (O_EXCL) — a local
+    // attacker who pre-creates the path as a symlink would otherwise
+    // redirect our truncating write to an arbitrary user-writable file.
+    // Caller-supplied paths skip O_EXCL because operators legitimately
+    // want overwrite semantics for log rotation, but we still pin
+    // O_NOFOLLOW (refuse if the leaf is a symlink — operators planting
+    // a symlink there is suspicious) and mode 0600 (logs may echo
+    // prompts that contain secrets).
+    int flags = O_WRONLY | O_CREAT | O_NOFOLLOW | O_CLOEXEC;
+    flags |= auto_path ? O_EXCL : O_TRUNC;
+    const int fd = ::open(resolved.c_str(), flags, 0600);
+    if (fd < 0) return nullptr;
+    std::FILE * fp = ::fdopen(fd, "w");
+    if (!fp) { ::close(fd); return nullptr; }
 
     // Header — keeps a stray log self-describing.
     char ts[32] = {0};
