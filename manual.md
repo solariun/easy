@@ -3,6 +3,9 @@
 This is the **hands-on** book. It assumes nothing beyond "I can compile a
 C++17 program". By the end you will know how to:
 
+* read the **Primer** below first if you've never traced a tool
+  call end-to-end — it's the bottom-up walkthrough that makes the
+  rest of the manual click
 * compile easyai and download a model
 * run `easyai-local` and talk to it
 * host `easyai-server` and call it from Claude Code, OpenAI SDKs, or curl
@@ -23,6 +26,7 @@ C++17 program". By the end you will know how to:
 
 | Part | Chapter | What you get |
 |------|---------|--------------|
+| **Primer** | How a tool call works on the wire | The 10 steps from your `Tool` declaration to the model's final answer — bytes, Jinja templates, parsing, dispatch, follow-up turn |
 | **1** | Getting set up         | Prereqs, repo layout, building, GPUs, models |
 | **2** | Using the binaries     | `easyai-local`, `easyai-server`, `easyai-mcp-server`, `easyai-cli`, `easyai-agent`, `easyai-chat`, `easyai-recipes` |
 | **3** | Embedding `libeasyai`  | `Agent` (3-line hello), `Backend` (local↔remote), `Engine` API top-to-bottom, callbacks, presets, tools, escape hatches |
@@ -35,10 +39,314 @@ C++17 program". By the end you will know how to:
 | **10** | Troubleshooting       | Build, GPU, runtime, model, tool, network, TLS issues |
 | **11** | Design references     | Pointers into `design.md` for the deeper "why" |
 
-> If you're new, read 1 → 2 → 3.  If you want to ship something to a
-> remote model right now, jump to **Part 4**.  If you want to write
-> your own tool, **Part 5** is the cookbook.  If something's broken,
-> **Part 10** has a triage matrix.
+> If you're new, read **Primer** → 1 → 2 → 3.  If you want to ship
+> something to a remote model right now, jump to **Part 4**.  If you
+> want to write your own tool, **Part 5** is the cookbook.  If
+> something's broken, **Part 10** has a triage matrix.
+
+---
+
+## Primer — how a tool call works on the wire
+
+Read this first.  Everything else in the manual makes more sense
+once you can see the bytes flowing between you, easyai, and the
+model.  We trace one tool call end-to-end, bottom-up — your C++
+declaration → Jinja-rendered prompt → model output → parse →
+dispatch → result → next turn.  No magic.
+
+The example: a `get_weather` tool the model invokes for "what's
+the weather in Lisbon?".
+
+### Step 1 — you declare the tool (C++)
+
+```cpp
+auto weather = easyai::Tool::builder("get_weather")
+    .describe("Return the current weather for a city, in metric units.")
+    .param("city", "string", "City name, e.g. 'Lisbon'", /*required=*/true)
+    .handle([](const easyai::ToolCall & c) -> easyai::ToolResult {
+        std::string city = easyai::args::get_string_or(c.arguments_json, "city", "");
+        if (city.empty()) return easyai::ToolResult::error("'city' is required");
+        return easyai::ToolResult::ok("23 °C, sunny");
+    })
+    .build();
+
+engine.add_tool(weather);
+engine.chat("what's the weather in Lisbon?");
+```
+
+The `Tool` is four fields: `name`, `description`, `parameters_json`
+(a JSON schema), `handler`.  At this point easyai does nothing
+except remember the tool — no prompt has been built yet.
+
+### Step 2 — easyai builds the chat-template inputs
+
+When `chat()` runs, easyai hands the conversation + tool catalogue
+to llama.cpp's `common_chat_templates_inputs`.  Conceptually:
+
+```
+inputs = {
+  messages: [
+    { role: "system",    content: "<your system prompt>"     },
+    { role: "user",      content: "what's the weather in Lisbon?" }
+  ],
+  tools: [
+    {
+      type: "function",
+      function: {
+        name: "get_weather",
+        description: "Return the current weather for a city, in metric units.",
+        parameters: { type: "object",
+                      properties: { city: { type:"string", description:"…" } },
+                      required: ["city"] }
+      }
+    }
+  ],
+  add_generation_prompt: true
+}
+```
+
+easyai itself never decides how to format this — the **chat
+template baked into the GGUF** does.  The template is Jinja,
+shipped by the model author.  Different model families use
+different markup, which is why easyai needs three parallel
+recovery layers (Step 5).
+
+### Step 3 — Jinja renders the prompt the model actually sees
+
+The Jinja template walks `inputs.messages` and `inputs.tools` and
+emits a single string of bytes.  Here are three approximate
+renderings — your model's exact bytes depend on its template,
+but the shape is universal:
+
+**Qwen3 / Qwen2.5 (`<tool_call>` + JSON):**
+
+```
+<|im_start|>system
+<your system prompt>
+
+# Tools
+You have access to the following tools. To use one, emit a
+<tool_call>...</tool_call> block with the call as JSON.
+
+<tools>
+{"type":"function","function":{"name":"get_weather","description":"…","parameters":{…}}}
+</tools>
+<|im_end|>
+<|im_start|>user
+what's the weather in Lisbon?<|im_end|>
+<|im_start|>assistant
+```
+
+**Hermes-2-Pro (`<tool_call>` wrapping XML-ish):**
+
+```
+<|im_start|>system
+<your system prompt>
+
+You may call tools using:
+<tool_call>
+<function=NAME>
+<parameter=KEY>VALUE</parameter>
+</function>
+</tool_call>
+
+Tools available:
+- get_weather(city: string): Return the current weather for a city.
+<|im_end|>
+<|im_start|>user
+what's the weather in Lisbon?<|im_end|>
+<|im_start|>assistant
+```
+
+**ChatML / OpenAI-style (function-call JSON in a fenced block):**
+
+```
+<|im_start|>system
+<your system prompt>
+
+# Functions
+```json
+[{"name":"get_weather","description":"…","parameters":{…}}]
+```
+Call a function by emitting a fenced JSON block with `name` +
+`arguments`.
+<|im_end|>
+<|im_start|>user
+what's the weather in Lisbon?<|im_end|>
+<|im_start|>assistant
+```
+
+The same `Tool` you declared in C++ ends up in different markup
+in each.  You don't need to care: easyai handles all three.
+
+### Step 4 — the model emits a turn
+
+The model decodes one token at a time.  Each token streams to
+your `on_token` callback in real time.  When the model decides
+to call the tool, the **raw text it produces** in a Qwen-family
+model looks something like:
+
+```
+I'll check the current weather in Lisbon.
+<tool_call>{"name":"get_weather","arguments":{"city":"Lisbon"}}</tool_call>
+```
+
+The model then emits an end-of-turn token (e.g. `<|im_end|>`) and
+stops.  At this point easyai has the full raw turn as a string.
+
+### Step 5 — easyai parses the tool call (PEG + 3 recovery layers)
+
+`parse_assistant` (in `src/engine.cpp`) tries the parsers in
+order, fastest path first:
+
+1. **PEG parser** (llama.cpp's `common_chat_parse`).  Knows the
+   model family (selected from the GGUF metadata at load time)
+   and runs a grammar-driven parse.  Hits ~99 % of well-behaved
+   turns.
+2. **Qwen recovery scanner** (`recover_qwen_tool_calls`).  For
+   `<tool_call>{…}</tool_call>` blocks the PEG dropped because
+   of an inner-brace edge case.
+3. **Hermes recovery scanner** (`recover_hermes_tool_calls`).
+   For `<function=NAME><parameter=K>V</parameter></function>`
+   markup that the PEG sometimes fails to assemble.
+4. **Markdown recovery scanner** (`recover_markdown_tool_calls`).
+   Last-resort heuristic for "🔧 get_weather(city='Lisbon')"
+   and similar prose-style emissions some weak models prefer.
+
+All four converge on the same shape — `common_chat_msg` with a
+`content` field (visible reply, may be empty) and a
+`tool_calls[]` array.  After parsing, easyai materialises:
+
+```cpp
+struct ParsedAssistantTurn {
+    std::string content            = "I'll check the current weather in Lisbon.";
+    std::string reasoning_content  = "";          // any <think>…</think> block
+    std::vector<ToolCall> tool_calls = {
+        ToolCall {
+            .id              = "call_0",
+            .name            = "get_weather",
+            .arguments_json  = "{\"city\":\"Lisbon\"}"
+        }
+    };
+    std::string finish_reason = "tool_calls";
+};
+```
+
+### Step 6 — easyai dispatches to your handler
+
+For each entry in `tool_calls`, easyai looks up the registered
+`Tool` by name and invokes its handler.  The handler runs **on
+the same thread that called `chat()`** — it's just a function
+call.  No threads, no IPC, no fork.  Your handler is free to
+block, do HTTP, hit the disk, anything.
+
+```cpp
+// Inside Engine::Impl::dispatch_tool (simplified):
+auto * t = find_tool_by_name(call.name);             // Step 1
+if (!t) {
+    return ToolResult::error("unknown tool: " + call.name);
+}
+ToolResult result = t->handler(call);                 // Step 2 — your code
+if (on_tool) on_tool(call, result);                   // Step 3 — observability hook
+return result;
+```
+
+For our example:
+
+```cpp
+ToolCall  in  = { .name = "get_weather", .arguments_json = "{\"city\":\"Lisbon\"}", … };
+ToolResult out = { .content = "23 °C, sunny", .is_error = false };
+```
+
+### Step 7 — easyai pushes the result back into history
+
+A new message of role `tool` is appended:
+
+```cpp
+HistoryMessage {
+    role          = "tool",
+    content       = "23 °C, sunny",
+    tool_name     = "get_weather",
+    tool_call_id  = "call_0"   // matches the call's id
+};
+```
+
+The `tool_call_id` is what links the result to the assistant's
+preceding `tool_calls[i].id`.  Without it, the chat template
+can't pair them up and weak models hallucinate the result back
+to themselves.
+
+### Step 8 — next turn renders with the result included
+
+easyai re-runs Jinja over the now-extended history and feeds it
+back into llama.cpp.  Approximate Qwen3 rendering:
+
+```
+…(system + user same as before)…
+<|im_start|>assistant
+I'll check the current weather in Lisbon.
+<tool_call>{"name":"get_weather","arguments":{"city":"Lisbon"}}</tool_call><|im_end|>
+<|im_start|>tool
+<tool_response>
+{"name":"get_weather","content":"23 °C, sunny"}
+</tool_response><|im_end|>
+<|im_start|>assistant
+```
+
+The model now sees its own previous tool_call AND the result it
+got back.  It picks up where it left off.
+
+### Step 9 — model produces the final answer
+
+```
+The current weather in Lisbon is 23 °C and sunny.<|im_end|>
+```
+
+`finish_reason` is `stop`.  No more tool_calls.  easyai returns
+the visible content from `chat()`.
+
+### Step 10 — the loop (if there are more tool calls)
+
+If the model emits another `tool_call` instead of stopping,
+easyai loops back to Step 6.  Each loop counts as one **hop**;
+the budget is `Engine::max_tool_hops()` (default 8, bumped to
+99999 when `bash` is enabled).  Hop exhaustion returns whatever
+the latest visible content is, plus a `last_error()` string.
+
+There's a second safety net: if the model produces an
+"announce-only" turn ("Let me search…", "I'll look that up…")
+without actually emitting a tool_call, easyai discards that
+turn, appends a corrective synthetic user message ("don't
+announce, execute"), and retries up to
+`Engine::max_incomplete_retries()` times (default 10).  This is
+the `looks_like_announce_phrase` predicate in `src/engine.cpp`,
+and it's why weak / 1-bit-quant models still drive a
+multi-tool flow reliably.
+
+### What this buys you
+
+* You write **one** `Tool` declaration; it works across model
+  families.  The Jinja template + the recovery layers absorb the
+  dialect differences.
+* You can swap models freely.  Qwen → Hermes → DeepSeek-R1 → a
+  Bonsai-class 1-bit quant — your tool code is unchanged.
+* You can reason about correctness.  Every byte of every step
+  above is reproducible: turn on `--verbose` (CLI) or open
+  `/tmp/easyai-<pid>-<epoch>.log` and you see the rendered
+  prompt, the raw model output, the parsed `tool_calls`, the
+  dispatch summary, and the next-turn render — in order.
+
+When something goes wrong — model never calls the tool, calls
+the wrong tool, hallucinates an argument — you read the log
+top-to-bottom against this primer and find the layer that
+broke.  Most of the time it's Step 3 (your tool description
+wasn't clear enough for the model) or Step 6 (your handler
+returned an error the model couldn't recover from).
+
+Now that you have the picture, the rest of the manual fills in
+the practical details: Part 3 / Part 4 show how to wire this up
+in C++; Part 5 is the cookbook for declaring tools that the
+model actually calls correctly.
 
 ---
 
