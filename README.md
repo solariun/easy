@@ -43,6 +43,31 @@ A running log of user-facing changes. Latest first — keep this list
 current as features land so anyone returning to the repo (or
 landing on it for the first time) sees what shipped recently.
 
+### 2026-05-02 — Fourth-pass security audit + readability batch
+
+* **`/tmp` log file hardened (security, MEDIUM).** The auto-generated
+  raw transaction log at `/tmp/easyai-<pid>-<epoch>.log` is now
+  created with `O_EXCL | O_NOFOLLOW | O_CLOEXEC` and mode `0600`. The
+  predictable path used to follow symlinks on `fopen("w")`, so a
+  local attacker on a multi-tenant host could plant a symlink
+  pointing at any user-writable file (`~/.bashrc`, `~/.ssh/…`) and
+  have the next `easyai-*` process truncate-and-overwrite it.
+  Mode `0644` (process umask) also leaked prompts — which can
+  contain API keys or PII — to other accounts on the same box.
+  `O_EXCL` makes the create atomic-or-fail and `0600` keeps logs
+  private. Caller-supplied paths (`--log-file PATH`) keep `O_TRUNC`
+  for log rotation but still gain `O_NOFOLLOW + 0600`. Full
+  write-up in [`SECURITY_AUDIT.md`](SECURITY_AUDIT.md) §19.
+* **Internal readability batch (no public API change).** Three
+  inline patterns were lifted into named helpers so the call sites
+  read top-to-bottom: `file_mtime_unix()` (replaces three copies of
+  the C++17 file_clock→system_clock idiom in `rag_tools.cpp`),
+  `glob_to_regex()` + `kGlobRegexMetachars` (lifts the wildcard
+  state machine out of `fs_glob` in `builtin_tools.cpp`), and
+  `looks_like_announce_phrase()` (lifts the 30-line retry predicate
+  out of `Engine::chat_continue` in `engine.cpp`, where it was
+  used twice). All seven binaries build clean.
+
 ### 2026-05-01 — MCP CLIENT, RAG memory framing, web_google, macOS installer fix
 
 * **`easyai-server` is now also an MCP client.** Pass `--mcp <url>`
@@ -184,6 +209,341 @@ landing on it for the first time) sees what shipped recently.
 * **Tolerant tool output** — non-UTF-8 bytes in tool results no
   longer abort the SSE stream; the bytes get a U+FFFD substitute
   and the stream stays alive.
+
+---
+
+## All options at a glance
+
+Every CLI flag, INI key, and library setter the project ships
+today, in tables. Skim once to learn the surface; come back when
+you want to tune something specific. Deeper reference is linked
+per row.
+
+This repo builds seven binaries. Two are production daemons
+(`easyai-server`, `easyai-mcp-server`), two are user CLIs
+(`easyai-cli`, `easyai-local`), three are example apps the lib
+ships to demonstrate the API (`easyai-chat`, `easyai-agent`,
+`easyai-recipes`).
+
+### `easyai-server` — chat HTTP server (also speaks MCP)
+
+Full reference: [`easyai-server.md`](easyai-server.md).
+INI defaults under `/etc/easyai/easyai.ini` — every flag below
+has a matching INI key (see [`easyai-server.md`](easyai-server.md) §1).
+
+| Flag | Default | What it does |
+|---|---|---|
+| `-m, --model PATH` | (required) | GGUF model file. |
+| `--config PATH` | `/etc/easyai/easyai.ini` | Central INI; CLI > INI > hardcoded. |
+| `--host ADDR` | `127.0.0.1` | Bind address (`0.0.0.0` = any iface). |
+| `--port N` | `8080` | TCP port. |
+| `--max-body N` | 8 MiB | Cap on request body. |
+| `-s, --system-file PATH` | — | Default system prompt, from file. |
+| `--system TEXT` | — | Default system prompt, inline. |
+| `--no-local-tools` | off | Don't expose the local built-in toolbelt. |
+| `--mcp URL` | — | Connect upstream MCP server as client; merge catalogue. |
+| `--mcp-token TOK` | — | Bearer for `--mcp`. |
+| `--no-mcp-auth` | off | Force `/mcp` open even with `[MCP_USER]` populated. |
+| `--sandbox DIR` | server cwd | Root for `fs_*` / `bash` / external `$SANDBOX`. |
+| `--allow-fs` | off | Register `fs_read_file`, `fs_write_file`, `fs_list_dir`, `fs_glob`, `fs_grep`. |
+| `--allow-bash` | off | Register `bash` (NOT a hardened sandbox). |
+| `--use-google` | off | Register `web_google` (needs `GOOGLE_API_KEY` + `GOOGLE_CSE_ID`). |
+| `--experimental-rag` | off | Collapse the six `rag_*` tools into one `rag(action=…)`. |
+| `--external-tools DIR` | — | Load every `EASYAI-*.tools` manifest in `DIR`. |
+| `--RAG DIR` | — | Enable RAG (5 tools, persistent memory). |
+| `--preset NAME` | `balanced` | Ambient sampling preset. |
+| `--temperature F` | per preset | Override temperature (0.0–2.0). |
+| `--top-p F` | per preset | Nucleus sampling p. |
+| `--top-k N` | per preset | Top-k cutoff. |
+| `--min-p F` | per preset | Min-p threshold. |
+| `--repeat-penalty F` | per preset | Repetition penalty. |
+| `--max-tokens N` | unlimited | Cap tokens per request. |
+| `--seed U32` | random | RNG seed (0 = random). |
+| `--max-incomplete-retries N` | 10 | Retry budget for "announce-only" turns; 0 disables. |
+| `-c, --ctx N` | 8192 | Context size. |
+| `--batch N` | = ctx | Logical batch size. |
+| `--ngl N` | -1 (auto) | GPU layers (0 = CPU only). |
+| `-t, --threads N` | hw cores | CPU threads. |
+| `-ctk, --cache-type-k TYPE` | `f16` | K-cache dtype (`f32`,`f16`,`bf16`,`q8_0`,`q4_0`,`q4_1`,`q5_0`,`q5_1`,`iq4_nl`). |
+| `-ctv, --cache-type-v TYPE` | `f16` | V-cache dtype (same set). |
+| `-nkvo, --no-kv-offload` | off | Keep KV cache on CPU even with GPU layers. |
+| `--kv-unified` | off | Single unified KV buffer across sequences. |
+| `--override-kv K=T:V` | — | GGUF metadata override (`int`,`float`,`bool`,`str`); repeatable. |
+| `-a, --alias NAME` | `easyai` | Public model id reported by `/v1/models`. |
+| `--api-key KEY` | — | Require Bearer auth on every `/v1` route. |
+| `-fa, --flash-attn` | auto | Force flash attention on. |
+| `-tb, --threads-batch N` | = threads | Threads for prompt-eval batches. |
+| `-np, --parallel N` | 1 | Compat-only; warns when >1. |
+| `--mlock` | off | mlock model weights into RAM. |
+| `--no-mmap` | off | Disable mmap (read GGUF into RAM). |
+| `--numa STRATEGY` | off | `distribute`,`isolate`,`numactl`,`mirror`. |
+| `--metrics` | off | Expose Prometheus `/metrics`. |
+| `--reasoning on\|off` | on | Enable model thinking. |
+| `--no-think` | off | Strip `<think>…</think>` from replies. |
+| `--inject-datetime on\|off` | on | Append authoritative date/time to system prompt. |
+| `--knowledge-cutoff YYYY-MM` | `2024-10` | Cutoff hint used by `--inject-datetime`. |
+| `-v, --verbose` | off | Engine logs raw model output + parser actions. |
+| `--webui MODE` | `modern` | `modern` (embedded SvelteKit) or `minimal` (inline). |
+| `--webui-title TEXT` | `Box EasyAI` | Browser tab + sidebar brand. |
+| `--webui-icon PATH` | — | Favicon (`.ico`,`.png`,`.svg`,`.gif`,`.jpg`,`.webp`). |
+| `--webui-placeholder S` | `Type a message…` | Input box placeholder. |
+
+### `easyai-mcp-server` — standalone MCP provider (no model)
+
+Same tool catalogue as `easyai-server` but no GGUF loaded —
+designed for high-concurrency multi-client deployments. Full
+reference: [`easyai-mcp-server.md`](easyai-mcp-server.md).
+
+| Flag | Default | What it does |
+|---|---|---|
+| `--config PATH` | `/etc/easyai/easyai-mcp.ini` | Central INI. |
+| `--host ADDR` | `127.0.0.1` | Bind address. |
+| `--port N` | `8089` | TCP port. |
+| `-n, --name ID` | `easyai-mcp` | Server identity on `/health` + MCP `initialize`. |
+| `--max-body N` | 1 MiB | Cap on request body. |
+| `-t, --threads N` | 256 | cpp-httplib worker pool. |
+| `--max-concurrent-calls N` | 256 | In-flight `tools/call` cap (503 on saturation). |
+| `--sandbox DIR` | cwd | Root for `fs_*` / `bash` / `$SANDBOX`. |
+| `--allow-fs` | off | Register `fs_*` tools. |
+| `--allow-bash` | off | Register `bash`. |
+| `--no-tools` | off | Skip the built-in toolbelt entirely. |
+| `--external-tools DIR` | — | Load `EASYAI-*.tools` manifests. |
+| `--RAG DIR` | — | Enable the six RAG tools. |
+| `--api-key TOK` | — | Bearer required for `/health`, `/metrics`, `/v1/tools`. |
+| `--no-mcp-auth` | off | Force `/mcp` open. |
+| `--metrics` | off | Enable Prometheus `/metrics`. |
+| `-v, --verbose` | off | Log every dispatch to stderr. |
+
+### `easyai-cli` — interactive remote CLI
+
+Talks to any OpenAI-compatible endpoint (our `easyai-server`,
+upstream `llama-server`, OpenAI itself, etc.).
+
+| Flag | Default | What it does |
+|---|---|---|
+| `--url URL` | `$EASYAI_URL` | OpenAI-compat endpoint. |
+| `--api-key KEY` | `$EASYAI_API_KEY` | Bearer auth. |
+| `--model NAME` | `$EASYAI_MODEL` | Request body `model` field. |
+| `--timeout SECONDS` | 600 | Read+write timeout. |
+| `--insecure-tls` | off | Skip peer cert check (DEV ONLY). |
+| `--ca-cert PATH` | system | Custom CA bundle (PEM). |
+| `--system TEXT` | — | Inline system prompt. |
+| `--system-file PATH` | — | System prompt from file. |
+| `--temperature F` | server | Sampling temperature. |
+| `--top-p F` | server | Nucleus top-p. |
+| `--top-k N` | server | Top-k cutoff. |
+| `--min-p F` | server | min-p (llama-server / easyai). |
+| `--repeat-penalty F` | server | Repetition penalty. |
+| `--frequency-penalty F` | server | OpenAI standard \[-2.0, 2.0\]. |
+| `--presence-penalty F` | server | OpenAI standard \[-2.0, 2.0\]. |
+| `--seed N` | random | Deterministic sampling seed. |
+| `--max-tokens N` | server | Cap reply length. |
+| `--stop SEQ` | — | Add a stop string (repeatable). |
+| `--extra-json '{…}'` | — | Free-form JSON merged into the request body. |
+| `--tools LIST` | datetime,plan,web_search,web_fetch,system_* | Comma list of locally-registered tools. |
+| `--sandbox DIR` | — | Enable `fs_*` (read/list/glob/grep/write) scoped to `DIR`. |
+| `--allow-bash` | off | Register `bash` (uses `--sandbox` as cwd, else current dir). |
+| `--use-google` | off | Register `web_google`. |
+| `--experimental-rag` | off | Single `rag(action=…)` tool. |
+| `--external-tools DIR` | — | Load `EASYAI-*.tools` manifests. |
+| `--RAG DIR` | — | Enable RAG. |
+| `--no-plan` | off | Don't auto-register the planning tool. |
+| `-p, --prompt TEXT` | (REPL) | One-shot prompt; without it you get a REPL. |
+| `--no-reasoning` | shown | Hide `delta.reasoning_content`. |
+| `--max-reasoning N` | 0 (off) | Abort SSE when accumulated reasoning > N chars. |
+| `--no-retry-on-incomplete` | retry on | Disable auto-retry-with-nudge. |
+| `--verbose` | off | Log HTTP+SSE traffic + dispatch to stderr + tee log. |
+| `-q, --quiet` | off | Disable spinner glyph + ctx-fill gauge. |
+| `--log-file PATH` | auto-`/tmp` | Tee raw transaction log here (implies `--verbose`). |
+| `--list-tools` | — | Print local tools (no chat). |
+| `--list-remote-tools` | — | `GET /v1/tools` (no chat). |
+| `--list-models` | — | `GET /v1/models`. |
+| `--health` | — | `GET /health`. |
+| `--props` | — | `GET /props`. |
+| `--metrics` | — | `GET /metrics` (Prometheus text). |
+| `--set-preset NAME` | — | `POST /v1/preset {preset:NAME}`. |
+
+### `easyai-local` — local-engine REPL
+
+Loads a GGUF model in-process (no server). For remote endpoints
+use `easyai-cli`.
+
+| Flag | Default | What it does |
+|---|---|---|
+| `-m, --model PATH` | (required) | GGUF file. |
+| `-p, --prompt TEXT` | (REPL) | One-shot: run prompt, print, exit. |
+| `-s, --system-file PATH` | — | System prompt from file. |
+| `--system TEXT` | — | Inline system prompt. |
+| `--preset NAME` | `balanced` | Initial preset. |
+| `--no-think` | off | Strip `<think>…</think>` from output. |
+| `-q, --quiet` | off | Disable spinner glyph + ctx-fill gauge. |
+| `--temperature F` | per preset | Override temperature. |
+| `--top-p F` | per preset | top-p. |
+| `--top-k N` | per preset | top-k. |
+| `--min-p F` | per preset | min-p. |
+| `--repeat-penalty F` | per preset | Repetition penalty. |
+| `--max-tokens N` | unlimited | Cap tokens per turn. |
+| `--seed U32` | random | RNG seed. |
+| `-c, --ctx N` | 4096 | Context size. |
+| `--batch N` | = ctx | Logical batch size. |
+| `--ngl N` | -1 (auto) | GPU layers. |
+| `-t, --threads N` | hw cores | CPU threads. |
+| `--no-tools` | off | Skip the built-in toolbelt. |
+| `--sandbox DIR` | — | Enable `fs_*` scoped to `DIR`. |
+| `--allow-bash` | off | Register `bash`. |
+| `--external-tools DIR` | — | Load `EASYAI-*.tools` manifests. |
+| `--RAG DIR` | — | Enable RAG. |
+| `-ctk, --cache-type-k TYPE` | `f16` | K-cache dtype. |
+| `-ctv, --cache-type-v TYPE` | `f16` | V-cache dtype. |
+| `-nkvo, --no-kv-offload` | off | Keep KV cache on CPU. |
+| `--kv-unified` | off | Single unified KV buffer. |
+| `--override-kv K=T:V` | — | GGUF metadata override (repeatable). |
+
+### Example apps (lib API demos)
+
+Three small binaries under `examples/` show the lib API in
+context. They take minimal flags — the real config happens in
+the C++ source as fluent setter chains. Read these as the
+canonical "how do I use the lib?" answer.
+
+| Binary | Min flags | Purpose |
+|---|---|---|
+| `easyai-chat` | `-m PATH` OR `--url BASE`, `[--system TEXT]` | One-shot chat over Engine OR Client (auto-picks). |
+| `easyai-agent` | `-m PATH`, `[-c CTX]`, `[-ngl N]` | Tiny agentic-loop demo with tool registration. |
+| `easyai-recipes` | `-m PATH` | Five recipes (chat, persona, REPL, tools, agent loop). |
+
+### Library API — `easyai::Agent`
+
+The 30-second front door. Construct, optionally chain a few
+fluent setters, call `ask()`. Header:
+[`include/easyai/agent.hpp`](include/easyai/agent.hpp).
+
+| Method | Type | Default | What it does |
+|---|---|---|---|
+| `Agent(model_path)` | ctor | — | Local model. |
+| `Agent::remote(base_url, api_key="")` | static | — | Remote endpoint. |
+| `.system(prompt)` | `string` | — | System prompt. |
+| `.sandbox(dir)` | `string` | — | Enable `fs_*` scoped to `dir`. |
+| `.allow_bash(on=true)` | `bool` | off | Register `bash`. |
+| `.preset(name)` | `string` | `balanced` | Sampling profile. |
+| `.remote_model(id)` | `string` | — | Remote model id (remote mode only). |
+| `.temperature(t) / .top_p(p) / .top_k(k) / .min_p(p)` | scalar | per preset | Sampling overrides. |
+| `.on_token(cb)` | `function` | — | Streaming-token callback. |
+| `.ask(text)` | call | — | One-shot turn; runs tool dispatch inline. |
+| `.reset()` | call | — | Wipe history. |
+| `.last_error()` | accessor | — | Diagnostic. |
+| `.backend()` | accessor | — | Escape hatch to the underlying `Backend &`. |
+
+### Library API — `easyai::Engine` (local llama.cpp)
+
+Full local engine. Header:
+[`include/easyai/engine.hpp`](include/easyai/engine.hpp).
+
+| Method | Type | Default | What it does |
+|---|---|---|---|
+| `.model(gguf_path)` | `string` | — | GGUF file. |
+| `.context(n) / .batch(n)` | `int` | 4096 / = ctx | KV / logical batch size. |
+| `.gpu_layers(n)` | `int` | -1 (auto) | -1 = all, 0 = CPU only. |
+| `.threads(n) / .threads_batch(n)` | `int` | hw / = threads | CPU threads. |
+| `.seed(u32)` | `uint32_t` | random | RNG seed. |
+| `.system(prompt)` | `string` | — | System prompt. |
+| `.temperature(t) / .top_p(p) / .top_k(k) / .min_p(p)` | scalar | 0.7 / 0.95 / 40 / 0.05 | Sampling. |
+| `.repeat_penalty(r)` | `float` | 1.1 | Repetition penalty. |
+| `.max_tokens(n)` | `int` | -1 (until ctx) | Per-turn cap. |
+| `.tool_choice_auto / .tool_choice_required / .tool_choice_none` | call | auto | Tool-choice mode. |
+| `.parallel_tool_calls(on)` | `bool` | off | Allow parallel tool calls. |
+| `.verbose(on)` | `bool` | off | Engine debug logs. |
+| `.max_tool_hops(n)` | `int` | 8 | Agentic-loop cap (bumped to 99999 with `bash`). |
+| `.retry_on_incomplete(on)` | `bool` | on | Auto-retry "announce-only" turns. |
+| `.max_incomplete_retries(n)` | `int` | 10 | Retry budget; 0 disables. |
+| `.stop_at_ctx_pct(pct)` | `int` | 100 | Hard ceiling on context fill; 0 disables. |
+| `.cache_type_k(name) / .cache_type_v(name)` | `string` | `f16` | KV-cache dtype. |
+| `.no_kv_offload(on) / .kv_unified(on)` | `bool` | off | KV placement / layout. |
+| `.add_kv_override(spec)` | `string` | — | GGUF metadata override (repeatable). |
+| `.flash_attn(on) / .use_mlock(on) / .use_mmap(on)` | `bool` | auto/off/on | Compute / memory. |
+| `.numa(strategy)` | `string` | off | `distribute` / `isolate` / `numactl` / `""`. |
+| `.enable_thinking(on)` | `bool` | on | Chat-template thinking flag. |
+| `.add_tool(t) / .clear_tools()` | call | — | Tool registration. |
+| `.on_token(cb) / .on_tool(cb) / .on_hop_reset(cb) / .on_incomplete_retry(cb)` | callback | — | Streaming hooks. |
+| `.load() / .reset() / .clear_kv()` | call | — | Lifecycle. |
+| `.set_sampling(t,p,k,m)` | call | — | Re-sample mid-conversation. |
+| `.push_message(role, content, [tool_name, tool_call_id])` | call | — | Append history without generating. |
+| `.replace_history(messages)` | call | — | Full-fidelity history replay. |
+| `.chat(text) / .chat_continue() / .generate_one() / .generate()` | call | — | Inference primitives. |
+| `.request_cancel() / .clear_cancel() / .cancel_requested()` | call | — | Thread-safe cancel. |
+| `.last_error() / .last_was_ctx_full() / .turns() / .tools() / .backend_summary() / .n_ctx() / .model_path() / .perf_data() / .perf_reset()` | accessor | — | Introspection. |
+
+### Library API — `easyai::Client` (remote OpenAI-compat)
+
+Remote counterpart of `Engine`. Tools execute LOCALLY in the
+consumer process. Header:
+[`include/easyai/client.hpp`](include/easyai/client.hpp).
+
+| Method | Type | Default | What it does |
+|---|---|---|---|
+| `.endpoint(url)` | `string` | — | `http(s)://host[:port]`. |
+| `.api_key(key)` | `string` | — | Bearer token. |
+| `.timeout_seconds(s)` | `int` | 600 | Connect+read timeout. |
+| `.verbose(v)` | `bool` | off | Log SSE lines to stderr. |
+| `.log_file(fp)` | `FILE*` | — | Tee every HTTP transaction. |
+| `.max_reasoning_chars(n)` | `int` | 0 (off) | Abort SSE when reasoning > N chars. |
+| `.retry_on_incomplete(v)` | `bool` | on | Auto-retry "announce-only" turns. |
+| `.stop_at_ctx_pct(pct)` | `int` | 100 | Bail when server-reported `ctx_used/n_ctx` exceeds. |
+| `.max_tool_hops(n)` | `int` | 8 | Agentic-loop cap. |
+| `.tls_insecure(v) / .ca_cert_path(path)` | `bool` / `string` | off / system | HTTPS-only TLS knobs. |
+| `.model(id)` | `string` | — | Request body `model` field. |
+| `.system(prompt)` | `string` | — | System prompt(s). |
+| `.temperature(t) / .top_p(v) / .top_k(v) / .min_p(v)` | scalar | server | Sampling. |
+| `.repeat_penalty(v) / .frequency_penalty(v) / .presence_penalty(v)` | float | server | Penalties. |
+| `.seed(s)` | `long long` | -1 | -1 = randomise. |
+| `.max_tokens(n)` | `int` | server | Cap. |
+| `.stop(sequences)` | `vector<string>` | — | Stop strings. |
+| `.extra_body_json(raw)` | `string` | — | Free-form JSON merged into request body. |
+| `.add_tool(t) / .clear_tools() / .tools()` | call | — | Tool registration. |
+| `.on_token(cb) / .on_reason(cb) / .on_tool(cb)` | callback | — | Streaming hooks. |
+| `.chat(text) / .chat_continue() / .clear_history()` | call | — | Inference + history. |
+| `.list_models / .list_remote_tools / .health / .metrics / .props / .set_preset` | call | — | Direct endpoint helpers. |
+| `.request_cancel() / .clear_cancel() / .cancel_requested()` | call | — | Thread-safe cancel. |
+| `.last_error() / .last_turn_was_incomplete() / .last_ctx_used() / .last_n_ctx() / .last_ctx_pct() / .last_was_ctx_full()` | accessor | — | Introspection. |
+
+### Library API — `easyai::cli::Toolbelt`
+
+Canonical agent toolset, fluently configured. Replaces the
+"copy the same `if (sandbox.empty()) … else …` block five times"
+pattern. Header: [`include/easyai/cli.hpp`](include/easyai/cli.hpp).
+
+| Method | Default | What it does |
+|---|---|---|
+| `.sandbox(dir)` | `""` | Root for `fs_*` (empty = no fs tools). |
+| `.allow_fs(on)` | on | Register `fs_*` (off in server unless `--allow-fs`). |
+| `.allow_bash(on)` | off | Register `bash` (also bumps `max_tool_hops` to 99999). |
+| `.with_plan(plan)` | — | Register the planning tool backed by a `Plan&`. |
+| `.no_web(on)` | off | Drop `web_search` / `web_fetch`. |
+| `.no_datetime(on)` | off | Drop `datetime`. |
+| `.use_google(on)` | off | Add `web_google` (env vars required at apply-time). |
+| `.tools()` | — | Materialise `vector<Tool>`. |
+| `.apply(engine) / .apply(client)` | — | Register on the consumer + bump hops if bash. |
+
+### Sampling presets
+
+Named profiles applied via `--preset NAME` (binaries) or
+`Engine::set_sampling()` / `easyai::find_preset()` (lib).
+Numbers are baselines; `<preset> <number>` overrides
+temperature only.
+
+| Name | temp | top_p | top_k | min_p | Use for |
+|---|---|---|---|---|---|
+| `deterministic` | 0.0 | 1.0 | 1 | 0.00 | Greedy decoding — same prompt always gives the same answer. |
+| `precise` | 0.2 | 0.95 | 40 | 0.10 | Code, math, factual Q&A. |
+| `balanced` | 0.7 | 0.95 | 40 | 0.05 | Default chat. |
+| `creative` | 1.0 | 0.95 | 40 | 0.05 | Brainstorm, fiction, surprising phrasing. |
+| `wild` | 1.4 | 0.98 | 60 | 0.00 | Maximum entropy, exploration. |
+
+Aliases (case-insensitive) recognised by `find_preset()`:
+`exact`→`precise`, `default`→`balanced`, `fun`→`creative`,
+`chaos`→`wild`, `greedy`→`deterministic`.
+
+Header: [`include/easyai/presets.hpp`](include/easyai/presets.hpp).
 
 ---
 

@@ -305,6 +305,43 @@ Webui title default also flips to `"Deep"`.
 ## 5. Recent commits (most recent first)
 
 ```
+2026-05-02 — Fourth-pass security audit + readability batch.
+
+(commits 5143799 + b44b615) Two small commits, no public API
+                 change. Fourth security pass found one MEDIUM:
+                 the auto-generated transaction log at
+                 /tmp/easyai-<pid>-<epoch>.log was opened with
+                 std::fopen("w") (follows symlinks) and process
+                 umask (typically 0644 → world-readable). Path is
+                 predictable (16-bit PID + 1-second epoch), so a
+                 local attacker on a multi-tenant host could
+                 plant a symlink at the predicted path pointing
+                 at any user-writable file (~/.bashrc, ~/.ssh/…)
+                 and have the next easyai-* process truncate-
+                 and-overwrite it. Mode 0644 also leaked prompts
+                 (which can contain API keys or PII) to other
+                 accounts on the same box. Fixed in src/log.cpp
+                 (auto_open) and src/cli.cpp (open_log_tee) by
+                 swapping fopen for ::open with
+                 O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC,
+                 mode 0600, then ::fdopen. Caller-supplied paths
+                 keep O_TRUNC for log rotation but still gain
+                 O_NOFOLLOW + 0600. Validated with a standalone
+                 symlink-attack smoke test (errno=EEXIST,
+                 victim file untouched). Documented in
+                 SECURITY_AUDIT.md §19. The same audit pass
+                 cleared nine other findings as already-mitigated
+                 / by-design / accepted-risk (§19.2).
+                 Readability batch: three inline patterns lifted
+                 into named helpers — file_mtime_unix() in
+                 rag_tools.cpp (3 dup), glob_to_regex() +
+                 kGlobRegexMetachars in builtin_tools.cpp, and
+                 looks_like_announce_phrase() in engine.cpp
+                 (used twice inside chat_continue). Helpers carry
+                 the WHY comments; call sites are now one line.
+                 Net diff +103/-85 across three files; all 7
+                 binaries build clean.
+
 2026-04-30 (late evening) — Central INI config (/etc/easyai/easyai.ini).
 
 (pending commit) Single config file replaces ~17-flag systemd

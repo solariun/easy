@@ -645,10 +645,18 @@ Highlights of the work documented in [`SECURITY_AUDIT.md`](SECURITY_AUDIT.md):
   Suppresses post-cutoff hallucination by anchoring "today" to the
   real wall clock and explicitly telling the model to call a tool or
   state uncertainty for facts beyond `--knowledge-cutoff`.
-- **Three audit passes** — first / second / third (latest 2026-04-30,
-  closing 3 HIGH and 7 MEDIUM findings including the `apply_ini_to_args`
-  dead-code path, `--no-mcp-auth` disconnect, sandbox symlink escape,
-  and `bash` fork-hardening parity with external-tools).
+- **Auto-generated transaction logs at `/tmp/easyai-<pid>-<epoch>.log`
+  are created with `O_EXCL | O_NOFOLLOW | O_CLOEXEC` and mode `0600`.**
+  `O_EXCL` makes the create atomic-or-fail so a local attacker can't
+  win the race by pre-planting a symlink at the predictable path; mode
+  `0600` keeps prompt content (which can include API keys / PII) private
+  to the running user even on multi-tenant hosts.
+- **Four audit passes** — first / second / third / fourth (latest
+  2026-05-02, closing the `/tmp` log symlink/race; the third pass on
+  2026-04-30 closed 3 HIGH and 7 MEDIUM findings including the
+  `apply_ini_to_args` dead-code path, `--no-mcp-auth` disconnect,
+  sandbox symlink escape, and `bash` fork-hardening parity with
+  external-tools).
 
 For threat models requiring OS-level isolation: run easyai-server
 inside a container / firejail / unprivileged user with disabled
