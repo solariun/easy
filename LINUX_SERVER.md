@@ -328,7 +328,7 @@ EOF
 sudo systemctl restart easyai-server
 ```
 
-**Full reference:** `RAG.md`. File format, the five tools, workflows,
+**Full reference:** `RAG.md`. File format, the seven tools, workflows,
 roadmap, troubleshooting.
 
 ---

@@ -3039,17 +3039,18 @@ static bool require_auth(const ServerCtx & ctx, const httplib::Request & req,
         "                                GOOGLE_CSE_ID env vars; counts\n"
         "                                against Google's quota (free tier:\n"
         "                                100 queries/day per key).\n"
-        "      --experimental-rag       Collapse the six rag_* tools into a\n"
+        "      --experimental-rag       Collapse the seven rag_* tools into a\n"
         "                                single `rag` tool with an `action`\n"
-        "                                parameter (\"save\" / \"search\" /\n"
-        "                                \"load\" / \"list\" / \"delete\" /\n"
-        "                                \"keywords\"). On-disk format and\n"
-        "                                semantics are unchanged; the six\n"
-        "                                tools are NOT registered when this\n"
-        "                                is set. Smaller catalog at the cost\n"
-        "                                of accuracy on weak / 1-bit-quant\n"
-        "                                tool callers — leave off if you're\n"
-        "                                running Bonsai-class models.\n"
+        "                                parameter (\"save\" / \"append\" /\n"
+        "                                \"search\" / \"load\" / \"list\" /\n"
+        "                                \"delete\" / \"keywords\"). On-disk\n"
+        "                                format and semantics are unchanged;\n"
+        "                                the seven tools are NOT registered\n"
+        "                                when this is set. Smaller catalog at\n"
+        "                                the cost of accuracy on weak /\n"
+        "                                1-bit-quant tool callers — leave\n"
+        "                                off if you're running Bonsai-class\n"
+        "                                models.\n"
         "      --external-tools <dir>   Load every EASYAI-*.tools file in <dir>\n"
         "                                as an external-tools manifest. Empty\n"
         "                                directory is a normal state (no extra\n"
@@ -3060,13 +3061,15 @@ static bool require_auth(const ServerCtx & ctx, const httplib::Request & req,
         "                                See EXTERNAL_TOOLS.md for the schema and\n"
         "                                collaboration workflow.\n"
         "      --RAG <dir>              Enable RAG, the agent's persistent\n"
-        "                                registry / long-term memory. Each entry\n"
-        "                                is one Markdown file in <dir>. Five\n"
-        "                                tools added: rag_save, rag_search,\n"
-        "                                rag_load, rag_list, rag_delete. The\n"
+        "                                registry / long-term memory. Each\n"
+        "                                entry is one Markdown file in <dir>.\n"
+        "                                Seven tools added: rag_save,\n"
+        "                                rag_append (grow an existing memory),\n"
+        "                                rag_search, rag_load, rag_list,\n"
+        "                                rag_delete, rag_keywords. The\n"
         "                                installed systemd unit always passes\n"
-        "                                this flag; manual invocations need it\n"
-        "                                explicitly. See RAG.md.\n"
+        "                                this flag; manual invocations need\n"
+        "                                it explicitly. See RAG.md.\n"
         "\nModel tuning (apply on top of --preset):\n"
         "      --preset <name>          Ambient preset (default 'balanced')\n"
         "      --temperature <f>        Override temperature (0.0-2.0)\n"
@@ -3165,7 +3168,7 @@ struct ServerArgs {
     bool        allow_bash = false; // explicit opt-in for the `bash` tool
     bool        use_google = false; // explicit opt-in for the `web_google` tool
                                     // (also requires GOOGLE_API_KEY + GOOGLE_CSE_ID)
-    bool        experimental_rag = false; // collapse the six rag_* tools into
+    bool        experimental_rag = false; // collapse the seven rag_* tools into
                                           // a single dispatched `rag(action=...)`
                                           // tool. Disables the six-tool layout.
     std::string external_tools_dir; // optional: dir of EASYAI-*.tools files
@@ -3686,15 +3689,16 @@ int main(int argc, char ** argv) {
     }
 
     // RAG — the agent's persistent registry / long-term memory.
-    // Five tools (rag_save / rag_search / rag_load / rag_list /
-    // rag_delete) registered when --RAG <dir> is given. The dir
-    // does NOT have to exist yet; rag_save creates it on first
-    // call. The systemd-installed server passes --RAG by default
-    // (see scripts/install_easyai_server.sh). See RAG.md.
+    // Seven tools (rag_save / rag_append / rag_search / rag_load /
+    // rag_list / rag_delete / rag_keywords) registered when
+    // --RAG <dir> is given. The dir does NOT have to exist yet;
+    // rag_save creates it on first call. The systemd-installed
+    // server passes --RAG by default (see
+    // scripts/install_easyai_server.sh). See RAG.md.
     if (!args.rag_dir.empty()) {
         if (args.experimental_rag) {
             // Single-tool dispatcher: model sees one `rag` tool with an
-            // `action` parameter. Disables the six rag_* layout — they
+            // `action` parameter. Disables the seven rag_* layout — they
             // would just confuse the model with two paths to the same
             // store.
             ctx->default_tools.push_back(
@@ -3706,6 +3710,7 @@ int main(int argc, char ** argv) {
         } else {
             auto rag = easyai::tools::make_rag_tools(args.rag_dir);
             ctx->default_tools.push_back(std::move(rag.save));
+            ctx->default_tools.push_back(std::move(rag.append));
             ctx->default_tools.push_back(std::move(rag.search));
             ctx->default_tools.push_back(std::move(rag.load));
             ctx->default_tools.push_back(std::move(rag.list));

@@ -22,7 +22,7 @@ the whole system.
 1. [What RAG is, and why](#1-what-rag-is-and-why)
 2. [Quickstart](#2-quickstart)
 3. [The file format on disk](#3-the-file-format-on-disk)
-4. [The six tools (and the one-tool dispatcher)](#4-the-six-tools)
+4. [The seven tools (and the one-tool dispatcher)](#4-the-seven-tools)
 5. [How the model is encouraged to use it](#5-how-the-model-is-encouraged-to-use-it)
 6. [Workflows](#6-workflows)
 7. [Best practices](#7-best-practices)
@@ -37,11 +37,12 @@ the whole system.
 
 RAG is a **keyword-indexed key/value store**, owned by the agent,
 persisted on disk, accessible to the agent as **its own memory** —
-something it can search, store, recall, update, and forget. Six tools
-expose those verbs:
+something it can search, store, append to, recall, update, and
+forget. Seven tools expose those verbs:
 
 ```
-rag_save(title, keywords[], content, fix?)  store / update; fix=true → immutable memory
+rag_save(title, keywords[], content, fix?)  store / overwrite; fix=true → immutable memory
+rag_append(title, content, keywords?[])     grow an existing memory without losing the previous body
 rag_search(keywords[], page?, max_results?) find by 1+ keywords (≥2 matches when 2+ given), paginated
 rag_load(titles[1..4])                      recall up to 4 full bodies
 rag_list(prefix?, max?)                     browse titles
@@ -77,50 +78,61 @@ fixed memory is for the operator to remove the file from disk by hand.
 ### The single-tool dispatcher (experimental)
 
 `--experimental-rag` (server / CLI flag, also in the INI) collapses
-the six tools into one:
+the seven tools into one:
 
 ```
-rag(action="save"|"search"|"load"|"list"|"delete"|"keywords", ...)
+rag(action="save"|"append"|"search"|"load"|"list"|"delete"|"keywords", ...)
 ```
 
 Same on-disk format, same `RagStore`, same fix-memory rules. Just a
 different shape for the model's tool catalog. Exposes 1 tool entry
-instead of 6 (saves a few hundred tokens per turn) at the cost of
+instead of 7 (saves a few hundred tokens per turn) at the cost of
 accuracy on weak / 1-bit-quant tool callers — leave it off for
-Bonsai-class models. When this flag is on the six `rag_*` tools are
-NOT registered; only `rag(action=...)` is reachable.
+Bonsai-class models. When this flag is on the seven `rag_*` tools
+are NOT registered; only `rag(action=...)` is reachable.
 
 ### How information flows
 
 ```
-  ┌──────────────────────────────────────────────────────────────┐
-  │                         THE MODEL                             │
-  │              (sees the 6 tools in its toolbelt)               │
-  └──────────────────────────────────────────────────────────────┘
-           │           │           │           │           │           │
-           ▼           ▼           ▼           ▼           ▼           ▼
-        ┌──────┐   ┌────────┐  ┌────────┐  ┌──────┐  ┌────────┐  ┌──────────┐
-        │ save │   │ search │  │  load  │  │ list │  │ delete │  │ keywords │
-        │      │   │        │  │        │  │      │  │        │  │          │
-        │write │   │ find   │  │ read   │  │browse│  │ prune  │  │vocab     │
-        │ /    │   │ by     │  │ up to  │  │titles│  │ stale  │  │overview  │
-        │amend │   │keyword │  │  4     │  │      │  │        │  │ (counts) │
-        └──┬───┘   └───┬────┘  └───┬────┘  └──┬───┘  └───┬────┘  └────┬─────┘
-           │           │           │           │           │           │
-           ▼           ▼           ▼           ▼           ▼           ▼
-  ┌──────────────────────────────────────────────────────────────┐
-  │                        RagStore (in-process)                  │
-  │  ┌────────────────────────────────────────────────────────┐  │
-  │  │  in-memory index: title → { keywords, mtime, bytes }   │  │
-  │  │  lazy-loaded from disk on first call, kept fresh by    │  │
-  │  │  every save / delete; mutex-guarded                     │  │
-  │  └────────────────────────────────────────────────────────┘  │
-  │                                                               │
-  │   search / list / keywords  ─→  index lookup, no disk read    │
-  │   load                      ─→  one file read off disk        │
-  │   save                      ─→  atomic tempfile + rename(2)   │
-  │   delete                    ─→  unlink + index erase          │
-  └──────────────────────────────┬───────────────────────────────┘
+  ┌──────────────────────────────────────────────────────────────────┐
+  │                            THE MODEL                              │
+  │                (sees the 7 tools in its toolbelt)                 │
+  └──────────────────────────────────────────────────────────────────┘
+        WRITE PATH (mutates state — unique_lock)
+        ┌──────┐    ┌────────┐    ┌────────┐
+        │ save │    │ append │    │ delete │
+        │      │    │        │    │        │
+        │new / │    │ grow   │    │ prune  │
+        │over- │    │existing│    │ stale  │
+        │write │    │ memory │    │ memory │
+        └──┬───┘    └────┬───┘    └────┬───┘
+           │             │             │
+        READ PATH (parallel — shared_lock)
+        ┌────────┐  ┌────────┐  ┌──────┐  ┌──────────┐
+        │ search │  │  load  │  │ list │  │ keywords │
+        │        │  │        │  │      │  │          │
+        │ find by│  │ read   │  │browse│  │vocab     │
+        │keyword │  │ up to  │  │titles│  │overview  │
+        │        │  │  4     │  │      │  │ (counts) │
+        └────┬───┘  └────┬───┘  └──┬───┘  └────┬─────┘
+             │           │         │           │
+             ▼           ▼         ▼           ▼
+  ┌──────────────────────────────────────────────────────────────────┐
+  │                       RagStore (in-process)                       │
+  │  ┌──────────────────────────────────────────────────────────┐   │
+  │  │  in-memory index: title → { keywords, mtime, bytes }     │   │
+  │  │  lazy-loaded from disk on first call, kept fresh by      │   │
+  │  │  every save / append / delete; shared_mutex (multi-      │   │
+  │  │  reader / single-writer)                                  │   │
+  │  └──────────────────────────────────────────────────────────┘   │
+  │                                                                   │
+  │   search / list / keywords  ─→  index lookup, no disk read        │
+  │   load                      ─→  one file read off disk            │
+  │   save                      ─→  atomic tempfile + rename(2)       │
+  │   append                    ─→  read body → merge → atomic write  │
+  │                                  (whole RMW under unique_lock)    │
+  │   delete                    ─→  unlink + index erase              │
+  └──────────────────────────────┬───────────────────────────────────┘
                                  │
                                  ▼
   ┌──────────────────────────────────────────────────────────────┐
@@ -232,7 +244,7 @@ mkdir -p ~/easyai-reg
 easyai-cli --url http://127.0.0.1:8080 --RAG ~/easyai-reg
 ```
 
-Same six tools, but the memory lives in your home directory.
+Same seven tools, but the memory lives in your home directory.
 
 ### From easyai-local (single-process REPL with RAG)
 
@@ -333,7 +345,7 @@ use `.` for hierarchy.
 
 ---
 
-## 4. The six tools
+## 4. The seven tools
 
 Each tool description below is what the MODEL sees. The descriptions
 were written to actively encourage use — see §5.
@@ -346,18 +358,63 @@ rag_save(title: string, keywords: string[], content: string,
 ```
 
 Writes `<root>/<title>.md`. Overwrites if it already exists (this is
-how the model **updates** a memory). Atomic on POSIX (tempfile +
-rename). Refuses invalid title or keywords with a clear error.
+how the model **replaces** a memory wholesale; for **growing** an
+existing memory without losing its body, use `rag_append`). Atomic
+on POSIX (tempfile + rename). Refuses invalid title or keywords with
+a clear error.
 
 Pass `fix=true` to mint a **fixed memory**: the title is auto-
 prepended with `fix-easyai-` if not already, and from then on the
 file is immutable through the tool surface — `rag_save` will refuse
-to overwrite it and `rag_delete` will refuse to remove it. Use this
-to seed system designs, hard rules, ground-truth definitions the
-model must not rewrite mid-conversation. The on-disk content is
-plain Markdown like any other memory; the immutability is enforced
-by the title prefix, so `ls fix-easyai-*` is the canonical "show me
-every fixed memory" listing.
+to overwrite it, `rag_append` will refuse to grow it, and `rag_delete`
+will refuse to remove it. Use this to seed system designs, hard
+rules, ground-truth definitions the model must not rewrite mid-
+conversation. The on-disk content is plain Markdown like any other
+memory; the immutability is enforced by the title prefix, so
+`ls fix-easyai-*` is the canonical "show me every fixed memory"
+listing.
+
+### rag_append
+
+```
+rag_append(title: string, content: string,
+           keywords?: string[]) -> ok
+```
+
+Read-modify-write on an EXISTING memory: reads the current body off
+disk, appends `content` after a Markdown horizontal rule (`---`),
+and writes the merged file back via the same atomic tempfile +
+rename(2) `rag_save` uses. Use this when you've **learned more
+about something you already wrote down** — refining a user's
+preferences, accumulating a project's running log, growing a
+debugging trail across sessions — without losing the previous
+content.
+
+Why a separator? So the operator opening the `.md` file sees
+exactly where each appendix begins. Multiple appends stack: old →
+rule → newer → rule → newest. The format stays plain Markdown.
+
+`keywords` is optional. When passed, the array's keywords are
+**merged into** the memory's existing keyword list — duplicates
+deduped, total still capped at 8 (oldest wins on overflow). Use
+this when the appendix broadens the memory's topic: a memory
+tagged `["user-prefs"]` gaining a section about hardware should
+add `"hardware"` so future `rag_search` reaches it.
+
+Refused on:
+- titles that don't exist (use `rag_save` to create);
+- titles starting with `fix-easyai-` (immutable);
+- merged content that would exceed 256 KiB (split into a new
+  memory with `rag_save` instead).
+
+Concurrency. The whole RMW (existence check + read + merge + write)
+runs under one `unique_lock` on the store's `shared_mutex`, so
+concurrent `rag_append` / `rag_save` / `rag_delete` calls on the
+same store serialise. Two threads appending to the SAME title
+queue up; both appendices land. Concurrent reads (`rag_search` /
+`rag_load` / `rag_list` / `rag_keywords`) hold a shared_lock and
+parallelise except while a writer holds the unique_lock — same
+discipline as the rest of the RagStore.
 
 ### rag_search
 
@@ -486,10 +543,10 @@ deletion.
 ### The single-tool dispatcher (experimental)
 
 Pass `--experimental-rag` (or `[SERVER] experimental_rag = on` in
-the INI) to collapse the six tools into one:
+the INI) to collapse the seven tools into one:
 
 ```
-rag(action: "save" | "search" | "load" | "list" | "delete" | "keywords",
+rag(action: "save" | "append" | "search" | "load" | "list" | "delete" | "keywords",
     title?, titles?, keywords?, content?, fix?,
     prefix?, max?, max_results?, page?, min_count?) -> same output
 ```
@@ -497,14 +554,14 @@ rag(action: "save" | "search" | "load" | "list" | "delete" | "keywords",
 `action` is required; the rest are conditionally required by the
 chosen action (the legacy validation messages still apply, including
 the "missing required argument: keywords" / "title" / `…` you'd see
-from the six-tool layout). The dispatcher rewrites guidance text in
-its responses — references like `Use rag_load with…` come back as
-`Use rag(action="load") with…` so the model only sees the tool name
-it can actually call.
+from the seven-tool layout). The dispatcher rewrites guidance text
+in its responses — references like `Use rag_load with…` come back
+as `Use rag(action="load") with…` so the model only sees the tool
+name it can actually call.
 
 **On-disk layout, locking discipline, fix-memory rules, error
 messages — all unchanged.** Internally the dispatcher captures the
-same six handler closures the legacy layout uses; switching shapes
+same seven handler closures the legacy layout uses; switching shapes
 between sessions is safe because the directory is the source of
 truth and both shapes read/write the same files.
 
@@ -520,7 +577,7 @@ When to leave it off (the default):
   schema tool calls are noticeably less reliable than flat ones —
   Bonsai-class targets, BitNet, anything below ~4 bits.
 * You have prompts / system messages that explicitly mention the
-  six tool names as instructions to the model.
+  seven tool names as instructions to the model.
 
 ---
 

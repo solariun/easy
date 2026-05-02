@@ -56,11 +56,12 @@
 
 namespace easyai::tools {
 
-// The six tools that comprise the RAG surface. They share an
+// The seven tools that comprise the RAG surface. They share an
 // internal store object that holds the in-memory index and
 // serialises disk writes.
 struct RagTools {
     Tool save;      // rag_save(title, keywords[], content)
+    Tool append;    // rag_append(title, content, keywords?[]) — RMW on existing
     Tool search;    // rag_search(keywords[], max_results=10) — ≥2 matches when 2+ kw
     Tool load;      // rag_load(titles[1..4])
     Tool list;      // rag_list(prefix?, max=50)
@@ -84,21 +85,22 @@ struct RagTools {
 RagTools make_rag_tools(std::string root_dir);
 
 // Experimental — single-tool RAG dispatcher. Exposes one `rag` tool
-// with an `action` parameter selecting one of "save" / "search" /
-// "load" / "list" / "delete" / "keywords"; remaining params (title,
-// keywords, content, fix, titles, prefix, max, max_results, page,
-// min_count) are routed to the matching action's handler internally.
+// with an `action` parameter selecting one of "save" / "append" /
+// "search" / "load" / "list" / "delete" / "keywords"; remaining
+// params (title, keywords, content, fix, titles, prefix, max,
+// max_results, page, min_count) are routed to the matching action's
+// handler internally.
 //
-// Behaviour and on-disk format are byte-identical to the six-tool
+// Behaviour and on-disk format are byte-identical to the seven-tool
 // build (same RagStore, same handlers) — this is purely a different
 // shape for the model's tool catalog. When this is registered, the
-// six rag_* tools should NOT be registered: the same operations are
-// reachable through `rag(action=...)` and exposing both would just
-// confuse the model with two paths to the same thing.
+// seven rag_* tools should NOT be registered: the same operations
+// are reachable through `rag(action=...)` and exposing both would
+// just confuse the model with two paths to the same thing.
 //
-// Why "experimental": collapsing six flat schemas into one
+// Why "experimental": collapsing seven flat schemas into one
 // discriminated schema costs accuracy on weak / 1-bit-quant tool
-// callers. We keep the legacy six-tool layout as the default and
+// callers. We keep the legacy seven-tool layout as the default and
 // expose this only behind --experimental-rag for operators who
 // want to trade some calling reliability for a smaller catalog.
 Tool make_unified_rag_tool(std::string root_dir);

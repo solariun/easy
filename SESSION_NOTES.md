@@ -305,6 +305,67 @@ Webui title default also flips to `"Deep"`.
 ## 5. Recent commits (most recent first)
 
 ```
+2026-05-02 (later) — RAG: rag_append + user-focus prompts.
+
+(pending commit) Adds a seventh tool to RagTools: rag_append.
+                 Read-modify-write on an existing memory: reads
+                 body off disk, appends new content after a
+                 Markdown horizontal rule (`---`), atomically
+                 rewrites via tempfile + rename (same
+                 save_locked path rag_save uses). The whole RMW
+                 runs under one std::unique_lock<shared_mutex>,
+                 so concurrent appenders to the SAME title queue
+                 cleanly (both appendices land), and concurrent
+                 saves/deletes/reads serialise / parallelise via
+                 the existing reader/writer discipline. Refuses
+                 on titles that don't exist, on fix-easyai-* (the
+                 immutability invariant covers append the same
+                 way it covers save/delete), and when merged
+                 size > kMaxContentBytes (256 KiB).
+                 Optional keywords[] arg merges into the existing
+                 keyword list (deduped, total still capped at 8;
+                 oldest wins on overflow). New handler:
+                 make_append_handler in src/rag_tools.cpp;
+                 wired into make_rag_tools as RagTools::append
+                 and into make_unified_rag_tool as
+                 action="append" (kSubs entry added so legacy
+                 prose references like rag_append in the inner
+                 description get rewritten to
+                 rag(action="append") inside unified mode).
+                 User-focus prompt update: rag_save and
+                 rag_append descriptions now explicitly tell the
+                 model to prioritise notes about the user
+                 themselves (name, role, hardware, projects,
+                 working style, corrections, likes, dislikes)
+                 and prefer rag_append on the existing profile
+                 memory over rag_save (which would overwrite).
+                 Suggested user-* titles: user-profile,
+                 user-prefs, user-projects, user-hardware,
+                 user-corrections.
+                 All four consumers updated to register the new
+                 tool: examples/server.cpp, examples/mcp_server.cpp,
+                 examples/cli.cpp (with tools_enabled gating
+                 mirroring the rest), src/backend.cpp (used by
+                 easyai-local + easyai-chat). Help-text strings
+                 also updated — the lib went from 5/6 to seven
+                 tools and every CLI reference (server.cpp,
+                 cli.cpp, local.cpp, mcp_server.cpp) now lists
+                 the canonical seven names.
+                 Docs: README.md (What's new + options table),
+                 RAG.md (TOC, intro, quickstart, full
+                 rag_append section in §4, dispatcher §,
+                 tool-flow ASCII diagram restructured into
+                 write-row + read-row), manual.md, design.md
+                 (renamed "Why five tools" → "Why seven tools"),
+                 LINUX_SERVER.md, MCP.md (3 places),
+                 easyai-server.md (INI table + flag reference +
+                 cross-refs), easyai-mcp-server.md, SECURITY_AUDIT.md
+                 (§16.6b reflects shared_mutex + seven tools).
+                 All 7 binaries build clean. easyai-cli
+                 --list-tools confirms the new tool registers
+                 correctly (16 tools when --RAG is on: 9 default
+                 + 7 RAG).
+
 2026-05-02 — Fourth-pass security audit + readability batch.
 
 (commits 5143799 + b44b615) Two small commits, no public API

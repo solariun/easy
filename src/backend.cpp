@@ -65,11 +65,13 @@ bool LocalBackend::init(std::string & err) {
     // RAG — the agent's persistent registry (long-term memory).
     // Registered when the operator gives us a directory. The
     // directory does NOT have to exist yet; the tools create it on
-    // first save. Five tools: rag_save / rag_search / rag_load /
-    // rag_list / rag_delete. See RAG.md for the full guide.
+    // first save. Seven tools: rag_save / rag_append / rag_search /
+    // rag_load / rag_list / rag_delete / rag_keywords. See RAG.md for
+    // the full guide.
     if (!cfg.rag_dir.empty()) {
         auto rag = tools::make_rag_tools(cfg.rag_dir);
         engine.add_tool(rag.save);
+        engine.add_tool(rag.append);
         engine.add_tool(rag.search);
         engine.add_tool(rag.load);
         engine.add_tool(rag.list);

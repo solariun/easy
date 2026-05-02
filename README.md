@@ -43,6 +43,34 @@ A running log of user-facing changes. Latest first — keep this list
 current as features land so anyone returning to the repo (or
 landing on it for the first time) sees what shipped recently.
 
+### 2026-05-02 (later) — RAG `rag_append` + user-focus prompts
+
+* **`rag_append` — new RAG tool.** Adds new content to the end of
+  an existing memory without losing the previous body. Read-modify-
+  write under one `unique_lock` on the store's `shared_mutex`, so
+  concurrent appenders queue cleanly (no lost appendix, no torn
+  merge for any reader); on disk the new content is separated from
+  the old by a Markdown horizontal rule (`---`) so the operator
+  reading the `.md` file sees exactly where each appendix starts.
+  Refuses on titles that don't exist (use `rag_save`), on fixed
+  memories (`fix-easyai-*`), and when the merged size would exceed
+  256 KiB. Optional `keywords[]` parameter merges into the existing
+  keyword list (deduped, capped at 8). Wired into every consumer
+  (server, MCP server, CLI, local backend) and the experimental
+  single-tool dispatcher (`rag(action="append", ...)`). Full doc:
+  [`RAG.md`](RAG.md) §4.
+* **User-focus prompt update.** `rag_save` and `rag_append` tool
+  descriptions now explicitly tell the model to prioritise notes
+  about the user themselves — name, role, hardware, projects,
+  working style, corrections, likes, dislikes — and to grow that
+  memory across sessions with `rag_append` instead of rewriting it
+  with `rag_save`. The next conversation (tomorrow, three months
+  from now) starts with the user already known, so they don't have
+  to explain themselves twice. The lib went from 5/6 RAG tools to
+  the canonical seven (`rag_save`, `rag_append`, `rag_search`,
+  `rag_load`, `rag_list`, `rag_delete`, `rag_keywords`); all CLI
+  help text, help comments, and docs updated to match.
+
 ### 2026-05-02 — Fourth-pass security audit + readability batch
 
 * **`/tmp` log file hardened (security, MEDIUM).** The auto-generated
@@ -186,8 +214,8 @@ landing on it for the first time) sees what shipped recently.
   has an INI key (FlagDef table refactor); precedence is CLI > INI
   > hardcoded default. Edit the file, `systemctl restart`, done.
   Full reference in [`easyai-server.md`](easyai-server.md) §1.
-* **RAG: persistent memory.** Six tools (`rag_save`, `rag_search`,
-  `rag_load`, `rag_list`, `rag_delete`, `rag_keywords`).
+* **RAG: persistent memory.** Seven tools (`rag_save`, `rag_append`,
+  `rag_search`, `rag_load`, `rag_list`, `rag_delete`, `rag_keywords`).
   Multi-keyword search with adaptive threshold + pagination. One
   Markdown file per entry — operator-readable, hand-editable. See
   [`RAG.md`](RAG.md).
@@ -571,10 +599,12 @@ no API bill, no data leaving the box.**
   Model Context Protocol client auto-discovers the tool catalogue.
   **Write one tool — every AI app on your machine can call it.**
 
-* **Long-term memory built in.** RAG: six tools the agent uses to
-  save, search, load, list, delete, and inventory its own
-  knowledge. One human-readable Markdown file per entry — `cat`,
-  `vim`, `grep` it. No vector DB to babysit.
+* **Long-term memory built in.** RAG: seven tools the agent uses
+  to save, append (grow what you already know about the user
+  without losing the previous body), search, load, list, delete,
+  and inventory its own knowledge. One human-readable Markdown
+  file per entry — `cat`, `vim`, `grep` it. No vector DB to
+  babysit.
 
 * **Operator-defined tool packs.** Drop a JSON manifest in
   `/etc/easyai/external-tools/`, the agent picks it up at startup.
@@ -771,8 +801,8 @@ no shell.
 | `--allow-bash`        | `bash` (run `/bin/sh -c`). cwd = `--sandbox <dir>` if given, otherwise the binary's CWD. NOT a hardened sandbox — runs with your user privileges. Also bumps the agentic-loop `max_tool_hops` to 99999 (bash flows naturally span many turns). |
 | `--use-google`        | `web_google` (Google Custom Search JSON API). Requires `GOOGLE_API_KEY` and `GOOGLE_CSE_ID` env vars. Counts against your Google quota — free tier is 100 queries/day per key. Silently skipped if either env var is missing. |
 | `--external-tools <dir>` | Load every `EASYAI-<name>.tools` file in `<dir>` as an operator-defined tool pack. Per-file fault isolation (a bad file is logged + skipped, the agent still starts). Spawns via `fork`+`execve` — never a shell. **This is the supported way to give the model focused powers without flipping `--allow-bash`.** See [`EXTERNAL_TOOLS.md`](EXTERNAL_TOOLS.md). |
-| `--RAG <dir>`         | Enable RAG, the agent's persistent **memory** (search / store / recall / update / forget). Six tools by default — `rag_save`, `rag_search`, `rag_load`, `rag_list`, `rag_delete`, `rag_keywords` — each memory one Markdown file in `<dir>`. Memories whose title starts with `fix-easyai-` are immutable: pass `fix=true` to `rag_save` to mint one. The systemd-installed server passes this by default (`/var/lib/easyai/rag`). See [`RAG.md`](RAG.md). |
-| `--experimental-rag`  | Replace the six `rag_*` tools with a single `rag(action=...)` dispatcher. Same on-disk format, same fix-memory semantics — only the catalog shape changes. Smaller catalog (1 entry vs 6) at the cost of accuracy on small / 1-bit-quant tool callers. Has no effect when `--RAG` is also off. |
+| `--RAG <dir>`         | Enable RAG, the agent's persistent **memory** (search / store / append / recall / update / forget). Seven tools by default — `rag_save`, `rag_append` (grow an existing memory without losing its body), `rag_search`, `rag_load`, `rag_list`, `rag_delete`, `rag_keywords` — each memory one Markdown file in `<dir>`. Memories whose title starts with `fix-easyai-` are immutable: pass `fix=true` to `rag_save` to mint one. The systemd-installed server passes this by default (`/var/lib/easyai/rag`). See [`RAG.md`](RAG.md). |
+| `--experimental-rag`  | Replace the seven `rag_*` tools with a single `rag(action=...)` dispatcher. Same on-disk format, same fix-memory semantics — only the catalog shape changes. Smaller catalog (1 entry vs 7) at the cost of accuracy on small / 1-bit-quant tool callers. Has no effect when `--RAG` is also off. |
 | `--mcp <url>`         | Connect to a remote MCP server as a CLIENT (e.g. another `easyai-server` or `easyai-mcp-server`). The upstream's tool catalogue is fetched via `tools/list` and merged into the local one; each remote tool's handler proxies `tools/call` back to it. Local tool names win on collision (remote dup skipped with a warning). Pair with `--mcp-token <token>` when the upstream requires bearer auth. |
 | `--no-local-tools`    | Skip the LOCAL built-in toolbelt entirely (datetime, web_*, fs_*, bash, ...). Useful when you want ONLY external tools, ONLY RAG, or ONLY tools fetched via `--mcp`. Does NOT disable the MCP client — that's controlled by `--mcp`. **Renamed from `--no-tools`.** |
 

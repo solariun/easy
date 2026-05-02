@@ -720,7 +720,7 @@ What's planned next, roughly in priority order:
   upgrade / backup).
 - [`MCP.md`](MCP.md) — the MCP protocol surface, per-client
   connection cookbook, security model.
-- [`RAG.md`](RAG.md) — persistent registry, the six tools, workflows.
+- [`RAG.md`](RAG.md) — persistent registry, the seven tools, workflows.
 - [`EXTERNAL_TOOLS.md`](EXTERNAL_TOOLS.md) — operator-defined
   external tools (`EASYAI-*.tools` JSON manifests).
 - [`SECURITY_AUDIT.md`](SECURITY_AUDIT.md) — three audit passes,

@@ -284,7 +284,7 @@ struct Options {
     bool        use_google      = false;       // opt-in: register `web_google`
                                                 // (also needs GOOGLE_API_KEY +
                                                 // GOOGLE_CSE_ID env vars)
-    bool        experimental_rag = false;       // collapse six rag_* into a
+    bool        experimental_rag = false;       // collapse seven rag_* into a
                                                 // single `rag(action=...)` tool;
                                                 // disables the six-tool layout.
     std::set<std::string> tools_enabled;       // empty = all defaults
@@ -361,10 +361,14 @@ void usage(const char * argv0) {
 "                                 fs_read_file, fs_list_dir, fs_glob,\n"
 "                                 fs_grep, fs_write_file, bash,\n"
 "                                 system_meminfo, system_loadavg,\n"
-"                                 system_cpu_usage, system_swaps\n"
+"                                 system_cpu_usage, system_swaps,\n"
+"                                 rag_save, rag_append, rag_search,\n"
+"                                 rag_load, rag_list, rag_delete,\n"
+"                                 rag_keywords (rag_* require --RAG DIR)\n"
 "                               default: datetime,plan,web_search,web_fetch,\n"
 "                                 system_meminfo,system_loadavg,\n"
-"                                 system_cpu_usage,system_swaps\n"
+"                                 system_cpu_usage,system_swaps,\n"
+"                                 (every rag_* registered when --RAG is set)\n"
 "    --sandbox DIR              enable fs_list_dir, fs_read_file,\n"
 "                                 fs_glob, fs_grep AND fs_write_file,\n"
 "                                 ALL scoped to DIR.  Without --sandbox\n"
@@ -380,9 +384,9 @@ void usage(const char * argv0) {
 "                                 GOOGLE_API_KEY and GOOGLE_CSE_ID env\n"
 "                                 vars; counts against your Google quota\n"
 "                                 (free tier: 100 queries/day).\n"
-"    --experimental-rag         collapse the six rag_* tools into a single\n"
+"    --experimental-rag         collapse the seven rag_* tools into a single\n"
 "                                 `rag(action=...)` tool. On-disk format is\n"
-"                                 unchanged; the six tools are NOT registered\n"
+"                                 unchanged; the seven tools are NOT registered\n"
 "                                 when this is set. Smaller catalog at the\n"
 "                                 cost of accuracy on weak / 1-bit-quant\n"
 "                                 tool callers — leave off if you're running\n"
@@ -395,9 +399,10 @@ void usage(const char * argv0) {
 "                                 warnings (errors are always shown).\n"
 "                                 See EXTERNAL_TOOLS.md.\n"
 "    --RAG DIR                  enable RAG (the agent's persistent registry)\n"
-"                                 rooted at DIR. Registers rag_save /\n"
-"                                 rag_search / rag_load / rag_list /\n"
-"                                 rag_delete tools so the model can keep\n"
+"                                 rooted at DIR. Registers seven tools:\n"
+"                                 rag_save / rag_append (grow an existing\n"
+"                                 memory) / rag_search / rag_load /\n"
+"                                 rag_list / rag_delete / rag_keywords —\n"
 "                                 long-term memory across sessions. Each\n"
 "                                 entry is a small Markdown file in DIR.\n"
 "                                 See RAG.md.\n"
@@ -650,10 +655,11 @@ void register_tools(easyai::Client & cli,
     if (wants("system_swaps"))     cli.add_tool(systools::make_system_swaps());
 
     // RAG — the agent's persistent registry / long-term memory.
-    // Five tools (rag_save / rag_search / rag_load / rag_list /
-    // rag_delete) registered when --RAG <dir> is given. The dir
-    // does not need to exist yet; rag_save creates it on first
-    // call. See RAG.md for the full guide.
+    // Seven tools (rag_save / rag_append / rag_search / rag_load /
+    // rag_list / rag_delete / rag_keywords) registered when
+    // --RAG <dir> is given. The dir does not need to exist yet;
+    // rag_save creates it on first call. See RAG.md for the full
+    // guide.
     if (!o.rag_dir.empty()) {
         if (o.experimental_rag) {
             // Single-tool dispatcher: model sees one `rag(action=...)`
@@ -668,6 +674,7 @@ void register_tools(easyai::Client & cli,
         } else {
             auto rag = easyai::tools::make_rag_tools(o.rag_dir);
             if (o.tools_enabled.empty() || o.tools_enabled.count("rag_save"))     cli.add_tool(rag.save);
+            if (o.tools_enabled.empty() || o.tools_enabled.count("rag_append"))   cli.add_tool(rag.append);
             if (o.tools_enabled.empty() || o.tools_enabled.count("rag_search"))   cli.add_tool(rag.search);
             if (o.tools_enabled.empty() || o.tools_enabled.count("rag_load"))     cli.add_tool(rag.load);
             if (o.tools_enabled.empty() || o.tools_enabled.count("rag_list"))     cli.add_tool(rag.list);

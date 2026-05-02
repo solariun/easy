@@ -385,7 +385,7 @@ const std::vector<FlagDef> & kFlags() {
         "      --external-tools <dir>   Load every EASYAI-*.tools manifest\n"
         "                                in <dir>. Per-file fault isolation.\n"
         "                                See EXTERNAL_TOOLS.md.\n"
-        "      --RAG <dir>              Enable the six RAG tools rooted at\n"
+        "      --RAG <dir>              Enable the seven RAG tools rooted at\n"
         "                                <dir>. See RAG.md.\n"
         "\nAuth:\n"
         "      --api-key <token>        Bearer required for /health,\n"
@@ -825,10 +825,11 @@ int main(int argc, char ** argv) {
         for (auto & t : tb.tools()) ctx->default_tools.push_back(std::move(t));
     }
 
-    // -------- RAG (six tools) ---------------------------------------------
+    // -------- RAG (seven tools) -------------------------------------------
     if (!args.rag_dir.empty()) {
         auto rag = easyai::tools::make_rag_tools(args.rag_dir);
         ctx->default_tools.push_back(std::move(rag.save));
+        ctx->default_tools.push_back(std::move(rag.append));
         ctx->default_tools.push_back(std::move(rag.search));
         ctx->default_tools.push_back(std::move(rag.load));
         ctx->default_tools.push_back(std::move(rag.list));

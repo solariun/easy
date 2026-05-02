@@ -49,7 +49,7 @@ connect to easyai-server and use its tools as if they were native.
 ## 1. What we expose, and why
 
 `easyai-server` registers a tool catalogue at startup — built-in
-tools, the RAG (six tools), and any operator-defined tools loaded
+tools, the RAG (seven tools), and any operator-defined tools loaded
 from `--external-tools`. The MCP layer exposes that **same**
 catalogue via the Model Context Protocol so other AI applications
 can list and dispatch them as if they had registered the tools
@@ -665,7 +665,7 @@ succeeded, only the wrapped tool reported a problem.
 
 ### Tools/list returns more entries than I expected
 
-Every registered tool is exposed: built-ins + RAG (six tools) +
+Every registered tool is exposed: built-ins + RAG (seven tools) +
 external-tools (operator's `EASYAI-*.tools` manifests). Use
 `/health` to see the count and `/v1/tools` for a brief
 description list.
@@ -686,6 +686,6 @@ without a restart, but it's not in V1.
 ---
 
 *See also:* `LINUX_SERVER.md` (operator's guide), `RAG.md` (the
-six tools the model writes to and clients read from),
+seven tools the model writes to and clients read from),
 `EXTERNAL_TOOLS.md` (operator-defined tool packs that show up in
 the MCP catalogue alongside built-ins), `design.md` (architecture).

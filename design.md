@@ -835,7 +835,7 @@ from `rename(2)`. We get indexing from a 200-line in-memory map
 that's rebuilt on first use (cost: parse N small files once per
 process — fast).
 
-### Why five tools, not one
+### Why seven tools, not one
 
 A single `reg(action, ...)` tool would shorten the schema but
 collapse the model's intent. Separate tools encode the intent in
@@ -844,9 +844,10 @@ choosing. `rag_save` calls and `rag_search` calls show up
 distinctly in audit logs / hooks; coarse `reg(action="save", ...)`
 calls would all blur together.
 
-Five also matches the natural workflow: save (write), search +
-load (read in two steps because previewing keeps the prompt
-slim), list (browse), delete (curate).
+Seven also matches the natural workflow: save (write a new memory),
+append (grow an existing one without losing its body), search +
+load (read in two steps because previewing keeps the prompt slim),
+list (browse), delete (curate), keywords (vocabulary review).
 
 ### Why max 4 entries per `rag_load`
 

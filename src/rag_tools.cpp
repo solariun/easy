@@ -407,7 +407,7 @@ struct EntryMeta {
 };
 
 // ---------------------------------------------------------------------------
-// RagStore — the shared state for all six tools.
+// RagStore — the shared state for all seven tools.
 // ---------------------------------------------------------------------------
 //
 // `mu` is a shared_mutex so high-concurrency MCP traffic (rag_search /
@@ -764,6 +764,172 @@ ToolHandler make_save_handler(std::shared_ptr<RagStore> store) {
           << keywords.size() << " keyword" << (keywords.size() == 1 ? "" : "s")
           << (title_is_fixed(title) ? ", FIXED — immutable from now on" : "")
           << ")";
+        return ToolResult::ok(o.str());
+    };
+}
+
+// rag_append — read-modify-write an existing memory.
+//
+// Concurrency contract (this is the part that has to be right):
+//   * The whole RMW (existence check + load_one + merge +
+//     save_locked) runs under ONE std::unique_lock<shared_mutex>,
+//     same writer-discipline as rag_save / rag_delete. So all
+//     four scenarios serialise correctly:
+//       - two threads appending to the SAME title  → ordered;
+//         both appendices land, last writer's appendix is last.
+//       - two threads appending to DIFFERENT titles → still
+//         serialised (one shared_mutex per RagStore); cheap
+//         compared to disk I/O.
+//       - append vs concurrent rag_save / rag_delete → also
+//         under unique_lock; whichever lands first wins, the
+//         other sees the post-state (not-found or merged-content).
+//       - append vs concurrent reads (rag_search / rag_load /
+//         rag_list / rag_keywords) → readers hold shared_lock,
+//         block until our write commits, then proceed.
+//   * save_locked writes via tempfile + rename(2), so a reader
+//     that obtains the file path some other way (e.g. another
+//     process slurp_capped'ing the .md directly) sees either the
+//     old full body or the new merged body — never a half-applied
+//     append. The single-process invariant in the header
+//     ("Concurrency: ... single-process is the supported model")
+//     means cross-process semantics are best-effort, not contract.
+//   * load_one and save_locked are designed to be called WITH the
+//     unique_lock already held — they don't re-acquire, so there
+//     is no upgrade dance and no risk of self-deadlock.
+ToolHandler make_append_handler(std::shared_ptr<RagStore> store) {
+    return [store](const ToolCall & c) -> ToolResult {
+        std::string title;
+        if (!args::get_string(c.arguments_json, "title", title) || title.empty()) {
+            return ToolResult::error("missing required argument: title");
+        }
+        if (!is_valid_title(title, kMaxTitleBytes)) {
+            return ToolResult::error(
+                "title \"" + title + "\" is invalid; must match "
+                "[A-Za-z0-9._+-]{1," + std::to_string(kMaxTitleBytes) + "}");
+        }
+
+        std::string suffix;
+        if (!args::get_string(c.arguments_json, "content", suffix)) {
+            return ToolResult::error("missing required argument: content");
+        }
+        if (suffix.empty()) {
+            return ToolResult::error(
+                "content is empty — nothing to append. If you want to "
+                "replace the whole memory, use rag_save with the same title.");
+        }
+
+        // Optional: extra keywords to merge into the existing list.
+        // Validated up-front (before we hold the lock) so a malformed
+        // call returns a clean error without churning state.
+        std::vector<std::string> extra_keywords;
+        std::string err;
+        if (args::has(c.arguments_json, "keywords")
+                && !parse_string_array(c.arguments_json, "keywords",
+                                       extra_keywords, err)) {
+            return ToolResult::error(err);
+        }
+        for (const auto & k : extra_keywords) {
+            if (!is_valid_id(k, kMaxKeywordBytes)) {
+                return ToolResult::error(
+                    "keyword \"" + k + "\" is invalid; must match "
+                    "[A-Za-z0-9._+-]{1," + std::to_string(kMaxKeywordBytes) + "}");
+            }
+        }
+
+        // WRITE: unique_lock for the whole RMW so a concurrent
+        // rag_save (also unique_lock) can't slip between our read of
+        // the existing body and the rewrite of the merged content.
+        std::unique_lock<std::shared_mutex> lock(store->mu);
+
+        // Existence check before we touch disk: the model should
+        // know to call rag_save instead of rag_append for a brand-
+        // new memory. We use the in-memory index as the source of
+        // truth (load_index_locked ran at startup).
+        if (store->index.count(title) == 0) {
+            return ToolResult::error(
+                "no memory titled \"" + title + "\" — use rag_save to "
+                "create a new memory, or rag_list / rag_search to find "
+                "the title you meant.");
+        }
+
+        // Immutability gate: fixed memories live forever as written.
+        // Even an append would mutate them, so refuse the same way
+        // rag_save and rag_delete do.
+        if (title_is_fixed(title)) {
+            return ToolResult::error(
+                "memory \"" + title + "\" is fixed (immutable) — cannot "
+                "append. Pick a different title for a related memory, "
+                "or have the operator remove the file from disk first.");
+        }
+
+        // Read the existing body + keywords back from disk via the
+        // store helper (slurp + parse_entry, capped at
+        // kMaxContentBytes + 4 KiB header room — same cap rag_load
+        // uses, so an oversized hand-edited file is rejected with
+        // the same message the rest of the surface produces).
+        std::vector<std::string> old_keywords;
+        std::string              old_body;
+        std::int64_t             old_mtime = 0;   // unused but required by the API
+        if (!store->load_one(title, old_keywords, old_body, old_mtime, err)) {
+            return ToolResult::error(err);
+        }
+
+        // Compose the merged body. We insert a Markdown horizontal
+        // rule as the separator so the operator opening the .md file
+        // sees exactly where the appendix begins. Trim any trailing
+        // newlines from the existing body first so the rule sits on
+        // a clean blank line regardless of how the previous save
+        // happened to terminate.
+        std::string merged = old_body;
+        while (!merged.empty() && (merged.back() == '\n' || merged.back() == '\r')) {
+            merged.pop_back();
+        }
+        if (!merged.empty()) merged += "\n\n---\n\n";
+        merged += suffix;
+
+        if (merged.size() > kMaxContentBytes) {
+            return ToolResult::error(
+                "appended memory would exceed " + std::to_string(kMaxContentBytes)
+                + " bytes (existing " + std::to_string(old_body.size())
+                + " B + appendix " + std::to_string(suffix.size())
+                + " B + separator). Split into a new memory with rag_save "
+                  "instead, or condense the appendix.");
+        }
+
+        // Merge keywords: keep the existing order (the model relies on
+        // search ranking that's stable across appends), then append any
+        // extras the model passed that weren't already there. Cap at
+        // kMaxKeywordsPerEntry; oldest stays.
+        std::vector<std::string> merged_keywords = old_keywords;
+        for (const auto & k : extra_keywords) {
+            const bool already = std::find(merged_keywords.begin(),
+                                           merged_keywords.end(), k)
+                                 != merged_keywords.end();
+            if (!already && merged_keywords.size() < kMaxKeywordsPerEntry) {
+                merged_keywords.push_back(k);
+            }
+        }
+        if (merged_keywords.empty()) {
+            // Defensive — every saved memory has at least one keyword
+            // (rag_save enforces it). If somehow we read back an entry
+            // with none (operator hand-edited the keywords: header out),
+            // require the model to supply them on append rather than
+            // writing a search-invisible memory.
+            return ToolResult::error(
+                "existing memory has no keywords (someone may have hand-"
+                "edited it); pass keywords[] to rag_append so the merged "
+                "memory remains searchable.");
+        }
+
+        if (!store->save_locked(title, merged_keywords, merged, err)) {
+            return ToolResult::error(err);
+        }
+
+        std::ostringstream o;
+        o << "appended to \"" << title << kEntrySuffix << "\" ("
+          << "+" << suffix.size() << " B → " << merged.size() << " B total, "
+          << merged_keywords.size() << " keyword"
+          << (merged_keywords.size() == 1 ? "" : "s") << ")";
         return ToolResult::ok(o.str());
     };
 }
@@ -1262,7 +1428,7 @@ ToolHandler make_keywords_handler(std::shared_ptr<RagStore> store) {
 }
 
 // Build a RagStore at `root_dir` and eager-load its index. Shared
-// between the six-tool factory (make_rag_tools) and the experimental
+// between the seven-tool factory (make_rag_tools) and the experimental
 // single-tool factory (make_unified_rag_tool) so both shapes see the
 // same on-disk content and there's no chance of a divergent eager-
 // load policy. After this returns, every read path can take a
@@ -1296,6 +1462,19 @@ RagTools make_rag_tools(std::string root_dir) {
             "documents the user fed you. The more carefully you populate your "
             "memory, the smarter you become over time — future conversations "
             "will rag_search and find what THIS conversation taught you.\n"
+            "\n"
+            "USER FOCUS — prioritise notes about the user themselves. "
+            "Whenever the user reveals who they are or how they work — name, "
+            "role, hardware, projects, working style, tools they prefer, "
+            "things they've corrected you about, things they like, things "
+            "they hate — that's a memory worth keeping. Suggested titles: "
+            "`user-profile`, `user-prefs`, `user-projects`, `user-hardware`, "
+            "`user-corrections`. The next conversation (could be tomorrow, "
+            "could be in three months) starts by recalling these, so the "
+            "user doesn't have to explain themselves twice. When you learn "
+            "ONE MORE thing about the user later, prefer rag_append on the "
+            "matching profile memory over rag_save (which would overwrite); "
+            "the running profile keeps growing without losing context.\n"
             "\n"
             "Pick a short descriptive title (letters / digits / dash / underscore "
             "only — no spaces) and 2-5 short keywords so rag_search can recall it "
@@ -1354,6 +1533,79 @@ RagTools make_rag_tools(std::string root_dir) {
                "user explicitly asks to learn something as a fixed rule, system "
                "design, or ground-truth definition. Default false.", false)
         .handle(make_save_handler(store))
+        .build();
+
+    out.append = Tool::builder("rag_append")
+        .describe(
+            "Add new content to the end of an EXISTING memory. Use this "
+            "when you learned more about something you already wrote down "
+            "— refining a user's preferences, accumulating a project's "
+            "running log, growing a debugging trail across sessions — "
+            "WITHOUT losing the previous content.\n"
+            "\n"
+            "When to prefer rag_append over rag_save:\n"
+            "  - the existing memory is still correct, you just have more\n"
+            "    to add (a new fact, a clarification, a follow-up note)\n"
+            "  - you're keeping a chronological log (decisions, attempts,\n"
+            "    observations about the user)\n"
+            "  - the user told you 'add this to what you already know\n"
+            "    about X' — append is the natural verb\n"
+            "\n"
+            "When to use rag_save instead: when the existing memory is\n"
+            "wrong / superseded / has the wrong title or wrong keywords.\n"
+            "rag_save with the same title overwrites cleanly; rag_append\n"
+            "preserves history.\n"
+            "\n"
+            "How the appendix looks on disk: the new content is added\n"
+            "after a Markdown horizontal rule (`---`) so the operator\n"
+            "reading the .md file sees exactly where each appendix\n"
+            "begins. Multiple appends stack — old → rule → newer →\n"
+            "rule → newest.\n"
+            "\n"
+            "USER FOCUS — track the user as they reveal themselves: their\n"
+            "name, role, hardware, projects, working style, tools they\n"
+            "prefer, things they've corrected you about, what they liked\n"
+            "or disliked. Each conversation is a chance to learn one more\n"
+            "thing. Whenever the user says \"I am…\", \"I prefer…\",\n"
+            "\"my setup is…\", \"don't…\", \"always…\", that's a memory\n"
+            "worth keeping — and on the next conversation, rag_append is\n"
+            "how you grow it without losing what you already learned.\n"
+            "\n"
+            "ERRORS:\n"
+            "  - title not found → use rag_save to create it; use\n"
+            "    rag_list / rag_search if you're not sure of the exact\n"
+            "    title\n"
+            "  - title is fixed (`fix-easyai-` prefix) → fixed memories\n"
+            "    are immutable; pick a different title for a related\n"
+            "    memory (e.g. `<topic>-notes`)\n"
+            "  - merged content would exceed 256 KiB → split into a new\n"
+            "    memory with rag_save instead, or condense the appendix\n"
+            "\n"
+            "Optional `keywords` extends the memory's keyword list (for\n"
+            "rag_search recall) — existing keywords are preserved, new\n"
+            "ones are deduped against them, total still capped at 8."
+        )
+        .param("title", "string",
+               "Exact title of an existing memory. Letters, digits, dash, "
+               "underscore. 1..64 chars. Use rag_list or rag_search first "
+               "if you don't remember the exact spelling. "
+               "Titles starting with 'fix-easyai-' are immutable and "
+               "will be rejected.", true)
+        .param("content", "string",
+               "Text to append after the existing body. Free-form UTF-8 "
+               "up to whatever room is left (existing + separator + new ≤ "
+               "256 KB). Markdown / prose / code blocks all fine. The "
+               "library inserts a `---` Markdown rule before this text so "
+               "you don't need to add your own separator.", true)
+        .param("keywords", "array",
+               "Optional. 0..8 additional keywords to merge into the "
+               "memory's keyword list. Existing keywords are preserved; "
+               "new ones are deduped and the total stays capped at 8 "
+               "(oldest wins on overflow). Use this when the appendix "
+               "broadens the memory's topic — e.g. a memory tagged "
+               "[\"user-prefs\"] gaining a section about hardware should "
+               "add \"hardware\" so future rag_search reaches it.", false)
+        .handle(make_append_handler(store))
         .build();
 
     out.search = Tool::builder("rag_search")
@@ -1533,10 +1785,10 @@ RagTools make_rag_tools(std::string root_dir) {
 // discriminator) trip up smaller / quantised tool-callers far more
 // often than a flat "everything optional" schema does. Validation
 // stays runtime: each handler rejects calls missing its required
-// fields with the same crisp messages the legacy six-tool flow uses.
+// fields with the same crisp messages the legacy seven-tool flow uses.
 //
 // The on-disk format and locking discipline are byte-identical to the
-// six-tool build — same RagStore, same load_index_locked() pre-warm,
+// seven-tool build — same RagStore, same load_index_locked() pre-warm,
 // same shared/unique mutex split.
 Tool make_unified_rag_tool(std::string root_dir) {
     auto store = build_rag_store(std::move(root_dir));
@@ -1547,6 +1799,7 @@ Tool make_unified_rag_tool(std::string root_dir) {
     // `search` / `load` / `list` / `keywords` calls inside the same
     // process.
     auto h_save     = make_save_handler    (store);
+    auto h_append   = make_append_handler  (store);
     auto h_search   = make_search_handler  (store);
     auto h_load     = make_load_handler    (store);
     auto h_list     = make_list_handler    (store);
@@ -1557,14 +1810,26 @@ Tool make_unified_rag_tool(std::string root_dir) {
         .describe(
             "EXPERIMENTAL — your memory, accessed through one tool. Pick an "
             "action; the parameters needed depend on which action you choose. "
-            "Six actions are supported, each mapping 1:1 to a behaviour from "
-            "the legacy six-tool RAG layout:\n"
+            "Seven actions are supported, each mapping 1:1 to a behaviour from "
+            "the legacy seven-tool RAG layout:\n"
             "\n"
             "  action=\"save\"\n"
-            "    Store a memory. Required: title, keywords (array, 1..8), "
-            "    content. Optional: fix (boolean — when true, the title is "
-            "    auto-prepended with `fix-easyai-` and the memory becomes "
-            "    immutable: future save / delete on it are refused).\n"
+            "    Store a memory (creates new or overwrites existing). Required: "
+            "    title, keywords (array, 1..8), content. Optional: fix (boolean "
+            "    — when true, the title is auto-prepended with `fix-easyai-` "
+            "    and the memory becomes immutable: future save / delete / "
+            "    append on it are refused).\n"
+            "\n"
+            "  action=\"append\"\n"
+            "    Add new content to the end of an EXISTING memory without losing "
+            "    the previous body. Required: title (must already exist), "
+            "    content. Optional: keywords (array — extra keywords to merge, "
+            "    deduped against existing, total still capped at 8). The "
+            "    library inserts a Markdown `---` rule before the appendix so "
+            "    each addition is visually delimited on disk. Use this for "
+            "    chronological logs and for growing what you already know "
+            "    about the user. Refuses on fix-easyai-* (immutable) titles "
+            "    and on titles that don't exist (use save to create).\n"
             "\n"
             "  action=\"search\"\n"
             "    Search memories by keyword(s). Required: keywords (array). "
@@ -1607,30 +1872,36 @@ Tool make_unified_rag_tool(std::string root_dir) {
             "what THIS conversation taught you."
         )
         .param("action",      "string",
-               "Required. One of: \"save\", \"search\", \"load\", \"list\", "
-               "\"delete\", \"keywords\". Each action consumes a subset of "
-               "the other parameters; see the tool description for the "
-               "per-action requirements.", true)
+               "Required. One of: \"save\", \"append\", \"search\", "
+               "\"load\", \"list\", \"delete\", \"keywords\". Each action "
+               "consumes a subset of the other parameters; see the tool "
+               "description for the per-action requirements.", true)
         .param("title",       "string",
-               "Used by save / delete. 1..64 chars [A-Za-z0-9._+-]. With "
-               "fix=true on a save the prefix `fix-easyai-` is auto-added "
-               "if not present.", false)
+               "Used by save / append / delete. 1..64 chars [A-Za-z0-9._+-]. "
+               "With fix=true on a save the prefix `fix-easyai-` is auto-"
+               "added if not present.", false)
         .param("titles",      "array",
                "Used by load. Array of 1..4 exact memory titles to recall.",
                false)
         .param("keywords",    "array",
-               "Used by save / search. 1..8 short keywords [A-Za-z0-9._+-]. "
-               "On save: tags this memory; on search: the query.",
+               "Used by save / append / search. 1..8 short keywords "
+               "[A-Za-z0-9._+-]. On save: tags this memory; on append: "
+               "extra keywords merged into the existing list (deduped, "
+               "total still capped at 8); on search: the query.",
                false)
         .param("content",     "string",
-               "Used by save. The memory body, free-form UTF-8 up to 256 KB.",
+               "Used by save / append. On save: the full memory body. On "
+               "append: text added after the existing body (separated by "
+               "a Markdown `---` rule). Free-form UTF-8; total size on "
+               "disk capped at 256 KB.",
                false)
         .param("fix",         "boolean",
                "Used by save. When true, store as IMMUTABLE — title is "
-               "prefixed with `fix-easyai-` and future save / delete on "
-               "this memory are refused. Use only when the user explicitly "
-               "asks to learn something as a fixed rule / system design / "
-               "ground-truth definition. Default false.", false)
+               "prefixed with `fix-easyai-` and future save / append / "
+               "delete on this memory are refused. Use only when the user "
+               "explicitly asks to learn something as a fixed rule / "
+               "system design / ground-truth definition. Default false.",
+               false)
         .param("prefix",      "string",
                "Used by list. Filter titles starting with this prefix. "
                "Pass `fix-easyai-` to see every immutable memory.", false)
@@ -1646,23 +1917,24 @@ Tool make_unified_rag_tool(std::string root_dir) {
                "Used by keywords. Hide keywords used by fewer than this "
                "many memories (default 1 = show all). Set min_count=2 to "
                "filter out one-offs.", false)
-        .handle([h_save, h_search, h_load, h_list, h_delete, h_keywords]
+        .handle([h_save, h_append, h_search, h_load, h_list, h_delete, h_keywords]
                 (const ToolCall & c) -> ToolResult {
             std::string action;
             if (!args::get_string(c.arguments_json, "action", action)
                     || action.empty()) {
                 return ToolResult::error(
                     "missing required argument: action. Use one of "
-                    "\"save\", \"search\", \"load\", \"list\", \"delete\", "
-                    "\"keywords\".");
+                    "\"save\", \"append\", \"search\", \"load\", "
+                    "\"list\", \"delete\", \"keywords\".");
             }
             // Each branch forwards the original ToolCall — the per-
             // action handlers parse their own params out of
             // arguments_json with the same helpers (args::get_string,
-            // parse_string_array, etc.) the legacy six-tool flow uses,
+            // parse_string_array, etc.) the legacy seven-tool flow uses,
             // so error messages and validation stay byte-identical.
             ToolResult r;
             if      (action == "save")     r = h_save(c);
+            else if (action == "append")   r = h_append(c);
             else if (action == "search")   r = h_search(c);
             else if (action == "load")     r = h_load(c);
             else if (action == "list")     r = h_list(c);
@@ -1671,26 +1943,31 @@ Tool make_unified_rag_tool(std::string root_dir) {
             else {
                 return ToolResult::error(
                     "unknown action \"" + action + "\". Valid: \"save\", "
-                    "\"search\", \"load\", \"list\", \"delete\", "
-                    "\"keywords\".");
+                    "\"append\", \"search\", \"load\", \"list\", "
+                    "\"delete\", \"keywords\".");
             }
 
-            // The inner handlers still cite the six-tool names
-            // (rag_save, rag_search, ...) in their guidance prose.
-            // In unified mode the model has only `rag` in its
-            // catalog, so any literal `rag_<verb>` reference would
-            // be a dangling identifier. Rewrite each occurrence in
-            // place to the dispatch form the model can actually
-            // call. Cheap (O(n) over a small message); the set of
-            // substitutions is closed and stable.
+            // The inner handlers still cite the seven-tool names
+            // (rag_save, rag_append, rag_search, ...) in their
+            // guidance prose. In unified mode the model has only
+            // `rag` in its catalog, so any literal `rag_<verb>`
+            // reference would be a dangling identifier. Rewrite
+            // each occurrence in place to the dispatch form the
+            // model can actually call. Cheap (O(n) over a small
+            // message); the set of substitutions is closed and
+            // stable.
             struct Sub { const char * from; const char * to; };
             static const Sub kSubs[] = {
-                { "rag_save",     "rag(action=\"save\")"     },
-                { "rag_search",   "rag(action=\"search\")"   },
-                { "rag_load",     "rag(action=\"load\")"     },
-                { "rag_list",     "rag(action=\"list\")"     },
+                // Order matters: rag_append must come before rag_a... siblings
+                // would, but only rag_save shares the leading 'rag_' so any
+                // order works. Keep alphabetical for grep-ability.
+                { "rag_append",   "rag(action=\"append\")"   },
                 { "rag_delete",   "rag(action=\"delete\")"   },
                 { "rag_keywords", "rag(action=\"keywords\")" },
+                { "rag_list",     "rag(action=\"list\")"     },
+                { "rag_load",     "rag(action=\"load\")"     },
+                { "rag_save",     "rag(action=\"save\")"     },
+                { "rag_search",   "rag(action=\"search\")"   },
             };
             for (const auto & s : kSubs) {
                 std::string from = s.from;

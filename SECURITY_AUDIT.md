@@ -625,10 +625,11 @@ loads each one independently. Security-relevant behaviour:
 
 ### 16.6b RAG — persistent registry surface
 
-Lives in `src/rag_tools.cpp`. Five tools (`rag_save`, `rag_search`,
-`rag_load`, `rag_list`, `rag_delete`) the agent uses to write to
-and read from a directory of small Markdown files. Path-traversal
-is the only security-relevant primitive; the rest is correctness.
+Lives in `src/rag_tools.cpp`. Seven tools (`rag_save`, `rag_append`,
+`rag_search`, `rag_load`, `rag_list`, `rag_delete`, `rag_keywords`)
+the agent uses to write to and read from a directory of small
+Markdown files. Path-traversal is the only security-relevant
+primitive; the rest is correctness.
 
 - **Path-traversal closed at the regex.** Title and keyword
   identifiers must match `^[A-Za-z0-9._+-]{1,64}$` /
@@ -646,10 +647,17 @@ is the only security-relevant primitive; the rest is correctness.
 - **No JSON parser involvement.** The on-disk format is plain text
   with one `keywords:` header. Corrupt files are silently skipped
   at index time; the index doesn't crash the agent.
-- **Mutex-guarded index.** All five tools share an in-memory
-  `std::map<title, EntryMeta>` guarded by a `std::mutex`. The
-  body is read off-disk per `rag_load`, never cached, so memory
-  doesn't grow with entry count beyond the metadata.
+- **Mutex-guarded index.** All seven tools share an in-memory
+  `std::map<title, EntryMeta>` guarded by a `std::shared_mutex`
+  (multi-reader / single-writer). Reads (`rag_search` /
+  `rag_load` / `rag_list` / `rag_keywords`) take a `shared_lock`
+  and parallelise; writes (`rag_save` / `rag_append` /
+  `rag_delete`) take a `unique_lock` and serialise — `rag_append`
+  in particular runs the entire read-modify-write under one
+  unique_lock so concurrent appenders queue cleanly without
+  losing each other's appendix. The body is read off-disk per
+  `rag_load` / `rag_append`, never cached, so memory doesn't
+  grow with entry count beyond the metadata.
 - **Filesystem permissions are the access boundary.** The installer
   creates `/var/lib/easyai/rag/` mode 750 owned by the `easyai`
   service user. The agent is the only thing that can read or
