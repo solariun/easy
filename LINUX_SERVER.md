@@ -112,11 +112,14 @@ Important pieces:
 - `--external-tools /etc/easyai/external-tools`. Operator-defined
   tools live here. Empty dir is a normal state.
 - `--RAG /var/lib/easyai/rag`. The agent's persistent **memory**
-  (search / store / recall / update / forget). Memories whose title
+  (search / store / recall / update / forget). DEFAULT: registers
+  ONE `rag(action=...)` tool with sub-actions save / append /
+  search / load / list / delete / keywords. Memories whose title
   starts with `fix-easyai-` are immutable — the model can't
   overwrite or forget them, useful for seeding system designs and
-  hard rules. The optional `--experimental-rag` flag collapses the
-  six `rag_*` tools into one `rag(action=...)` dispatcher.
+  hard rules. Pass `--split-rag` (or `[SERVER] split_rag = on` in
+  the INI) to opt back into the legacy seven separate `rag_*`
+  tools — useful for weak / 1-bit-quant tool callers.
 
 Optional add-ons the systemd unit does NOT pass by default but the
 installer leaves room for in `/etc/easyai/easyai.ini`:
@@ -328,8 +331,9 @@ EOF
 sudo systemctl restart easyai-server
 ```
 
-**Full reference:** `RAG.md`. File format, the seven tools, workflows,
-roadmap, troubleshooting.
+**Full reference:** `RAG.md`. File format, the unified
+`rag(action=...)` tool (or the seven `rag_*` tools under
+`--split-rag`), workflows, roadmap, troubleshooting.
 
 ---
 
@@ -581,13 +585,15 @@ Expected (rough):
 
 - 4 (datetime, web_search, web_fetch, plan)
 - + 1 (`--use-google`: web_google) — only when env vars set
-- + 6 (RAG: rag_save / search / load / list / delete / keywords)
+- + 1 (RAG default: single `rag(action=...)` dispatcher)
 - + 6 (`--allow-fs`: read_file / write_file / list_dir / glob / grep / get_current_dir)
 - + 1 (`--allow-bash`: bash)
 - + N (your `--external-tools` packs)
 - + M (tools fetched via `--mcp` from an upstream MCP server)
-- The `--experimental-rag` flag replaces the 6 RAG tools with 1
-  unified `rag` tool — subtract 5 if you flip it on.
+- The `--split-rag` flag replaces the unified `rag` tool with the
+  legacy seven (`rag_save` / `rag_append` / `rag_search` / `rag_load`
+  / `rag_list` / `rag_delete` / `rag_keywords`) — add 6 if you flip
+  it on.
 
 ### RAG working?
 

@@ -398,7 +398,8 @@ just one consumer of those factories.
 | `web_fetch` | `easyai::tools::web_fetch()` | `load_tools` + libcurl at build |
 | `fs_read_file`, `fs_write_file`, `fs_list_dir`, `fs_glob`, `fs_grep`, `get_current_dir` | `easyai::tools::fs_*()`, `get_current_dir()` | `--allow-fs` |
 | `bash` | `easyai::tools::bash(sandbox)` | `--allow-bash` |
-| `rag_save`, `rag_search`, `rag_load`, `rag_list`, `rag_delete`, `rag_keywords` | `easyai::tools::make_rag_tools(dir)` | `--RAG <dir>` |
+| `rag` (single dispatcher with sub-actions: save / append / search / load / list / delete / keywords) | `easyai::tools::make_unified_rag_tool(dir)` | `--RAG <dir>` (default RAG layout) |
+| `rag_save`, `rag_append`, `rag_search`, `rag_load`, `rag_list`, `rag_delete`, `rag_keywords` | `easyai::tools::make_rag_tools(dir)` | `--RAG <dir>` + `--split-rag` (`[SERVER] split_rag = on`) |
 | (any `EASYAI-*.tools` manifest) | `easyai::load_external_tools_from_dir(dir, reserved)` | `--external-tools <dir>` |
 
 The `plan` tool is **deliberately omitted** in `easyai-mcp-server` —
@@ -720,7 +721,8 @@ What's planned next, roughly in priority order:
   upgrade / backup).
 - [`MCP.md`](MCP.md) — the MCP protocol surface, per-client
   connection cookbook, security model.
-- [`RAG.md`](RAG.md) — persistent registry, the seven tools, workflows.
+- [`RAG.md`](RAG.md) — persistent registry, the unified `rag(action=...)`
+  tool (or seven `rag_*` tools under `--split-rag`), workflows.
 - [`EXTERNAL_TOOLS.md`](EXTERNAL_TOOLS.md) — operator-defined
   external tools (`EASYAI-*.tools` JSON manifests).
 - [`SECURITY_AUDIT.md`](SECURITY_AUDIT.md) — three audit passes,

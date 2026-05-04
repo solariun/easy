@@ -69,7 +69,9 @@ struct RagTools {
     Tool keywords;  // rag_keywords(min_count=1, max=200) — vocabulary overview
 };
 
-// Build the six RAG tools rooted at `root_dir`. The directory is
+// Build the seven legacy RAG tools rooted at `root_dir` (the "split"
+// layout: rag_save / rag_append / rag_search / rag_load / rag_list /
+// rag_delete / rag_keywords as separate tools). The directory is
 // created on demand at first save; missing-directory at registration
 // time is NOT an error (operator may not have provisioned it yet).
 //
@@ -82,9 +84,12 @@ struct RagTools {
 // refuses to remove them. Use this to seed system designs / domain
 // knowledge / hard rules the model must not rewrite mid-conversation.
 // rag_search / rag_load always see fixed entries.
+//
+// This is the OPT-IN layout, exposed behind --split-rag. The default
+// build registers the unified `rag(action=...)` tool below.
 RagTools make_rag_tools(std::string root_dir);
 
-// Experimental — single-tool RAG dispatcher. Exposes one `rag` tool
+// Default RAG layout — single-tool dispatcher. Exposes one `rag` tool
 // with an `action` parameter selecting one of "save" / "append" /
 // "search" / "load" / "list" / "delete" / "keywords"; remaining
 // params (title, keywords, content, fix, titles, prefix, max,
@@ -98,11 +103,12 @@ RagTools make_rag_tools(std::string root_dir);
 // are reachable through `rag(action=...)` and exposing both would
 // just confuse the model with two paths to the same thing.
 //
-// Why "experimental": collapsing seven flat schemas into one
-// discriminated schema costs accuracy on weak / 1-bit-quant tool
-// callers. We keep the legacy seven-tool layout as the default and
-// expose this only behind --experimental-rag for operators who
-// want to trade some calling reliability for a smaller catalog.
+// Why this is the default: a single `rag(action=...)` keeps the tool
+// catalogue small (one entry instead of seven) and lets the model
+// reason about RAG as ONE capability with sub-actions, which most
+// modern tool-callers handle cleanly. Operators who run weak /
+// 1-bit-quant callers that struggle with discriminated schemas can
+// opt back into the legacy seven-tool layout via --split-rag.
 Tool make_unified_rag_tool(std::string root_dir);
 
 }  // namespace easyai::tools

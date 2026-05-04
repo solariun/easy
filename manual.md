@@ -1270,12 +1270,25 @@ for (const auto & t : loaded.tools) {
 > The authoritative guide is [`RAG.md`](RAG.md). The summary below
 > is a quick reference.
 
-RAG gives the agent seven tools to remember things across sessions:
+RAG gives the agent a tool surface for remembering things across
+sessions. Two layouts share the same on-disk store and the same
+seven handlers:
 
 ```cpp
+// DEFAULT: one tool with seven sub-actions.
+engine.add_tool(easyai::tools::make_unified_rag_tool("/var/lib/easyai/rag"));
+// rag(action="save",     title, keywords[], content, fix?)
+// rag(action="append",   title, content, keywords?)        — grow an existing memory
+// rag(action="search",   keywords[], max_results=10)
+// rag(action="load",     titles[1..4])
+// rag(action="list",     prefix?, max=50)
+// rag(action="delete",   title)
+// rag(action="keywords", min_count=1, max=200)
+
+// OPT-IN (--split-rag): seven separate tools.
 auto rag = easyai::tools::make_rag_tools("/var/lib/easyai/rag");
 engine.add_tool(rag.save);     // rag_save(title, keywords[], content, fix?)
-engine.add_tool(rag.append);   // rag_append(title, content, keywords?)  — grow an existing memory
+engine.add_tool(rag.append);   // rag_append(title, content, keywords?)
 engine.add_tool(rag.search);   // rag_search(keywords[], max_results=10)
 engine.add_tool(rag.load);     // rag_load(titles[1..4])
 engine.add_tool(rag.list);     // rag_list(prefix?, max=50)
@@ -1284,8 +1297,10 @@ engine.add_tool(rag.keywords); // rag_keywords(min_count=1, max=200)
 ```
 
 Or via the `--RAG <dir>` flag in `easyai-server`, `easyai-cli`, and
-`easyai-local`. The systemd-installed server passes
-`--RAG /var/lib/easyai/rag` by default.
+`easyai-local` — that picks the unified dispatcher by default. Pass
+`--split-rag` (or `[SERVER] split_rag = on` in the INI) to opt back
+into the legacy seven-tool layout. The systemd-installed server
+passes `--RAG /var/lib/easyai/rag` by default.
 
 Each entry is one Markdown file `<title>.md` in the configured
 directory:

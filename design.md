@@ -835,19 +835,34 @@ from `rename(2)`. We get indexing from a 200-line in-memory map
 that's rebuilt on first use (cost: parse N small files once per
 process — fast).
 
-### Why seven tools, not one
+### One tool by default, seven tools under `--split-rag`
 
-A single `reg(action, ...)` tool would shorten the schema but
-collapse the model's intent. Separate tools encode the intent in
-the tool name, which is the strongest signal the model has when
-choosing. `rag_save` calls and `rag_search` calls show up
-distinctly in audit logs / hooks; coarse `reg(action="save", ...)`
-calls would all blur together.
+The default surface is **one** `rag(action=...)` tool with seven
+sub-actions (save / append / search / load / list / delete /
+keywords). This keeps the model's tool catalog short — one entry
+instead of seven — which most modern tool-callers handle cleanly
+and which saves a few hundred tokens per turn that would otherwise
+go to schema definitions in the prompt.
 
-Seven also matches the natural workflow: save (write a new memory),
-append (grow an existing one without losing its body), search +
-load (read in two steps because previewing keeps the prompt slim),
-list (browse), delete (curate), keywords (vocabulary review).
+Behind the discriminator the seven handlers are still distinct
+closures with the same validation messages and the same audit
+shape — just multiplexed through one entry point. `rag(action="save",
+...)` and `rag(action="search", ...)` are still distinguishable in
+hooks / logs by their `action` argument, so curating by intent
+remains possible.
+
+Operators on weak / 1-bit-quant tool callers (Bonsai-class, BitNet)
+where discriminated schemas are noticeably less reliable than flat
+ones can pass `--split-rag` (or `[SERVER] split_rag = on` in the
+INI) to opt back into the legacy seven separate tools. Same store,
+same on-disk format, same handlers — only the catalog shape
+changes.
+
+The natural workflow underneath is unchanged either way: save
+(write a new memory), append (grow an existing one without losing
+its body), search + load (read in two steps because previewing
+keeps the prompt slim), list (browse), delete (curate), keywords
+(vocabulary review).
 
 ### Why max 4 entries per `rag_load`
 
@@ -873,9 +888,9 @@ operational experience we'll tune the descriptions further.
 | Tier | Audience | RAG surface |
 | --- | --- | --- |
 | 1 — façade | beginner | `easyai::Agent` could opt into RAG with a single setter (future). |
-| 2 — fluent | intermediate | Already exposed as `make_rag_tools(dir)` returning a `RagTools` struct of five `Tool` values that you `add_tool`. |
-| 3 — operator | deployment | `--RAG <dir>` flag on all three CLIs; systemd unit passes it for free. |
-| 4 — escape hatch | extension | The `RagStore` private class is replaceable: a future variant could swap files for SQLite or vector store while keeping the same 5-tool surface. |
+| 2 — fluent | intermediate | Two factories: `make_unified_rag_tool(dir)` returns one `Tool` (the default `rag(action=...)` dispatcher); `make_rag_tools(dir)` returns a `RagTools` struct of seven `Tool` values you `add_tool` individually (the `--split-rag` layout). Both share the same `RagStore`. |
+| 3 — operator | deployment | `--RAG <dir>` flag on all three CLIs (defaults to the unified dispatcher); `--split-rag` (or `[SERVER] split_rag = on` in INI) opts back into the seven-tool layout; systemd unit passes `--RAG` for free. |
+| 4 — escape hatch | extension | The `RagStore` private class is replaceable: a future variant could swap files for SQLite or a vector store while keeping the same handler signatures behind both factories. |
 
 ### What RAG is not
 

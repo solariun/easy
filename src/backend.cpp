@@ -65,18 +65,27 @@ bool LocalBackend::init(std::string & err) {
     // RAG — the agent's persistent registry (long-term memory).
     // Registered when the operator gives us a directory. The
     // directory does NOT have to exist yet; the tools create it on
-    // first save. Seven tools: rag_save / rag_append / rag_search /
-    // rag_load / rag_list / rag_delete / rag_keywords. See RAG.md for
-    // the full guide.
+    // first save.
+    //
+    // Default: a single `rag(action=...)` dispatcher with sub-actions
+    // save / append / search / load / list / delete / keywords.
+    // Opt-in --split-rag (cfg.split_rag=true) registers the legacy
+    // seven separate rag_* tools instead — useful for weak /
+    // 1-bit-quant callers that handle many flat schemas more
+    // reliably than one discriminated schema. See RAG.md.
     if (!cfg.rag_dir.empty()) {
-        auto rag = tools::make_rag_tools(cfg.rag_dir);
-        engine.add_tool(rag.save);
-        engine.add_tool(rag.append);
-        engine.add_tool(rag.search);
-        engine.add_tool(rag.load);
-        engine.add_tool(rag.list);
-        engine.add_tool(rag.del);
-        engine.add_tool(rag.keywords);
+        if (cfg.split_rag) {
+            auto rag = tools::make_rag_tools(cfg.rag_dir);
+            engine.add_tool(rag.save);
+            engine.add_tool(rag.append);
+            engine.add_tool(rag.search);
+            engine.add_tool(rag.load);
+            engine.add_tool(rag.list);
+            engine.add_tool(rag.del);
+            engine.add_tool(rag.keywords);
+        } else {
+            engine.add_tool(tools::make_unified_rag_tool(cfg.rag_dir));
+        }
     }
 
     // External tools directory. Loaded after the built-in toolbelt so

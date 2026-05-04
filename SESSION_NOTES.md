@@ -305,6 +305,69 @@ Webui title default also flips to `"Deep"`.
 ## 5. Recent commits (most recent first)
 
 ```
+2026-05-04 — RAG default flipped to single-tool dispatcher; --split-rag
+                 opts back into legacy seven; concise default prompt.
+
+(pending commit) Two user-driven changes:
+
+  (1) RAG default flip. The unified `rag(action=...)` dispatcher
+      used to be opt-in behind --experimental-rag; it is now the
+      DEFAULT for every binary (easyai-server, easyai-cli,
+      easyai-local, easyai-mcp-server). The legacy seven separate
+      `rag_*` tools are still available behind a renamed flag,
+      --split-rag (and INI key SERVER.split_rag), for operators
+      driving weak / 1-bit-quant tool callers (Bonsai-class) that
+      handle many flat schemas more reliably than one
+      discriminated schema. On-disk format, locking, and
+      fix-memory rules unchanged — only the catalog shape
+      differs. Files: include/easyai/rag_tools.hpp (comments
+      flipped), src/rag_tools.cpp (description prose, drop
+      "EXPERIMENTAL —" prefix, dispatcher section header),
+      include/easyai/backend.hpp + src/backend.cpp (Config gains
+      split_rag bool; LocalBackend picks the factory by it),
+      examples/cli.cpp (--split-rag flag, register_tools branch
+      flipped, --tools/--RAG help refreshed), examples/server.cpp
+      (FlagDef table: split_rag/--split-rag/SERVER.split_rag,
+      registration block flipped, --RAG/--split-rag help
+      refreshed), examples/mcp_server.cpp (same FlagDef + INI
+      key + registration flip), examples/local.cpp (--split-rag
+      arg, plumbed into LocalBackend::Config). All four affected
+      binaries build clean. easyai-cli --list-tools --RAG <dir>
+      reports "rag" by default; with --split-rag added, reports
+      the seven legacy names. Server INI sanity-check confirms
+      [SERVER] split_rag = on logs "RAG enabled (split: seven
+      rag_* tools)" while the absence logs "RAG enabled (single
+      rag tool)".
+
+  (2) Default system prompt rewritten to emphasise plan → act →
+      iterate in tight steps, kept brief on purpose so the user
+      has room to refine. examples/server.cpp's kBuiltinSystem
+      and examples/local.cpp's kBuiltinSystem went from ~30-90
+      lines of operating-loop / rule prose down to ~20-30 lines
+      that say: answer briefly; for real work, plan ONE small
+      next step, act on it in the same turn, read the result,
+      then finish or take ONE more step; stop as soon as you
+      have something useful. Retains the no-announce-without-
+      call rule and the search → fetch discipline. The server
+      prompt is what plays through /v1/chat/completions when
+      no client supplies its own system message; easyai-cli
+      remains a thin client and uses whatever prompt the
+      backing server defaults to.
+
+  Docs updated: README.md (new What's new entry + every
+  --experimental-rag mention rewritten to --split-rag with
+  flipped polarity in the options/flags tables), RAG.md (intro
+  example switched to rag(action=...), §4 dispatcher rewritten
+  as default + opt-in seven), easyai-server.md (INI table row
+  + "All options" row flipped), LINUX_SERVER.md (default-paths
+  block + tool-count math reflect new default), MCP.md (catalog
+  references mention both layouts), manual.md (RAG quickstart
+  shows both factories), design.md ("Why seven tools" rewritten
+  as "One tool by default, seven under --split-rag" + four-tier
+  table updated), easyai-mcp-server.md (tool-source table now
+  has BOTH rows), SECURITY_AUDIT.md (mutex paragraph clarifies
+  both layouts share the same RagStore + locks).
+
 2026-05-02 (later) — RAG: rag_append + user-focus prompts.
 
 (pending commit) Adds a seventh tool to RagTools: rag_append.

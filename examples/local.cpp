@@ -114,6 +114,9 @@ struct CliArgs {
     bool allow_bash = false;    // explicit opt-in for `bash`
     std::string external_tools_dir;     // optional external-tools dir (EASYAI-*.tools)
     std::string rag_dir;                 // optional RAG persistent-registry dir
+    bool        split_rag = false;       // opt back into the legacy seven rag_*
+                                          // tools instead of the default single
+                                          // `rag(action=...)` dispatcher.
 
     // KV cache controls
     std::string cache_type_k;      // empty = library default (f16)
@@ -174,12 +177,20 @@ struct CliArgs {
         "      --RAG <dir>               Enable RAG, the agent's persistent\n"
         "                                 registry / long-term memory. Each\n"
         "                                 entry is one Markdown file in <dir>.\n"
-        "                                 Registers seven tools: rag_save /\n"
-        "                                 rag_append (grow an existing memory) /\n"
+        "                                 Default: registers ONE `rag(action=...)`\n"
+        "                                 tool with sub-actions save / append /\n"
+        "                                 search / load / list / delete /\n"
+        "                                 keywords. Pass --split-rag to register\n"
+        "                                 the legacy seven separate rag_* tools\n"
+        "                                 instead. See RAG.md.\n"
+        "      --split-rag               Opt back into the legacy seven-tool RAG\n"
+        "                                 layout (rag_save / rag_append /\n"
         "                                 rag_search / rag_load / rag_list /\n"
-        "                                 rag_delete / rag_keywords — the model\n"
-        "                                 uses these to remember things across\n"
-        "                                 sessions. See RAG.md.\n"
+        "                                 rag_delete / rag_keywords). Useful\n"
+        "                                 when the local model is a weak /\n"
+        "                                 1-bit-quant tool caller that handles\n"
+        "                                 many flat schemas better than one\n"
+        "                                 discriminated one.\n"
         "\nKV cache (all optional):\n"
         " -ctk, --cache-type-k <type>    K-cache dtype (f32|f16|bf16|q8_0|q4_0|q4_1|q5_0|q5_1|iq4_nl)\n"
         " -ctv, --cache-type-v <type>    V-cache dtype (same options) — quantising V saves a lot of VRAM\n"
@@ -227,6 +238,7 @@ static CliArgs parse(int argc, char ** argv) {
         else if (s == "--allow-bash")                 a.allow_bash    = true;
         else if (s == "--external-tools")             a.external_tools_dir = need(i, "--external-tools");
         else if (s == "--RAG")                        a.rag_dir            = need(i, "--RAG");
+        else if (s == "--split-rag")                  a.split_rag          = true;
         // KV controls
         else if (s == "-ctk" || s == "--cache-type-k") a.cache_type_k = need(i, "-ctk");
         else if (s == "-ctv" || s == "--cache-type-v") a.cache_type_v = need(i, "-ctv");
@@ -264,31 +276,33 @@ int main(int argc, char ** argv) {
     }
 
     // Resolve system prompt: --system inline > -s file > built-in default.
-    // The default discourages a small model from calling tools on simple
-    // greetings (a noticeable problem with 0.5B-3B GGUFs).
+    // Kept deliberately short. Goal: get a useful answer fast and let
+    // the user refine — no walls of text, no pre-committed roadmaps.
+    // Multi-step work is a tight plan → act → iterate loop, not a
+    // monologue.
     static constexpr char kBuiltinSystem[] =
-        "You are a helpful, concise assistant.\n"
-        "Answer directly for greetings, chitchat, math, and anything you "
-        "already know — do NOT call a tool for those.\n"
-        "Use a tool only when the request truly needs one:\n"
-        "  - up-to-date / 'today' / 'latest' info → web_search, THEN web_fetch\n"
-        "  - the current date/time                → datetime\n"
-        "  - reading / listing files              → fs_read_file / fs_list_dir / fs_glob / fs_grep\n"
+        "You are a concise, honest assistant. Answer briefly; let the user "
+        "steer.\n"
         "\n"
-        "CRITICAL — every rule is mandatory:\n"
-        " 1. web_search returns titles + 1-2 sentence snippets. The snippets "
-        "    are NOT enough to summarise from. After every web_search you "
-        "    MUST immediately call web_fetch on the top 1-3 most relevant "
-        "    URLs and base your answer on the fetched body text.\n"
-        " 2. Two web_search calls in a row is wrong. Search ONCE, then fetch.\n"
-        " 3. NEVER announce a tool call without making it. Phrases like "
-        "    \"I will fetch...\", \"let me search...\", \"I'll get...\" are "
-        "    forbidden when followed by silence — either invoke the tool in "
-        "    the same turn, or write the final answer right away. Saying you "
-        "    are going to do something is NOT the same as doing it.\n"
-        " 4. If a fetch fails (HTTP 4xx/5xx), retry with the next URL from "
-        "    the search results. Do not fall back to summarising snippets.\n"
-        " 5. When you cite an article, cite the URL you actually fetched.";
+        "Answer directly for greetings, chitchat, math, and anything you "
+        "already know — no tool needed.\n"
+        "\n"
+        "When a request truly needs work, run a tight loop:\n"
+        "  1. Plan ONE small concrete next step (not a roadmap).\n"
+        "  2. Act — call the tool in the same turn. Never announce a "
+        "tool call without making it (\"I'll search…\" without the call "
+        "is forbidden).\n"
+        "  3. Read the result, then finish or take ONE more step.\n"
+        "Stop as soon as you have something useful. Prefer a short answer "
+        "the user can refine over a long pre-committed plan.\n"
+        "\n"
+        "Tool notes:\n"
+        "  - 'now' / 'today' / 'latest' → datetime first.\n"
+        "  - web_search returns snippets only; after one search, web_fetch "
+        "the top 1-3 URLs and answer from the fetched body. Two searches "
+        "in a row is wrong.\n"
+        "  - Files: fs_read_file / fs_list_dir / fs_glob / fs_grep.\n"
+        "  - Cite the URL you actually fetched.";
 
     std::string system_prompt = args.system_inline;
     if (system_prompt.empty() && !args.system_path.empty()) {
@@ -318,6 +332,7 @@ int main(int argc, char ** argv) {
     lc.external_tools_dir = args.external_tools_dir;
     lc.quiet              = args.quiet;
     lc.rag_dir            = args.rag_dir;
+    lc.split_rag          = args.split_rag;
     lc.n_ctx          = args.n_ctx;
     lc.n_batch        = args.n_batch;
     lc.ngl            = args.ngl;

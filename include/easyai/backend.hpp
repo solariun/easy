@@ -74,6 +74,9 @@ public:
         std::string external_tools_dir; // optional external-tools dir (EASYAI-*.tools)
         bool        quiet           = false; // suppress sanity warnings (errors still emitted)
         std::string rag_dir;            // optional RAG (long-term registry) dir; empty = RAG off
+        bool        split_rag    = false; // opt back into the legacy seven rag_*
+                                          // tools instead of the default single
+                                          // `rag(action=...)` dispatcher.
         int         n_ctx      = 4096;
         int         n_batch    = 0;     // 0 = follow ctx
         int         ngl        = -1;

@@ -1428,11 +1428,12 @@ ToolHandler make_keywords_handler(std::shared_ptr<RagStore> store) {
 }
 
 // Build a RagStore at `root_dir` and eager-load its index. Shared
-// between the seven-tool factory (make_rag_tools) and the experimental
-// single-tool factory (make_unified_rag_tool) so both shapes see the
-// same on-disk content and there's no chance of a divergent eager-
-// load policy. After this returns, every read path can take a
-// shared_lock and observe `index_loaded == true` without racing.
+// between the seven-tool factory (make_rag_tools, opt-in via
+// --split-rag) and the default single-tool factory
+// (make_unified_rag_tool) so both shapes see the same on-disk
+// content and there's no chance of a divergent eager-load policy.
+// After this returns, every read path can take a shared_lock and
+// observe `index_loaded == true` without racing.
 std::shared_ptr<RagStore> build_rag_store(std::string root_dir) {
     auto store = std::make_shared<RagStore>(std::move(root_dir));
     {
@@ -1772,7 +1773,7 @@ RagTools make_rag_tools(std::string root_dir) {
 }
 
 // ---------------------------------------------------------------------------
-// Experimental: single-tool dispatcher
+// Default layout: single-tool dispatcher
 // ---------------------------------------------------------------------------
 // Wraps the same six handlers behind one Tool that takes an `action`
 // parameter. The handler closures (make_save_handler / make_search_handler
@@ -1808,10 +1809,9 @@ Tool make_unified_rag_tool(std::string root_dir) {
 
     return Tool::builder("rag")
         .describe(
-            "EXPERIMENTAL — your memory, accessed through one tool. Pick an "
-            "action; the parameters needed depend on which action you choose. "
-            "Seven actions are supported, each mapping 1:1 to a behaviour from "
-            "the legacy seven-tool RAG layout:\n"
+            "Your memory, accessed through one tool. Pick an action; the "
+            "parameters needed depend on which action you choose. "
+            "Seven actions are supported:\n"
             "\n"
             "  action=\"save\"\n"
             "    Store a memory (creates new or overwrites existing). Required: "

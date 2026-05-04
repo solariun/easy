@@ -43,6 +43,29 @@ A running log of user-facing changes. Latest first — keep this list
 current as features land so anyone returning to the repo (or
 landing on it for the first time) sees what shipped recently.
 
+### 2026-05-04 — Single-tool RAG is now the default; concise system prompt
+
+* **Default RAG layout flipped: one `rag(action=...)` tool.** The
+  unified single-tool dispatcher used to be opt-in behind
+  `--experimental-rag`; it is now the default for every binary
+  (`easyai-server`, `easyai-cli`, `easyai-local`, `easyai-mcp-server`).
+  One catalog entry instead of seven keeps the model's tool list
+  short and saves a few hundred tokens per turn. On-disk format,
+  locking, and fix-memory rules are unchanged.
+* **`--split-rag` opts back into the legacy seven `rag_*` tools.**
+  Replaces `--experimental-rag`. Same semantics, opposite default.
+  Wired as a CLI flag on every binary AND as `[SERVER] split_rag`
+  in the INI overlay (`easyai.ini` / `easyai-mcp.ini`). Useful for
+  weak / 1-bit-quant tool callers (Bonsai-class) that handle many
+  flat schemas more reliably than one discriminated schema.
+* **Default system prompts trimmed.** `easyai-server` and
+  `easyai-local` now ship a much shorter built-in prompt focused on
+  a tight **plan → act → iterate** loop with one small concrete
+  next step at a time, finishing as soon as the answer is useful so
+  the user has room to refine. Cuts about three quarters of the old
+  prompt's length while keeping the no-announce-without-call rule
+  and the search → fetch discipline.
+
 ### 2026-05-02 (later) — RAG `rag_append` + user-focus prompts
 
 * **`rag_append` — new RAG tool.** Adds new content to the end of
@@ -123,11 +146,15 @@ landing on it for the first time) sees what shipped recently.
   truth definitions the model must not rewrite. Search / load /
   list output gain a human-readable `modified` date and a `[FIXED]`
   / `fixed: yes/no` marker. See [`RAG.md`](RAG.md).
-* **Experimental single-tool RAG via `--experimental-rag`.** Same
-  store, same handlers, same on-disk format — just one
-  `rag(action=...)` tool instead of six `rag_*` tools. Saves a few
-  hundred catalog tokens at the cost of accuracy on weak / 1-bit-
-  quant tool callers. Off by default; flip on for strong models.
+* **Single-tool RAG dispatcher is the default.** One
+  `rag(action=...)` tool exposes save / append / search / load /
+  list / delete / keywords as sub-actions. Same store, same
+  handlers, same on-disk format. Saves a few hundred catalog tokens
+  per turn and keeps the model's tool list short. Pass `--split-rag`
+  (or `[SERVER] split_rag = on` in the INI) to opt back into the
+  legacy seven separate `rag_*` tools — useful for weak / 1-bit-
+  quant tool callers (Bonsai-class) that handle many flat schemas
+  more reliably than one discriminated schema.
 * **`web_google` builtin.** Google Custom Search JSON API. Gated by
   `--use-google` (also `[SERVER] use_google`). Reads
   `GOOGLE_API_KEY` and `GOOGLE_CSE_ID` from env at call time so a
@@ -276,9 +303,9 @@ has a matching INI key (see [`easyai-server.md`](easyai-server.md) §1).
 | `--allow-fs` | off | Register `fs_read_file`, `fs_write_file`, `fs_list_dir`, `fs_glob`, `fs_grep`. |
 | `--allow-bash` | off | Register `bash` (NOT a hardened sandbox). |
 | `--use-google` | off | Register `web_google` (needs `GOOGLE_API_KEY` + `GOOGLE_CSE_ID`). |
-| `--experimental-rag` | off | Collapse the six `rag_*` tools into one `rag(action=…)`. |
+| `--split-rag` | off | Opt back into the legacy seven `rag_*` tools instead of the default single `rag(action=…)` dispatcher. |
 | `--external-tools DIR` | — | Load every `EASYAI-*.tools` manifest in `DIR`. |
-| `--RAG DIR` | — | Enable RAG (5 tools, persistent memory). |
+| `--RAG DIR` | — | Enable RAG (default: one `rag(action=…)` tool; with `--split-rag`: seven `rag_*` tools). Persistent memory. |
 | `--preset NAME` | `balanced` | Ambient sampling preset. |
 | `--temperature F` | per preset | Override temperature (0.0–2.0). |
 | `--top-p F` | per preset | Nucleus sampling p. |
@@ -372,9 +399,9 @@ upstream `llama-server`, OpenAI itself, etc.).
 | `--sandbox DIR` | — | Enable `fs_*` (read/list/glob/grep/write) scoped to `DIR`. |
 | `--allow-bash` | off | Register `bash` (uses `--sandbox` as cwd, else current dir). |
 | `--use-google` | off | Register `web_google`. |
-| `--experimental-rag` | off | Single `rag(action=…)` tool. |
+| `--split-rag` | off | Legacy seven `rag_*` tools instead of the default single `rag(action=…)`. |
 | `--external-tools DIR` | — | Load `EASYAI-*.tools` manifests. |
-| `--RAG DIR` | — | Enable RAG. |
+| `--RAG DIR` | — | Enable RAG (default: one `rag(action=…)` tool). |
 | `--no-plan` | off | Don't auto-register the planning tool. |
 | `-p, --prompt TEXT` | (REPL) | One-shot prompt; without it you get a REPL. |
 | `--no-reasoning` | shown | Hide `delta.reasoning_content`. |
@@ -599,12 +626,15 @@ no API bill, no data leaving the box.**
   Model Context Protocol client auto-discovers the tool catalogue.
   **Write one tool — every AI app on your machine can call it.**
 
-* **Long-term memory built in.** RAG: seven tools the agent uses
-  to save, append (grow what you already know about the user
-  without losing the previous body), search, load, list, delete,
-  and inventory its own knowledge. One human-readable Markdown
-  file per entry — `cat`, `vim`, `grep` it. No vector DB to
-  babysit.
+* **Long-term memory built in.** RAG: one `rag(action=...)` tool
+  by default (sub-actions save / append / search / load / list /
+  delete / keywords) the agent uses to save, append (grow what
+  you already know about the user without losing the previous
+  body), search, load, list, delete, and inventory its own
+  knowledge. Pass `--split-rag` to expose them as seven separate
+  `rag_*` tools instead — same store, useful for weak / 1-bit-
+  quant tool callers. One human-readable Markdown file per entry
+  — `cat`, `vim`, `grep` it. No vector DB to babysit.
 
 * **Operator-defined tool packs.** Drop a JSON manifest in
   `/etc/easyai/external-tools/`, the agent picks it up at startup.
@@ -801,8 +831,8 @@ no shell.
 | `--allow-bash`        | `bash` (run `/bin/sh -c`). cwd = `--sandbox <dir>` if given, otherwise the binary's CWD. NOT a hardened sandbox — runs with your user privileges. Also bumps the agentic-loop `max_tool_hops` to 99999 (bash flows naturally span many turns). |
 | `--use-google`        | `web_google` (Google Custom Search JSON API). Requires `GOOGLE_API_KEY` and `GOOGLE_CSE_ID` env vars. Counts against your Google quota — free tier is 100 queries/day per key. Silently skipped if either env var is missing. |
 | `--external-tools <dir>` | Load every `EASYAI-<name>.tools` file in `<dir>` as an operator-defined tool pack. Per-file fault isolation (a bad file is logged + skipped, the agent still starts). Spawns via `fork`+`execve` — never a shell. **This is the supported way to give the model focused powers without flipping `--allow-bash`.** See [`EXTERNAL_TOOLS.md`](EXTERNAL_TOOLS.md). |
-| `--RAG <dir>`         | Enable RAG, the agent's persistent **memory** (search / store / append / recall / update / forget). Seven tools by default — `rag_save`, `rag_append` (grow an existing memory without losing its body), `rag_search`, `rag_load`, `rag_list`, `rag_delete`, `rag_keywords` — each memory one Markdown file in `<dir>`. Memories whose title starts with `fix-easyai-` are immutable: pass `fix=true` to `rag_save` to mint one. The systemd-installed server passes this by default (`/var/lib/easyai/rag`). See [`RAG.md`](RAG.md). |
-| `--experimental-rag`  | Replace the seven `rag_*` tools with a single `rag(action=...)` dispatcher. Same on-disk format, same fix-memory semantics — only the catalog shape changes. Smaller catalog (1 entry vs 7) at the cost of accuracy on small / 1-bit-quant tool callers. Has no effect when `--RAG` is also off. |
+| `--RAG <dir>`         | Enable RAG, the agent's persistent **memory** (search / store / append / recall / update / forget). DEFAULT: registers ONE `rag(action=...)` tool with sub-actions `save`, `append` (grow an existing memory without losing its body), `search`, `load`, `list`, `delete`, `keywords` — each memory one Markdown file in `<dir>`. Memories whose title starts with `fix-easyai-` are immutable: pass `fix=true` (sub-action `save`) to mint one. Pass `--split-rag` (below) to register the legacy seven separate tools instead. The systemd-installed server passes this by default (`/var/lib/easyai/rag`). See [`RAG.md`](RAG.md). |
+| `--split-rag`         | Opt back into the legacy seven `rag_*` tools (`rag_save`, `rag_append`, `rag_search`, `rag_load`, `rag_list`, `rag_delete`, `rag_keywords`) instead of the default single `rag(action=...)` dispatcher. Same on-disk format, same fix-memory semantics — only the catalog shape changes. Useful for weak / 1-bit-quant tool callers (Bonsai-class) that handle many flat schemas more reliably than one discriminated schema. Has no effect when `--RAG` is also off. |
 | `--mcp <url>`         | Connect to a remote MCP server as a CLIENT (e.g. another `easyai-server` or `easyai-mcp-server`). The upstream's tool catalogue is fetched via `tools/list` and merged into the local one; each remote tool's handler proxies `tools/call` back to it. Local tool names win on collision (remote dup skipped with a warning). Pair with `--mcp-token <token>` when the upstream requires bearer auth. |
 | `--no-local-tools`    | Skip the LOCAL built-in toolbelt entirely (datetime, web_*, fs_*, bash, ...). Useful when you want ONLY external tools, ONLY RAG, or ONLY tools fetched via `--mcp`. Does NOT disable the MCP client — that's controlled by `--mcp`. **Renamed from `--no-tools`.** |
 

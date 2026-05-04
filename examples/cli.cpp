@@ -284,9 +284,13 @@ struct Options {
     bool        use_google      = false;       // opt-in: register `web_google`
                                                 // (also needs GOOGLE_API_KEY +
                                                 // GOOGLE_CSE_ID env vars)
-    bool        experimental_rag = false;       // collapse seven rag_* into a
-                                                // single `rag(action=...)` tool;
-                                                // disables the six-tool layout.
+    bool        split_rag        = false;       // opt back into the legacy
+                                                // seven rag_* tools (rag_save /
+                                                // rag_append / rag_search /
+                                                // rag_load / rag_list /
+                                                // rag_delete / rag_keywords);
+                                                // default is the single
+                                                // `rag(action=...)` dispatcher.
     std::set<std::string> tools_enabled;       // empty = all defaults
     std::string external_tools_dir;            // dir of EASYAI-*.tools files
     std::string rag_dir;                        // optional RAG persistent-registry dir
@@ -362,13 +366,18 @@ void usage(const char * argv0) {
 "                                 fs_grep, fs_write_file, bash,\n"
 "                                 system_meminfo, system_loadavg,\n"
 "                                 system_cpu_usage, system_swaps,\n"
+"                                 rag (default RAG layout — single tool;\n"
+"                                   requires --RAG DIR),\n"
 "                                 rag_save, rag_append, rag_search,\n"
 "                                 rag_load, rag_list, rag_delete,\n"
-"                                 rag_keywords (rag_* require --RAG DIR)\n"
+"                                 rag_keywords (legacy split layout —\n"
+"                                   only when --split-rag is also set)\n"
 "                               default: datetime,plan,web_search,web_fetch,\n"
 "                                 system_meminfo,system_loadavg,\n"
 "                                 system_cpu_usage,system_swaps,\n"
-"                                 (every rag_* registered when --RAG is set)\n"
+"                                 (rag is auto-registered when --RAG is set;\n"
+"                                  with --split-rag the seven rag_* tools are\n"
+"                                  registered instead)\n"
 "    --sandbox DIR              enable fs_list_dir, fs_read_file,\n"
 "                                 fs_glob, fs_grep AND fs_write_file,\n"
 "                                 ALL scoped to DIR.  Without --sandbox\n"
@@ -384,13 +393,16 @@ void usage(const char * argv0) {
 "                                 GOOGLE_API_KEY and GOOGLE_CSE_ID env\n"
 "                                 vars; counts against your Google quota\n"
 "                                 (free tier: 100 queries/day).\n"
-"    --experimental-rag         collapse the seven rag_* tools into a single\n"
-"                                 `rag(action=...)` tool. On-disk format is\n"
-"                                 unchanged; the seven tools are NOT registered\n"
-"                                 when this is set. Smaller catalog at the\n"
-"                                 cost of accuracy on weak / 1-bit-quant\n"
-"                                 tool callers — leave off if you're running\n"
-"                                 a Bonsai-class model.\n"
+"    --split-rag                opt back into the legacy seven-tool RAG layout\n"
+"                                 (rag_save / rag_append / rag_search /\n"
+"                                 rag_load / rag_list / rag_delete /\n"
+"                                 rag_keywords as separate tools). The\n"
+"                                 DEFAULT is now the single `rag(action=...)`\n"
+"                                 dispatcher; pass --split-rag if you're\n"
+"                                 driving a weak / 1-bit-quant tool caller\n"
+"                                 (Bonsai-class) that handles many flat\n"
+"                                 schemas better than one discriminated one.\n"
+"                                 On-disk format is byte-identical either way.\n"
 "    --external-tools DIR       load every EASYAI-*.tools file in DIR as an\n"
 "                                 external-tools manifest. Empty dir is a\n"
 "                                 normal state (no extra tools). Per-file\n"
@@ -399,13 +411,13 @@ void usage(const char * argv0) {
 "                                 warnings (errors are always shown).\n"
 "                                 See EXTERNAL_TOOLS.md.\n"
 "    --RAG DIR                  enable RAG (the agent's persistent registry)\n"
-"                                 rooted at DIR. Registers seven tools:\n"
-"                                 rag_save / rag_append (grow an existing\n"
-"                                 memory) / rag_search / rag_load /\n"
-"                                 rag_list / rag_delete / rag_keywords —\n"
-"                                 long-term memory across sessions. Each\n"
-"                                 entry is a small Markdown file in DIR.\n"
-"                                 See RAG.md.\n"
+"                                 rooted at DIR. Default: registers ONE\n"
+"                                 `rag(action=...)` tool with sub-actions\n"
+"                                 save / append / search / load / list /\n"
+"                                 delete / keywords. Pass --split-rag to\n"
+"                                 register the legacy seven separate rag_*\n"
+"                                 tools instead. Each memory is a small\n"
+"                                 Markdown file in DIR. See RAG.md.\n"
 "    --no-plan                  don't auto-register the planning tool\n"
 "\n"
 "  Behaviour:\n"
@@ -492,7 +504,7 @@ bool parse_args(int argc, char ** argv, Options & o) {
         else if (a == "--sandbox")        o.sandbox       = need(i, "--sandbox");
         else if (a == "--allow-bash")     o.allow_bash    = true;
         else if (a == "--use-google")     o.use_google    = true;
-        else if (a == "--experimental-rag") o.experimental_rag = true;
+        else if (a == "--split-rag")        o.split_rag        = true;
         else if (a == "--external-tools") o.external_tools_dir = need(i, "--external-tools");
         else if (a == "--RAG")            o.rag_dir            = need(i, "--RAG");
         else if (a == "--temperature")    o.temperature       = std::stof(need(i, "--temperature"));
@@ -661,17 +673,11 @@ void register_tools(easyai::Client & cli,
     // rag_save creates it on first call. See RAG.md for the full
     // guide.
     if (!o.rag_dir.empty()) {
-        if (o.experimental_rag) {
-            // Single-tool dispatcher: model sees one `rag(action=...)`
-            // tool. The six legacy rag_* tools are NOT registered when
-            // this is on — exposing both paths to the same store would
-            // just confuse the model. The unified tool is gated only
-            // by --experimental-rag (NOT by --tools), so anyone opting
-            // in unambiguously gets only the new shape.
-            if (o.tools_enabled.empty() || o.tools_enabled.count("rag")) {
-                cli.add_tool(easyai::tools::make_unified_rag_tool(o.rag_dir));
-            }
-        } else {
+        if (o.split_rag) {
+            // Legacy seven-tool layout (opt-in via --split-rag): one tool
+            // per RAG action. Useful for weak / 1-bit-quant callers that
+            // handle many flat schemas more reliably than one discriminated
+            // schema.
             auto rag = easyai::tools::make_rag_tools(o.rag_dir);
             if (o.tools_enabled.empty() || o.tools_enabled.count("rag_save"))     cli.add_tool(rag.save);
             if (o.tools_enabled.empty() || o.tools_enabled.count("rag_append"))   cli.add_tool(rag.append);
@@ -680,6 +686,14 @@ void register_tools(easyai::Client & cli,
             if (o.tools_enabled.empty() || o.tools_enabled.count("rag_list"))     cli.add_tool(rag.list);
             if (o.tools_enabled.empty() || o.tools_enabled.count("rag_delete"))   cli.add_tool(rag.del);
             if (o.tools_enabled.empty() || o.tools_enabled.count("rag_keywords")) cli.add_tool(rag.keywords);
+        } else {
+            // Default: single `rag(action=...)` dispatcher. The seven
+            // rag_* tools are NOT registered — exposing both paths to
+            // the same store would just confuse the model. Gated only
+            // on the `rag` name when the operator passed --tools.
+            if (o.tools_enabled.empty() || o.tools_enabled.count("rag")) {
+                cli.add_tool(easyai::tools::make_unified_rag_tool(o.rag_dir));
+            }
         }
     }
 

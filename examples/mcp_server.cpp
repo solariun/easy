@@ -219,6 +219,9 @@ struct ServerArgs {
     // Tool packs.
     std::string external_tools_dir;
     std::string rag_dir;
+    bool        split_rag = false;        // opt back into the legacy seven
+                                          // rag_* tools instead of the default
+                                          // single `rag(action=...)` dispatcher.
 
     // HTTP knobs.
     std::size_t max_body    = kDefaultMaxBody;
@@ -316,6 +319,7 @@ const std::vector<FlagDef> & kFlags() {
         { {"--no-tools"},              "SERVER", "load_tools",             "load_tools",          false, SET_BOOL_FALSE(&ServerArgs::load_tools) },
         { {"--external-tools"},        "SERVER", "external_tools",         "external_tools",      true,  SET_STR(&ServerArgs::external_tools_dir) },
         { {"--RAG"},                   "SERVER", "rag",                    "rag",                 true,  SET_STR(&ServerArgs::rag_dir) },
+        { {"--split-rag"},             "SERVER", "split_rag",              "split_rag",           false, SET_BOOL_TRUE(&ServerArgs::split_rag) },
         // ----- SERVER: auth -----
         { {"--api-key"},               "SERVER", "api_key",                "api_key",             true,  SET_STR(&ServerArgs::api_key) },
         { {"--no-mcp-auth"},           "",       "",                       "no_mcp_auth",         false, SET_BOOL_TRUE(&ServerArgs::no_mcp_auth) },
@@ -385,8 +389,16 @@ const std::vector<FlagDef> & kFlags() {
         "      --external-tools <dir>   Load every EASYAI-*.tools manifest\n"
         "                                in <dir>. Per-file fault isolation.\n"
         "                                See EXTERNAL_TOOLS.md.\n"
-        "      --RAG <dir>              Enable the seven RAG tools rooted at\n"
-        "                                <dir>. See RAG.md.\n"
+        "      --RAG <dir>              Enable RAG, the agent's persistent\n"
+        "                                registry, rooted at <dir>. Default:\n"
+        "                                registers ONE `rag(action=...)` tool\n"
+        "                                with sub-actions save / append /\n"
+        "                                search / load / list / delete /\n"
+        "                                keywords. Pass --split-rag to\n"
+        "                                register the legacy seven separate\n"
+        "                                rag_* tools instead. See RAG.md.\n"
+        "      --split-rag              Opt back into the legacy seven-tool\n"
+        "                                RAG layout. INI: SERVER.split_rag=on.\n"
         "\nAuth:\n"
         "      --api-key <token>        Bearer required for /health,\n"
         "                                /metrics, /v1/tools when set.\n"
@@ -402,8 +414,8 @@ const std::vector<FlagDef> & kFlags() {
         "key reference):\n"
         "  [SERVER]      every flag above (host, port, sandbox, threads,\n"
         "                 max_concurrent_calls, allow_fs, allow_bash,\n"
-        "                 external_tools, rag, api_key, mcp_auth, metrics,\n"
-        "                 verbose, max_body, name).\n"
+        "                 external_tools, rag, split_rag, api_key, mcp_auth,\n"
+        "                 metrics, verbose, max_body, name).\n"
         "  [MCP_USER]    one user per line: name = bearer-token.\n"
         "                 Populating any line enables Bearer auth on /mcp.\n",
         argv0);
@@ -825,19 +837,33 @@ int main(int argc, char ** argv) {
         for (auto & t : tb.tools()) ctx->default_tools.push_back(std::move(t));
     }
 
-    // -------- RAG (seven tools) -------------------------------------------
+    // -------- RAG ---------------------------------------------------------
+    // Default: one `rag(action=...)` tool. --split-rag opts back into
+    // the legacy seven separate rag_* tools (useful for weak /
+    // 1-bit-quant callers that handle many flat schemas more reliably
+    // than one discriminated schema).
     if (!args.rag_dir.empty()) {
-        auto rag = easyai::tools::make_rag_tools(args.rag_dir);
-        ctx->default_tools.push_back(std::move(rag.save));
-        ctx->default_tools.push_back(std::move(rag.append));
-        ctx->default_tools.push_back(std::move(rag.search));
-        ctx->default_tools.push_back(std::move(rag.load));
-        ctx->default_tools.push_back(std::move(rag.list));
-        ctx->default_tools.push_back(std::move(rag.del));
-        ctx->default_tools.push_back(std::move(rag.keywords));
-        std::fprintf(stderr,
-            "easyai-mcp-server: RAG enabled, root = %s\n",
-            args.rag_dir.c_str());
+        if (args.split_rag) {
+            auto rag = easyai::tools::make_rag_tools(args.rag_dir);
+            ctx->default_tools.push_back(std::move(rag.save));
+            ctx->default_tools.push_back(std::move(rag.append));
+            ctx->default_tools.push_back(std::move(rag.search));
+            ctx->default_tools.push_back(std::move(rag.load));
+            ctx->default_tools.push_back(std::move(rag.list));
+            ctx->default_tools.push_back(std::move(rag.del));
+            ctx->default_tools.push_back(std::move(rag.keywords));
+            std::fprintf(stderr,
+                "easyai-mcp-server: RAG enabled (split: seven rag_* "
+                "tools), root = %s\n",
+                args.rag_dir.c_str());
+        } else {
+            ctx->default_tools.push_back(
+                easyai::tools::make_unified_rag_tool(args.rag_dir));
+            std::fprintf(stderr,
+                "easyai-mcp-server: RAG enabled (single rag tool), "
+                "root = %s\n",
+                args.rag_dir.c_str());
+        }
     }
 
     // -------- external-tools dir -----------------------------------------

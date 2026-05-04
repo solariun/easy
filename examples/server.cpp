@@ -3039,18 +3039,19 @@ static bool require_auth(const ServerCtx & ctx, const httplib::Request & req,
         "                                GOOGLE_CSE_ID env vars; counts\n"
         "                                against Google's quota (free tier:\n"
         "                                100 queries/day per key).\n"
-        "      --experimental-rag       Collapse the seven rag_* tools into a\n"
-        "                                single `rag` tool with an `action`\n"
-        "                                parameter (\"save\" / \"append\" /\n"
-        "                                \"search\" / \"load\" / \"list\" /\n"
-        "                                \"delete\" / \"keywords\"). On-disk\n"
-        "                                format and semantics are unchanged;\n"
-        "                                the seven tools are NOT registered\n"
-        "                                when this is set. Smaller catalog at\n"
-        "                                the cost of accuracy on weak /\n"
-        "                                1-bit-quant tool callers — leave\n"
-        "                                off if you're running Bonsai-class\n"
-        "                                models.\n"
+        "      --split-rag              Opt back into the legacy seven-tool RAG\n"
+        "                                layout (rag_save / rag_append /\n"
+        "                                rag_search / rag_load / rag_list /\n"
+        "                                rag_delete / rag_keywords as\n"
+        "                                separate tools). The DEFAULT is now\n"
+        "                                the single `rag(action=...)`\n"
+        "                                dispatcher; pass --split-rag if\n"
+        "                                you're driving a weak / 1-bit-quant\n"
+        "                                tool caller (Bonsai-class) that\n"
+        "                                handles many flat schemas better\n"
+        "                                than one discriminated one. On-disk\n"
+        "                                format is byte-identical either way.\n"
+        "                                INI: SERVER.split_rag=on.\n"
         "      --external-tools <dir>   Load every EASYAI-*.tools file in <dir>\n"
         "                                as an external-tools manifest. Empty\n"
         "                                directory is a normal state (no extra\n"
@@ -3063,13 +3064,15 @@ static bool require_auth(const ServerCtx & ctx, const httplib::Request & req,
         "      --RAG <dir>              Enable RAG, the agent's persistent\n"
         "                                registry / long-term memory. Each\n"
         "                                entry is one Markdown file in <dir>.\n"
-        "                                Seven tools added: rag_save,\n"
-        "                                rag_append (grow an existing memory),\n"
-        "                                rag_search, rag_load, rag_list,\n"
-        "                                rag_delete, rag_keywords. The\n"
-        "                                installed systemd unit always passes\n"
-        "                                this flag; manual invocations need\n"
-        "                                it explicitly. See RAG.md.\n"
+        "                                Default: registers ONE `rag(action=...)`\n"
+        "                                tool with sub-actions save / append /\n"
+        "                                search / load / list / delete /\n"
+        "                                keywords. Pass --split-rag to register\n"
+        "                                the legacy seven separate rag_* tools\n"
+        "                                instead. The installed systemd unit\n"
+        "                                always passes this flag; manual\n"
+        "                                invocations need it explicitly. See\n"
+        "                                RAG.md.\n"
         "\nModel tuning (apply on top of --preset):\n"
         "      --preset <name>          Ambient preset (default 'balanced')\n"
         "      --temperature <f>        Override temperature (0.0-2.0)\n"
@@ -3168,9 +3171,12 @@ struct ServerArgs {
     bool        allow_bash = false; // explicit opt-in for the `bash` tool
     bool        use_google = false; // explicit opt-in for the `web_google` tool
                                     // (also requires GOOGLE_API_KEY + GOOGLE_CSE_ID)
-    bool        experimental_rag = false; // collapse the seven rag_* tools into
-                                          // a single dispatched `rag(action=...)`
-                                          // tool. Disables the six-tool layout.
+    bool        split_rag = false;        // opt back into the legacy seven
+                                          // rag_* tools (rag_save / rag_append
+                                          // / rag_search / rag_load / rag_list
+                                          // / rag_delete / rag_keywords);
+                                          // default is the single
+                                          // `rag(action=...)` dispatcher.
     std::string external_tools_dir; // optional: dir of EASYAI-*.tools files
     std::string rag_dir;             // optional: RAG persistent-registry dir
     std::string preset     = "balanced";
@@ -3378,7 +3384,7 @@ static const std::vector<FlagDef> & kFlags() {
         { {"--allow-fs"},          "SERVER", "allow_fs",       "allow_fs",       false, SET_BOOL_TRUE(&ServerArgs::allow_fs) },
         { {"--allow-bash"},        "SERVER", "allow_bash",     "allow_bash",     false, SET_BOOL_TRUE(&ServerArgs::allow_bash) },
         { {"--use-google"},        "SERVER", "use_google",     "use_google",     false, SET_BOOL_TRUE(&ServerArgs::use_google) },
-        { {"--experimental-rag"},  "SERVER", "experimental_rag","experimental_rag",false, SET_BOOL_TRUE(&ServerArgs::experimental_rag) },
+        { {"--split-rag"},         "SERVER", "split_rag",      "split_rag",      false, SET_BOOL_TRUE(&ServerArgs::split_rag) },
         // --no-local-tools (formerly --no-tools): disables only the
         // LOCAL built-in toolbelt; remote tools fetched via --mcp are
         // unaffected. The INI key was renamed accordingly so the YAML
@@ -3524,91 +3530,39 @@ int main(int argc, char ** argv) {
     // is very likely to over-eagerly call tools on simple greetings ("hi"
     // → web_search).  Operators can fully replace it via -s.
     static constexpr char kBuiltinSystem[] =
-        "You are Deep — an expert system engineer who answers from CHECKED\n"
-        "FACTS, not impressions.  You make difficult topics (AI, systems\n"
-        "engineering, infrastructure) accessible to people of every skill\n"
-        "level by being clear, honest, and never compromising on accuracy.\n"
+        "You are Deep — a clear, honest assistant. Answer briefly and let\n"
+        "the user steer. Lead with the answer; show work only when the user\n"
+        "would need it.\n"
         "\n"
-        "## Operating loop: TIME → THINK → PLAN → EXECUTE → VERIFY\n"
-        "1. **Time first.** Before answering anything that touches \"now\",\n"
-        "   \"today\", a deadline, a version, a release, or a fact that\n"
-        "   could have changed since your training cutoff, your FIRST tool\n"
-        "   call is `datetime`.  Anchor the rest of the turn to the real\n"
-        "   wall clock.\n"
-        "2. **Think.** State the goal in one sentence.  Identify what you\n"
-        "   know, what you need to find out, and what could go wrong.\n"
-        "3. **Plan.** For any task that needs 2+ tool calls (research,\n"
-        "   multi-source synthesis, file edit + verify, build/test/fix\n"
-        "   loops), call `plan(action='add', text='…')` BEFORE the first\n"
-        "   real tool, listing the steps so the user can see and intervene.\n"
-        "4. **Execute.** Run each step with the right tool.  No tool is\n"
-        "   off-limits if it helps you finish the task — use every tool\n"
-        "   available to you with judgement.\n"
-        "5. **Verify.** Before claiming success, check: does the file\n"
-        "   exist? does the test pass? does the URL really say what I\n"
-        "   summarised?  When in doubt, run another tool to confirm\n"
-        "   instead of guessing.\n"
-        "\n"
-        "## RULE 1 (above all): EXECUTE OR ANSWER, NEVER ANNOUNCE\n"
-        "If you decide a tool is needed, CALL IT in the same turn — emit\n"
-        "the actual tool_call now.  Sentences like \"I'll search…\",\n"
-        "\"Let me fetch…\", \"I'll look that up…\", \"Now I'll…\",\n"
-        "\"Right now I'll…\" are FORBIDDEN unless the tool_call follows in\n"
-        "this same turn.  If you cannot or will not call a tool, give the\n"
-        "user the final answer right now (or say plainly \"I don't have\n"
-        "live access; I can only tell you what I know up to my training\n"
-        "cutoff\").  Stating intent without execution is a critical\n"
-        "failure for this assistant.\n"
-        "\n"
-        "## When to use a tool\n"
         "Answer directly for greetings, chitchat, math, and anything you\n"
-        "already know — do NOT call a tool for those.  Use a tool only\n"
-        "when the request truly needs one:\n"
-        "  - 'now' / 'today' / 'latest'           → datetime FIRST, then\n"
-        "                                            web_search → web_fetch\n"
-        "  - reading / listing files              → fs_read_file / fs_list_dir\n"
-        "                                            / fs_glob / fs_grep\n"
-        "  - writing files                        → fs_write_file (paths are\n"
-        "                                            virtual, rooted at `/`)\n"
-        "  - running commands / pipelines         → bash (when registered)\n"
-        "  - host observability                   → system_meminfo / loadavg /\n"
-        "                                            cpu_usage / swaps\n"
-        "Be a system engineer: choose the cheapest tool that answers the\n"
-        "question, then verify with a second one if the answer is\n"
-        "load-bearing.\n"
+        "already know — no tool needed.\n"
         "\n"
-        "## Plan tool — for any non-trivial multi-step task\n"
-        "If the user's request needs 2+ tool calls (e.g. search-then-fetch,\n"
-        "multi-source research, file edit + verify, compile/run/fix loops)\n"
-        "call `plan` BEFORE the first real tool to outline the steps:\n"
-        "  plan(action='add', text='datetime — anchor today')\n"
-        "  plan(action='add', text='search arxiv listing')\n"
-        "  plan(action='add', text='fetch top 3 papers')\n"
-        "  plan(action='add', text='draft summary, cite urls')\n"
-        "Then mark each step as you go:\n"
-        "  plan(action='start', id='1')   → before doing it\n"
-        "  plan(action='done',  id='1')   → after success\n"
-        "The user sees the checklist live and can intervene if you go off-\n"
-        "track.  Skip planning for single-tool turns and chitchat.\n"
+        "When a request truly needs work, run a tight loop:\n"
+        "  1. Plan ONE small concrete next step (not a roadmap).\n"
+        "  2. Act — call the tool in the same turn. Never announce a tool\n"
+        "     call without making it (\"I'll search…\", \"Let me fetch…\",\n"
+        "     \"Now I'll…\" without the call is forbidden).\n"
+        "  3. Read the result, then finish or take ONE more step.\n"
+        "Stop as soon as you have something useful. Prefer a short answer\n"
+        "the user can refine over a long pre-committed plan. Use the `plan`\n"
+        "tool only when the task genuinely needs a multi-step checklist the\n"
+        "user can watch — skip it for single-tool turns and chitchat.\n"
         "\n"
-        "## Mandatory rules for sourced answers\n"
-        " - web_search returns titles + 1-2 sentence snippets.  The\n"
-        "   snippets are NOT enough to summarise from.  After every\n"
-        "   web_search you MUST immediately call web_fetch on the top 1-3\n"
-        "   most relevant URLs and base your answer on the fetched body.\n"
-        " - Two web_search calls in a row is wrong.  Search ONCE, then\n"
-        "   fetch.\n"
-        " - If a fetch fails (HTTP 4xx/5xx), retry with the next URL from\n"
-        "   the search results.  Do not fall back to summarising snippets.\n"
-        " - When you cite an article, cite the URL you actually fetched.\n"
-        " - When you state a fact that could have a date attached, attach\n"
-        "   the date.  \"Released April 2026\" beats \"recently released.\"\n"
+        "Tool notes:\n"
+        "  - 'now' / 'today' / 'latest' → datetime first.\n"
+        "  - web_search returns snippets only; after ONE search, web_fetch\n"
+        "    the top 1-3 URLs and answer from the fetched body. Two searches\n"
+        "    in a row is wrong.\n"
+        "  - Files: fs_read_file / fs_list_dir / fs_glob / fs_grep; writes:\n"
+        "    fs_write_file (paths virtual, rooted at `/`).\n"
+        "  - Commands: bash (when registered).\n"
+        "  - Host metrics: system_meminfo / loadavg / cpu_usage / swaps.\n"
+        "  - Long-term memory: rag(action=…) save / append / search / load.\n"
+        "  - Cite URLs you actually fetched. Attach dates to dated facts\n"
+        "    (\"released April 2026\" beats \"recently released\").\n"
         "\n"
-        "## Voice\n"
-        "Be terse.  Lead with the answer.  Show the work only when the\n"
-        "user would need it (debug context, a tradeoff worth flagging,\n"
-        "a verification step).  No marketing, no \"As an AI, I…\".  Honest\n"
-        "about uncertainty: \"I'm not sure — let me check\" → call a tool.";
+        "Be terse. Be honest about uncertainty: \"I'm not sure — let me\n"
+        "check\" → call a tool.";
 
     std::string default_system = args.system_inline;
     if (default_system.empty() && !args.system_path.empty()) {
@@ -3696,18 +3650,11 @@ int main(int argc, char ** argv) {
     // server passes --RAG by default (see
     // scripts/install_easyai_server.sh). See RAG.md.
     if (!args.rag_dir.empty()) {
-        if (args.experimental_rag) {
-            // Single-tool dispatcher: model sees one `rag` tool with an
-            // `action` parameter. Disables the seven rag_* layout — they
-            // would just confuse the model with two paths to the same
-            // store.
-            ctx->default_tools.push_back(
-                easyai::tools::make_unified_rag_tool(args.rag_dir));
-            std::fprintf(stderr,
-                "easyai-server: RAG enabled (experimental: single "
-                "rag tool), root = %s\n",
-                args.rag_dir.c_str());
-        } else {
+        if (args.split_rag) {
+            // Legacy seven-tool layout (opt-in via --split-rag): one tool
+            // per RAG action. Useful for weak / 1-bit-quant callers that
+            // handle many flat schemas more reliably than one discriminated
+            // schema.
             auto rag = easyai::tools::make_rag_tools(args.rag_dir);
             ctx->default_tools.push_back(std::move(rag.save));
             ctx->default_tools.push_back(std::move(rag.append));
@@ -3717,7 +3664,18 @@ int main(int argc, char ** argv) {
             ctx->default_tools.push_back(std::move(rag.del));
             ctx->default_tools.push_back(std::move(rag.keywords));
             std::fprintf(stderr,
-                "easyai-server: RAG enabled, root = %s\n",
+                "easyai-server: RAG enabled (split: seven rag_* "
+                "tools), root = %s\n",
+                args.rag_dir.c_str());
+        } else {
+            // Default: single `rag(action=...)` dispatcher. The seven
+            // rag_* tools are NOT registered — exposing both paths to
+            // the same store would just confuse the model.
+            ctx->default_tools.push_back(
+                easyai::tools::make_unified_rag_tool(args.rag_dir));
+            std::fprintf(stderr,
+                "easyai-server: RAG enabled (single rag tool), "
+                "root = %s\n",
                 args.rag_dir.c_str());
         }
     }

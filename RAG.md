@@ -22,7 +22,7 @@ the whole system.
 1. [What RAG is, and why](#1-what-rag-is-and-why)
 2. [Quickstart](#2-quickstart)
 3. [The file format on disk](#3-the-file-format-on-disk)
-4. [The seven tools (and the one-tool dispatcher)](#4-the-seven-tools)
+4. [The seven actions (default unified tool, or seven tools under `--split-rag`)](#4-the-seven-tools)
 5. [How the model is encouraged to use it](#5-how-the-model-is-encouraged-to-use-it)
 6. [Workflows](#6-workflows)
 7. [Best practices](#7-best-practices)
@@ -38,19 +38,25 @@ the whole system.
 RAG is a **keyword-indexed key/value store**, owned by the agent,
 persisted on disk, accessible to the agent as **its own memory** —
 something it can search, store, append to, recall, update, and
-forget. Seven tools expose those verbs:
+forget. The default registration exposes ONE tool with seven sub-
+actions:
 
 ```
-rag_save(title, keywords[], content, fix?)  store / overwrite; fix=true → immutable memory
-rag_append(title, content, keywords?[])     grow an existing memory without losing the previous body
-rag_search(keywords[], page?, max_results?) find by 1+ keywords (≥2 matches when 2+ given), paginated
-rag_load(titles[1..4])                      recall up to 4 full bodies
-rag_list(prefix?, max?)                     browse titles
-rag_delete(title)                           forget a stale memory (fixed memories refused)
-rag_keywords(min_count?, max?)              vocabulary overview
+rag(action="save",     title, keywords[], content, fix?)   store / overwrite; fix=true → immutable memory
+rag(action="append",   title, content, keywords?[])        grow an existing memory without losing the previous body
+rag(action="search",   keywords[], page?, max_results?)    find by 1+ keywords (≥2 matches when 2+ given), paginated
+rag(action="load",     titles[1..4])                       recall up to 4 full bodies
+rag(action="list",     prefix?, max?)                      browse titles
+rag(action="delete",   title)                              forget a stale memory (fixed memories refused)
+rag(action="keywords", min_count?, max?)                   vocabulary overview
 ```
 
-That is the whole API.
+That is the whole API. Pass `--split-rag` (or `[SERVER] split_rag = on`
+in the INI) to flatten this into the legacy seven separate tools
+(`rag_save`, `rag_append`, `rag_search`, `rag_load`, `rag_list`,
+`rag_delete`, `rag_keywords`) — useful for weak / 1-bit-quant tool
+callers that handle many flat schemas more reliably than one
+discriminated schema.
 
 The model decides what to remember and how to classify it. Keywords
 are how it finds memories again later. The directory is the index.
@@ -75,21 +81,28 @@ user explicitly asks to "learn this as a rule", "remember this as the
 design", "this is the spec — memorise it". The only way to change a
 fixed memory is for the operator to remove the file from disk by hand.
 
-### The single-tool dispatcher (experimental)
+### The single-tool dispatcher (default) and the legacy seven-tool layout
 
-`--experimental-rag` (server / CLI flag, also in the INI) collapses
-the seven tools into one:
+By **default**, `--RAG <dir>` registers ONE tool that bundles every RAG
+action behind an `action` parameter:
 
 ```
 rag(action="save"|"append"|"search"|"load"|"list"|"delete"|"keywords", ...)
 ```
 
-Same on-disk format, same `RagStore`, same fix-memory rules. Just a
-different shape for the model's tool catalog. Exposes 1 tool entry
-instead of 7 (saves a few hundred tokens per turn) at the cost of
-accuracy on weak / 1-bit-quant tool callers — leave it off for
-Bonsai-class models. When this flag is on the seven `rag_*` tools
-are NOT registered; only `rag(action=...)` is reachable.
+Same on-disk format, same `RagStore`, same fix-memory rules. The
+catalogue carries 1 entry instead of 7, which keeps the toolbelt
+readable for the model and saves a few hundred tokens per turn.
+
+If you're driving a **weak / 1-bit-quant tool caller** (Bonsai-class)
+that handles many flat schemas more reliably than one discriminated
+schema, pass `--split-rag` (server / CLI / local flag — also
+`[SERVER] split_rag = on` in the INI) to opt back into the legacy
+seven-tool layout: `rag_save`, `rag_append`, `rag_search`,
+`rag_load`, `rag_list`, `rag_delete`, `rag_keywords`. When
+`--split-rag` is on the unified `rag(action=...)` is NOT registered,
+and vice-versa — the two paths to the same store would just confuse
+the model.
 
 ### How information flows
 
@@ -244,7 +257,8 @@ mkdir -p ~/easyai-reg
 easyai-cli --url http://127.0.0.1:8080 --RAG ~/easyai-reg
 ```
 
-Same seven tools, but the memory lives in your home directory.
+Same single `rag(action=...)` tool (or seven `rag_*` tools with
+`--split-rag`), but the memory lives in your home directory.
 
 ### From easyai-local (single-process REPL with RAG)
 
@@ -345,10 +359,15 @@ use `.` for hierarchy.
 
 ---
 
-## 4. The seven tools
+## 4. The seven actions
 
-Each tool description below is what the MODEL sees. The descriptions
-were written to actively encourage use — see §5.
+By default the model sees ONE tool with seven sub-actions
+(`rag(action=...)`); under `--split-rag` it sees the same seven
+behaviours as separate `rag_*` tools. Either way the descriptions
+below are what the MODEL reads; they were written to actively
+encourage use — see §5. Action names below match the `action`
+parameter in the unified shape and the suffix of the legacy split
+shape (`save` ↔ `rag_save`, etc.).
 
 ### rag_save
 
@@ -540,10 +559,10 @@ has invested in; the long tail is candidates for either
 consolidation (rename to a more general keyword + rag_save) or
 deletion.
 
-### The single-tool dispatcher (experimental)
+### The single-tool dispatcher (default) and `--split-rag`
 
-Pass `--experimental-rag` (or `[SERVER] experimental_rag = on` in
-the INI) to collapse the seven tools into one:
+By default, `--RAG <dir>` registers ONE tool that bundles every
+action:
 
 ```
 rag(action: "save" | "append" | "search" | "load" | "list" | "delete" | "keywords",
@@ -552,12 +571,12 @@ rag(action: "save" | "append" | "search" | "load" | "list" | "delete" | "keyword
 ```
 
 `action` is required; the rest are conditionally required by the
-chosen action (the legacy validation messages still apply, including
-the "missing required argument: keywords" / "title" / `…` you'd see
-from the seven-tool layout). The dispatcher rewrites guidance text
-in its responses — references like `Use rag_load with…` come back
-as `Use rag(action="load") with…` so the model only sees the tool
-name it can actually call.
+chosen action (the same validation messages apply, including
+"missing required argument: keywords" / "title" / `…` from the
+seven-tool layout). The dispatcher rewrites guidance text in its
+responses — references like `Use rag_load with…` come back as
+`Use rag(action="load") with…` so the model only sees the tool name
+it can actually call.
 
 **On-disk layout, locking discipline, fix-memory rules, error
 messages — all unchanged.** Internally the dispatcher captures the
@@ -565,17 +584,17 @@ same seven handler closures the legacy layout uses; switching shapes
 between sessions is safe because the directory is the source of
 truth and both shapes read/write the same files.
 
-When to flip the flag on:
-* You're running a strong tool-calling model (Llama 3.x 70B, Qwen
-  2.5 14B+, GPT-OSS-class) where the catalog savings genuinely help
-  context pressure.
+When to leave it on (the default):
+* You're running a strong or medium-strength tool-calling model
+  (Llama 3.x, Qwen 2.5 14B+, GPT-OSS-class) where one entry beats
+  seven for catalog cleanliness and context pressure.
 * You want a tighter `/v1/models` tool-list or a smaller MCP
   catalogue exposed downstream.
 
-When to leave it off (the default):
-* You're running a 1-bit / heavily-quantised model where dispatched-
-  schema tool calls are noticeably less reliable than flat ones —
-  Bonsai-class targets, BitNet, anything below ~4 bits.
+When to pass `--split-rag` (or `[SERVER] split_rag = on` in the INI):
+* You're running a 1-bit / heavily-quantised model where
+  discriminated-schema tool calls are noticeably less reliable than
+  flat ones — Bonsai-class targets, BitNet, anything below ~4 bits.
 * You have prompts / system messages that explicitly mention the
   seven tool names as instructions to the model.
 

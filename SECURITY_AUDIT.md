@@ -647,17 +647,19 @@ primitive; the rest is correctness.
 - **No JSON parser involvement.** The on-disk format is plain text
   with one `keywords:` header. Corrupt files are silently skipped
   at index time; the index doesn't crash the agent.
-- **Mutex-guarded index.** All seven tools share an in-memory
-  `std::map<title, EntryMeta>` guarded by a `std::shared_mutex`
-  (multi-reader / single-writer). Reads (`rag_search` /
-  `rag_load` / `rag_list` / `rag_keywords`) take a `shared_lock`
-  and parallelise; writes (`rag_save` / `rag_append` /
-  `rag_delete`) take a `unique_lock` and serialise — `rag_append`
-  in particular runs the entire read-modify-write under one
-  unique_lock so concurrent appenders queue cleanly without
-  losing each other's appendix. The body is read off-disk per
-  `rag_load` / `rag_append`, never cached, so memory doesn't
-  grow with entry count beyond the metadata.
+- **Mutex-guarded index.** All seven action handlers share an
+  in-memory `std::map<title, EntryMeta>` guarded by a
+  `std::shared_mutex` (multi-reader / single-writer). Reads
+  (`search` / `load` / `list` / `keywords`) take a `shared_lock`
+  and parallelise; writes (`save` / `append` / `delete`) take a
+  `unique_lock` and serialise — `append` in particular runs the
+  entire read-modify-write under one unique_lock so concurrent
+  appenders queue cleanly without losing each other's appendix.
+  The body is read off-disk per `load` / `append`, never cached,
+  so memory doesn't grow with entry count beyond the metadata.
+  The default `rag(action=...)` dispatcher and the `--split-rag`
+  seven-tool layout share the same `RagStore` and the same
+  locking discipline; only the catalog shape changes.
 - **Filesystem permissions are the access boundary.** The installer
   creates `/var/lib/easyai/rag/` mode 750 owned by the `easyai`
   service user. The agent is the only thing that can read or
