@@ -3014,6 +3014,20 @@ static bool require_auth(const ServerCtx & ctx, const httplib::Request & req,
         "                                default) sends no Authorization\n"
         "                                header — use this when the\n"
         "                                upstream is in open mode.\n"
+        "      --http-retries N         Extra attempts on transient HTTP\n"
+        "                                failures (connect refused, read\n"
+        "                                timeout, 5xx). Applies to the MCP\n"
+        "                                client (--mcp), web_search/web_fetch\n"
+        "                                tools, and any other libcurl-based\n"
+        "                                tool. 0 disables. Default 5.\n"
+        "                                Each retry logs to stderr.\n"
+        "      --http-timeout SECONDS   HTTP read/write timeout for the\n"
+        "                                listen socket AND the MCP-client\n"
+        "                                connection. Bumped from llama-server's\n"
+        "                                60 s to 600 s default to accommodate\n"
+        "                                long thinking turns. INI key:\n"
+        "                                [SERVER] http_timeout. Logged\n"
+        "                                unconditionally at startup.\n"
         "      --sandbox <dir>          Restrict fs_* and bash to <dir>\n"
         "                                (when --allow-fs / --allow-bash\n"
         "                                register them).  Without --sandbox\n"
@@ -3166,6 +3180,13 @@ struct ServerArgs {
                                      // as a CLIENT (consumes its tools).
     std::string mcp_token;           // Bearer token for the upstream MCP
                                      // server; empty → no auth header.
+    int         http_retries = 5;    // extra attempts on transient HTTP
+                                     // failures (MCP client + web tools)
+    int         http_timeout = 600;  // listen socket + MCP-client read/write
+                                     // timeout in seconds.  Bumped from
+                                     // llama-server's 60 s default to give
+                                     // long-thinking models room to breathe
+                                     // before the network drops them.
     std::string sandbox;            // optional: scope fs_* / bash to this dir
     bool        allow_fs   = false; // explicit opt-in for the fs_* tools
     bool        allow_bash = false; // explicit opt-in for the `bash` tool
@@ -3392,6 +3413,8 @@ static const std::vector<FlagDef> & kFlags() {
         { {"--no-local-tools"},    "SERVER", "local_tools",    "local_tools",    false, SET_BOOL_FALSE(&ServerArgs::local_tools) },
         { {"--mcp"},               "SERVER", "mcp",            "mcp",            true,  SET_STR(&ServerArgs::mcp_url) },
         { {"--mcp-token"},         "SERVER", "mcp_token",      "mcp_token",      true,  SET_STR(&ServerArgs::mcp_token) },
+        { {"--http-retries"},      "SERVER", "http_retries",   "http_retries",   true,  SET_INT(&ServerArgs::http_retries) },
+        { {"--http-timeout"},      "SERVER", "http_timeout",   "http_timeout",   true,  SET_INT(&ServerArgs::http_timeout) },
         { {"--no-think"},          "SERVER", "no_think",       "no_think",       false, SET_BOOL_TRUE(&ServerArgs::no_think) },
         { {"--inject-datetime"},   "SERVER", "inject_datetime","inject_datetime",true,  SET_BOOL_TRUE(&ServerArgs::inject_datetime) },
         { {"--knowledge-cutoff"},  "SERVER", "knowledge_cutoff","knowledge_cutoff",true, SET_STR(&ServerArgs::knowledge_cutoff) },
@@ -3697,7 +3720,13 @@ int main(int argc, char ** argv) {
         easyai::mcp::ClientOptions opts;
         opts.url             = args.mcp_url;
         opts.bearer_token    = args.mcp_token;
-        opts.timeout_seconds = 20;
+        // Honour the operator's --http-timeout and --http-retries for
+        // the MCP client too, so a flaky upstream MCP server doesn't
+        // wedge the chat path.  The retry budget logs each attempt to
+        // stderr unconditionally — operators see drops in journalctl
+        // even without --verbose.
+        opts.timeout_seconds = args.http_timeout > 0 ? args.http_timeout : 20;
+        opts.retries         = args.http_retries < 0 ? 0 : args.http_retries;
 
         std::string err;
         auto remote = easyai::mcp::fetch_remote_tools(opts, err);
@@ -5444,14 +5473,17 @@ int main(int argc, char ** argv) {
         "                backend=%s  ctx=%d  tools=%zu  preset=%s\n"
         "                listening on http://%s:%d  (webui at /)\n"
         "                inject_datetime=%s  cutoff=%s  verbose=%s\n"
-        "                max_tool_hops=99999  retry_on_incomplete=ON\n",
+        "                max_tool_hops=99999  retry_on_incomplete=ON\n"
+        "                http_timeout=%ds (read/write)  http_retries=%d\n",
         ctx->model_id.c_str(), ctx->engine.backend_summary().c_str(),
         ctx->engine.n_ctx(), ctx->default_tools.size(),
         ctx->default_preset.name.c_str(),
         args.host.c_str(), args.port,
         ctx->inject_datetime ? "ON" : "OFF",
         ctx->knowledge_cutoff.c_str(),
-        args.verbose ? "ON" : "OFF");
+        args.verbose ? "ON" : "OFF",
+        args.http_timeout > 0 ? args.http_timeout : 600,
+        args.http_retries < 0 ? 0 : args.http_retries);
     if (args.verbose) {
         std::fprintf(stderr,
             "[easyai-server] VERBOSE: per-request POST line + per-hop "
@@ -5462,8 +5494,17 @@ int main(int argc, char ** argv) {
     // -------- http server -------------------------------------------------
     httplib::Server svr;
     svr.set_payload_max_length(args.max_body);
-    svr.set_read_timeout (60);
-    svr.set_write_timeout(60);
+    // Apply the configured HTTP timeout to BOTH directions.  Default is
+    // 600 s (10 min) so long thinking turns don't trip a mid-stream cut
+    // when the model goes quiet for minutes between visible tokens —
+    // see ServerArgs::http_timeout.  Logged below in the startup
+    // banner so an operator reading journalctl knows the value in
+    // effect without grepping --verbose output.
+    {
+        const int t = args.http_timeout > 0 ? args.http_timeout : 600;
+        svr.set_read_timeout (t);
+        svr.set_write_timeout(t);
+    }
 
     // CORS — permissive to be friendly with browser-based clients. Tighten if
     // exposing on a public network.
@@ -5642,13 +5683,49 @@ int main(int argc, char ** argv) {
 
     // Last-chance error handler — never let a thrown exception propagate
     // out of the HTTP layer (httplib would close the socket abruptly).
-    svr.set_exception_handler([](const auto &, auto & res, std::exception_ptr ep) {
+    svr.set_exception_handler([](const auto & req, auto & res, std::exception_ptr ep) {
         try { if (ep) std::rethrow_exception(ep); }
         catch (const std::exception & e) {
+            // Always log to stderr — operators reading journalctl need
+            // to see uncaught exceptions / timeouts even without
+            // --verbose. The mark_problem() call below also drops a
+            // greppable banner into the raw log file.
+            std::fprintf(stderr,
+                "[easyai-server] EXCEPTION on %s %s from %s:%d : %s\n",
+                req.method.c_str(), req.path.c_str(),
+                req.remote_addr.c_str(), req.remote_port,
+                e.what());
+            easyai::log::mark_problem(
+                "Server: uncaught exception on %s %s from %s:%d : %s",
+                req.method.c_str(), req.path.c_str(),
+                req.remote_addr.c_str(), req.remote_port,
+                e.what());
             res.status = 500;
             res.set_content(error_json(std::string("uncaught: ") + e.what(),
                                         "internal_error"),
                             "application/json");
+        }
+    });
+
+    // cpp-httplib hands any read/write timeout (including the long
+    // SSE-stream cuts that prompt a "Failed to read connection" on the
+    // client side) to its error handler with status 408 Request Timeout
+    // when no other handler set the body. Hook it so a timeout doesn't
+    // disappear silently from the operator's stderr.
+    svr.set_error_handler([](const auto & req, auto & res) {
+        if (res.status == 408 || res.status == 504) {
+            std::fprintf(stderr,
+                "[easyai-server] WARN HTTP %d timeout on %s %s from %s:%d "
+                "(check --http-timeout, currently logged in startup banner)\n",
+                res.status,
+                req.method.c_str(), req.path.c_str(),
+                req.remote_addr.c_str(), req.remote_port);
+        } else if (res.status >= 500) {
+            std::fprintf(stderr,
+                "[easyai-server] ERROR HTTP %d on %s %s from %s:%d\n",
+                res.status,
+                req.method.c_str(), req.path.c_str(),
+                req.remote_addr.c_str(), req.remote_port);
         }
     });
 

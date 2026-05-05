@@ -58,8 +58,15 @@ public:
     // ----- transport / auth (fluent) ---------------------------------------
     Client & endpoint        (std::string url);             // http(s)://host[:port]
     Client & api_key         (std::string key);             // Bearer
-    Client & timeout_seconds (int  s);                      // connect+read; default 600
+    Client & timeout_seconds (int  s);                      // connect+read; default 1800
     Client & verbose         (bool v);                      // log SSE lines to stderr
+
+    // Number of EXTRA attempts on transport failures (connect refused,
+    // read timeout, 5xx with no streamed bytes yet). 0 disables retries
+    // entirely; default is 5.  Each retry logs via easyai::log::error so
+    // operators see it on stderr even without --verbose.  Mid-stream
+    // failures are NEVER retried (would duplicate output / state).
+    Client & http_retries    (int  n);
 
     // Tee EVERY HTTP transaction (request body + raw SSE chunks + tool
     // dispatch summaries) into the given FILE*.  The Client does NOT

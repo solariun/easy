@@ -307,7 +307,8 @@ struct Options {
     int                      max_tokens        = -1;
     std::vector<std::string> stop_sequences;
     std::string              extra_body;       // JSON object literal
-    int                      timeout           = 600;
+    int                      timeout           = 1800;  // 30 min — generous for thinking models
+    int                      http_retries      = 5;     // extra attempts on transient HTTP fails
     bool        show_reasoning   = true;   // default ON; --no-reasoning to opt out
     bool        verbose          = false;
     bool        quiet            = false;  // --quiet/-q: disable spinner + ctx-% gauge
@@ -337,7 +338,15 @@ void usage(const char * argv0) {
 "    --url URL                  OpenAI-compat endpoint (EASYAI_URL)\n"
 "    --api-key KEY              Bearer auth (EASYAI_API_KEY)\n"
 "    --model NAME               request body 'model' field (EASYAI_MODEL)\n"
-"    --timeout SECONDS          read+write timeout (default 600)\n"
+"    --timeout SECONDS          read+write timeout (default 1800 = 30 min,\n"
+"                                tuned for thinking models with long\n"
+"                                reasoning streams). EASYAI_TIMEOUT env\n"
+"                                also accepted.\n"
+"    --http-retries N           extra attempts on transient HTTP failures\n"
+"                                (connect refused, read timeout, 5xx) per\n"
+"                                request. 0 disables. Default 5. Each retry\n"
+"                                logs to stderr. EASYAI_HTTP_RETRIES env\n"
+"                                also accepted.\n"
 "    --insecure-tls             skip peer cert check (https only — DEV ONLY)\n"
 "    --ca-cert PATH             trust this CA bundle (PEM) for https://\n"
 "\n"
@@ -492,6 +501,12 @@ bool parse_args(int argc, char ** argv, Options & o) {
     if (const char * v = std::getenv("EASYAI_URL"))     o.url     = v;
     if (const char * v = std::getenv("EASYAI_API_KEY")) o.api_key = v;
     if (const char * v = std::getenv("EASYAI_MODEL"))   o.model   = v;
+    if (const char * v = std::getenv("EASYAI_TIMEOUT")) {
+        try { o.timeout = std::stoi(v); } catch (...) {}
+    }
+    if (const char * v = std::getenv("EASYAI_HTTP_RETRIES")) {
+        try { o.http_retries = std::stoi(v); } catch (...) {}
+    }
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -499,6 +514,7 @@ bool parse_args(int argc, char ** argv, Options & o) {
         else if (a == "--api-key")        o.api_key = need(i, "--api-key");
         else if (a == "--model")          o.model   = need(i, "--model");
         else if (a == "--timeout")        o.timeout = std::stoi(need(i, "--timeout"));
+        else if (a == "--http-retries")   o.http_retries = std::stoi(need(i, "--http-retries"));
         else if (a == "--system")         o.system_prompt = need(i, "--system");
         else if (a == "--system-file")    o.system_file   = need(i, "--system-file");
         else if (a == "--sandbox")        o.sandbox       = need(i, "--sandbox");
@@ -1117,7 +1133,7 @@ int main(int argc, char ** argv) {
     easyai::Client cli;
     if (log_fp) cli.log_file(log_fp);
     if (!o.url.empty()) cli.endpoint(o.url);
-    cli.model(o.model).timeout_seconds(o.timeout);
+    cli.model(o.model).timeout_seconds(o.timeout).http_retries(o.http_retries);
     if (!o.api_key.empty())            cli.api_key(o.api_key);
     if (!o.system_prompt.empty())      cli.system(o.system_prompt);
     if (o.temperature       >= 0.0f)   cli.temperature(o.temperature);

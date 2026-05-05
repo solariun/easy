@@ -33,10 +33,12 @@
 #include "easyai/tool.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -66,6 +68,7 @@ struct Conn {
     std::string         url;             // base, no trailing /mcp
     std::string         bearer;
     int                 timeout_seconds = 20;
+    int                 retries         = 5;   // extra attempts on transient failure
     std::mutex          mu;              // guards the easy handle below
     CURL *              h = nullptr;
     std::atomic<long>   next_id{1};
@@ -76,6 +79,30 @@ struct Conn {
     Conn(const Conn &) = delete;
     Conn & operator=(const Conn &) = delete;
 };
+
+// True for transient libcurl errors worth retrying. Permanent errors
+// (bad URL, SSL cert) and 4xx HTTP fall through and surface as-is.
+bool curl_error_is_retryable(CURLcode rc) {
+    switch (rc) {
+        case CURLE_COULDNT_CONNECT:
+        case CURLE_COULDNT_RESOLVE_HOST:
+        case CURLE_COULDNT_RESOLVE_PROXY:
+        case CURLE_OPERATION_TIMEDOUT:
+        case CURLE_RECV_ERROR:
+        case CURLE_SEND_ERROR:
+        case CURLE_GOT_NOTHING:
+        case CURLE_PARTIAL_FILE:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// Exponential backoff: 250ms, 500ms, 1s, 2s, 4s, capped.
+int mcp_retry_backoff_ms(int attempt) {
+    int ms = 250 << (attempt > 4 ? 4 : attempt);
+    return ms > 4000 ? 4000 : ms;
+}
 
 // libcurl write callback that appends to a std::string up to
 // kMaxResponseBytes. Returning short of `incoming` makes curl abort
@@ -141,9 +168,47 @@ bool http_post_json(Conn & c, const std::string & body,
     }
     curl_easy_setopt(c.h, CURLOPT_HTTPHEADER, headers);
 
-    CURLcode rc = curl_easy_perform(c.h);
+    // Retry loop — only spans pre-stream errors.  http_post_json reads
+    // the whole response into `out` before returning, so there's no
+    // partial-stream concern.  Reset `out` between attempts so a
+    // partial body from a failed try doesn't leak into the next.
+    const int max_attempts = (c.retries < 0 ? 0 : c.retries) + 1;
+    CURLcode rc = CURLE_OK;
     long http_code = 0;
-    curl_easy_getinfo(c.h, CURLINFO_RESPONSE_CODE, &http_code);
+    for (int attempt = 1; attempt <= max_attempts; ++attempt) {
+        out.clear();
+        rc = curl_easy_perform(c.h);
+        http_code = 0;
+        curl_easy_getinfo(c.h, CURLINFO_RESPONSE_CODE, &http_code);
+
+        const bool curl_ok = (rc == CURLE_OK);
+        const bool http_ok = (http_code >= 200 && http_code < 300)
+                          || http_code == 0;  // 0 when curl failed pre-headers
+        if (curl_ok && http_ok) break;
+
+        // Decide whether to retry.  Transient curl error → yes.
+        // 5xx → yes.  Permanent curl error or 4xx → no.
+        const bool retryable = (!curl_ok && curl_error_is_retryable(rc))
+                            || (curl_ok && http_code >= 500 && http_code < 600);
+        if (!retryable) break;
+        if (attempt >= max_attempts) {
+            easyai::log::error(
+                "[easyai-mcp] %s attempt %d/%d failed (%s) — "
+                "retry budget exhausted\n",
+                full_url.c_str(), attempt, max_attempts,
+                curl_ok ? ("HTTP " + std::to_string(http_code)).c_str()
+                        : curl_easy_strerror(rc));
+            break;
+        }
+        const int backoff = mcp_retry_backoff_ms(attempt - 1);
+        easyai::log::error(
+            "[easyai-mcp] %s attempt %d/%d failed (%s); retrying in %dms\n",
+            full_url.c_str(), attempt, max_attempts,
+            curl_ok ? ("HTTP " + std::to_string(http_code)).c_str()
+                    : curl_easy_strerror(rc),
+            backoff);
+        std::this_thread::sleep_for(std::chrono::milliseconds(backoff));
+    }
     curl_slist_free_all(headers);
 
     if (rc != CURLE_OK) {
@@ -279,6 +344,7 @@ std::vector<Tool> fetch_remote_tools(const ClientOptions & opts,
     conn->url             = normalize_url(opts.url);
     conn->bearer          = opts.bearer_token;
     conn->timeout_seconds = opts.timeout_seconds > 0 ? opts.timeout_seconds : 20;
+    conn->retries         = opts.retries < 0 ? 0 : opts.retries;
 
     // ---------- initialize ----------
     // We claim the same protocol version easyai-server advertises;

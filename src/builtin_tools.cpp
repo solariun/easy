@@ -1,4 +1,5 @@
 #include "easyai/builtin_tools.hpp"
+#include "easyai/log.hpp"
 #include "easyai/tool.hpp"
 
 #include <algorithm>
@@ -17,6 +18,7 @@
 #include <regex>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <fcntl.h>
@@ -309,10 +311,39 @@ static bool url_is_safe_scheme(const std::string & url) {
     return lower_starts_with("http://") || lower_starts_with("https://");
 }
 
+// Default extra-attempts on transient curl/HTTP failures for web tools.
+// Web fetches go to the open internet so transient failures are normal —
+// 5 retries gives operator-grade resilience without spending forever on
+// a hard-down site.  Each retry logs through easyai::log::error so it
+// surfaces on stderr without --verbose.
+static constexpr int kWebHttpRetries = 5;
+
+static bool web_curl_retryable(CURLcode rc) {
+    switch (rc) {
+        case CURLE_COULDNT_CONNECT:
+        case CURLE_COULDNT_RESOLVE_HOST:
+        case CURLE_COULDNT_RESOLVE_PROXY:
+        case CURLE_OPERATION_TIMEDOUT:
+        case CURLE_RECV_ERROR:
+        case CURLE_SEND_ERROR:
+        case CURLE_GOT_NOTHING:
+        case CURLE_PARTIAL_FILE:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static int web_retry_backoff_ms(int attempt) {
+    int ms = 250 << (attempt > 4 ? 4 : attempt);
+    return ms > 4000 ? 4000 : ms;
+}
+
 static bool http_get(const std::string & url,
                      const std::vector<std::string> & extra_headers,
                      std::string & body, std::string & err,
-                     long timeout_s = 20, long max_bytes = 2 * 1024 * 1024) {
+                     long timeout_s = 20, long max_bytes = 2 * 1024 * 1024,
+                     int retries = kWebHttpRetries) {
     if (!url_is_safe_scheme(url)) {
         err = "only http:// and https:// URLs are allowed";
         return false;
@@ -352,9 +383,42 @@ static bool http_get(const std::string & url,
     headers = append_edge_browser_headers(headers);
     if (headers) curl_easy_setopt(c, CURLOPT_HTTPHEADER, headers);
 
-    CURLcode rc = curl_easy_perform(c);
+    const int max_attempts = (retries < 0 ? 0 : retries) + 1;
+    CURLcode rc = CURLE_OK;
     long http_code = 0;
-    curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &http_code);
+    for (int attempt = 1; attempt <= max_attempts; ++attempt) {
+        body.clear();
+        sink.body      = &body;
+        sink.truncated = false;
+        rc = curl_easy_perform(c);
+        http_code = 0;
+        curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &http_code);
+
+        const bool curl_ok = (rc == CURLE_OK);
+        const bool http_ok = (http_code >= 200 && http_code < 300) || http_code == 0;
+        if (curl_ok && http_ok) break;
+
+        const bool retryable = (!curl_ok && web_curl_retryable(rc))
+                            || (curl_ok && http_code >= 500 && http_code < 600);
+        if (!retryable) break;
+        if (attempt >= max_attempts) {
+            easyai::log::error(
+                "[easyai-web] GET %s attempt %d/%d failed (%s) — "
+                "retry budget exhausted\n",
+                url.c_str(), attempt, max_attempts,
+                curl_ok ? ("HTTP " + std::to_string(http_code)).c_str()
+                        : curl_easy_strerror(rc));
+            break;
+        }
+        const int backoff = web_retry_backoff_ms(attempt - 1);
+        easyai::log::error(
+            "[easyai-web] GET %s attempt %d/%d failed (%s); retrying in %dms\n",
+            url.c_str(), attempt, max_attempts,
+            curl_ok ? ("HTTP " + std::to_string(http_code)).c_str()
+                    : curl_easy_strerror(rc),
+            backoff);
+        std::this_thread::sleep_for(std::chrono::milliseconds(backoff));
+    }
     if (headers) curl_slist_free_all(headers);
     curl_easy_cleanup(c);
 
@@ -375,7 +439,8 @@ static bool http_post_form(const std::string & url,
                            const std::string & form_body,
                            std::string & body, std::string & err,
                            long timeout_s = 20,
-                           long max_bytes = 4 * 1024 * 1024) {
+                           long max_bytes = 4 * 1024 * 1024,
+                           int  retries   = kWebHttpRetries) {
     if (!url_is_safe_scheme(url)) {
         err = "only http:// and https:// URLs are allowed";
         return false;
@@ -423,9 +488,42 @@ static bool http_post_form(const std::string & url,
     headers = append_edge_browser_headers(headers);
     curl_easy_setopt(c, CURLOPT_HTTPHEADER, headers);
 
-    CURLcode rc = curl_easy_perform(c);
+    const int max_attempts = (retries < 0 ? 0 : retries) + 1;
+    CURLcode rc = CURLE_OK;
     long http_code = 0;
-    curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &http_code);
+    for (int attempt = 1; attempt <= max_attempts; ++attempt) {
+        body.clear();
+        sink.body      = &body;
+        sink.truncated = false;
+        rc = curl_easy_perform(c);
+        http_code = 0;
+        curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &http_code);
+
+        const bool curl_ok = (rc == CURLE_OK);
+        const bool http_ok = (http_code >= 200 && http_code < 300) || http_code == 0;
+        if (curl_ok && http_ok) break;
+
+        const bool retryable = (!curl_ok && web_curl_retryable(rc))
+                            || (curl_ok && http_code >= 500 && http_code < 600);
+        if (!retryable) break;
+        if (attempt >= max_attempts) {
+            easyai::log::error(
+                "[easyai-web] POST %s attempt %d/%d failed (%s) — "
+                "retry budget exhausted\n",
+                url.c_str(), attempt, max_attempts,
+                curl_ok ? ("HTTP " + std::to_string(http_code)).c_str()
+                        : curl_easy_strerror(rc));
+            break;
+        }
+        const int backoff = web_retry_backoff_ms(attempt - 1);
+        easyai::log::error(
+            "[easyai-web] POST %s attempt %d/%d failed (%s); retrying in %dms\n",
+            url.c_str(), attempt, max_attempts,
+            curl_ok ? ("HTTP " + std::to_string(http_code)).c_str()
+                    : curl_easy_strerror(rc),
+            backoff);
+        std::this_thread::sleep_for(std::chrono::milliseconds(backoff));
+    }
     curl_slist_free_all(headers);
     curl_easy_cleanup(c);
 

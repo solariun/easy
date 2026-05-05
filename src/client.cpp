@@ -34,6 +34,7 @@
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
 #include <utility>
 
 namespace easyai {
@@ -177,6 +178,43 @@ private:
     std::string buf_;
 };
 
+// Exponential backoff for retry attempt N (0-indexed):
+// 250ms, 500ms, 1s, 2s, 4s, 4s, … capped at 4s.  Bounded so a long
+// retry budget can't stall a stuck call for minutes.
+int retry_backoff_ms(int attempt) {
+    int ms = 250 << (attempt > 4 ? 4 : attempt);
+    return ms > 4000 ? 4000 : ms;
+}
+
+// Decide whether a cpp-httplib failure is worth retrying.  Pre-stream
+// connect/read/write failures and 5xx responses qualify; 4xx (auth /
+// bad request) does not.  `received_anything` short-circuits to false:
+// retrying a half-streamed turn would duplicate output.
+bool is_retryable_httplib(const httplib::Result & res,
+                          bool received_anything) {
+    if (received_anything) return false;
+    if (!res) {
+        // Transport error before we got headers — connect refused,
+        // dns failure, read/write timeout, peer reset.
+        switch (res.error()) {
+            case httplib::Error::Connection:
+            case httplib::Error::BindIPAddress:
+            case httplib::Error::Read:
+            case httplib::Error::Write:
+            case httplib::Error::ExceedRedirectCount:
+            case httplib::Error::Canceled:
+            case httplib::Error::SSLConnection:
+            case httplib::Error::ConnectionTimeout:
+                return true;
+            default:
+                return true;  // be generous — operator can lower retries
+        }
+    }
+    // Got a response; only retry server-side errors.  4xx is a contract
+    // failure (bad token, malformed body) and won't fix itself.
+    return res->status >= 500 && res->status < 600;
+}
+
 }  // namespace
 
 // ===========================================================================
@@ -198,11 +236,19 @@ struct Client::Impl {
     // Transport / auth.
     std::string endpoint;
     std::string api_key;
-    int         timeout_seconds = 600;
+    // 1800s (30 min) — generous default for thinking models that may
+    // hold a stream open for many minutes between visible tokens while
+    // emitting only delta.reasoning_content. The previous 600s default
+    // was tripping on long deliberation turns.
+    int         timeout_seconds = 1800;
     bool        verbose         = false;
     bool        tls_insecure    = false;   // skip peer cert verification
     std::string tls_ca_path;                // PEM bundle for custom CAs
     int         max_reasoning_chars = 0;    // 0 = unlimited; >0 aborts SSE on overflow
+    // Retry budget for pre-stream HTTP failures (connect refused, read
+    // timeout, 5xx before any byte streamed). Mid-stream failures are
+    // never retried.  Default 5 — see Client::http_retries().
+    int         http_retries        = 5;
     // Default ON: when the server flags a turn as incomplete (model
     // announced a tool but never emitted it, or stopped with a tiny
     // post-tool-call reply), we discard the bad turn, append a
@@ -545,10 +591,44 @@ struct Client::Impl {
         }
 
         auto headers = headers_with_auth("text/event-stream");
-        auto res = cli->Post(path, headers, body, "application/json",
-                             [&](const char * d, size_t l) {
-                                 return on_chunk(d, l);
-                             });
+        // Retry loop — only wraps the pre-stream connect.  Once
+        // `received_anything` is true (the server started emitting SSE)
+        // we can't safely re-issue: the model already produced bytes
+        // the caller has seen, and a fresh attempt would duplicate
+        // them.  See is_retryable_httplib() above.
+        httplib::Result res;
+        const int max_attempts = http_retries + 1;
+        for (int attempt = 1; attempt <= max_attempts; ++attempt) {
+            if (cancel_requested.load(std::memory_order_relaxed)) {
+                last_error = "cancelled";
+                return false;
+            }
+            res = cli->Post(path, headers, body, "application/json",
+                            [&](const char * d, size_t l) {
+                                return on_chunk(d, l);
+                            });
+            if (reasoning_aborted) break;  // soft success; handled below
+            if (received_anything)  break;  // partial response — keep what we have
+            if (res && res->status >= 200 && res->status < 300) break;
+            if (!is_retryable_httplib(res, received_anything)) break;
+            if (attempt >= max_attempts) {
+                easyai::log::error(
+                    "[easyai-cli] HTTP attempt %d/%d failed (%s) — "
+                    "retry budget exhausted\n",
+                    attempt, max_attempts,
+                    res ? ("HTTP " + std::to_string(res->status)).c_str()
+                        : httplib::to_string(res.error()).c_str());
+                break;
+            }
+            const int backoff = retry_backoff_ms(attempt - 1);
+            easyai::log::error(
+                "[easyai-cli] HTTP attempt %d/%d failed (%s); retrying in %dms\n",
+                attempt, max_attempts,
+                res ? ("HTTP " + std::to_string(res->status)).c_str()
+                    : httplib::to_string(res.error()).c_str(),
+                backoff);
+            std::this_thread::sleep_for(std::chrono::milliseconds(backoff));
+        }
 
         if (reasoning_aborted) {
             // We deliberately closed the stream when reasoning_content
@@ -870,7 +950,23 @@ struct Client::Impl {
         auto cli = make_http();
         if (!cli) return false;
         auto headers = headers_with_auth(accept);
-        auto res = cli->Get(base_path() + path, headers);
+        const std::string full_path = base_path() + path;
+        const int max_attempts = http_retries + 1;
+        httplib::Result res;
+        for (int attempt = 1; attempt <= max_attempts; ++attempt) {
+            res = cli->Get(full_path, headers);
+            if (res && res->status >= 200 && res->status < 300) break;
+            if (!is_retryable_httplib(res, /*received=*/false)) break;
+            if (attempt >= max_attempts) break;
+            const int backoff = retry_backoff_ms(attempt - 1);
+            easyai::log::error(
+                "[easyai-cli] GET %s attempt %d/%d failed (%s); retrying in %dms\n",
+                full_path.c_str(), attempt, max_attempts,
+                res ? ("HTTP " + std::to_string(res->status)).c_str()
+                    : httplib::to_string(res.error()).c_str(),
+                backoff);
+            std::this_thread::sleep_for(std::chrono::milliseconds(backoff));
+        }
         if (!res) {
             last_error = "HTTP request failed: "
                        + httplib::to_string(res.error());
@@ -891,7 +987,23 @@ struct Client::Impl {
         auto cli = make_http();
         if (!cli) return false;
         auto headers = headers_with_auth("application/json");
-        auto res = cli->Post(base_path() + path, headers, body, "application/json");
+        const std::string full_path = base_path() + path;
+        const int max_attempts = http_retries + 1;
+        httplib::Result res;
+        for (int attempt = 1; attempt <= max_attempts; ++attempt) {
+            res = cli->Post(full_path, headers, body, "application/json");
+            if (res && res->status >= 200 && res->status < 300) break;
+            if (!is_retryable_httplib(res, /*received=*/false)) break;
+            if (attempt >= max_attempts) break;
+            const int backoff = retry_backoff_ms(attempt - 1);
+            easyai::log::error(
+                "[easyai-cli] POST %s attempt %d/%d failed (%s); retrying in %dms\n",
+                full_path.c_str(), attempt, max_attempts,
+                res ? ("HTTP " + std::to_string(res->status)).c_str()
+                    : httplib::to_string(res.error()).c_str(),
+                backoff);
+            std::this_thread::sleep_for(std::chrono::milliseconds(backoff));
+        }
         if (!res) {
             last_error = "HTTP request failed: "
                        + httplib::to_string(res.error());
@@ -928,6 +1040,7 @@ Client & Client::endpoint        (std::string url) { p_->endpoint        = std::
 Client & Client::api_key         (std::string key) { p_->api_key         = std::move(key); return *this; }
 Client & Client::timeout_seconds (int  s)          { p_->timeout_seconds = s;   return *this; }
 Client & Client::verbose         (bool v)          { p_->verbose         = v;   return *this; }
+Client & Client::http_retries    (int  n)          { p_->http_retries    = n < 0 ? 0 : n; return *this; }
 Client & Client::log_file        (std::FILE * fp)  { p_->log_fp          = fp;  return *this; }
 Client & Client::tls_insecure    (bool v)          { p_->tls_insecure    = v;   return *this; }
 Client & Client::ca_cert_path    (std::string p)   { p_->tls_ca_path     = std::move(p); return *this; }

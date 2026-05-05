@@ -61,6 +61,13 @@ struct ClientOptions {
     // (tools/call returns once the remote handler is done; if you
     // want a long-running proxied tool, raise this).
     int         timeout_seconds = 20;
+
+    // Number of EXTRA attempts on transient transport failures
+    // (connect refused, DNS, send/recv error, timeout, 5xx). 4xx
+    // (auth, bad request) is never retried.  Each retry logs through
+    // easyai::log::error so it lands on stderr without --verbose.
+    // Default 5; set 0 to disable.
+    int         retries          = 5;
 };
 
 // Connect, run `initialize` + `tools/list`, and return one Tool per
