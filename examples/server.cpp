@@ -5378,74 +5378,36 @@ int main(int argc, char ** argv) {
                 << "});"
                 << "})();</script>";
 
-            // ----- block7: reasoning panel — kill double scrollbar +
-            //               auto-pin to bottom while streaming -----------
-            // The bundle's Reasoning collapsible nests two overflow:auto
-            // boxes (the Radix [data-slot="collapsible-content"] outer
-            // wrapper AND a content-block child with max-height). Both
-            // were rendering scrollbars at the same time, so the user
-            // saw a stacked pair on the right edge.
+            // ----- block7: reasoning panel — flatten all internal
+            //               scrolling so it grows with content -------
+            // Previous attempt pinned the inner scroll to the bottom on
+            // every mutation, but lost the race to the bundle's Svelte
+            // reactive update — each reasoning_content delta replaces
+            // the inner element, so a captured `scrollEl` reference is
+            // stale by the time the pin fires.  User saw the inner
+            // scrollbar parked partway up while content streamed below.
             //
-            // Fix: force overflow:hidden on the OUTER (defence-in-depth
-            // on top of the CSS rule in webui/index.html — the
-            // bundle's class hashes change every rebuild and the static
-            // selector doesn't always win), find the inner scrollable
-            // by walking the subtree for the deepest element whose
-            // computed overflow-y is auto/scroll AND whose scrollHeight
-            // genuinely exceeds clientHeight, and pin it to the bottom
-            // on every content mutation.  User-initiated scroll-up
-            // pauses the auto-pin (typical chat-app behaviour: respect
-            // the reader who wants to look at older reasoning); coming
-            // back near the bottom resumes it.
+            // New strategy: walk the entire reasoning-panel subtree and
+            // force `overflow:visible` + `max-height:none` on every
+            // descendant.  The panel grows to fit; the chat conversation
+            // list (which already auto-scrolls to bottom on new content)
+            // becomes the single scrollbar that always shows the latest
+            // streamed line.  No inner pin, no race, one scrollbar.
+            //
+            // We re-flatten on every subtree mutation (childList +
+            // attributes on style/class) so the bundle can't sneak the
+            // overflow back in via a Svelte rerender that resets our
+            // inline styles.  Scoped to reasoning panels only — by the
+            // trigger sibling's text matching `^Reasoning` — so other
+            // collapsibles (tools, citations, future panels) keep
+            // their default behaviour.
             inj <<
               "<script>(()=>{"
-                "console.log('[easyai-inject] block7 reasoning-autoscroll');"
-                // Walk the panel subtree, return the innermost element
-                // whose computed overflow-y is auto/scroll AND has more
-                // content than fits.  Skips the panel itself when we've
-                // forced overflow:hidden on it (the OUTER fix).
-                "const findScrollable=(root)=>{"
-                  "if(!root)return null;"
-                  "const all=[root,...root.querySelectorAll('*')];"
-                  "let chosen=null;"
-                  "for(const el of all){"
-                    "const cs=getComputedStyle(el);"
-                    "const oy=cs.overflowY;"
-                    "if((oy==='auto'||oy==='scroll')"
-                      "&&el.scrollHeight>el.clientHeight+1){"
-                      "chosen=el;"           // innermost wins
-                    "}"
-                  "}"
-                  "return chosen;"
-                "};"
-                "const STATE=new WeakMap();"
-                "const NEAR_BOTTOM=24;"      // px tolerance
-                "const nearBottom=(el)=>"
-                  "(el.scrollHeight-el.scrollTop-el.clientHeight)<=NEAR_BOTTOM;"
-                "const wireOnce=(el)=>{"
-                  "if(STATE.has(el))return;"
-                  "STATE.set(el,{pinned:true});"
-                  // Track whether user wants to follow the bottom.
-                  // wheel/touch/key events flip pinned=false; once they
-                  // scroll back near the bottom we resume auto-pinning.
-                  "el.addEventListener('scroll',()=>{"
-                    "const st=STATE.get(el);"
-                    "if(!st)return;"
-                    "st.pinned=nearBottom(el);"
-                  "},{passive:true});"
-                  "el.scrollTop=el.scrollHeight;"
-                "};"
-                "const stick=(el)=>{"
-                  "const st=STATE.get(el);"
-                  "if(!st||st.pinned){"
-                    "el.scrollTop=el.scrollHeight;"
-                  "}"
-                "};"
-                "const seen=new WeakSet();"
+                "console.log('[easyai-inject] block7 reasoning-flatten');"
                 "const isReasoningPanel=(panel)=>{"
-                  // Match by the trigger sibling/ancestor's text — only
-                  // touch reasoning collapsibles, leave any unrelated
-                  // ones (tools panel, citations, etc.) alone.
+                  // Match by the trigger sibling/ancestor's text. Walk
+                  // up a few levels because the trigger may live in a
+                  // grand-parent wrapper depending on bundle layout.
                   "let p=panel;"
                   "for(let i=0;i<5&&p;i++){"
                     "const tr=p.querySelector"
@@ -5457,32 +5419,41 @@ int main(int argc, char ** argv) {
                   "}"
                   "return false;"
                 "};"
+                "const flatten=(panel)=>{"
+                  // Apply to the panel itself + every descendant.
+                  // overflow visible: no internal scrollbars.
+                  // max-height none: no height clamp; panel grows
+                  // naturally with content.
+                  "const all=[panel,...panel.querySelectorAll('*')];"
+                  "for(const el of all){"
+                    "const cs=getComputedStyle(el);"
+                    "if(cs.overflowY==='auto'||cs.overflowY==='scroll'){"
+                      "el.style.setProperty('overflow-y','visible','important');"
+                    "}"
+                    "if(cs.overflowX==='auto'||cs.overflowX==='scroll'){"
+                      "el.style.setProperty('overflow-x','visible','important');"
+                    "}"
+                    "const mh=cs.maxHeight;"
+                    "if(mh&&mh!=='none'&&mh!=='0px'){"
+                      "el.style.setProperty('max-height','none','important');"
+                    "}"
+                  "}"
+                "};"
+                "const seen=new WeakSet();"
                 "const handle=(panel)=>{"
                   "if(seen.has(panel))return;"
                   "if(!isReasoningPanel(panel))return;"
                   "seen.add(panel);"
-                  // Defence-in-depth: outer wrapper must not scroll.
-                  // The CSS rule in webui/index.html does the same job
-                  // statically; this inline fallback survives bundle
-                  // rebuilds that reshuffle the class names.
-                  "panel.style.setProperty('overflow','hidden','important');"
-                  "let tries=0;"
-                  "const tryWire=()=>{"
-                    "const sc=findScrollable(panel);"
-                    "if(sc&&sc!==panel){"
-                      "wireOnce(sc);"
-                      // Stick to bottom on any subsequent mutation.
-                      // Includes characterData so per-token text inserts
-                      // (the streaming case) trigger the pin.
-                      "new MutationObserver(()=>stick(sc)).observe(panel,{"
-                        "childList:true,subtree:true,characterData:true"
-                      "});"
-                      "stick(sc);"
-                      "return;"
-                    "}"
-                    "if(++tries<40)setTimeout(tryWire,150);"
-                  "};"
-                  "tryWire();"
+                  "flatten(panel);"
+                  // Re-flatten on every reactive update — the bundle
+                  // may rerender inner blocks (per-token reasoning
+                  // delta) and reset our inline styles to its hashed
+                  // class CSS.  Watching style/class attributes too
+                  // catches rerenders that just reattach classes.
+                  "new MutationObserver(()=>flatten(panel)).observe(panel,{"
+                    "childList:true,subtree:true,attributes:true,"
+                    "attributeFilter:['style','class']"
+                  "});"
                 "};"
                 "const sweep=()=>{"
                   "document.querySelectorAll("

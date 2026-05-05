@@ -14,9 +14,17 @@
 		<link href="./bundle.css" rel="stylesheet">
 		<link rel="modulepreload" href="./bundle.js">
 		<style>
-			/* Fix double scrollbar on CollapsibleContentBlock (Reasoning panel) */
+			/* Reasoning panel: no internal scrollbar. Let the panel grow
+			   with content; the chat conversation's own auto-scroll-to-
+			   bottom is the single scrollbar that follows the latest
+			   streamed line. The runtime-injected block7 (in
+			   examples/server.cpp) does the same thing with !important
+			   inline styles, scoped to reasoning panels only — this
+			   static rule is a defence-in-depth on the OUTER Radix
+			   slot. */
 			[data-slot="collapsible-content"] {
-				overflow: hidden !important;
+				overflow: visible !important;
+				max-height: none !important;
 			}
 		</style>
 	</head>
