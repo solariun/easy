@@ -83,8 +83,12 @@ public:
         int         n_threads  = 0;
         bool        load_tools = true;
         Preset      preset{};
-        // Sampling overrides (applied after preset). -1 / 0 means "unset".
-        float       repeat_penalty = -1.0f;
+        // Sampling overrides (applied after preset).  -1 / 0 means
+        // "unset" for fields where that's a sentinel; repeat_penalty
+        // defaults to 1.15 (anti-loop safety net — thinking models
+        // sometimes lock into rephrasing their own intent).  Set 1.0
+        // explicitly to disable the penalty.
+        float       repeat_penalty = 1.15f;
         int         max_tokens     = -1;
         std::uint32_t seed         = 0u;
         // KV cache & GGUF-metadata overrides

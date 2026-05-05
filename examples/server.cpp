@@ -3093,7 +3093,9 @@ static bool require_auth(const ServerCtx & ctx, const httplib::Request & req,
         "      --top-p <f>              Override nucleus sampling p\n"
         "      --top-k <n>              Override top-k\n"
         "      --min-p <f>              Override min-p\n"
-        "      --repeat-penalty <f>     Override repeat penalty\n"
+        "      --repeat-penalty <f>     Repetition penalty (default 1.15 —\n"
+        "                                anti-loop safety net; pass 1.0 to\n"
+        "                                disable).  INI: [ENGINE] repeat_penalty.\n"
         "      --max-tokens <n>         Cap tokens generated per request\n"
         "      --seed <u32>             RNG seed (0 = random)\n"
         "      --max-incomplete-retries <n>\n"
@@ -3222,7 +3224,11 @@ struct ServerArgs {
     float       top_p          = -1.0f;
     int         top_k          = -1;
     float       min_p          = -1.0f;
-    float       repeat_penalty = -1.0f;
+    // 1.15 by default — anti-loop safety net for thinking models that
+    // sometimes rephrase their own intent ("I'll write X / Let me write
+    // X / OK, creating X" forever). Set repeat_penalty = 1.0 in the INI
+    // (or pass --repeat-penalty 1.0) to disable.
+    float       repeat_penalty = 1.15f;
     int         max_tokens     = -1;
     uint32_t    seed           = 0u;
 

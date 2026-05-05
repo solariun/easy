@@ -1988,7 +1988,7 @@ cli.temperature(0.2f)
    .top_p(0.95f)
    .top_k(40)
    .min_p(0.05f)               // llama-server / easyai
-   .repeat_penalty(1.1f)       // llama-server / easyai
+   .repeat_penalty(1.15f)      // anti-loop default; pass 1.0 to disable
    .frequency_penalty(0.0f)    // OpenAI standard, [-2.0, 2.0]
    .presence_penalty(0.0f)     // OpenAI standard, [-2.0, 2.0]
    .seed(42)                   // deterministic; -1 = randomise

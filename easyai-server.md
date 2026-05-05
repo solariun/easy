@@ -147,7 +147,7 @@ Model loading and inference tunables.
 | `top_p` | float | `--top-p` | (preset) | Sampling override. |
 | `top_k` | int | `--top-k` | (preset) | Sampling override. |
 | `min_p` | float | `--min-p` | (preset) | Sampling override. |
-| `repeat_penalty` | float | `--repeat-penalty` | (preset) | Sampling override. |
+| `repeat_penalty` | float | `--repeat-penalty` | `1.15` | Repetition penalty — anti-loop safety net for thinking models that lock into rephrasing their own intent ("I'll write X / Let me write X / OK, creating X" forever). Set `1.0` to disable. |
 | `max_tokens` | int | `--max-tokens` | `-1` (until EOS / ctx full) | Per-turn cap. |
 | `seed` | uint32 | `--seed` | `0` (random) | RNG seed. |
 | `max_incomplete_retries` | int | `--max-incomplete-retries` | `10` | How many times the engine discards + nudges + retries when the model finishes a turn with no tool_call and only an "announce" snippet ("Let me…", "I'll…"). `0` disables retries (equivalent to `retry_on_incomplete = off`). Bump to 15-20 for weak / 1-bit-quant models that keep announcing-without-acting. Each retry surfaces in the webui Thinking panel as `↻ Retry N/max`. |

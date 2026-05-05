@@ -102,7 +102,9 @@ struct CliArgs {
     float top_p          = -1.0f;
     int   top_k          = -1;
     float min_p          = -1.0f;
-    float repeat_penalty = -1.0f;
+    // 1.15 by default — anti-loop safety net (rephrasing loops on
+    // thinking models). Pass --repeat-penalty 1.0 to disable.
+    float repeat_penalty = 1.15f;
     int   max_tokens     = -1;     // -1 = until EOG / context full
     uint32_t seed        = 0u;     // 0 = leave as preset/library default
 
@@ -148,7 +150,9 @@ struct CliArgs {
         "      --top-p <f>               Override nucleus sampling p\n"
         "      --top-k <n>               Override top-k\n"
         "      --min-p <f>               Override min-p\n"
-        "      --repeat-penalty <f>      Repeat penalty\n"
+        "      --repeat-penalty <f>      Repetition penalty (default 1.15 —\n"
+        "                                anti-loop safety net; pass 1.0 to\n"
+        "                                disable)\n"
         "      --max-tokens <n>          Cap tokens generated per turn\n"
         "      --seed <u32>              RNG seed (0 = random)\n"
         "\nEngine tuning:\n"

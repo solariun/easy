@@ -281,7 +281,13 @@ struct Client::Impl {
     float                    top_p             = -1.0f;
     int                      top_k             = -1;
     float                    min_p             = -1.0f;
-    float                    repeat_penalty    = -1.0f;
+    // Anti-loop safety net: thinking models sometimes lock into rephrasing
+    // their own intent ("I'll write types.h / Let me write…" forever).  A
+    // mild repetition penalty breaks the cycle without hurting normal
+    // factual answers.  Pin 1.15 by default for every Client (the value
+    // is sent in every request body; pass `repeat_penalty(1.0f)` to
+    // disable, or any other value to override).
+    float                    repeat_penalty    = 1.15f;
     float                    frequency_penalty = -2.0f;  // -2 = unset (real OpenAI range starts at -2)
     float                    presence_penalty  = -2.0f;
     long long                seed              = -1;

@@ -78,7 +78,7 @@ class Engine {
     Engine & top_p         (float p);              // default 0.95
     Engine & top_k         (int   k);              // default 40
     Engine & min_p         (float p);              // default 0.05
-    Engine & repeat_penalty(float r);              // default 1.1
+    Engine & repeat_penalty(float r);              // default 1.15 (anti-loop)
     Engine & max_tokens    (int   n);              // per chat() call, -1 = until ctx
     Engine & tool_choice_auto    ();
     Engine & tool_choice_required();

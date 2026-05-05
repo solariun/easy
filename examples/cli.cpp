@@ -300,7 +300,10 @@ struct Options {
     float                    top_p             = -1.0f;
     int                      top_k             = -1;
     float                    min_p             = -1.0f;
-    float                    repeat_penalty    = -1.0f;
+    // 1.15 by default to break thinking-model rephrasing loops
+    // ("I'll write types.h / Let me write types.h / OK, creating
+    // types.h" repeated). Pass --repeat-penalty 1.0 to disable.
+    float                    repeat_penalty    = 1.15f;
     float                    frequency_penalty = -2.0f;
     float                    presence_penalty  = -2.0f;
     long long                seed              = -1;
@@ -359,7 +362,9 @@ void usage(const char * argv0) {
 "    --top-p F                  nucleus top-p\n"
 "    --top-k N                  top-k cutoff\n"
 "    --min-p F                  llama-server / easyai min-p\n"
-"    --repeat-penalty F         llama-server / easyai repetition penalty\n"
+"    --repeat-penalty F         repetition penalty (default 1.15 — anti-loop\n"
+"                                safety net for thinking models). Pass 1.0\n"
+"                                to disable.\n"
 "    --frequency-penalty F      OpenAI standard ([-2.0, 2.0])\n"
 "    --presence-penalty F       OpenAI standard ([-2.0, 2.0])\n"
 "    --seed N                   deterministic sampling seed\n"

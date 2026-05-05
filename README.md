@@ -313,7 +313,7 @@ has a matching INI key (see [`easyai-server.md`](easyai-server.md) §1).
 | `--top-p F` | per preset | Nucleus sampling p. |
 | `--top-k N` | per preset | Top-k cutoff. |
 | `--min-p F` | per preset | Min-p threshold. |
-| `--repeat-penalty F` | per preset | Repetition penalty. |
+| `--repeat-penalty F` | 1.15 | Repetition penalty — anti-loop safety net for thinking models that lock into rephrasing their own intent. `--repeat-penalty 1.0` disables. |
 | `--max-tokens N` | unlimited | Cap tokens per request. |
 | `--seed U32` | random | RNG seed (0 = random). |
 | `--max-incomplete-retries N` | 10 | Retry budget for "announce-only" turns; 0 disables. |
@@ -391,7 +391,7 @@ upstream `llama-server`, OpenAI itself, etc.).
 | `--top-p F` | server | Nucleus top-p. |
 | `--top-k N` | server | Top-k cutoff. |
 | `--min-p F` | server | min-p (llama-server / easyai). |
-| `--repeat-penalty F` | server | Repetition penalty. |
+| `--repeat-penalty F` | 1.15 | Repetition penalty — anti-loop default; pass 1.0 to disable. |
 | `--frequency-penalty F` | server | OpenAI standard \[-2.0, 2.0\]. |
 | `--presence-penalty F` | server | OpenAI standard \[-2.0, 2.0\]. |
 | `--seed N` | random | Deterministic sampling seed. |
@@ -439,7 +439,7 @@ use `easyai-cli`.
 | `--top-p F` | per preset | top-p. |
 | `--top-k N` | per preset | top-k. |
 | `--min-p F` | per preset | min-p. |
-| `--repeat-penalty F` | per preset | Repetition penalty. |
+| `--repeat-penalty F` | 1.15 | Repetition penalty — anti-loop default; pass 1.0 to disable. |
 | `--max-tokens N` | unlimited | Cap tokens per turn. |
 | `--seed U32` | random | RNG seed. |
 | `-c, --ctx N` | 4096 | Context size. |
@@ -506,7 +506,7 @@ Full local engine. Header:
 | `.seed(u32)` | `uint32_t` | random | RNG seed. |
 | `.system(prompt)` | `string` | — | System prompt. |
 | `.temperature(t) / .top_p(p) / .top_k(k) / .min_p(p)` | scalar | 0.7 / 0.95 / 40 / 0.05 | Sampling. |
-| `.repeat_penalty(r)` | `float` | 1.1 | Repetition penalty. |
+| `.repeat_penalty(r)` | `float` | 1.15 | Repetition penalty — anti-loop default. Set to 1.0 to disable. |
 | `.max_tokens(n)` | `int` | -1 (until ctx) | Per-turn cap. |
 | `.tool_choice_auto / .tool_choice_required / .tool_choice_none` | call | auto | Tool-choice mode. |
 | `.parallel_tool_calls(on)` | `bool` | off | Allow parallel tool calls. |
@@ -553,7 +553,8 @@ consumer process. Header:
 | `.model(id)` | `string` | — | Request body `model` field. |
 | `.system(prompt)` | `string` | — | System prompt(s). |
 | `.temperature(t) / .top_p(v) / .top_k(v) / .min_p(v)` | scalar | server | Sampling. |
-| `.repeat_penalty(v) / .frequency_penalty(v) / .presence_penalty(v)` | float | server | Penalties. |
+| `.repeat_penalty(v)` | float | 1.15 | Repetition penalty — anti-loop default; `1.0` disables. |
+| `.frequency_penalty(v) / .presence_penalty(v)` | float | server | OpenAI-shape penalties. |
 | `.seed(s)` | `long long` | -1 | -1 = randomise. |
 | `.max_tokens(n)` | `int` | server | Cap. |
 | `.stop(sequences)` | `vector<string>` | — | Stop strings. |
