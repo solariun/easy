@@ -85,13 +85,27 @@ on the command line and stdin.
 
 | Mode | Trigger | Behaviour |
 | --- | --- | --- |
-| **REPL** | No `-p`, no positional prompt, stdin is a TTY | Interactive prompt loop. `Ctrl-D` to exit. History persists during the session. |
+| **REPL** | No `-p`, no positional prompt, stdin is a TTY | Interactive prompt loop. `Ctrl-D` to exit. History persists during the session. `Ctrl-C` during a turn → graceful exit (see below). |
 | **One-shot** | `-p <text>` OR a positional argument | Send the single prompt, stream the reply, exit. |
 | **Piped** | stdin is a pipe (anything redirected in) | Reads stdin into the prompt and runs once. Same as one-shot. |
 | **Management** | `--list-models`, `--list-tools`, `--list-remote-tools`, `--health`, `--props`, `--metrics`, `--set-preset`, `--show-system-prompt` | Hits the named endpoint (or, for `--show-system-prompt`, just resolves locally), prints the result, exits. No chat. See [§12](#12-management-subcommands). |
 
 The four are mutually exclusive: passing `-p` AND a management flag is
 an error.
+
+### Ctrl-C and SIGTERM
+
+Two signal-handling modes — `--quiet` switches between them.
+
+| Mode | First Ctrl-C / SIGTERM | Second Ctrl-C |
+| --- | --- | --- |
+| **interactive** (default) | Mid-turn: prints `<exiting: waiting for the ai session to be finished. Ctrl-C again to force.>` and lets the in-flight chat finish naturally. The conversation isn't truncated mid-stream; the program exits cleanly (rc=0) once the turn ends. At a REPL prompt (no chat in flight): exits immediately, same as `Ctrl-D`. | Hard cancel (rc=130) — the server's decode loop is told to stop, the SSE stream aborts. Use this when the model is genuinely stuck. |
+| **`--quiet`** | Hard cancel immediately (rc=130). This is the expected behavior for `kill <pid>` in a script — no graceful waiting, no extra stderr noise. | Same — already cancelled. |
+
+The first-Ctrl-C-is-graceful behavior in interactive mode is there
+because for a long thinking turn the user usually wants to *finish
+this answer and stop*, not to truncate it. The second-Ctrl-C escape
+hatch covers the "model got stuck" case.
 
 ---
 
@@ -162,7 +176,7 @@ prepended (see [§6](#6-system-prompt--injected-blocks)).
 | `--no-retry-on-incomplete` | Disable the auto-retry-with-nudge for incomplete turns (default: ON). |
 | `--retry-on-incomplete` | Legacy alias for the now-default behaviour. No-op. |
 | `--verbose`, `-v` | Log HTTP+SSE traffic to stderr. ALSO writes the raw transaction (request body, every SSE chunk, every tool dispatch input/output) to `/tmp/easyai-cli-{pid}-{epoch}.log`. |
-| `-q`, `--quiet` | Disable the spinner glyph + context-fill gauge. Use for batch / scripted runs. |
+| `-q`, `--quiet` | Disable the spinner glyph + context-fill gauge. Use for batch / scripted runs. **Also changes `Ctrl-C` / `SIGTERM` semantics** — see [§3 → Ctrl-C and SIGTERM](#ctrl-c-and-sigterm). |
 | `--log-file PATH` | Override the auto-generated transaction log path. Implies `--verbose`. |
 
 ### Management subcommands (one only, no chat)
