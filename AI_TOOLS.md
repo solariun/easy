@@ -225,6 +225,9 @@ Why JSON Schema? Three reasons:
 > **⚠ Pitfall — under-described parameters.**
 > Writing `{"query": {"type": "string"}}` with no description is one of the most common mistakes. The model will guess what `query` means from the tool name, and it will sometimes guess wrong. Treat every description field as if you were writing documentation for a junior developer who has never used your codebase before.
 
+> **🛠 Practical guidance.**
+> For the recipe used by `plan` / `rag` / the polished filesystem tools — when to use single-action vs. multi-action shape, what to put in `describe()`, how to lead each `.param()` description, and the tolerance shims that catch models going off-spec — see [`design.md` §5 "Writing tool descriptions reliably"](design.md) and [`manual.md` §3.2.1](manual.md). The two together are the working contract for a reliable tool surface.
+
 ## Chapter 10 — The Agent Loop
 
 Once a model can call tools, the conversation grows a new shape. It is no longer one user message and one assistant reply. It is a **loop**:

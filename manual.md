@@ -756,6 +756,203 @@ engine.add_tool(
 something fancier (nested objects, enums) build the schema string yourself
 and use `Tool::make(name, description, schema_json, handler)`.
 
+### 3.2.1 Writing reliable tool descriptions
+
+> **Read this before shipping a tool.** The model never sees your
+> handler — it sees only the tool's `name`, `description`, and
+> `parameters_json`. Treat that text as the contract; vague or
+> under-described tools produce malformed calls or the wrong action,
+> and the model will not learn from a stack trace.
+
+Two patterns ship in `src/`. Use whichever fits your tool's shape.
+
+#### Pattern A — single-action tools
+
+The default for a tool that does one thing. Examples in-tree:
+`web_fetch`, `read_file`, `bash`, `glob`, `grep`. Recipe:
+
+1. Open with one sentence: what does this tool do?
+2. State Required vs. Optional parameters explicitly.
+3. Describe the **output shape** — what does the model see back?
+   ("one path per line, sorted", "two lines: UTC + local", etc.)
+4. Show one or two concrete example payloads.
+5. List error / edge-case behavior (truncation, missing path, regex
+   flavor, …).
+6. Each `.param()` description leads with `Required.` or `Optional.`,
+   then the constraint and default.
+
+Concrete: this is the polished `read_file` description (excerpted from
+`src/builtin_tools.cpp`):
+
+```cpp
+Tool::builder("read_file")
+    .describe(
+        "Read a UTF-8 text file from disk and return its contents.\n"
+        "\n"
+        "The filesystem you see is rooted at `/`; use paths like "
+        "`/report.md` or `/docs/spec.md`. Required: path. Optional: "
+        "offset, limit (default returns the first 64 KB; pass offset to "
+        "page through larger files).\n"
+        "\n"
+        "Examples:\n"
+        "  {path:\"/report.md\"}\n"
+        "  {path:\"/docs/spec.md\", offset:65536, limit:65536}\n"
+        "\n"
+        "Errors return a single-line message starting with `error:`. "
+        "Reading a binary file returns the raw bytes — prefer the "
+        "dedicated tools or `bash` (e.g. `file <path>`) for those.")
+    .param("path",   "string",
+           "Required. File path under the sandbox root, e.g. "
+           "`/report.md` or `/docs/spec.md`.", true)
+    .param("offset", "integer",
+           "Optional. Skip this many bytes from the start of the file "
+           "before reading. Default 0. Use the previous read's "
+           "(offset + bytes_returned) to page forward.", false)
+    .param("limit",  "integer",
+           "Optional. Maximum bytes to return. Default 65536 (64 KB). "
+           "Larger files are truncated; raise this only when you "
+           "really need a bigger chunk.", false)
+    .handle(...)
+    .build();
+```
+
+Compare this to the original one-line `"Read a UTF-8 text file..."`:
+the model now knows exactly what it gets back, has a paginating
+example, and has been told what NOT to use this for.
+
+#### Pattern B — multi-action tools
+
+A single tool that dispatches on a top-level `action` field. Reach for
+this when you have N closely-related operations that share state and
+parameters: `plan` (add / update / delete / list), `rag` (save / append
+/ search / load / list / delete / keywords). Recipe:
+
+1. Open with the purpose sentence + `Pick an action; the parameters
+   needed depend on which action you choose. N actions are supported:`
+2. One section per action: `action="X"` heading, then Required /
+   Optional, then 2–4 example payloads (literal, copy-pasteable).
+3. Closing notes: shared semantics (status enum, id format, etc.).
+4. Per-property `.description` strings lead with **which actions
+   consume them**: `"Used by add / update / delete. ..."`. The model
+   maps each parameter to the right action without re-reading the
+   description body.
+
+Concrete: this is how the `plan` tool's description is laid out — see
+`src/plan.cpp:Plan::tool()`. The closing line — *"The 'items' array
+MUST be a real JSON array, not a quoted string."* — is there because
+real models repeatedly emitted `"items": "[...]"` in production. Bake
+those lessons into the description.
+
+#### Why the rich form matters
+
+Models follow examples more reliably than they parse JSON-schema
+constraints. A description that *shows* a valid call is worth ten that
+describe the schema in prose. Three concrete failure modes that better
+descriptions prevent:
+
+* The model invents a parameter name (`"file"` instead of `"path"`)
+  because the description used the word "file" without showing the
+  exact key.
+* The model omits a required field because the schema marked it
+  required but the description didn't repeat that.
+* The model mixes shapes from two actions (`{action:"add", id:"1"}`)
+  because the description says `add` accepts `text` somewhere but
+  doesn't show what an `add` payload looks like end-to-end.
+
+#### Tolerance shims — what to do when models go off-spec anyway
+
+A good description prevents most misfires. The rest are the cost of
+running real models on tool calls. The library is built around the
+assumption that tool handlers will see imperfect input.
+
+**1. Use the lenient `args::*` helpers.** Don't roll your own JSON probe
+in a handler — the shipped helpers already accept the shapes models
+actually emit:
+
+| Helper        | Accepts (beyond the spec form) |
+|---------------|--------------------------------|
+| `get_string`  | `42` (number → `"42"`), `true` / `false` (bool → string) |
+| `get_int`     | `"42"` (quoted integer literal) |
+| `get_bool`    | `"true"` / `"false"` / `"1"` / `"0"` |
+| `get_array`   | `"[{...}]"` (stringified JSON array — unwrapped and re-parsed) |
+
+**2. Infer required fields when the model omits them.** When the schema
+requires `action` but the model leaves it out, look at the fields that
+*are* present and pick the most likely intent. The pattern from
+`src/plan.cpp`:
+
+```cpp
+if (action.empty()) {
+    if (items present and first item has text)        action = "add";
+    else if (items present and first item has status) action = "update";
+    else if (items present and first item has id)     action = "delete";
+    else if (top-level text is present)               action = "add";
+    else if (top-level status is present)             action = "update";
+    else if (top-level id is present)                 action = "delete";
+    else                                              action = "list";
+}
+```
+
+For multi-action tools where the same payload could mean different
+things, disambiguate using **current state**: in `plan` we check
+whether the supplied id already exists — if not, the model is
+creating; if so, the model is updating.
+
+**3. Map common synonyms.** Models pick near-miss verbs all the time.
+
+```cpp
+if      (action == "create" || action == "append" ||
+         action == "insert" || action == "new")    action = "add";
+else if (action == "modify" || action == "change" ||
+         action == "edit"   || action == "set")    action = "update";
+else if (action == "remove" || action == "rm")     action = "delete";
+else if (action == "show"   || action == "get"  ||
+         action == "view")                         action = "list";
+```
+
+**4. Errors that teach.** When you must reject a call, return an error
+whose body shows the correct shape *inline*:
+
+```cpp
+return ToolResult::error(
+    "plan: 'add' needs either text or items. Examples: "
+    "{action:\"add\", text:\"my step\"} or "
+    "{action:\"add\", items:[{text:\"a\"}, {text:\"b\"}]}. "
+    "items must be a real JSON array, not a quoted string.");
+```
+
+The model receives a copy-pasteable example for its next call instead
+of a cryptic hint.
+
+**5. Coalesce notifications across batched mutations.** When a handler
+mutates shared state in a loop (e.g. plan items) and that state has
+subscribers (UI, telemetry), use an RAII guard to fold the per-item
+callbacks into one fire at scope exit. Otherwise the UI re-renders
+once per item:
+
+```cpp
+{
+    Plan::Batch batch(*self);   // begin batch
+    for (const auto & e : items) self->add(...);
+}                                // single on_change here
+```
+
+The `Plan::Batch` guard is in `easyai/plan.hpp`; the same pattern
+applies to any `on_change`-style observable in a tool.
+
+#### Quick checklist before you ship a new tool
+
+- [ ] One-sentence purpose at the top of `describe()`.
+- [ ] Required vs. Optional parameters listed explicitly in prose.
+- [ ] Output shape described (lines? sorted? errors?).
+- [ ] At least one concrete example payload.
+- [ ] Per-`.param()` description leads with `Required.`/`Optional.`,
+      then constraints, then default.
+- [ ] Errors reference the correct shape inline.
+- [ ] Lenient `args::*` helpers used (no hand-rolled JSON parsing).
+- [ ] If multi-action: action inference + synonym mapping in place.
+- [ ] If batching: callbacks coalesced (RAII guard).
+
 ### 3.3 Sandboxed filesystem tools
 
 Always pass a root directory:
@@ -1771,6 +1968,11 @@ Same engine, same callback shape, full schema control.
 
 ##### Where to read more
 
+* [3.2.1 Writing reliable tool descriptions](#321-writing-reliable-tool-descriptions)
+  — the contract with the model. Single-action vs. multi-action
+  patterns, the per-`param()` description style used in-tree, and the
+  tolerance shims (synonym mapping, action inference, error messages
+  that teach) that keep tools robust when the model goes off-spec.
 * **`src/builtin_tools.cpp`** — `web_search`, `web_fetch`, and the
   filesystem tools.  All written with the exact API you've been using.
   No internal magic; copy any of them as a starting point.

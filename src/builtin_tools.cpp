@@ -538,9 +538,14 @@ static bool http_post_form(const std::string & url,
 // ============================================================================
 Tool datetime() {
     return Tool::builder("datetime")
-        .describe("Returns the current date and time in UTC and local time. "
-                  "Useful when the user asks 'what time is it' or for date "
-                  "arithmetic.")
+        .describe(
+            "Return the current wall-clock time. Output is two lines: "
+            "`UTC:   YYYY-MM-DD HH:MM:SS` and `Local: YYYY-MM-DD HH:MM:SS "
+            "<TZ>` (server's local timezone). No parameters.\n"
+            "\n"
+            "Use when the user asks for the time/date, when you need an "
+            "anchor for relative phrasing (\"yesterday\", \"in 3 days\"), "
+            "or before any date arithmetic. Example call: {}.")
         .handle([](const ToolCall &) {
             using namespace std::chrono;
             auto now = system_clock::now();
@@ -1117,11 +1122,32 @@ inline std::string glob_to_regex(const std::string & pattern) {
 Tool fs_read_file(std::string root) {
     auto sb = std::make_shared<Sandbox>(std::move(root));
     return Tool::builder("read_file")
-        .describe("Read a UTF-8 text file from disk and return its contents. "
-                  "The filesystem you see is rooted at `/`; use paths like `/report.md` or `/docs/spec.md`.")
-        .param("path",   "string",  "Path to the file, e.g. `/report.md` or `/docs/spec.md`.", true)
-        .param("offset", "integer", "Skip this many bytes from the start", false)
-        .param("limit",  "integer", "Maximum bytes to return (default 64KB)", false)
+        .describe(
+            "Read a UTF-8 text file from disk and return its contents.\n"
+            "\n"
+            "The filesystem you see is rooted at `/`; use paths like "
+            "`/report.md` or `/docs/spec.md`. Required: path. Optional: "
+            "offset, limit (default returns the first 64 KB; pass offset to "
+            "page through larger files).\n"
+            "\n"
+            "Examples:\n"
+            "  {path:\"/report.md\"}\n"
+            "  {path:\"/docs/spec.md\", offset:65536, limit:65536}\n"
+            "\n"
+            "Errors return a single-line message starting with `error:`. "
+            "Reading a binary file returns the raw bytes — prefer the "
+            "dedicated tools or `bash` (e.g. `file <path>`) for those.")
+        .param("path",   "string",
+               "Required. File path under the sandbox root, e.g. "
+               "`/report.md` or `/docs/spec.md`.", true)
+        .param("offset", "integer",
+               "Optional. Skip this many bytes from the start of the file "
+               "before reading. Default 0. Use the previous read's "
+               "(offset + bytes_returned) to page forward.", false)
+        .param("limit",  "integer",
+               "Optional. Maximum bytes to return. Default 65536 (64 KB). "
+               "Larger files are truncated; raise this only when you "
+               "really need a bigger chunk.", false)
         .handle([sb](const ToolCall & c) {
             std::string path; long long offset = 0, limit = 64 * 1024;
             if (!args::get_string(c.arguments_json, "path", path))
@@ -1171,11 +1197,32 @@ Tool fs_read_file(std::string root) {
 Tool fs_write_file(std::string root) {
     auto sb = std::make_shared<Sandbox>(std::move(root));
     return Tool::builder("write_file")
-        .describe("Write text to a file (overwrites). Creates parent directories. "
-                  "The filesystem you see is rooted at `/`; use paths like `/report.md` or `/docs/notes.md`.")
-        .param("path",    "string",  "Destination path, e.g. `/report.md` or `/docs/notes.md`.", true)
-        .param("content", "string",  "UTF-8 text content to write", true)
-        .param("append",  "boolean", "If true, append instead of overwriting", false)
+        .describe(
+            "Write UTF-8 text to a file. Default mode OVERWRITES any "
+            "existing content; pass append=true to extend instead. Missing "
+            "parent directories are created automatically.\n"
+            "\n"
+            "The filesystem you see is rooted at `/`; use paths like "
+            "`/report.md` or `/docs/notes.md`. Required: path, content. "
+            "Optional: append.\n"
+            "\n"
+            "Examples:\n"
+            "  {path:\"/report.md\", content:\"# Title\\n\\nBody...\"}\n"
+            "  {path:\"/log.txt\", content:\"line\\n\", append:true}\n"
+            "\n"
+            "On success returns `wrote N bytes to <path>`. Errors return a "
+            "single-line message starting with `error:`.")
+        .param("path",    "string",
+               "Required. Destination file path under the sandbox root. "
+               "Parent directories are created if missing. Examples: "
+               "`/report.md`, `/docs/notes.md`.", true)
+        .param("content", "string",
+               "Required. UTF-8 text to write. Use `\\n` for newlines. "
+               "Binary content is not supported — use bash for that.", true)
+        .param("append",  "boolean",
+               "Optional. If true, append to the file instead of "
+               "overwriting it (creates the file if missing). Default "
+               "false (overwrite).", false)
         .handle([sb](const ToolCall & c) {
             std::string path, content; bool append = false;
             if (!args::get_string(c.arguments_json, "path",    path))
@@ -1231,9 +1278,24 @@ Tool fs_write_file(std::string root) {
 Tool fs_list_dir(std::string root) {
     auto sb = std::make_shared<Sandbox>(std::move(root));
     return Tool::builder("list_dir")
-        .describe("List the entries (files and directories) inside a directory. "
-                  "The filesystem you see is rooted at `/`; use `/` for the top, `/subdir` for nested paths.")
-        .param("path", "string", "Directory path, e.g. `/` or `/subdir`.", true)
+        .describe(
+            "List the entries (files and directories) inside one directory, "
+            "non-recursively. Use `glob` for recursive / pattern matching.\n"
+            "\n"
+            "Output is one entry per line, sorted, with a trailing `/` on "
+            "directories. Hidden entries (dotfiles) are included. The "
+            "filesystem is rooted at `/`. Required: path.\n"
+            "\n"
+            "Examples:\n"
+            "  {path:\"/\"}            # top-level entries\n"
+            "  {path:\"/src\"}         # one nested level\n"
+            "\n"
+            "Errors (path missing, not a directory) return a single-line "
+            "message starting with `error:`.")
+        .param("path", "string",
+               "Required. Directory path under the sandbox root. Use `/` "
+               "for the top, `/subdir` for nested paths. Trailing slashes "
+               "are accepted.", true)
         .handle([sb](const ToolCall & c) {
             std::string path;
             if (!args::get_string(c.arguments_json, "path", path))
@@ -1266,11 +1328,29 @@ Tool fs_list_dir(std::string root) {
 Tool fs_glob(std::string root) {
     auto sb = std::make_shared<Sandbox>(std::move(root));
     return Tool::builder("glob")
-        .describe("Find files whose names match a wildcard pattern (e.g. '*.cpp', "
-                  "'src/**/*.h'). Recursive by default. "
-                  "The filesystem you see is rooted at `/`; results are returned as `/`-rooted paths.")
-        .param("pattern", "string", "Wildcard pattern (* matches any chars except /; ** matches across dirs)", true)
-        .param("path",    "string", "Optional starting directory, e.g. `/src` (default = `/`).", false)
+        .describe(
+            "Find files by wildcard pattern. Recursive by default.\n"
+            "\n"
+            "Pattern grammar: `*` matches any run of characters except `/`; "
+            "`**` matches across directory boundaries; `?` matches one "
+            "character; `[abc]` matches one of a set. Required: pattern. "
+            "Optional: path (the starting directory; defaults to `/`).\n"
+            "\n"
+            "Output is one matching path per line, sorted, rooted at `/`. "
+            "Examples:\n"
+            "  {pattern:\"*.cpp\"}                       # any .cpp anywhere\n"
+            "  {pattern:\"**/*.hpp\", path:\"/src\"}      # .hpp under /src\n"
+            "  {pattern:\"src/**/*.{c,cc,cpp}\"}          # multiple suffixes\n"
+            "\n"
+            "Use `grep` to search file contents; use `list_dir` to browse "
+            "a single non-recursive level.")
+        .param("pattern", "string",
+               "Required. Wildcard pattern. `*` matches anything except "
+               "`/`, `**` crosses directory boundaries, `?` matches one "
+               "char, `[abc]` matches a character class.", true)
+        .param("path",    "string",
+               "Optional. Starting directory under the sandbox root. "
+               "Default `/`. Example: `/src`.", false)
         .handle([sb](const ToolCall & c) {
             std::string pattern, sub;
             if (!args::get_string(c.arguments_json, "pattern", pattern))
@@ -1313,13 +1393,43 @@ Tool fs_glob(std::string root) {
 Tool fs_grep(std::string root) {
     auto sb = std::make_shared<Sandbox>(std::move(root));
     return Tool::builder("grep")
-        .describe("Search file contents for a regular expression. Returns matching lines with file:line prefixes. "
-                  "The filesystem you see is rooted at `/`; result paths come back as `/`-rooted.")
-        .param("pattern",       "string",  "Regular expression to search for", true)
-        .param("path",          "string",  "Optional starting directory, e.g. `/src` (default = `/`).", false)
-        .param("file_glob",     "string",  "Optional filename glob to limit search (e.g. '*.cpp')", false)
-        .param("max_matches",   "integer", "Stop after this many matches (default 100)", false)
-        .param("case_insensitive", "boolean", "Case-insensitive match (default false)", false)
+        .describe(
+            "Search file contents for a regular expression, recursively.\n"
+            "\n"
+            "Regex flavor is ECMAScript (same as JavaScript / std::regex): "
+            "`.`, `*`, `+`, `?`, `()`, `|`, `[]`, `\\d`, `\\w`, `\\s`, "
+            "anchors `^`/`$`. Each line is matched independently.\n"
+            "\n"
+            "Output: one match per line as `<path>:<lineno>:<line>`, paths "
+            "rooted at `/`, sorted by path. Stops after `max_matches` "
+            "(default 100).\n"
+            "\n"
+            "Required: pattern. Optional: path (start dir, default `/`), "
+            "file_glob (limit by filename), max_matches, case_insensitive.\n"
+            "\n"
+            "Examples:\n"
+            "  {pattern:\"TODO\"}\n"
+            "  {pattern:\"class\\\\s+\\\\w+\", path:\"/src\", file_glob:\"*.hpp\"}\n"
+            "  {pattern:\"error\", case_insensitive:true, max_matches:50}\n"
+            "\n"
+            "Use `glob` to find files by name; use `read_file` to read one.")
+        .param("pattern",       "string",
+               "Required. ECMAScript regular expression. Each line is "
+               "tested with regex_search (substring match), so anchor with "
+               "`^` / `$` if you want full-line matches.", true)
+        .param("path",          "string",
+               "Optional. Starting directory under the sandbox root. "
+               "Default `/`. Example: `/src`.", false)
+        .param("file_glob",     "string",
+               "Optional. Wildcard pattern restricting which filenames are "
+               "searched (matched against the basename). Examples: "
+               "`*.cpp`, `*.{c,h}`, `test_*.py`.", false)
+        .param("max_matches",   "integer",
+               "Optional. Stop after this many matching lines. Default 100. "
+               "Lines past the cap are silently dropped.", false)
+        .param("case_insensitive", "boolean",
+               "Optional. If true, the regex matches case-insensitively "
+               "(adds std::regex::icase). Default false.", false)
         .handle([sb](const ToolCall & c) {
             std::string pattern, sub, file_glob;
             long long max_matches = 100;

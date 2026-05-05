@@ -333,6 +333,105 @@ deliberately single-level scanners that don't pull a JSON dependency into
 your handler code. For nested args, include `nlohmann/json.hpp` yourself
 (it's vendored by llama.cpp).
 
+The scanners are **deliberately lenient** about the shape they accept:
+`get_string` reads a quoted integer as a string (`"42"` → `"42"`);
+`get_int` accepts a numeric literal or a quoted one (`42` or `"42"`);
+`get_array` accepts a real array *or* a stringified array (`"[1,2]"`).
+This is the backstop for the smaller / quantised models that imitate the
+shape they saw in the prompt instead of the one declared in the schema.
+Use these helpers in every handler — don't roll your own JSON probe.
+
+### Writing tool descriptions reliably
+
+The model never sees your handler. It sees the tool's `name`,
+`description`, and `parameters_json` — treat that text as the contract.
+Vague or under-described tools produce malformed calls, the wrong action,
+or silent loops where the model retries variants until the budget runs
+out. Two patterns are used in-tree:
+
+**Multi-action tools** (`plan`, `rag`) dispatch on a top-level `action`
+field. The description must enumerate every action and state, per action,
+what is Required and what is Optional. The shape:
+
+```
+<one-sentence purpose>. Pick an action; the parameters needed depend
+on which action you choose. N actions are supported:
+
+  action="X"
+    <what it does>. Required: A, B. Optional: C. Examples:
+      {action:"X", A:"...", B:"..."}
+      {action:"X", items:[{A:"..."}]}
+
+  action="Y"
+    ...
+```
+
+Per-property `description` strings in the schema lead with **which
+actions consume them** — `"Used by add / update / delete. ..."`. Models
+following the schema can map a parameter to the right action without
+re-reading the body.
+
+**Single-action tools** (`web_fetch`, `read_file`, `bash`, …) describe
+one operation. The description should still cover:
+
+* the operation (one sentence),
+* Required vs. Optional parameters,
+* the **output shape** (e.g. "one path per line, sorted, rooted at `/`"),
+* one or two concrete example payloads,
+* error / edge-case behavior (truncation, missing path, regex flavor, …).
+
+Each `.param()` description leads with `Required` or `Optional`, then the
+constraint and a default if any. The terse `"Search query"` form trains
+the model to be terse back; the rich form
+`"Required. ECMAScript regular expression. Each line is tested with
+regex_search (substring match), so anchor with ^/$ if you want full-line
+matches."` keeps it precise.
+
+Models follow examples in the description more reliably than they parse
+JSON-schema constraints. A description that *shows* a valid call is
+worth ten that only describe the schema.
+
+### Tolerance shims — when the model goes off-spec anyway
+
+A good description prevents most misfires; the rest are the cost of
+running real models on tool calls. Mirror the lenient-parsing pattern at
+the handler boundary:
+
+* **Stringified containers.** Models occasionally emit
+  `"items": "[{...}]"` (the array as a quoted JSON string) instead of
+  `"items": [{...}]`. `args::get_array` already unwraps the string and
+  re-parses; rely on it.
+* **Missing required fields.** When the schema requires `action` but the
+  model omits it, infer from the fields that *are* present rather than
+  failing with `"missing 'action'"`. The pattern in `src/plan.cpp`:
+  if `items` is present and the first item has `text`, intent is
+  `add`; if it has `status`, intent is `update`; if it has only `id`,
+  intent is `delete`. Resolve ambiguity using current state (e.g. does
+  the id already exist in the plan?).
+* **Synonyms.** Map near-miss verbs to canonical actions
+  (`create` / `append` / `insert` → `add`, `remove` / `rm` → `delete`,
+  `show` / `get` / `view` → `list`).
+* **Errors that teach.** When you must reject a call, return an error
+  whose body shows the correct shape inline:
+  `plan: 'add' needs either text or items. Examples:
+  {action:"add", text:"my step"} or
+  {action:"add", items:[{text:"a"}, {text:"b"}]}.`
+  The model gets a copy-fixable example for the next call instead of a
+  cryptic hint.
+* **Coalesce notifications across batches.** A handler that mutates
+  shared state in a loop (e.g. plan items) should batch its `on_change`
+  callbacks via an RAII guard so the UI re-renders once per call, not
+  once per item — see `Plan::Batch` in `easyai/plan.hpp`.
+
+These are not workarounds; they are the contract of the tool boundary.
+The model is non-deterministic; the tool surface is deterministic. The
+gap is bridged by a strict schema, a forgiving parser, and errors that
+teach.
+
+For per-tool cookbook examples — building one from scratch, multiple
+parameters, tolerance shims walked through line-by-line — see
+`manual.md` §3.2.1.
+
 ---
 
 ## 5b. The OpenAI-protocol client (`libeasyai-cli`)
