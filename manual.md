@@ -958,11 +958,12 @@ applies to any `on_change`-style observable in a tool.
 Always pass a root directory:
 
 ```cpp
-engine.add_tool(easyai::tools::fs_read_file ("./workspace"));
-engine.add_tool(easyai::tools::fs_write_file("./workspace"));
-engine.add_tool(easyai::tools::fs_list_dir  ("./workspace"));
-engine.add_tool(easyai::tools::fs_glob      ("./workspace"));
-engine.add_tool(easyai::tools::fs_grep      ("./workspace"));
+engine.add_tool(easyai::tools::fs_read_file    ("./workspace"));
+engine.add_tool(easyai::tools::fs_write_file   ("./workspace"));
+engine.add_tool(easyai::tools::fs_list_dir     ("./workspace"));
+engine.add_tool(easyai::tools::fs_glob         ("./workspace"));
+engine.add_tool(easyai::tools::fs_grep         ("./workspace"));
+engine.add_tool(easyai::tools::get_sandbox_path("./workspace")); // ← the absolute path
 ```
 
 Paths sent by the model are anchored to the root by **iterating path
@@ -974,21 +975,30 @@ The model sees a virtual `/`-rooted filesystem (`/report.md`,
 `/docs/spec.md`); the real sandbox path is hidden from descriptions
 and result messages.
 
+`get_sandbox_path` is the model's escape hatch when it does need the
+real on-disk path (typing it back in chat, invoking bash with absolute
+paths, etc.). It captures the configured root at registration so the
+answer is pinned — distinct from `get_current_dir`, which reports the
+process's live cwd and can drift.
+
 ### 3.3.1 Toolbelt — register the canonical agent toolset in 3 lines
 
 Instead of hand-rolling the standard tool registration:
 
 ```cpp
 easyai::cli::Toolbelt()
-    .sandbox   ("./workspace")    // enables all fs_* tools, scoped here
-    .allow_bash()                  // adds bash, bumps max_tool_hops to 99999
+    .sandbox   ("./workspace")    // adds fs_* + get_sandbox_path
+    .allow_bash()                  // adds bash; ALSO ensures fs_* are on
     .with_plan (plan)              // adds the plan tool
     .apply     (engine);           // or .apply(client) for the remote variant
 ```
 
-The Toolbelt always includes `datetime` + `web_search` + `web_fetch`;
-fs_* and bash are gated behind `.sandbox()` and `.allow_bash()` so a
-fresh agent installation can't accidentally expose write or shell.
+The Toolbelt always includes `datetime` + `web_search` + `web_fetch`.
+The filesystem set (`fs_*` + `get_sandbox_path`) is enabled by **either**
+`.sandbox()` or `.allow_bash()` — bash is strictly more permissive than
+`fs_*`, so allowing bash without `fs_*` is incoherent (the model would
+fall back to `cat > file` for ordinary writes). A fresh agent
+installation that calls neither still can't expose write or shell.
 
 ### 3.3.2 Bash tool — when you need a real shell
 

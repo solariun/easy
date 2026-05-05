@@ -391,6 +391,36 @@ Models follow examples in the description more reliably than they parse
 JSON-schema constraints. A description that *shows* a valid call is
 worth ten that only describe the schema.
 
+### Sandbox + tool defaults
+
+Two flags control file/shell access:
+
+* `--sandbox <dir>` — sets the working root for `fs_*` and `bash`.
+* `--allow-bash` — registers the `bash` tool.
+
+`fs_*` (and `get_sandbox_path`) auto-register whenever **either** flag
+is set. Bash subsumes the `fs_*` surface, so requiring an extra
+`--allow-fs` flag for the narrower set was inverted from the threat
+model — and produced sessions where the model had bash but no `fs_*`,
+trapping it into `cat > file` / `sed -i` for ordinary file work.
+`--allow-fs` still works (sets the working root to `.` if alone) but
+is redundant when `--sandbox` or `--allow-bash` is already given.
+
+The Toolbelt's `apply()` path also prepends two small in-binary blocks
+to the user's system prompt when the agent has any create/mutate
+affordance:
+
+* `[environment]` — the absolute path of the sandbox root, so the
+  model doesn't waste turn 1 on `get_current_dir` / `pwd`.
+* `[guidance]` — "pick one viable implementation and carry it through"
+  assertiveness rule, so smaller models don't enumerate options or
+  stop at a draft.
+
+`get_sandbox_path` is registered alongside `get_current_dir` (the
+process cwd, can drift) — pinned at registration to the configured
+root so its answer is always the truth even if the process chdir's
+later.
+
 ### Tolerance shims — when the model goes off-spec anyway
 
 A good description prevents most misfires; the rest are the cost of

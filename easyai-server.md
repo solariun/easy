@@ -93,7 +93,7 @@ The HTTP layer, paths, tool gating, MCP auth.
 | `host` | string | `--host` | `127.0.0.1` | Bind address. `0.0.0.0` to listen on every interface. |
 | `port` | int | `--port` | `8080` | TCP port. |
 | `alias` | string | `-a`, `--alias` | basename of `model` | Public model id reported by `/v1/models` and `/api/tags`. |
-| `sandbox` | path | `--sandbox` | (none) | Root directory for `bash` and `fs_*` tools. |
+| `sandbox` | path | `--sandbox` | (none) | Root directory for `bash` and `fs_*` tools. **Auto-registers the `fs_*` tools** when set (no need to also pass `--allow-fs`). `bash` still requires `--allow-bash`. |
 | `system_file` | path | `-s`, `--system-file` | (none — uses built-in default) | File containing the server-default system prompt. |
 | `system_inline` | string | `--system` | (none) | Inline system prompt. Beats `system_file` if both are set. |
 | `external_tools` | path | `--external-tools` | (none — feature off) | Directory of `EASYAI-*.tools` manifests. See `EXTERNAL_TOOLS.md`. |
@@ -104,8 +104,8 @@ The HTTP layer, paths, tool gating, MCP auth.
 | `webui_placeholder` | string | `--webui-placeholder` | `Type a message…` | Input box hint. |
 | `metrics` | bool | `--metrics` | `off` | Expose Prometheus `/metrics`. |
 | `verbose` | bool | `-v`, `--verbose` | `off` | Noisy logs. |
-| `allow_fs` | bool | `--allow-fs` | `off` | Register `fs_read_file / fs_write_file / fs_list_dir / fs_glob / fs_grep` (sandbox required). |
-| `allow_bash` | bool | `--allow-bash` | `off` | Register the `bash` tool. **Not** a hardened sandbox. |
+| `allow_fs` | bool | `--allow-fs` | `off` | Register `fs_read_file / fs_write_file / fs_list_dir / fs_glob / fs_grep` plus `get_sandbox_path`. **Implied by `--sandbox` and by `--allow-bash`** — pass it explicitly only to register `fs_*` alone (no sandbox dir, no shell). When neither sandbox nor bash is set, `--allow-fs` defaults the working root to `.` (cwd). |
+| `allow_bash` | bool | `--allow-bash` | `off` | Register the `bash` tool **and** the `fs_*` set (bash subsumes fs_*; without fs_* the model would use bash for ordinary file work). **Not** a hardened sandbox. |
 | `use_google` | bool | `--use-google` | `off` | Register the `web_google` tool (Google Custom Search JSON API). Requires `GOOGLE_API_KEY` and `GOOGLE_CSE_ID` env vars. Counts against your Google quota (free tier: 100 queries/day per key). When either env var is missing the tool is silently skipped. |
 | `split_rag` | bool | `--split-rag` | `off` | Opt back into the legacy seven-tool RAG layout (`rag_save`, `rag_append`, `rag_search`, `rag_load`, `rag_list`, `rag_delete`, `rag_keywords`). The DEFAULT is the single `rag(action=...)` dispatcher; flip this on if you're driving a weak / 1-bit-quant tool caller (Bonsai-class) that handles many flat schemas more reliably than one discriminated schema. On-disk format is byte-identical either way. |
 | `mcp` | string | `--mcp` | (none — MCP client off) | URL of an upstream MCP server to connect to as a CLIENT. Format: `http(s)://host:port` (the `/mcp` endpoint is appended). Tools fetched from the upstream are merged into the local catalogue; local-tool names take precedence on collision. Failure at startup logs a warning and continues with whatever local / RAG tools were registered. |
@@ -387,9 +387,9 @@ opt-in is logged at startup with sanity warnings.
 | Flag / INI key | What it enables |
 | --- | --- |
 | (no flag) | `datetime`, `web_search`, `web_fetch`. |
-| `--sandbox <dir>` (`[SERVER] sandbox`) | Sets the root for filesystem-flavoured tools. The binary `chdir`s into `<dir>` so `get_current_dir` reports the sandbox path back to the model. Required for `--allow-fs`. |
-| `--allow-fs` (`[SERVER] allow_fs`) | `fs_read_file / fs_write_file / fs_list_dir / fs_glob / fs_grep` plus `get_current_dir`, ALL scoped to the sandbox. |
-| `--allow-bash` (`[SERVER] allow_bash`) | `bash` (run `/bin/sh -c`). cwd = sandbox if given, else the binary's CWD. NOT a hardened sandbox — runs with this process's user privileges. Also bumps the agentic-loop `max_tool_hops` to 99999 (bash flows naturally span many turns). |
+| `--sandbox <dir>` (`[SERVER] sandbox`) | Sets the root for filesystem-flavoured tools. The binary `chdir`s into `<dir>` and **auto-registers `fs_*` plus `get_sandbox_path`** scoped to it (no need for `--allow-fs`). `bash` still requires `--allow-bash`. |
+| `--allow-fs` (`[SERVER] allow_fs`) | `fs_read_file / fs_write_file / fs_list_dir / fs_glob / fs_grep` plus `get_current_dir` and `get_sandbox_path`. **Implied** by `--sandbox` and by `--allow-bash`; pass it explicitly only to register `fs_*` alone (no sandbox dir, no shell). The working root is `--sandbox <dir>` if given, else `.` (the server's cwd). |
+| `--allow-bash` (`[SERVER] allow_bash`) | `bash` (run `/bin/sh -c`) **plus the `fs_*` set** (bash subsumes them). cwd = sandbox if given, else the binary's CWD. NOT a hardened sandbox — runs with this process's user privileges. Also bumps the agentic-loop `max_tool_hops` to 99999 (bash flows naturally span many turns). |
 | `--use-google` (`[SERVER] use_google`) | `web_google` (Google Custom Search JSON API). Requires `GOOGLE_API_KEY` and `GOOGLE_CSE_ID` env vars; tool is silently skipped if either is missing so a key rotation that briefly drops the env doesn't take down the server. Counts against your Google quota (free tier: 100 queries/day per key). |
 | `--external-tools <dir>` (`[SERVER] external_tools`) | Load every `EASYAI-<name>.tools` file in `<dir>` as an operator-defined tool pack. Per-file fault isolation. Spawns via `fork`+`execve` — never a shell. **The supported way to give the model focused powers without flipping `--allow-bash`.** See [`EXTERNAL_TOOLS.md`](EXTERNAL_TOOLS.md). |
 | `--RAG <dir>` (`[SERVER] rag`) | Enable RAG, the agent's persistent **memory** (search / store / append / recall / update / forget). DEFAULT: registers ONE `rag(action=...)` tool with sub-actions `save`, `append` (grow an existing memory without losing its body), `search`, `load`, `list`, `delete`, `keywords` — each entry one Markdown file in `<dir>`, operator-readable and hand-editable. Memories whose title starts with `fix-easyai-` are immutable: save/append/delete refuse them. Pass `fix=true` (sub-action `save`) to mint one. Pass `--split-rag` (below) to register the legacy seven separate tools instead. The systemd-installed server passes this by default (`/var/lib/easyai/rag`). See [`RAG.md`](RAG.md). |
