@@ -1527,7 +1527,9 @@ Tool fs_grep(std::string root) {
 // the path this returns is exactly the directory the model's other
 // tools (bash, fs_*) will operate in. We resolve via getcwd() at call
 // time (not at registration) so a process that chdir'd later still
-// reports truthfully.
+// reports truthfully. Distinct from get_sandbox_path: this is the
+// process cwd (changes if the process chdir'd), get_sandbox_path is the
+// pinned sandbox boundary (always the truth).
 //
 // Two error paths surfaced as ToolResult::error:
 //   - getcwd returns nullptr (path too long, racing rmdir, EACCES on
@@ -1539,12 +1541,12 @@ Tool fs_grep(std::string root) {
 Tool get_current_dir() {
     return Tool::builder("get_current_dir")
         .describe(
-            "Returns the absolute path of the directory this agent is "
-            "running in. Other tools that take relative paths (bash, "
-            "read_file, write_file, list_dir, glob, grep) resolve them "
-            "against this directory. Call this once at the start of a "
-            "task if you need to know the absolute path; otherwise just "
-            "use relative paths and trust they land here. No parameters."
+            "Returns the absolute path of the process's current working "
+            "directory. In the standard CLI / server setup the process "
+            "chdir's into the sandbox at startup, so this typically "
+            "matches the sandbox root — but if you specifically want "
+            "the sandbox boundary, use `get_sandbox_path` (its answer "
+            "is pinned at registration and won't drift). No parameters."
         )
         .handle([](const ToolCall & /*c*/) {
             // PATH_MAX-sized stack buffer is the standard POSIX idiom;
@@ -1563,22 +1565,104 @@ Tool get_current_dir() {
         .build();
 }
 
+// get_sandbox_path — returns the absolute path of the sandbox root.
+// Captures the configured root at registration time (so the answer is
+// stable even if the process chdir'd later). When `root` is empty or
+// ".", we resolve the process's cwd at call time as a fallback — that
+// matches what `bash` with no sandbox actually uses.
+//
+// One error path surfaced as ToolResult::error: getcwd fails when no
+// sandbox was configured (path too long, racing rmdir, EACCES on a
+// parent component). We surface errno via strerror.
+Tool get_sandbox_path(std::string root) {
+    // Resolve the configured root to an absolute path NOW, so registration
+    // pins the answer. realpath() returns nullptr on transient failures
+    // (e.g. relative path with stale cwd) — we keep the original string
+    // as a fallback in that case.
+    std::string resolved;
+    if (!root.empty() && root != ".") {
+        char buf[PATH_MAX];
+        if (::realpath(root.c_str(), buf) != nullptr) {
+            resolved.assign(buf);
+        } else {
+            resolved = root;
+        }
+    }
+    // Capture by value into the closure; std::string move keeps it cheap.
+    return Tool::builder("get_sandbox_path")
+        .describe(
+            "Returns the absolute filesystem path of your sandbox root. "
+            "All filesystem tools (read_file, write_file, list_dir, "
+            "glob, grep) operate inside this directory; bash also runs "
+            "with this as its working directory. The fs tools' virtual "
+            "`/` maps here.\n"
+            "\n"
+            "Use this when you need to mention the real path in your "
+            "output (e.g. \"I created the file at <sandbox>/main.cpp\") "
+            "or when invoking bash with absolute paths. For everyday "
+            "file work prefer the dedicated fs tools' virtual `/` "
+            "addressing — you don't need this path for them.\n"
+            "\n"
+            "No parameters. Example call: {}."
+        )
+        .handle([resolved](const ToolCall & /*c*/) {
+            if (!resolved.empty()) return ToolResult::ok(resolved);
+            // Fallback: no sandbox configured — answer with the
+            // process's current cwd, which is what `bash` actually
+            // uses when registered with root=".".
+            char buf[PATH_MAX];
+            if (::getcwd(buf, sizeof(buf)) == nullptr) {
+                return ToolResult::error(
+                    std::string("getcwd failed: ") + std::strerror(errno));
+            }
+            const size_t n = ::strnlen(buf, sizeof(buf));
+            return ToolResult::ok(std::string(buf, n));
+        })
+        .build();
+}
+
 Tool bash(std::string root) {
     auto sb = std::make_shared<Sandbox>(std::move(root));
     return Tool::builder("bash")
         .describe(
-            "Run a shell command via `/bin/sh -c`. Output is stdout and stderr "
-            "merged; the working directory is the sandbox root — call "
-            "`get_current_dir` first if you need to know the absolute path "
-            "of where your command will run. Relative paths in your command "
-            "(e.g. `./build`, `src/main.cpp`) resolve against that directory. "
-            "Use this for grep | xargs, find, git, package managers, anything "
-            "you'd type in a terminal. "
-            "WARNING: this is NOT a hardened sandbox — the command runs with the "
-            "caller's user privileges and can read/write files, hit the network, "
-            "spawn processes, etc. Prefer the dedicated tools (read_file, "
-            "write_file, glob, grep) for simple file ops; reach for bash only "
-            "when you actually need shell features."
+            "Run a shell command via `/bin/sh -c`. Output is stdout and "
+            "stderr merged.\n"
+            "\n"
+            "FILE WORK — PREFER THE DEDICATED TOOLS. For reading, "
+            "writing, listing, finding, or searching files use "
+            "`read_file`, `write_file`, `list_dir`, `glob`, and `grep`. "
+            "They're faster, can't be foot-gunned with quoting / "
+            "redirection mistakes, and produce structured output the "
+            "model parses reliably. Reach for `bash` only when you need "
+            "shell features the dedicated tools don't have:\n"
+            "\n"
+            "  - pipelines (`grep | xargs`, `find ... -exec`, `... | "
+            "    awk ...`)\n"
+            "  - process orchestration (running a build, a test "
+            "    suite, a script)\n"
+            "  - tooling that has no equivalent fs tool (git, package "
+            "    managers, `make`, `cmake`, `python` / `node` REPLs, "
+            "    diff, file)\n"
+            "  - non-trivial in-place edits (sed/awk for line-range "
+            "    replacements; the `write_file` tool overwrites or "
+            "    appends only)\n"
+            "\n"
+            "If your command is `cat > file` / `cat <<EOF` / "
+            "`echo \"...\" > file` / `mkdir`, call `write_file` "
+            "instead — it does the same thing without the shell-quoting "
+            "minefield.\n"
+            "\n"
+            "WORKING DIRECTORY — bash runs with cwd pinned to the "
+            "sandbox root. Relative paths in your command (e.g. "
+            "`./build`, `src/main.cpp`) resolve there. Call "
+            "`get_sandbox_path` once at the start of a task if you "
+            "need the absolute path.\n"
+            "\n"
+            "WARNING: this is NOT a hardened sandbox — the command "
+            "runs with the caller's full uid/gid and can read/write "
+            "files, hit the network, spawn long-lived processes, etc. "
+            "Output is capped at 32 KB and a SIGTERM/SIGKILL deadline "
+            "(default 30s, max 300s) bounds the runtime."
         )
         .param("command", "string",
                "Shell command line. Quoted, piped, redirected etc. as you would "

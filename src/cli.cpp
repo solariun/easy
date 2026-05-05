@@ -53,25 +53,36 @@ std::vector<Tool> Toolbelt::tools() const {
             out.push_back(easyai::tools::web_google());
         }
     }
-    if (allow_fs_ && !sandbox_.empty()) {
-        out.push_back(easyai::tools::fs_list_dir  (sandbox_));
-        out.push_back(easyai::tools::fs_read_file (sandbox_));
-        out.push_back(easyai::tools::fs_glob      (sandbox_));
-        out.push_back(easyai::tools::fs_grep      (sandbox_));
-        out.push_back(easyai::tools::fs_write_file(sandbox_));
+    // fs_* and bash share a working root: the configured sandbox if set,
+    // otherwise ".". Whenever either category is enabled, both should be
+    // available — bash is strictly more permissive than fs_*, so allowing
+    // bash without fs_* is incoherent (and traps models into using bash
+    // for file work because there's nothing else). Conversely, anyone
+    // pointing at a sandbox wants file access in it.
+    const bool fs_on   = allow_fs_ && (!sandbox_.empty() || allow_bash_);
+    const bool bash_on = allow_bash_;
+    const std::string fs_root = sandbox_.empty() ? "." : sandbox_;
+    if (fs_on) {
+        out.push_back(easyai::tools::fs_list_dir  (fs_root));
+        out.push_back(easyai::tools::fs_read_file (fs_root));
+        out.push_back(easyai::tools::fs_glob      (fs_root));
+        out.push_back(easyai::tools::fs_grep      (fs_root));
+        out.push_back(easyai::tools::fs_write_file(fs_root));
     }
-    if (allow_bash_) {
-        const std::string root = sandbox_.empty() ? "." : sandbox_;
-        out.push_back(easyai::tools::bash(root));
+    if (bash_on) {
+        out.push_back(easyai::tools::bash(fs_root));
     }
-    // get_current_dir is registered whenever ANY filesystem-flavoured
-    // tool is on (fs_*, bash). It costs nothing, takes no parameters,
-    // and is the canonical way for the model to learn the sandbox path
-    // it should anchor relative paths against. Without an fs/bash tool
-    // there's nothing for it to anchor, so we keep it off — minimum
-    // surface area.
-    const bool any_fs_like = (allow_fs_ && !sandbox_.empty()) || allow_bash_;
-    if (any_fs_like) out.push_back(easyai::tools::get_current_dir());
+    // get_current_dir + get_sandbox_path register whenever ANY
+    // filesystem-flavoured tool is on. Both are parameter-free and
+    // cheap; the pair lets the model distinguish "where the process
+    // is right now" (cwd, can drift) from "the boundary I'm scoped
+    // to" (sandbox, pinned at registration). Without an fs/bash tool
+    // there's nothing for them to anchor, so we keep them off.
+    const bool any_fs_like = fs_on || bash_on;
+    if (any_fs_like) {
+        out.push_back(easyai::tools::get_current_dir());
+        out.push_back(easyai::tools::get_sandbox_path(fs_root));
+    }
     return out;
 }
 

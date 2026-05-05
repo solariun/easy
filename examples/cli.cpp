@@ -376,6 +376,7 @@ void usage(const char * argv0) {
 "    --tools LIST               comma list, valid names:\n"
 "                                 datetime, plan, web_search, web_fetch,\n"
 "                                 web_google (also needs --use-google),\n"
+"                                 get_current_dir, get_sandbox_path,\n"
 "                                 fs_read_file, fs_list_dir, fs_glob,\n"
 "                                 fs_grep, fs_write_file, bash,\n"
 "                                 system_meminfo, system_loadavg,\n"
@@ -387,21 +388,27 @@ void usage(const char * argv0) {
 "                                 rag_keywords (legacy split layout —\n"
 "                                   only when --split-rag is also set)\n"
 "                               default: datetime,plan,web_search,web_fetch,\n"
+"                                 get_current_dir,\n"
 "                                 system_meminfo,system_loadavg,\n"
 "                                 system_cpu_usage,system_swaps,\n"
 "                                 (rag is auto-registered when --RAG is set;\n"
 "                                  with --split-rag the seven rag_* tools are\n"
 "                                  registered instead)\n"
-"    --sandbox DIR              enable fs_list_dir, fs_read_file,\n"
-"                                 fs_glob, fs_grep AND fs_write_file,\n"
-"                                 ALL scoped to DIR.  Without --sandbox\n"
-"                                 the model has no file access.\n"
+"    --sandbox DIR              enable file work scoped to DIR.\n"
+"                                 Auto-registers fs_list_dir, fs_read_file,\n"
+"                                 fs_glob, fs_grep, fs_write_file AND\n"
+"                                 get_sandbox_path. Without --sandbox\n"
+"                                 (and without --allow-bash) the model has\n"
+"                                 no file access.\n"
 "    --allow-bash               register the `bash` tool (run shell\n"
-"                                 commands).  WARNING: NOT a hardened\n"
-"                                 sandbox — the command runs with your\n"
-"                                 user privileges (network, full FS, etc).\n"
-"                                 cwd is set to --sandbox DIR if given,\n"
-"                                 otherwise the current working dir.\n"
+"                                 commands). Implies fs_* tool registration\n"
+"                                 (bash subsumes them; without fs_* the\n"
+"                                 model would use bash for file work).\n"
+"                                 WARNING: NOT a hardened sandbox — the\n"
+"                                 command runs with your user privileges\n"
+"                                 (network, full FS, etc). cwd is set to\n"
+"                                 --sandbox DIR if given, otherwise the\n"
+"                                 current working dir.\n"
 "    --use-google               register the `web_google` tool (Google\n"
 "                                 Custom Search JSON API). Requires both\n"
 "                                 GOOGLE_API_KEY and GOOGLE_CSE_ID env\n"
@@ -617,13 +624,19 @@ const std::vector<std::string> kDefaultTools = {
     "system_meminfo", "system_loadavg", "system_cpu_usage", "system_swaps",
 };
 
-// fs_* tools that are auto-enabled by --sandbox DIR (when --tools is
-// empty).  Passing --sandbox is the explicit "give the model file
-// access scoped here" gesture; without --tools the docs promise
-// "enable fs_* tools" — this set is what that means.  fs_write_file
-// is included: --sandbox is the user's explicit write authorisation.
+// fs_* + companions auto-enabled by --sandbox DIR or --allow-bash.
+// Either flag is the operator's "the model can touch files" gesture:
+// --sandbox scopes the working root, --allow-bash is strictly more
+// permissive than fs_* (bash subsumes them all). Bundling fs_* with
+// bash means models reach for the structured tools instead of falling
+// back to `cat > file` / `sed -i` because the dedicated tools weren't
+// registered. fs_write_file is included: --sandbox / --allow-bash is
+// the operator's explicit write authorisation.
+// `get_sandbox_path` ships alongside so the model can resolve the real
+// on-disk path of its working root (fs_* otherwise speak a virtual `/`).
 const std::vector<std::string> kSandboxFsTools = {
     "fs_list_dir", "fs_read_file", "fs_glob", "fs_grep", "fs_write_file",
+    "get_sandbox_path",
 };
 
 void register_tools(easyai::Client & cli,
@@ -633,10 +646,14 @@ void register_tools(easyai::Client & cli,
     auto wants = [&](const std::string & name) {
         if (o.tools_enabled.empty()) {
             for (const auto & d : kDefaultTools) if (d == name) return true;
-            if (!o.sandbox.empty()) {
+            // fs_* auto-enable when EITHER --sandbox is set OR
+            // --allow-bash is on. Bash without fs_* is incoherent (bash
+            // is strictly more permissive), and a sandbox without fs_*
+            // is the same trap inverted.
+            if (!o.sandbox.empty() || o.allow_bash) {
                 for (const auto & d : kSandboxFsTools) if (d == name) return true;
             }
-            // bash is opt-in by --allow-bash (NOT auto-enabled by --sandbox).
+            // bash is opt-in by --allow-bash.
             if (o.allow_bash && name == "bash") return true;
             // web_google is opt-in by --use-google (NOT in kDefaultTools).
             // Even when the user passes --tools web_google explicitly we
@@ -668,6 +685,10 @@ void register_tools(easyai::Client & cli,
     if (wants("fs_glob"))       cli.add_tool(easyai::tools::fs_glob(root));
     if (wants("fs_grep"))       cli.add_tool(easyai::tools::fs_grep(root));
     if (wants("fs_write_file")) cli.add_tool(easyai::tools::fs_write_file(root));
+    // get_sandbox_path — pinned to the same root as fs_*/bash. Lets
+    // the model resolve the absolute on-disk path of where its work
+    // is landing, without depending on the process's cwd matching.
+    if (wants("get_sandbox_path")) cli.add_tool(easyai::tools::get_sandbox_path(root));
 
     // bash — same root as fs_*; opt-in via --allow-bash or --tools bash.
     if (wants("bash")) {
@@ -1140,6 +1161,51 @@ int main(int argc, char ** argv) {
     if (!o.url.empty()) cli.endpoint(o.url);
     cli.model(o.model).timeout_seconds(o.timeout).http_retries(o.http_retries);
     if (!o.api_key.empty())            cli.api_key(o.api_key);
+
+    // Prefix the user's system prompt with two small in-binary blocks:
+    //
+    //   [environment] — the absolute path of the agent's sandbox root.
+    //   Models without this typically waste turn 1 on
+    //   `get_current_dir` / `pwd` before they can do anything useful.
+    //   Injecting it up front saves the hop on every coding task.
+    //
+    //   [guidance] — "pick one implementation and ship it" assertiveness
+    //   note. Smaller models otherwise enumerate options, ask
+    //   permission for every choice, or stop at a draft. The user can
+    //   refine after they see something running.
+    //
+    // Both blocks are conditional on the agent actually having a
+    // create/mutate affordance (fs_* / bash / plan). With no such tool
+    // the guidance is irrelevant and we leave the prompt alone.
+    {
+        const bool any_fs_like = o.allow_bash || !o.sandbox.empty();
+        std::string prefix;
+        if (any_fs_like) {
+            std::string abs_root = o.sandbox.empty() ? "." : o.sandbox;
+            char rb[PATH_MAX];
+            if (::realpath(abs_root.c_str(), rb) != nullptr) abs_root = rb;
+            prefix += "[environment]\n";
+            prefix += "sandbox root: " + abs_root + "\n";
+            prefix += "fs_* tools' virtual `/` maps here; bash runs with "
+                      "this as its cwd.\n";
+        }
+        if (any_fs_like || !o.no_plan) {
+            if (!prefix.empty()) prefix += "\n";
+            prefix +=
+                "[guidance]\n"
+                "When asked to create something, pick one viable "
+                "implementation and carry it through to a working end "
+                "state. Do not enumerate options, branch on "
+                "hypotheticals, or stop at a draft. Choose, build, "
+                "verify it runs, then report. The user can ask for "
+                "refinements after they see it working.\n";
+        }
+        if (!prefix.empty()) {
+            o.system_prompt = o.system_prompt.empty()
+                                  ? prefix
+                                  : prefix + "\n" + o.system_prompt;
+        }
+    }
     if (!o.system_prompt.empty())      cli.system(o.system_prompt);
     if (o.temperature       >= 0.0f)   cli.temperature(o.temperature);
     if (o.top_p             >= 0.0f)   cli.top_p(o.top_p);

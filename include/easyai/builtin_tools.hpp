@@ -53,6 +53,18 @@ Tool fs_grep      (std::string root = ".");
 // way except an OS-level getcwd error which we surface as a tool error.
 Tool get_current_dir();
 
+// get_sandbox_path: returns the absolute path of the configured sandbox
+// root. Distinct from get_current_dir: the sandbox path is pinned at
+// registration time (via the `root` argument the toolbelt passes), so
+// it is always the boundary fs_* and bash operate inside, regardless
+// of what the process's cwd happens to be. When no sandbox is
+// configured (`root` empty or "."), this tool falls back to the
+// current working directory — same as get_current_dir would.
+//
+// No parameters. Use this when you need the real on-disk path of
+// where your work is landing (fs_* otherwise speaks a virtual `/`).
+Tool get_sandbox_path(std::string root = ".");
+
 // ---------- shell -------------------------------------------------------
 // Run a shell command via /bin/sh -c. Working directory is set to `root`.
 //

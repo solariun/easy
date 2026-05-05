@@ -3028,19 +3028,19 @@ static bool require_auth(const ServerCtx & ctx, const httplib::Request & req,
         "                                long thinking turns. INI key:\n"
         "                                [SERVER] http_timeout. Logged\n"
         "                                unconditionally at startup.\n"
-        "      --sandbox <dir>          Restrict fs_* and bash to <dir>\n"
-        "                                (when --allow-fs / --allow-bash\n"
-        "                                register them).  Without --sandbox\n"
-        "                                the tools default to the server's\n"
-        "                                cwd. NOTE: --sandbox alone NO LONGER\n"
-        "                                auto-enables fs_*; pass --allow-fs.\n"
+        "      --sandbox <dir>          Set the working root for fs_* and\n"
+        "                                bash. Implies --allow-fs (the fs_*\n"
+        "                                tools register automatically). Bash\n"
+        "                                still requires --allow-bash. Without\n"
+        "                                --sandbox the tools default to the\n"
+        "                                server's cwd.\n"
         "      --allow-fs               Register the fs_* tools (fs_read_file,\n"
         "                                fs_list_dir, fs_glob, fs_grep,\n"
-        "                                fs_write_file).  Scoped to --sandbox\n"
+        "                                fs_write_file). Scoped to --sandbox\n"
         "                                dir if given, otherwise the server's\n"
-        "                                cwd.  Off by default — fs_* are NOT\n"
-        "                                registered (and not exposed in the\n"
-        "                                webui) without this flag.\n"
+        "                                cwd. Implied by --sandbox and by\n"
+        "                                --allow-bash; pass it explicitly to\n"
+        "                                register fs_* alone.\n"
         "      --allow-bash             Register the `bash` tool (run shell\n"
         "                                commands). cwd = --sandbox dir if\n"
         "                                given, otherwise the server's cwd.\n"
@@ -3597,9 +3597,19 @@ int main(int argc, char ** argv) {
         "  - web_search returns snippets only; after ONE search, web_fetch\n"
         "    the top 1-3 URLs and answer from the fetched body. Two searches\n"
         "    in a row is wrong.\n"
-        "  - Files: fs_read_file / fs_list_dir / fs_glob / fs_grep; writes:\n"
-        "    fs_write_file (paths virtual, rooted at `/`).\n"
-        "  - Commands: bash (when registered).\n"
+        "  - Files: PREFER the dedicated tools — fs_read_file /\n"
+        "    fs_list_dir / fs_glob / fs_grep / fs_write_file (paths\n"
+        "    virtual, rooted at `/`). Do NOT use bash for `cat > file`,\n"
+        "    `cat <<EOF`, `echo > file`, `mkdir`, or for reading files —\n"
+        "    fs_write_file / fs_read_file / fs_list_dir do those without\n"
+        "    the shell-quoting minefield.\n"
+        "  - bash (when registered): for shell features the dedicated\n"
+        "    fs tools don't have — pipelines, `find | xargs`, build\n"
+        "    runners (make / cmake / cargo / npm), git, package\n"
+        "    managers, sed/awk for in-place edits.\n"
+        "  - get_sandbox_path: returns the absolute path of your sandbox\n"
+        "    root. Use it once if you need to mention the real on-disk\n"
+        "    path; fs_* otherwise speak a virtual `/`.\n"
         "  - Host metrics: system_meminfo / loadavg / cpu_usage / swaps.\n"
         "  - Long-term memory: rag(action=…) save / append / search / load.\n"
         "  - plan: action='add' (text or items[] up to 20), action='update'\n"
@@ -3608,6 +3618,14 @@ int main(int argc, char ** argv) {
         "    to mutate a step — use update.\n"
         "  - Cite URLs you actually fetched. Attach dates to dated facts\n"
         "    (\"released April 2026\" beats \"recently released\").\n"
+        "\n"
+        "## When asked to create something\n"
+        "Pick ONE viable implementation and carry it through to a working\n"
+        "end state. Don't enumerate options, don't branch on hypotheticals,\n"
+        "don't stop at a draft. Choose, build, verify it runs, then report.\n"
+        "The user can ask for refinements after they see it working — a\n"
+        "concrete imperfect result beats a thorough comparison of three\n"
+        "abstractions.\n"
         "\n"
         "Be terse. Be honest about uncertainty: \"I'm not sure — let me\n"
         "check\" → call a tool.";
@@ -3667,26 +3685,31 @@ int main(int argc, char ** argv) {
 
     // Default toolbelt — opt-out via --no-local-tools.
     //
-    // fs_* and bash are SHIPPED OFF by default: --allow-fs turns on the
-    // filesystem read/write set, and --allow-bash turns on the shell
-    // tool.  Both honour --sandbox <dir> if given (otherwise they fall
-    // back to the server's cwd).  Without an --allow-* flag the model —
-    // and the webui's "tools" listing — never sees the corresponding
-    // tools, so a fresh easyai-server install can't accidentally expose
-    // write access or shell.
+    // fs_* and bash are SHIPPED OFF by default. Either --sandbox <dir>,
+    // --allow-fs, or --allow-bash registers fs_* (any one of them is
+    // enough — they all imply file work). bash additionally requires
+    // --allow-bash. Without any of these flags the model — and the
+    // webui's "tools" listing — never sees the corresponding tools, so
+    // a fresh easyai-server install can't accidentally expose shell or
+    // write access.
     if (args.local_tools) {
-        // fs_* and bash share a root: --sandbox if given, else cwd.
-        // We only pass that root through to Toolbelt when SOMETHING is
-        // about to use it (allow_fs or allow_bash), so the engine
-        // doesn't spuriously hold onto a sandbox dir the user never
-        // intended to use.
+        // Determine the working root: --sandbox if given, else cwd
+        // when ANY filesystem-flavoured tool is on. We only pass a
+        // root through to Toolbelt when SOMETHING is about to use it,
+        // so the engine doesn't spuriously hold onto a sandbox dir the
+        // operator never intended to use.
         std::string sb = args.sandbox;
-        if (sb.empty() && (args.allow_fs || args.allow_bash)) sb = ".";
+        const bool any_fs_like = args.allow_fs || args.allow_bash || !sb.empty();
+        if (sb.empty() && any_fs_like) sb = ".";
         auto tb = easyai::cli::Toolbelt()
                       .sandbox   (sb)
-                      .allow_fs  (args.allow_fs)
                       .allow_bash(args.allow_bash)
                       .use_google(args.use_google);
+        // We deliberately don't propagate args.allow_fs as a hard gate
+        // anymore: the Toolbelt's predicate (sandbox set OR bash on)
+        // covers it. Operators who want fs_* WITHOUT bash still get
+        // them — passing --allow-fs sets sb="." above and the Toolbelt
+        // registers fs_* against that root.
         for (auto & t : tb.tools()) ctx->default_tools.push_back(std::move(t));
     }
 
