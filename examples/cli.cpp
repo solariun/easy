@@ -523,6 +523,20 @@ bool parse_args(int argc, char ** argv, Options & o) {
             std::fprintf(stderr, "missing value for %s\n", flag);
             return std::string();
         }
+        // Refuse to silently consume the next arg if it looks like
+        // another flag (`--something`). That's almost always a missing
+        // value typo, e.g. `--system --url X` where the user forgot the
+        // text for --system and then accidentally fed `--url` to it.
+        // Single-dash forms (`-1`, `-q`) stay valid because they're
+        // legitimate flag values for sampling / shorthand.
+        const char * next = argv[i + 1];
+        if (next[0] == '-' && next[1] == '-') {
+            std::fprintf(stderr,
+                "missing value for %s (next arg `%s` looks like a flag — "
+                "quote it if intentional, e.g. %s \"%s\")\n",
+                flag, next, flag, next);
+            return std::string();
+        }
         return argv[++i];
     };
     if (const char * v = std::getenv("EASYAI_URL"))     o.url     = v;
@@ -1188,15 +1202,16 @@ int main(int argc, char ** argv) {
         if (!buf.empty()) o.prompt = std::move(buf);
     }
 
-    // --list-tools is purely LOCAL — it prints the tools registered in
-    // this CLI process, no network needed.  When that's the ONLY thing
-    // requested, skip the --url requirement so `--list-tools` works on
-    // its own without an endpoint argument.
-    const bool only_local_listing =
-        o.list_tools
+    // Some diagnostics are purely LOCAL — no network call, so they
+    // shouldn't require --url:
+    //   --list-tools         (prints the tools registered in this CLI)
+    //   --show-system-prompt (prints the resolved system prompt)
+    // When ONLY one of these is requested, skip the --url requirement.
+    const bool only_local_diag =
+        (o.list_tools || o.show_system_prompt)
         && !o.list_models && !o.list_remote_tools && !o.health
         && !o.props && !o.metrics && o.set_preset.empty();
-    if (!only_local_listing && o.url.empty()) {
+    if (!only_local_diag && o.url.empty()) {
         std::fprintf(stderr, "%serror:%s --url (or EASYAI_URL) is required\n",
                      st.red(), st.reset());
         usage(argv[0]);
