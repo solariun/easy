@@ -105,7 +105,22 @@ void Plan::clear() {
 }
 
 void Plan::fire_changed_() {
+    if (batch_depth_ > 0) {
+        batch_dirty_ = true;
+        return;
+    }
     if (on_change_) on_change_(*this);
+}
+
+// RAII batch guard — coalesces on_change callbacks across a sequence of
+// mutations into a single fire at scope exit. Nestable; only the
+// outermost scope actually fires.
+Plan::Batch::Batch(Plan & p) : p_(&p) { ++p_->batch_depth_; }
+Plan::Batch::~Batch() {
+    if (--p_->batch_depth_ == 0 && p_->batch_dirty_) {
+        p_->batch_dirty_ = false;
+        if (p_->on_change_) p_->on_change_(*p_);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -193,6 +208,11 @@ Tool Plan::tool() {
         "Pass at most 20 items per call.",
         kSchema,
         [self](const ToolCall & call) -> ToolResult {
+            // Coalesce all mutations in this call into a single
+            // on_change notification — without this the UI re-renders
+            // the plan once per item in a batch.
+            Plan::Batch batch(*self);
+
             std::string action = args::get_string_or(
                 call.arguments_json, "action", "");
 

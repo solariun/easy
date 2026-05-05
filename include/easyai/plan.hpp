@@ -49,8 +49,27 @@ public:
     // long as the Engine / Client holds the Tool.
     Tool tool();
 
-    // Subscribers fire on every mutation (add/update/delete/clear).
+    // Subscribers fire on every mutation (add/update/delete/clear), or
+    // once at the end of a Batch if one is active.
     void on_change(ChangeCallback cb);
+
+    // RAII guard: while alive, suppresses on_change notifications and
+    // coalesces them into a single fire when destroyed (only if any
+    // mutation actually happened during the batch). Nestable; the
+    // outermost scope is what drives the single fire.
+    //
+    //   { Plan::Batch b(plan);
+    //     for (...) plan.add(...);   // no per-item callback
+    //   }                            // one callback here
+    class Batch {
+    public:
+        explicit Batch(Plan & p);
+        ~Batch();
+        Batch(const Batch &)             = delete;
+        Batch & operator=(const Batch &) = delete;
+    private:
+        Plan * p_;
+    };
 
     // Read-only access.
     const std::vector<PlanItem> & items() const;
@@ -77,6 +96,8 @@ private:
     std::vector<PlanItem>          items_;
     int                            next_id_ = 1;
     ChangeCallback                 on_change_;
+    int                            batch_depth_ = 0;
+    bool                           batch_dirty_ = false;
 
     void fire_changed_();
 };
