@@ -272,7 +272,21 @@ bool get_array(const std::string & json, const std::string & key,
     size_t i = find_key(json, key);
     if (i == std::string::npos) return false;
     i = skip_ws(json, i);
-    if (i >= json.size() || json[i] != '[') return false;
+    if (i >= json.size()) return false;
+
+    // Tolerate stringified arrays: smaller MoE/dense models often emit
+    //     "items": "[{\"text\":\"...\"}]"
+    // — the array escaped into a JSON string — instead of the spec form
+    //     "items": [{"text":"..."}].
+    // Same lenient pattern as get_string/get_int/get_bool above.
+    if (json[i] == '"') {
+        std::string unwrapped;
+        if (!read_json_string(json, i, unwrapped)) return false;
+        std::string synthetic = "{\"_a\":" + unwrapped + "}";
+        return get_array(synthetic, "_a", out);
+    }
+
+    if (json[i] != '[') return false;
     ++i;
     out.clear();
     i = skip_ws(json, i);

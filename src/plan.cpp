@@ -120,8 +120,10 @@ Tool Plan::tool() {
             R"(delete: remove steps by id (id='all' clears everything). )"
             R"(list: return the current plan."},)"
         R"("items":{"type":"array","maxItems":20,)"
-            R"("description":"Batch mode: array of up to 20 items. )"
-            R"(add=[{text}], update=[{id,text?,status?}], delete=[{id}].",)"
+            R"("description":"Batch mode: real JSON array (NOT a string). )"
+            R"(add  example: [{\"text\":\"step one\"},{\"text\":\"step two\"}]. )"
+            R"(update example: [{\"id\":\"1\",\"status\":\"done\"}]. )"
+            R"(delete example: [{\"id\":\"2\"}].",)"
             R"("items":{"type":"object","properties":{)"
                 R"("id":{"type":"string"},)"
                 R"("text":{"type":"string"},)"
@@ -141,12 +143,16 @@ Tool Plan::tool() {
     return Tool::make(
         "plan",
         "Track a step-by-step plan visible to the user in real time. "
-        "Use add to create new steps, update to modify existing ones "
-        "(never re-add — use update to change text or status). "
-        "Statuses: pending (default), working (in progress), done, "
-        "error, deleted (struck through). "
-        "Each action supports single-item fields (id, text, status) "
-        "or batch via 'items' array (max 20).",
+        "Simplest forms (prefer these): "
+        "{action:\"add\",text:\"step\"}, "
+        "{action:\"update\",id:\"1\",status:\"working\"}, "
+        "{action:\"update\",id:\"1\",status:\"done\"}, "
+        "{action:\"delete\",id:\"all\"}, "
+        "{action:\"list\"}. "
+        "Batch form uses a real JSON array in 'items' (not a quoted string): "
+        "{action:\"add\",items:[{text:\"a\"},{text:\"b\"}]}. "
+        "Statuses: pending (default), working, done, error, deleted. "
+        "Never re-add an existing step — use update to change its text or status.",
         kSchema,
         [self](const ToolCall & call) -> ToolResult {
             const std::string action = args::get_string_or(
@@ -176,7 +182,11 @@ Tool Plan::tool() {
                 std::string text = args::get_string_or(
                     call.arguments_json, "text", "");
                 if (text.empty())
-                    return ToolResult::error("plan: 'add' needs text or items array");
+                    return ToolResult::error(
+                        "plan: 'add' needs either text or items. Examples: "
+                        "{action:\"add\",text:\"my step\"} or "
+                        "{action:\"add\",items:[{text:\"a\"},{text:\"b\"}]}. "
+                        "items must be a real JSON array, not a quoted string.");
                 std::string id = self->add(std::move(text));
                 return ToolResult::ok("added id=" + id + "\n" +
                                       self->render_string());
@@ -204,7 +214,10 @@ Tool Plan::tool() {
                 std::string id = args::get_string_or(
                     call.arguments_json, "id", "");
                 if (id.empty())
-                    return ToolResult::error("plan: 'update' needs id or items array");
+                    return ToolResult::error(
+                        "plan: 'update' needs either id or items. Examples: "
+                        "{action:\"update\",id:\"1\",status:\"done\"} or "
+                        "{action:\"update\",items:[{id:\"1\",status:\"done\"}]}.");
                 std::string text = args::get_string_or(
                     call.arguments_json, "text", "");
                 std::string status = args::get_string_or(
@@ -240,7 +253,10 @@ Tool Plan::tool() {
                 }
                 if (id.empty())
                     return ToolResult::error(
-                        "plan: 'delete' needs id, id='all', or items array");
+                        "plan: 'delete' needs id, id='all', or items. Examples: "
+                        "{action:\"delete\",id:\"2\"}, "
+                        "{action:\"delete\",id:\"all\"}, or "
+                        "{action:\"delete\",items:[{id:\"2\"}]}.");
                 if (!self->remove(id))
                     return ToolResult::error("plan: unknown id " + id);
                 return ToolResult::ok("deleted " + id + "\n" +
