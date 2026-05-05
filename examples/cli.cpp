@@ -912,8 +912,11 @@ static void on_terminating_signal(int /*sig*/) {
         static const char kMsg[] =
             "\n<exiting: waiting for the ai session to be finished. "
             "Ctrl-C again to force.>\n";
-        // ::write is async-signal-safe; stdio is not.
-        (void) ::write(STDERR_FILENO, kMsg, sizeof(kMsg) - 1);
+        // ::write is async-signal-safe; stdio is not. GCC's
+        // warn_unused_result on write() bypasses the (void) cast, so
+        // assign-then-discard.
+        ssize_t _ = ::write(STDERR_FILENO, kMsg, sizeof(kMsg) - 1);
+        (void) _;
         return;
     }
 
