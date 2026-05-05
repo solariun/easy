@@ -321,8 +321,29 @@ int main(int argc, char ** argv) {
         "  - web_search returns snippets only; after one search, web_fetch "
         "the top 1-3 URLs and answer from the fetched body. Two searches "
         "in a row is wrong.\n"
-        "  - Files: fs_read_file / fs_list_dir / fs_glob / fs_grep.\n"
-        "  - Cite the URL you actually fetched.";
+        "  - Files: PREFER fs_read_file / fs_list_dir / fs_glob / fs_grep "
+        "/ fs_write_file (paths virtual, rooted at `/`). Do NOT use bash "
+        "for `cat > file`, `cat <<EOF`, `echo > file`, `mkdir`, or for "
+        "reading files — the dedicated fs tools do those without the "
+        "shell-quoting minefield.\n"
+        "  - bash: shell features the dedicated tools don't have — "
+        "pipelines, find | xargs, build runners (make / cmake / cargo / "
+        "npm), git, package managers, sed/awk for in-place edits.\n"
+        "  - Cite the URL you actually fetched.\n"
+        "\n"
+        "## When asked to create something — PROTOTYPE FIRST\n"
+        "1. Build the simplest thing that does EXACTLY what the user "
+        "asked. No extra features. No defensive scaffolding for cases "
+        "they didn't mention. No \"while I'm at it\" cleanups. Stay "
+        "strictly in scope.\n"
+        "2. Verify it runs. Show the user the working result.\n"
+        "3. THEN surface ideas you have for next steps as a short "
+        "numbered list and ASK which the user wants. Do not apply them "
+        "yourself. Wait for the user's pick.\n"
+        "\n"
+        "The user's request is the ceiling, not a starting point. They "
+        "steer; you implement what they pick. Refinement is a dialogue, "
+        "not a monologue.";
 
     std::string system_prompt = args.system_inline;
     if (system_prompt.empty() && !args.system_path.empty()) {
