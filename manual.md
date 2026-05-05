@@ -429,6 +429,7 @@ Outputs land in `build/`:
 ```
 build/easyai-local      # local-only REPL (loads a GGUF in-process)
 build/easyai-cli        # agentic REPL talking to a remote OpenAI-compat endpoint
+                        #   (full doc: easyai-cli.md)
 build/easyai-server     # HTTP server + webui  (full doc: easyai-server.md)
 build/easyai-mcp-server # standalone MCP-only HTTP daemon, no model loaded,
                         #   sized for thousands of parallel clients

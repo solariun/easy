@@ -681,6 +681,10 @@ ask for; the OS bounds what the *agent process* can do.
 - [`LINUX_SERVER.md`](LINUX_SERVER.md) — operator's guide for the
   systemd-installed server (file layout, the unit file, perf tuning,
   gotchas, backup / upgrade / uninstall).
+- [`easyai-cli.md`](easyai-cli.md) — the matching client: REPL,
+  one-shot, piped, management subcommands, tool registration, the
+  `[environment]` + `[guidance]` prompt injection, sampling, reasoning,
+  the raw transaction log.
 - [`easyai-mcp-server.md`](easyai-mcp-server.md) — standalone
   MCP-only server: same tools, no model, dedicated for high-concurrency
   multi-client deployments.
