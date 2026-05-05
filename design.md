@@ -132,7 +132,11 @@ Tier 4: raw llama.cpp handles, raw HTTP, custom Tool handlers
 3. Sensible defaults at every tier.  `Agent` registers
    datetime/web_search/web_fetch by default; fs_* and bash stay off
    until the user asks for them.  `Client::retry_on_incomplete` is on
-   by default.  `max_tool_hops` is 8 by default but bumps to 99999
+   by default.  `Client::http_retries` is 5 by default (pre-stream
+   transport failures retried with exponential backoff, logged on
+   stderr without `--verbose`).  `Client::timeout_seconds` is 1800 s
+   by default — generous for thinking models with long reasoning
+   streams.  `max_tool_hops` is 8 by default but bumps to 99999
    when bash registers.
 4. Honest documentation.  The bash tool's description in the model's
    tools list literally reads "NOT a hardened sandbox — runs with
@@ -388,6 +392,49 @@ arrive across multiple deltas keyed by `index`, and `arguments` is a
 *string concatenation* across deltas.  `PendingToolCall` accumulates
 these in a `std::map<int, PendingToolCall>` so out-of-order arrivals
 self-merge.
+
+### HTTP retry layer (pre-stream only)
+
+Transient transport failures are retried automatically.  Default
+`Client::http_retries(5)` produces up to six total attempts per HTTP
+call; `0` disables retries.  Backoff is exponential and capped:
+**250 ms → 500 ms → 1 s → 2 s → 4 s → 4 s …**.  The retry loop wraps
+all three call sites: the SSE `POST /v1/chat/completions` inside
+`stream_chat`, plus `simple_get` / `simple_post` (used by the
+management endpoints `health`, `metrics`, `props`, `list_models`,
+`list_remote_tools`, `set_preset`).
+
+Retry decision (`is_retryable_httplib`):
+
+| Condition                                | Retry? |
+|------------------------------------------|--------|
+| `received_anything == true` (mid-stream) | **No** |
+| `cancel_requested` set                   | **No** |
+| HTTP 4xx                                 | **No** (auth / contract failure) |
+| HTTP 5xx, no bytes streamed yet          | Yes |
+| Connect refused / DNS fail / read or write timeout / SSL handshake | Yes |
+
+The mid-stream rule is the load-bearing one.  Once the SSE buffer
+flips `received_anything = true`, the model has already produced
+visible tokens that the caller's `on_token` callback printed.  A
+fresh attempt would replay those tokens and corrupt the agent
+loop's history; the layer instead surfaces the partial turn as-is
+and lets `retry_on_incomplete` (a HIGHER-LEVEL retry — see §3) deal
+with it.
+
+Each retry logs once via `easyai::log::error("[easyai-cli] HTTP
+attempt N/M failed (REASON); retrying in Bms\n")`.  `easyai::log::error`
+tees to stderr, so operators see the retry pattern in journalctl
+output without `--verbose`.  The same wire bytes still land in the
+auto-opened `/tmp/easyai-client-PID-EPOCH.log` for postmortem.
+
+The same retry shape is replicated (with the same backoff schedule
+but a libcurl-flavoured retryable-error set: `CURLE_COULDNT_CONNECT`,
+`CURLE_OPERATION_TIMEDOUT`, `CURLE_RECV_ERROR`, `CURLE_SEND_ERROR`,
+`CURLE_GOT_NOTHING`, `CURLE_PARTIAL_FILE`, plus 5xx) in the MCP
+client (§6d) and the `web_fetch` / `web_search` helpers — every
+external HTTP boundary in the project goes through one of those
+three retry loops.
 
 ---
 
@@ -904,6 +951,134 @@ operational experience we'll tune the descriptions further.
   own state. There's no `BEGIN ... COMMIT`. The model is the
   consistency layer.
 
+## 5h. Plan — agent-visible task list
+
+Lives in `src/plan.cpp` + `include/easyai/plan.hpp`. User-facing
+documentation: `AI_TOOLS.md` §"plan" and the auto-register flow
+in `src/cli.cpp`. This section describes the architectural shape
+and the design rationale behind the schema.
+
+### One tool, four actions
+
+`Plan::tool()` returns a SINGLE `easyai::Tool` whose schema
+dispatches on an `action` enum: `add | update | delete | list`.
+A multi-action shape (vs. four separate tools) is deliberate:
+
+1. **Smaller tool catalogue.** The model's tool-pick fan-out is
+   one entry, not four.  Weak / 1-bit-quant models that get
+   confused by long catalogues stay fluent.
+2. **Symmetric input shape.** Every action accepts the same
+   `id` / `text` / `status` / `items` field set; the model
+   doesn't need to remember "is the field name `text` or `task`?"
+   per action.
+
+The trade-off — one less informative tool name in audit logs — is
+worth it for catalogue compactness.  RAG (§5g) chose differently
+(seven tools) because there the action names ARE the audit
+signal; for the plan tool, the `action` argument suffices because
+operators read the rendered checklist, not the raw tool calls.
+
+### Statuses encode display intent, not workflow
+
+Five statuses: **pending | working | done | error | deleted.**
+Each maps to a terminal rendering style:
+
+| Status   | Box   | ANSI                        | Intent |
+|----------|-------|-----------------------------|--------|
+| pending  | `[ ]` | bold                        | active, not started |
+| working  | `[~]` | bold cyan                   | active, in progress |
+| done     | `[x]` | dim                         | completed |
+| error    | `[!]` | red                         | failed (model decides) |
+| deleted  | `[-]` | dim + strikethrough         | removed but visible |
+
+`deleted` is a soft delete — the entry stays in the rendered list
+with a strikethrough, so the user sees what the model abandoned.
+A subsequent `clear()` (no tool action exposes it) is the only
+way to actually drop entries.  The choice trades memory growth
+on long sessions for transparency: the user can scroll back and
+see "yes, the model considered X, then deleted it" rather than
+"the model silently never mentioned X."
+
+`render(out, color=true)` emits the ANSI sequences; the same
+function with `color=false` emits a plain markdown checklist for
+consumption by the MODEL (we never show the model coloured
+escape sequences in the tool result, only the user's terminal
+sees them).  Two callers respect the operator's `Style.color`
+flag: `ui::render_plan` and `Streaming::attach(Plan&)`.
+
+### Batch mode (max 20 items)
+
+Each action accepts EITHER single-item top-level fields
+(`id`, `text`, `status`) OR an `items` array of up to 20 objects.
+The 20-item ceiling is enforced in the handler; larger arrays
+return an error.  The cap is small on purpose:
+
+- A turn that wants to enqueue 50 sub-steps has a planning
+  problem, not a batching problem.  The right answer is to
+  zoom out, not to send a bigger batch.
+- Schema validators that walk every item linearly want a small
+  upper bound.
+- 20 fits a typical "morning of work" plan (read-write-test-…)
+  without forcing the model into multiple add-batches.
+
+The fluent rule: `add` accepts `[{text}]`, `update` accepts
+`[{id, text?, status?}]`, `delete` accepts `[{id}]`.  Mixing
+single-field and `items` in the same call is allowed; `items`
+wins.  `delete` with `id="all"` is the explicit "wipe the
+plan" gesture (no `items`, no per-id calls).
+
+### Why `update` is not just `add` with a known id
+
+Before the redesign, the schema only had `add | start | done | list`.
+A model wanting to fix a typo in step 3 had no way to do it: re-adding
+created a duplicate entry, and `start`/`done` only flipped status.
+The model would noisily try to mutate the list by clearing and
+re-adding, which broke ID stability and confused the user reading
+the live checklist.
+
+`update` is the cleanest fix.  It takes the existing id, applies
+non-empty `text` and/or `status`, fires `on_change` once, and
+preserves the id (which the model has likely already cited in
+its visible reasoning).  The tool description tells the model
+explicitly: *"never re-add — use update to change text or
+status."*  The rule is short enough that even small models
+follow it.
+
+### `on_change` callback — the live checklist
+
+Every mutation fires `Plan::on_change(const Plan &)`.  The CLI
+binary's `Streaming::attach(Plan&)` wires that to a re-render
+under the spinner's lock, so the operator sees the checklist
+update inline as the model plans / executes.  This is the
+load-bearing UX feature — the plan isn't a "nice to have"
+status report, it's a real-time signal that the model is
+making progress.
+
+The callback runs synchronously on the dispatching thread
+(typically the agent loop).  Subscribers must be cheap; the
+default rendered path is one `ostringstream` build + a single
+`spinner_.write()` and that's it.
+
+### Plan vs. RAG vs. external-tools
+
+Three persistence-shaped tool families coexist; their roles
+are distinct:
+
+| Tool      | Lifetime          | Audience       | Writer |
+|-----------|-------------------|----------------|--------|
+| Plan      | one chat session  | the user, live | model  |
+| RAG       | across sessions   | the model     | model  |
+| Manifest  | across deploys    | the operator  | operator |
+
+A plan item is the next ten minutes of work.  A RAG entry is
+"things the model wants to remember next time."  A manifest
+tool is "binaries the operator pre-authorised."  Confusing them
+produces predictable failure modes (RAG entries that are stale
+within an hour because the model used them as a plan; manifest
+tools the model never calls because it expects them to behave
+like RAG).  Keeping the surfaces distinct keeps the model
+oriented.
+
 ---
 
 ## 6. The HTTP server
@@ -1056,6 +1231,26 @@ timeouts. So we ship the simpler half of the spec — POST request,
 JSON response, no session state — and reserve `GET /mcp` for the
 SSE notification stream a future PR will add.
 
+### Listen-socket timeouts (`--http-timeout`)
+
+cpp-httplib's `set_read_timeout` / `set_write_timeout` apply to
+EVERY request the server accepts, including `/v1/chat/completions`
+SSE streams and `/mcp` JSON-RPC calls.  Default **600 s** (10 min)
+is set high deliberately: a thinking-heavy model can hold an SSE
+stream open for many minutes between visible tokens while emitting
+only `delta.reasoning_content`.  At llama-server's traditional 60 s
+the connection drops mid-thought and the client sees
+`HTTP request failed: Failed to read connection`.
+
+The cap is operator-tunable via `--http-timeout SECONDS`
+(`[SERVER] http_timeout` in the INI), and the chosen value is
+echoed in the startup banner alongside `http_retries=N` so the
+operator sees it in journalctl without `--verbose`.  HTTP 408 / 504
+responses (cpp-httplib's timeout status) and any uncaught exception
+go through `set_error_handler` / `set_exception_handler` and log
+unconditionally — `[easyai-server] WARN HTTP 408 timeout on POST
+/v1/chat/completions from 10.0.0.1:54321 (check --http-timeout, …)`.
+
 ### Why `--external-tools` shows up here
 
 Operator-defined external tools (the `EASYAI-*.tools` manifests
@@ -1141,15 +1336,50 @@ patterns (a few tools/call per turn from one model) don't need it.
 
 ### Failure modes
 
-* **Network down at startup** → `fetch_remote_tools` returns empty +
-  err; the caller logs and continues. Server still starts.
-* **Auth rejected at startup** → same.
-* **Mid-session call failure** (network, 4xx, 5xx, malformed JSON)
-  → handler returns `ToolResult::error` with the curl message. The
-  agent loop sees a normal tool error and reacts.
+* **Network down at startup** → `fetch_remote_tools` exhausts the
+  retry budget (default 5 extra attempts, exponential backoff up to
+  4 s), returns empty + err; the caller logs and continues. Server
+  still starts.
+* **Auth rejected at startup** (HTTP 401/403/4xx) → not retried;
+  same fall-through. 4xx is treated as a contract failure.
+* **Mid-session call failure** (transient curl error or 5xx)
+  → retried up to `ClientOptions::retries` times with the same
+  backoff; each retry logs `[easyai-mcp] URL attempt N/M failed
+  (REASON); retrying in Bms`.  4xx and malformed JSON skip the
+  retry loop and surface immediately as `ToolResult::error`.
+* **Retry budget exhausted** → handler returns `ToolResult::error`
+  with the final curl/HTTP message; the agent loop sees a normal
+  tool error and reacts (typical model behaviour: try once more
+  through the model, then narrate the failure to the user).
 * **Name collision with a local tool** → the tool wiring code in
   the consumer (e.g. `examples/server.cpp`) skips the remote dup and
   logs at startup. Local tools always win.
+
+### Retry semantics (`ClientOptions::retries`, default 5)
+
+Symmetric with the libeasyai-cli retry layer (§5b) but on libcurl:
+
+| Condition                                       | Retry? |
+|-------------------------------------------------|--------|
+| `CURLE_OK` && HTTP 2xx                          | (success — exit loop) |
+| HTTP 4xx                                        | **No** |
+| HTTP 5xx                                        | Yes |
+| `CURLE_COULDNT_CONNECT` / `CURLE_COULDNT_RESOLVE_*` | Yes |
+| `CURLE_OPERATION_TIMEDOUT`                      | Yes |
+| `CURLE_RECV_ERROR` / `CURLE_SEND_ERROR`         | Yes |
+| `CURLE_GOT_NOTHING` / `CURLE_PARTIAL_FILE`      | Yes |
+| Other curl errors (bad URL, SSL cert, etc.)     | **No** (permanent) |
+
+The response buffer is reset at the top of each attempt so a
+partial body from a failed try doesn't leak into the next.  Because
+`http_post_json` reads the whole response before returning (no
+streaming), the "never retry mid-stream" rule from libeasyai-cli
+doesn't apply here — every retry is safe by construction.
+
+`opts.retries` is wired into `examples/server.cpp` from the new
+`--http-retries` flag (default 5), so the server's MCP-client side
+inherits the same retry budget that the operator picks for the
+listen socket.
 
 The `Conn` handle and the libcurl resource get cleaned up when the
 last `Tool` referencing them goes out of scope, which is process
@@ -1437,29 +1667,38 @@ it is non-zero.
 risk is purely supply-chain — we'd need DNS or TLS to be
 compromised first.
 
-#### 10.5.2  libcurl write callbacks don't enforce in-flight size cap
+#### 10.5.2  libcurl write callbacks — in-flight cap (RESOLVED)
 
-**Sites:** `src/builtin_tools.cpp::curl_write_cb` (line 210), used
-by `http_get` and `http_post_form`.
+**Sites:** `src/builtin_tools.cpp::curl_write_cb`, used by
+`http_get` and `http_post_form`.
+
+The current callback wraps a `HttpSink { body, max_bytes, truncated }`
+struct and stops appending the moment the body would exceed
+`max_bytes`:
 
 ```cpp
 static size_t curl_write_cb(void * buf, size_t sz, size_t n, void * ud) {
-    auto * out = static_cast<std::string *>(ud);
-    out->append(static_cast<char *>(buf), sz * n);
-    return sz * n;
+    auto * sink = static_cast<HttpSink *>(ud);
+    const size_t incoming = sz * n;
+    if (sink->body->size() >= sink->max_bytes) {
+        sink->truncated = true;
+        return incoming;          // accept-but-discard, no buffer growth
+    }
+    const size_t room = sink->max_bytes - sink->body->size();
+    const size_t take = (incoming <= room) ? incoming : room;
+    sink->body->append(static_cast<char *>(buf), take);
+    if (take < incoming) sink->truncated = true;
+    return incoming;
 }
 ```
 
-The `max_bytes` cap (`2 MiB` for `http_get`, `4 MiB` for
-`http_post_form`) is applied **after** `curl_easy_perform` returns,
-so a malicious server can stream gigabytes and we'll happily buffer
-all of it in `body`.  This is a **memory** DoS, not a stack one —
-listed here only because it shares the "input size unbounded" smell
-that drove the strip_html fix.
-
-**Fix:** make `curl_write_cb` return `0` when `out->size() + sz*n >
-max_bytes`, which tells libcurl to abort the transfer
-(`CURLE_WRITE_ERROR`).  ~4 lines.  Tracked.
+We chose accept-and-discard (return `incoming`) over abort-the-transfer
+(return `0`) deliberately — the latter surfaces as `CURLE_WRITE_ERROR`
+which the retry layer would interpret as a transient failure and
+retry, just to hit the same cap again.  Accept-and-discard caps RAM
+exactly while letting curl drain the connection cleanly.  The
+`truncated` flag is available to callers that want to surface "the
+result was capped" in the model-facing tool result.
 
 (Bounded already: `CURLOPT_TIMEOUT=20s`, `CURLOPT_MAXREDIRS=5`,
 `CURLOPT_NOSIGNAL=1` — these prevent infinite-redirect loops and
@@ -1557,6 +1796,5 @@ following rules apply to all easyai source from this point on:
 | HIGH     | Replace `std::regex` in `fs_grep` with RE2 or restrict to glob-only matching         |
 | HIGH     | Add SAX-based depth-bounded parser for HTTP `req.body` JSON                          |
 | MEDIUM   | Rewrite `web_search`'s DDG result extraction as a forward-only scanner               |
-| MEDIUM   | Move libcurl size cap into the write callback (`curl_write_cb`)                      |
 | LOW      | Add a fuzz harness against `strip_html` and `recover_qwen_tool_calls` (libfuzzer)    |
 | LOW      | Investigate switching to RE2 or a non-backtracking engine repo-wide                  |

@@ -299,6 +299,8 @@ has a matching INI key (see [`easyai-server.md`](easyai-server.md) §1).
 | `--mcp URL` | — | Connect upstream MCP server as client; merge catalogue. |
 | `--mcp-token TOK` | — | Bearer for `--mcp`. |
 | `--no-mcp-auth` | off | Force `/mcp` open even with `[MCP_USER]` populated. |
+| `--http-retries N` | 5 | Extra attempts on transient HTTP failures (MCP client + web tools). 0 disables. Logged on stderr. |
+| `--http-timeout SECONDS` | 600 | Read/write timeout for the listen socket AND the MCP-client connection. Bumped from llama-server's 60 s default to accommodate long thinking turns. |
 | `--sandbox DIR` | server cwd | Root for `fs_*` / `bash` / external `$SANDBOX`. |
 | `--allow-fs` | off | Register `fs_read_file`, `fs_write_file`, `fs_list_dir`, `fs_glob`, `fs_grep`. |
 | `--allow-bash` | off | Register `bash` (NOT a hardened sandbox). |
@@ -379,7 +381,8 @@ upstream `llama-server`, OpenAI itself, etc.).
 | `--url URL` | `$EASYAI_URL` | OpenAI-compat endpoint. |
 | `--api-key KEY` | `$EASYAI_API_KEY` | Bearer auth. |
 | `--model NAME` | `$EASYAI_MODEL` | Request body `model` field. |
-| `--timeout SECONDS` | 600 | Read+write timeout. |
+| `--timeout SECONDS` | 1800 | Read+write timeout (30 min — generous for thinking models). `EASYAI_TIMEOUT` env also accepted. |
+| `--http-retries N` | 5 | Extra attempts on transient HTTP failures (connect refused, read timeout, 5xx). 0 disables. Logged on stderr without `--verbose`. `EASYAI_HTTP_RETRIES` env also accepted. |
 | `--insecure-tls` | off | Skip peer cert check (DEV ONLY). |
 | `--ca-cert PATH` | system | Custom CA bundle (PEM). |
 | `--system TEXT` | — | Inline system prompt. |
@@ -538,7 +541,8 @@ consumer process. Header:
 |---|---|---|---|
 | `.endpoint(url)` | `string` | — | `http(s)://host[:port]`. |
 | `.api_key(key)` | `string` | — | Bearer token. |
-| `.timeout_seconds(s)` | `int` | 600 | Connect+read timeout. |
+| `.timeout_seconds(s)` | `int` | 1800 | Connect+read timeout (30 min — long enough for thinking models). |
+| `.http_retries(n)` | `int` | 5 | Extra attempts on transient HTTP failures (pre-stream only — never retries mid-stream). 0 disables. Each retry logs to stderr. |
 | `.verbose(v)` | `bool` | off | Log SSE lines to stderr. |
 | `.log_file(fp)` | `FILE*` | — | Tee every HTTP transaction. |
 | `.max_reasoning_chars(n)` | `int` | 0 (off) | Abort SSE when reasoning > N chars. |
@@ -1035,7 +1039,12 @@ Deep's operating loop is: **TIME → THINK → PLAN → EXECUTE → VERIFY**.
 - **Think.** State the goal, identify what's known vs. needs lookup,
   what could go wrong.
 - **Plan.** Multi-step tasks call `plan(action='add', text=…)` first
-  so the user can see and intervene live.
+  so the user can see and intervene live.  The model uses
+  `plan(action='update', id=…, status='working'|'done'|'error')`
+  to advance steps and `action='delete'` to retire abandoned ones
+  (rendered struck through, not removed). Statuses:
+  `pending | working | done | error | deleted`. Batch via the
+  `items` array (max 20).
 - **Execute.** Every registered tool is fair game.
 - **Verify.** Before claiming success — does the file exist? does
   the test pass? does the URL really say that?  When in doubt, run

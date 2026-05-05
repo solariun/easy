@@ -1962,7 +1962,8 @@ cli.endpoint("http://ai.local:8080")     // any /v1/chat/completions URL
    .api_key(std::getenv("OPENAI_API_KEY") ? std::getenv("OPENAI_API_KEY") : "")
    .model("EasyAi")                       // request body 'model' field
    .system("You are a planning agent. Be concise.")
-   .timeout_seconds(600)                  // connect + read
+   .timeout_seconds(1800)                 // connect + read (30 min — safe for thinking models)
+   .http_retries(5)                       // extra attempts on transient failures (default 5; 0 disables)
    .verbose(false);                       // true = log SSE traffic to stderr
 ```
 
@@ -2296,16 +2297,36 @@ cli.add_tool(plan.tool());      // or engine.add_tool(...)
 
 plan.on_change([](const easyai::Plan & p){
     std::cout << "\n=== plan ===\n";
-    p.render(std::cout);          // GitHub-style "- [ ] / [~] / [x]" checklist
+    p.render(std::cout, /*color=*/true);   // ANSI-styled checklist
 });
 ```
 
-The model is told it can call `plan(action="add"|"start"|"done"|"list", text=…, id=…)`.
-On non-trivial multi-step tasks, prompt it to "use the plan tool to
-break the task into steps and tick them off as you go" — works
-reliably with any tool-call-capable model (Qwen 2.5+, Llama 3+,
+The model sees ONE tool with an `action` enum:
+
+| Action   | Single-item shape                       | Batch shape (max 20)                                |
+|----------|-----------------------------------------|-----------------------------------------------------|
+| `add`    | `text="…"`                              | `items=[{text}, {text}, …]`                         |
+| `update` | `id="3", text?="…", status?="working"`  | `items=[{id, text?, status?}, …]`                   |
+| `delete` | `id="3"` (or `id="all"` to wipe)        | `items=[{id}, {id}, …]`                             |
+| `list`   | (no fields)                             | —                                                   |
+
+Statuses: **pending** (default on add) → **working** → **done**, plus
+**error** (model flags the step as failed) and **deleted** (soft
+delete — the entry stays in the list rendered struck-through, so
+the user can see what was abandoned).  Terminal rendering with
+`color=true`: bold for active items, dim for done, red for error,
+strikethrough+dim for deleted.
+
+The single-tool / multi-action shape is a deliberate trade — it
+keeps the model's tool-pick fan-out small and lets weak / 1-bit-quant
+models stay fluent. The tool description tells the model explicitly
+*"never re-add to mutate a step — use update"*, which closes the
+duplicate-id failure mode that earlier versions had.
+
+Works reliably with any tool-call-capable model (Qwen 2.5+, Llama 3+,
 DeepSeek, OpenAI o-series, Anthropic Claude via OpenAI-compat
-proxies).
+proxies). On non-trivial multi-step tasks, prompt it to "use the
+plan tool to break the task into steps and tick them off as you go".
 
 You can also seed the plan from your code before letting the model
 take over:
@@ -2314,6 +2335,11 @@ take over:
 plan.add("fetch arxiv listing");
 plan.add("triage by citation count");
 plan.add("draft 5-bullet digest");
+
+// Or programmatically advance / mark error / soft-delete:
+plan.update("1", /*text=*/"", /*status=*/"working");
+plan.update("2", /*text=*/"triage by citation count + h-index", "");
+plan.remove("3");        // marks "deleted" — stays visible, struck through
 ```
 
 ### 5.7 Cookbook — system observability tools
@@ -2394,10 +2420,12 @@ server {
         proxy_pass http://127.0.0.1:8080;
         proxy_http_version 1.1;
         proxy_set_header Connection "";
-        # SSE keepalive — agentic loops can run minutes:
+        # SSE keepalive — thinking models can hold a stream for many
+        # minutes between visible tokens; pick a value at least as
+        # high as the server's --http-timeout (default 600 s).
         proxy_buffering    off;
-        proxy_read_timeout 600;
-        proxy_send_timeout 600;
+        proxy_read_timeout 1800;
+        proxy_send_timeout 1800;
     }
 }
 ```
@@ -2421,7 +2449,12 @@ sudo scripts/install_easyai_server.sh --upgrade
 The script does `git fetch` + `git pull --ff-only` + rebuild +
 `systemctl restart easyai-server` in that order.  In-flight SSE
 streams are aborted when the old process dies; the client gets a
-`HTTP request failed: connection closed` error and can retry.
+`HTTP request failed: connection closed` error.  The client's
+built-in HTTP retry layer (`--http-retries`, default 5) does NOT
+re-issue mid-stream because the model has already produced visible
+tokens — the upgrade window is briefly visible to active users.
+For zero-downtime upgrades, run two backends behind a load
+balancer and drain one at a time.
 
 ### 6.4 Backups
 
@@ -2539,10 +2572,12 @@ No more dual-mode flag juggling on a single binary.
 
 `easyai-cli` (remote) supports the standard TLS + agentic flags:
 
-| Flag             | Effect                                                                |
-|------------------|-----------------------------------------------------------------------|
-| `--insecure-tls` | Skip peer certificate verification (DEV ONLY, https only).            |
-| `--ca-cert <path>` | Trust a custom CA bundle (PEM) for `https://` endpoints.            |
+| Flag             | Default | Effect                                                                |
+|------------------|---------|-----------------------------------------------------------------------|
+| `--insecure-tls` | off | Skip peer certificate verification (DEV ONLY, https only). |
+| `--ca-cert <path>` | system | Trust a custom CA bundle (PEM) for `https://` endpoints. |
+| `--timeout SECONDS` | 1800 | Read+write timeout. Bumped from llama-server's 600 s default for thinking models. `EASYAI_TIMEOUT` env. |
+| `--http-retries N` | 5 | Extra attempts on transient HTTP failures (connect refused, read timeout, 5xx). 0 disables. Logged on stderr. `EASYAI_HTTP_RETRIES` env. |
 
 Both binaries share the same preset commands, the same `/help`, and the
 same streaming-aware `<think>` stripper (`--no-reasoning` on `easyai-cli`,
@@ -2780,16 +2815,38 @@ The `cli-remote` binary exposes the same as `--insecure-tls` and
 
 ### `easyai::Client` — "HTTP request failed: …"
 
-The full text after the colon is what cpp-httplib reported:
+The full text after the colon is what cpp-httplib reported.  Note
+that the client retries transient failures up to **5 times by
+default** (configurable via `--http-retries N` / `cli.http_retries(n)`
+/ `EASYAI_HTTP_RETRIES`); each retry logs to stderr without
+`--verbose`:
+
+```
+[easyai-cli] HTTP attempt 1/6 failed (Could not establish connection); retrying in 250ms
+[easyai-cli] HTTP attempt 2/6 failed (Could not establish connection); retrying in 500ms
+…
+[easyai-cli] HTTP attempt 6/6 failed (…) — retry budget exhausted
+```
+
+If you see the budget-exhausted line, the underlying cause is one of:
 
 * `Connection refused` — the server isn't listening on that
   host/port. Check `--url` value and `nc -vz host port`.
 * `SSL handshake failed` — TLS mismatch.  Check the cert hostname
   matches what you're connecting to, the chain is complete, and that
   your client's CA store has the issuer (or pass `--ca-cert`).
-* `read timeout` — the model is taking longer than
-  `--timeout`.  Bump it (`--timeout 1200`) or raise it in code
-  (`cli.timeout_seconds(1200)`).
+* `read timeout` / `Failed to read connection` — the model is taking
+  longer than `--timeout`.  Default is now 1800 s (30 min), raised
+  from the older 600 s default specifically to accommodate thinking
+  models with long deliberation phases.  Bump further if needed
+  (`--timeout 3600` or `cli.timeout_seconds(3600)`); also bump the
+  server side (`easyai-server --http-timeout 3600`) so the listen
+  socket matches.
+
+Retries do NOT fire mid-stream — once the model has emitted any
+visible token the layer surfaces the partial response instead of
+re-issuing (which would duplicate output).  For mid-stream cuts the
+fix is the timeout, not the retry budget.
 
 ### `cli-remote` — `Output: 0 / 128000 (0%)` even after a long reply
 

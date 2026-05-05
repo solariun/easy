@@ -159,10 +159,23 @@ production agent without the sandbox firmly set.
   8 MiB by default (`--max-body N` to change).  Prevents a malicious
   client from sending a multi-GB JSON.
 * `set_read_timeout` / `set_write_timeout` enforce socket-level
-  timeouts; slow-loris connections bail at 60s.
+  timeouts; default raised to **600 s** (operator-tunable via
+  `--http-timeout SECONDS`, INI `[SERVER] http_timeout`) to
+  accommodate long thinking-model SSE streams.  This is a deliberate
+  trade against slow-loris resilience: 600 s is still finite, so a
+  connection that goes silent for >10 minutes is still dropped.
+  Public-facing deployments behind a reverse proxy should rely on
+  the proxy's own slow-loris defences (nginx `client_header_timeout`,
+  HAProxy `timeout client`) rather than this single backstop.
+  Listen-side timeouts (HTTP 408 / 504) are logged unconditionally
+  on stderr — visible in journalctl without `--verbose` — so
+  unusual frequency is operator-discoverable.
 * All handlers run inside `try/catch` via
   `svr.set_exception_handler` so a thrown C++ exception cannot tear
-  down the process.
+  down the process.  Both the exception handler and the new
+  `set_error_handler` log to stderr unconditionally with the
+  request method/path/peer, so an attacker probing for exception
+  paths leaves a paper trail.
 * `engine_mu` (mutex) serialises engine access across cpp-httplib
   worker threads — no race on the single shared `easyai::Engine`.
 * Bearer auth (`require_auth`) is constant-time-equality-free
@@ -235,6 +248,32 @@ The model can't escalate by emitting more tool calls per hop because
 each `delta.tool_calls` is bounded by the chat template's grammar.
 Tool-result content fed back into the model is clipped at the
 individual tool's `clip()` budget (typically 8-16 KiB).
+
+### 12b. HTTP retry layer — amplification risk note
+
+Three subsystems retry transient HTTP failures with exponential
+backoff (default 5 extra attempts, capped 250 ms → 4 s):
+
+* `easyai::Client` — outbound to `/v1/chat/completions`.
+* `easyai::mcp::fetch_remote_tools` — outbound to upstream `/mcp`.
+* `web_get` / `web_post_form` — outbound to arbitrary URLs.
+
+The retry budget is bounded (max 6 attempts × 4 s ceiling ≈ 24 s
+worst case per call), and the configurable knob (`--http-retries N`,
+`Client::http_retries(n)`) lets operators set 0 to disable on
+deployments that route through a separate retry layer (a sidecar
+proxy, an HAProxy `retry on` directive). Retries never fire mid-SSE-
+stream — once the model has emitted any visible bytes, the layer
+surfaces the partial response instead of re-issuing.
+
+Amplification surface: a hostile model that controls the URL
+parameter to `web_fetch` could direct retries at a victim host.
+The 4 s × 5 retry ceiling, combined with the per-fetch 2 MiB
+response cap and the 20 s per-attempt timeout, means the model
+gets ≤6 GETs and ≤12 MiB of response RAM per turn against any
+single target — well below the rate at which a target would notice.
+Operators concerned about this should still wrap egress in a proxy
+that enforces destination policy (recommendation §14).
 
 ---
 

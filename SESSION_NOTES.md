@@ -305,8 +305,84 @@ Webui title default also flips to `"Deep"`.
 ## 5. Recent commits (most recent first)
 
 ```
+2026-05-05 — Plan tool redesign + HTTP retries everywhere + bumped
+             timeout defaults + non-verbose timeout logging.
+
+(pending commit) Two-part change driven by an in-the-wild
+                 "Failed to read connection" SSE drop on a
+                 thinking model and a plan-tool duplicate-id
+                 bug Gustavo hit while watching a session.
+
+  Plan tool (src/plan.cpp + include/easyai/plan.hpp):
+    * New statuses: pending / working / done / error / deleted.
+      `working` replaces the old `doing`.  `deleted` is a soft
+      delete — entry stays in the list rendered struck-through,
+      so the user can see what the model abandoned.
+    * New actions: `update` (id + text? + status?) replaces the
+      old start/done; `delete` (id, items, or `id="all"`).
+      Tool description tells the model "never re-add to mutate
+      a step — use update", which closes the duplicate-id
+      failure mode (the original bug report).
+    * Batch mode: every action accepts an `items` array of
+      up to 20.  Single-item top-level fields (id/text/status)
+      remain for one-off ops.
+    * ANSI-colored render: `Plan::render(out, color=true)` emits
+      bold/cyan/dim/red/strikethrough.  ui::render_plan and
+      Streaming::attach(Plan&) pass through Style.color so the
+      checklist colours respect the operator's TTY / NO_COLOR.
+    * New args::get_array helper (no JSON dep) walks a JSON
+      array at top level and returns each element as a raw
+      JSON substring, handling nested objects/strings.
+
+  HTTP retry layer (3 sites, symmetric design):
+    * src/client.cpp — Client::http_retries(int) (default 5)
+      wraps stream_chat's POST + simple_get + simple_post.
+      NEVER retries mid-stream (received_anything sentinel).
+      4xx never retries.  Backoff 250ms→500ms→1s→2s→4s capped.
+    * src/mcp_client.cpp — ClientOptions::retries (default 5)
+      wraps http_post_json's curl_easy_perform.  Resets the
+      response buffer between attempts so partial bodies don't
+      leak.  No mid-stream concern (whole-response read).
+    * src/builtin_tools.cpp — http_get / http_post_form gain
+      a `retries` parameter (default kWebHttpRetries=5).
+      Same backoff + retryable-error set.
+    * tool.hpp/.cpp — args::get_array helper (also used by
+      plan.cpp).
+    * Retry events log via easyai::log::error so they land on
+      stderr without --verbose; format strings include trailing
+      \n (the existing "stream_chat failed" line ALREADY had
+      this bug — pre-dates this work).
+
+  Timeouts bumped:
+    * Client::timeout_seconds default: 600s → 1800s (30 min).
+      Long-thinking models hold streams for many minutes between
+      visible tokens.
+    * easyai-server cpp-httplib set_read/write_timeout: hardcoded
+      60s → configurable args.http_timeout (default 600s).
+      `--http-timeout SECONDS` / `[SERVER] http_timeout` in INI.
+
+  CLI / INI wiring:
+    * examples/cli.cpp: --http-retries N, EASYAI_HTTP_RETRIES env,
+      EASYAI_TIMEOUT env.
+    * examples/server.cpp: --http-retries N + --http-timeout SECONDS,
+      both via the FlagDef table (so they get CLI + INI for free).
+      MCP-client opts inherit both values.
+    * Startup banner now echoes "http_timeout=Xs http_retries=Y"
+      unconditionally so operators see them in journalctl.
+    * set_exception_handler now logs to stderr unconditionally
+      with method/path/peer; new set_error_handler logs HTTP
+      408/504 timeouts and 5xx with the same context.
+
+  Smoke tested: --http-retries 0 → 1 attempt; --http-retries 2
+  → 3 attempts with visible exponential backoff in the logs.
+  All examples build clean.  Documentation updated across
+  README / manual / design / easyai-server / MCP / LINUX_SERVER /
+  SECURITY_AUDIT (see commit "Docs: ...").
+```
+
+```
 2026-05-04 — RAG default flipped to single-tool dispatcher; --split-rag
-                 opts back into legacy seven; concise default prompt.
+             opts back into legacy seven; concise default prompt.
 
 (pending commit) Two user-driven changes:
 
@@ -367,7 +443,6 @@ Webui title default also flips to `"Deep"`.
   table updated), easyai-mcp-server.md (tool-source table now
   has BOTH rows), SECURITY_AUDIT.md (mutex paragraph clarifies
   both layouts share the same RagStore + locks).
-
 2026-05-02 (later) — RAG: rag_append + user-focus prompts.
 
 (pending commit) Adds a seventh tool to RagTools: rag_append.

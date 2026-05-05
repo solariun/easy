@@ -758,6 +758,30 @@ or shrink `-c 128000` to something smaller.
 easyai-server. The server sets it on streams, but a misconfigured
 proxy can override.
 
+If the proxy itself disconnects on long thinking turns, raise its
+read/write timeout to match the server's `--http-timeout` (default
+600 s; bump higher if you run thinking-heavy models). The nginx
+recipe in `manual.md` §6.1 uses `proxy_read_timeout 1800`; pick
+whichever is highest among nginx, `--http-timeout`, and the
+client's `--timeout`.
+
+### Client logs `[easyai-cli] HTTP attempt N/M failed`
+
+Expected behaviour, not a bug. The libeasyai-cli HTTP layer retries
+transient transport failures (default 5 extra attempts, exponential
+backoff) and logs every retry to stderr unconditionally so an
+operator reading journalctl sees the pattern without `--verbose`.
+If a long sequence of retries appears, the upstream is genuinely
+flapping; check the server-side journal for matching exceptions or
+`HTTP 408 timeout` warnings (also logged unconditionally) to see
+which side is dropping the connection.
+
+The same retry-and-log pattern applies to the MCP client
+(`[easyai-mcp]` prefix) when `--mcp <url>` points at a flaky
+upstream, and to libcurl-based built-in tools (`[easyai-web]`
+prefix) for `web_search` / `web_fetch`. Configurable via
+`--http-retries N` (default 5, set 0 to disable).
+
 ### External tool calls hang forever
 
 The tool's `timeout_ms` is too high (cap is 5 min). Edit the

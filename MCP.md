@@ -581,18 +581,34 @@ tool whose name already exists locally is skipped with a startup
 warning so the operator can see what was dropped. Pass
 `--no-local-tools` if you want the remote catalogue unopposed.
 
-**Failure modes.** Connect failure, auth rejection, or a malformed
-upstream response logs a warning and lets the server start anyway.
-A transient outage at the upstream MCP server should not take down
-chat. Mid-session call failures surface as `ToolResult::error` with
-the curl error attached — same shape every other tool failure has.
+**Retry & timeout.** The MCP client honours the same `--http-retries`
+(default `5`) and `--http-timeout` (default `600 s`) flags as the
+listen socket. Transient failures (`CURLE_COULDNT_CONNECT`,
+`CURLE_OPERATION_TIMEDOUT`, `CURLE_RECV_ERROR`/`SEND_ERROR`,
+`CURLE_GOT_NOTHING`/`PARTIAL_FILE`, plus HTTP 5xx) trigger an
+exponential-backoff retry (250 ms → 500 ms → 1 s → 2 s → 4 s,
+capped). 4xx responses (auth rejected, malformed request) skip
+the retry loop. Each retry logs to stderr unconditionally:
+
+```
+[easyai-mcp] http://up:8089/mcp attempt 2/6 failed (Couldn't connect to server); retrying in 500ms
+```
+
+**Failure modes.** A connect failure that exhausts the retry budget
+at startup logs a warning and lets the server start anyway — a
+transient outage at the upstream MCP server should not take down
+chat. Auth rejection (401/403) skips the retry loop and produces the
+same warning. Mid-session call failures, post-retry, surface as
+`ToolResult::error` with the curl/HTTP error attached — same shape
+every other tool failure has.
 
 **API for downstream consumers.** `easyai::mcp::fetch_remote_tools(opts)`
 is public in libeasyai; any program built on top of the engine
 library can stack a remote MCP catalogue without writing a new
-client. The implementation is libcurl-based, gated on
-`EASYAI_HAVE_CURL` (the same flag that gates `web_fetch` /
-`web_search`).
+client. `ClientOptions::retries` and `ClientOptions::timeout_seconds`
+are the programmatic equivalents of `--http-retries` / `--http-timeout`.
+The implementation is libcurl-based, gated on `EASYAI_HAVE_CURL`
+(the same flag that gates `web_fetch` / `web_search`).
 
 ---
 
