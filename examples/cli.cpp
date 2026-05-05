@@ -59,6 +59,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits.h>      // PATH_MAX (Linux: not pulled in transitively)
 #include <map>
 #include <set>
 #include <sstream>
