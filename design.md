@@ -870,9 +870,12 @@ external-tools manifest's `cwd: "$SANDBOX"` resolves to the same
 directory at load time — every fs-flavoured surface (built-in or
 operator-declared) agrees on what "here" means.
 
-The Toolbelt registers `get_current_dir` automatically when any
-fs-tool is enabled (`--allow-fs` or `--allow-bash`); it's free
-context the model needs to do useful work.
+The Toolbelt registers `get_current_dir` AND `get_sandbox_path`
+automatically when any fs-flavoured surface is enabled (`--sandbox`,
+`--allow-fs`, or `--allow-bash` — see §5 "Sandbox + tool defaults").
+The pair lets the model distinguish the live process cwd
+(`get_current_dir`, can drift) from the boundary it's scoped to
+(`get_sandbox_path`, pinned at registration).
 
 ### Where this fits in the four-tier API rule (§1b)
 

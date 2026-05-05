@@ -43,6 +43,85 @@ A running log of user-facing changes. Latest first — keep this list
 current as features land so anyone returning to the repo (or
 landing on it for the first time) sees what shipped recently.
 
+### 2026-05-05 — Tool surface + system prompt overhaul
+
+Driven by a production "models drift, use bash for file work, ignore
+tools" report. The fix landed across the tool descriptions, the
+default prompts, and the CLI flag wiring at once.
+
+* **`--sandbox` and `--allow-bash` now imply `fs_*`.** The previous
+  matrix had operators passing `--allow-bash --sandbox DIR` and ending
+  up with bash but no file tools — so the model fell back to
+  `cat > file` / `cat <<EOF` / `sed -i` for everything. Bash is
+  strictly more permissive than `fs_*`, so requiring an extra flag
+  was inverted. Both flags now register the full file set (and the
+  new `get_sandbox_path` companion) at once. `--allow-fs` still works
+  for the no-sandbox / no-bash case; otherwise it's redundant.
+* **New `get_sandbox_path` tool.** Returns the absolute path of the
+  sandbox root, pinned at registration time — distinct from
+  `get_current_dir` which is the live process cwd and can drift.
+  Lets the model resolve where its work actually lands without a
+  wasted `pwd` tool hop.
+* **`bash` description rewritten.** Now leads with **PREFER fs tools**
+  and lists the exact bash anti-patterns (`cat > file`, `cat <<EOF`,
+  `echo > file`, `mkdir`, `sed -i`) with the dedicated tool that
+  replaces each. Reserves bash for shell features the dedicated
+  tools don't have — pipelines, `find | xargs`, build runners
+  (make / cmake / cargo / npm), git, package managers, sed/awk for
+  in-place edits.
+* **System prompts inject `[environment]` + `[guidance]`.** When
+  any create/mutate affordance is registered (fs_* / bash / plan),
+  the cli prepends two short blocks to the user's `--system` content:
+  the absolute sandbox path (saves a "where am I" tool hop on turn 1)
+  and a PROTOTYPE-FIRST behavioral rule (build EXACTLY what the user
+  asked, verify it runs, surface improvements as a numbered list and
+  let the user pick). The same guidance lives in the server's Deep
+  persona and easyai-local's built-in prompt.
+* **Default sampling preset → `precise`** (was `balanced`).
+  Temp 0.2, top_p 0.95, top_k 40, min_p 0.10. Tuned for code,
+  math, and factual Q&A — the dominant use case for a tool-calling
+  agent. Flipped across server, local, cli, webui, library
+  fallbacks, and the systemd installer's INI templates. README's
+  preset table now includes a Behaviour column and a "Pick when…"
+  column to make the choice explicit.
+* **`--show-system-prompt`** added to all four binaries
+  (`easyai-cli`, `easyai-server`, `easyai-local`, `easyai-chat`).
+  Resolves the system prompt the binary would actually use (built-in
+  default → `--system-file` → `--system`, plus the cli's injected
+  blocks), prints, exits. No model load, no port bind, no network.
+  Useful for confirming the persona before bouncing a service.
+* **Graceful `Ctrl-C` in `easyai-cli`.** In interactive mode (no
+  `--quiet`), the first `Ctrl-C` mid-turn prints
+  `<exiting: waiting for the ai session to be finished. Ctrl-C
+  again to force.>` and lets the in-flight chat finish naturally
+  (rc=0). Conversation isn't truncated mid-stream. Second `Ctrl-C`
+  is the hard-cancel escape hatch (rc=130). `--quiet` keeps the
+  existing immediate-cancel for batch scripts.
+* **Plan tool tolerance shims.** `args::get_array` now accepts a
+  stringified JSON array (`"items": "[...]"`) — small/quantised
+  models repeatedly emit this shape. The handler infers a missing
+  `action` from the items' fields plus current plan state, and
+  maps common synonyms (`create` → `add`, `remove` → `delete`,
+  etc.). `add` honours an optional per-item `status` so create +
+  mark "working" lands in one call. Errors include the correct
+  shape inline so the model can copy-fix.
+* **Plan re-renders coalesce.** A new `Plan::Batch` RAII guard
+  collapses N per-item `on_change` callbacks across one tool call
+  into a single fire — the UI's "── plan ──" block now prints once
+  per batch, not once per item.
+* **New doc: [`easyai-cli.md`](easyai-cli.md)** mirrors
+  `easyai-server.md`. 14 sections covering connection, modes, full
+  flag reference, tool registration, system prompt + injection,
+  sampling, reasoning streams, the raw transaction log, RAG,
+  external tools, management subcommands, worked examples,
+  cross-references.
+* **Tool authoring guide.** New `design.md §5 Writing tool
+  descriptions reliably` (architectural) and `manual.md §3.2.1`
+  (cookbook) document the rag-style multi-action pattern, the
+  per-`.param()` "Used by add / update / …" idiom, and the
+  lenient-handler tolerance shims. `AI_TOOLS.md` Chapter 9 has a
+  pointer.
+
 ### 2026-05-04 — Single-tool RAG is now the default; concise system prompt
 
 * **Default RAG layout flipped: one `rag(action=...)` tool.** The
@@ -432,7 +511,7 @@ use `easyai-cli`.
 | `-p, --prompt TEXT` | (REPL) | One-shot: run prompt, print, exit. |
 | `-s, --system-file PATH` | — | System prompt from file. |
 | `--system TEXT` | — | Inline system prompt. |
-| `--preset NAME` | `balanced` | Initial preset. |
+| `--preset NAME` | `precise` | Initial preset. See [Sampling presets](#sampling-presets). |
 | `--no-think` | off | Strip `<think>…</think>` from output. |
 | `-q, --quiet` | off | Disable spinner glyph + ctx-fill gauge. |
 | `--temperature F` | per preset | Override temperature. |
@@ -483,7 +562,7 @@ fluent setters, call `ask()`. Header:
 | `.system(prompt)` | `string` | — | System prompt. |
 | `.sandbox(dir)` | `string` | — | Enable `fs_*` scoped to `dir`. |
 | `.allow_bash(on=true)` | `bool` | off | Register `bash`. |
-| `.preset(name)` | `string` | `balanced` | Sampling profile. |
+| `.preset(name)` | `string` | `precise` | Sampling profile. |
 | `.remote_model(id)` | `string` | — | Remote model id (remote mode only). |
 | `.temperature(t) / .top_p(p) / .top_k(k) / .min_p(p)` | scalar | per preset | Sampling overrides. |
 | `.on_token(cb)` | `function` | — | Streaming-token callback. |

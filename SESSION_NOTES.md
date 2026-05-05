@@ -305,6 +305,145 @@ Webui title default also flips to `"Deep"`.
 ## 5. Recent commits (most recent first)
 
 ```
+2026-05-05 — Tool surface + system prompt overhaul (single-day session,
+             ~25 commits). Driven by a production "models drift, use
+             bash for file work, ignore tools" report. Three big
+             changes plus a new doc.
+
+  Plan tool — tolerance shims + observation coalescing:
+    * args::get_array now unwraps a stringified JSON array
+      ("items": "[{...}]") — small/quantised models repeatedly
+      emit this shape. Same lenient pattern as get_string/get_int.
+    * Action inference when 'action' is missing: look at items'
+      fields and (for ambiguous cases) plan state to pick add /
+      update / delete. Plus synonym mapping (create → add,
+      remove → delete, etc.).
+    * `add` honours an optional per-item `status` so models can
+      create + mark "working" in one call.
+    * Plan::Batch RAII guard: coalesces on_change callbacks
+      across a tool call — was N renders for N items, now 1.
+    * Description rewritten in rag-style: action="X" sections,
+      Required/Optional per action, copy-pasteable example
+      payloads, role-prefixed param descriptions ("Used by add
+      / update / delete. ...").
+    * Fixed pre-existing stray '"' that made the schema invalid
+      JSON under strict parsers.
+    * Errors that teach: on rejection, the message includes the
+      correct shape inline ({action:"add",text:"..."}).
+
+  Built-in tools — described to the same standard:
+    * Polished 6 thin tools (datetime, read_file, write_file,
+      list_dir, glob, grep) with output-shape notes, examples,
+      param descriptions that lead with Required./Optional.
+      web_fetch / web_search / web_google / get_current_dir /
+      bash were already detailed and left alone.
+    * NEW tool: `get_sandbox_path` (alongside get_current_dir).
+      Pinned at registration to the configured root, so the
+      answer is always the truth — distinct from get_current_dir
+      which is the live cwd.
+    * `bash` description rewritten to LEAD with "PREFER fs tools",
+      list bash anti-patterns (cat > / cat <<EOF / echo > /
+      mkdir / sed -i) and which fs_* tool replaces each.
+      Reserves bash for shell features the dedicated tools don't
+      have (pipelines, find | xargs, build runners, git, etc).
+
+  Tool registration defaults:
+    * --sandbox <dir> NOW auto-registers fs_* + get_sandbox_path
+      (was: required separate --allow-fs).
+    * --allow-bash NOW also registers fs_* (bash is strictly
+      more permissive — allowing bash without fs_* is incoherent
+      and traps the model into using bash for file work).
+    * --allow-fs becomes implied by either flag; still works
+      explicitly for the no-sandbox / no-bash case.
+    * Toolbelt::tools() predicate + examples/cli.cpp wants()
+      lambda + examples/server.cpp arg wiring all updated
+      together.
+    * In-the-wild bug: a session with --allow-bash but no
+      --allow-fs produced a model with bash but no fs tools, so
+      it used cat > / sed -i for everything. Confirmed via raw
+      transaction log; new defaults eliminate the trap.
+
+  System prompt injection (easyai-cli):
+    * Two small blocks now prepend the user's --system /
+      --system-file content when the agent has any
+      create/mutate affordance:
+        [environment]  — absolute path of the sandbox root
+                         (saves the wasted "where am I" tool
+                         hop on turn 1)
+        [guidance]     — "PROTOTYPE FIRST. EXACTLY what the
+                         user asked, no more. Verify it runs.
+                         Surface ideas as a numbered list and
+                         ASK which the user wants. Do not apply
+                         them yourself. The user's request is
+                         the ceiling, not a starting point."
+    * Same guidance lives in server.cpp's Deep persona and
+      local.cpp's kBuiltinSystem so all three default-prompt
+      sites match.
+    * The PROTOTYPE-FIRST framing came from a second iteration —
+      previous "pick one and ship" didn't bound scope, models
+      kept adding features the user didn't ask for.
+
+  Default preset: balanced → precise everywhere:
+    * Library fallbacks (backend.cpp, cli_client.cpp,
+      presets.cpp), CLI defaults (server.cpp ServerArgs,
+      local.cpp CliArgs), webui PRESETS map + active button,
+      systemd installer INI templates (install_easyai_server.sh,
+      install_easyai_pi.sh).
+    * Tuned for code/math/factual Q&A — dominant use case for a
+      tool-calling agent.
+    * README §Sampling presets table rewritten with a Behaviour
+      column and a "Pick when…" column.
+
+  --show-system-prompt — added to all 4 binaries:
+    * easyai-cli, easyai-server, easyai-local, easyai-chat all
+      gain the flag. Each resolves the system prompt as if it
+      were about to run (built-in default → --system-file →
+      --system, plus the cli's [environment] / [guidance]
+      injection), prints, exits.
+    * Doesn't load the model, doesn't bind the port, doesn't
+      need --url on cli or -m on local. Pure diagnostic.
+    * easyai-cli sets EASYAI_NO_AUTO_LOG=1 in this mode so a
+      pure diagnostic doesn't leave an empty /tmp/*.log behind.
+
+  Graceful Ctrl-C in easyai-cli (interactive mode):
+    * Mid-turn first Ctrl-C / SIGTERM: prints
+      `<exiting: waiting for the ai session to be finished.
+      Ctrl-C again to force.>` and lets the in-flight chat
+      finish naturally. Exits rc=0 once the turn ends.
+      Conversation isn't truncated mid-stream.
+    * Second Ctrl-C: hard cancel (rc=130) — escape hatch.
+    * --quiet keeps the existing immediate-cancel for batch
+      scripts (kill <pid> still terminates immediately).
+    * Three new globals join g_signal_caught: g_quiet_mode,
+      g_in_chat, g_graceful_exit. Handler uses ::write to
+      STDERR_FILENO (printf isn't async-signal-safe).
+
+  Parser hardening (easyai-cli):
+    * need() lambda now refuses to consume the next argv as a
+      flag value if it starts with `--` — catches the typo
+      `--system --url X` (was: silently absorbed --url as the
+      value of --system, then "url required" later).
+    * --show-system-prompt joined --list-tools in the
+      only-local-diagnostic exemption so it works without
+      --url.
+
+  New doc: easyai-cli.md (552 lines, mirrors easyai-server.md).
+    Connection / modes / flags / tool registration / system
+    prompt + injection / sampling / reasoning / log /
+    management subcommands / 8 worked examples / cross-refs.
+    Cross-linked from README.md / easyai-server.md / manual.md.
+
+  Authoring guide: design.md §5 "Writing tool descriptions
+    reliably" (architectural) + manual.md §3.2.1 (cookbook).
+    Documents the rag-style pattern for multi-action tools
+    AND the lenient-handler tolerance shims (synonym mapping,
+    action inference, errors-that-teach, batch coalescing).
+    Pointer added from AI_TOOLS.md Chapter 9.
+
+  Linux portability fix: <limits.h> for PATH_MAX (not pulled
+    transitively on glibc); GCC warn_unused_result on write()
+    worked around with the assign-then-discard idiom.
+
 2026-05-05 — Plan tool redesign + HTTP retries everywhere + bumped
              timeout defaults + non-verbose timeout logging.
 

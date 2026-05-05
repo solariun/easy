@@ -468,7 +468,7 @@ You'll see something like:
 
 ```
 [easyai-local] loaded models/qwen2.5-1.5b-instruct-q4_k_m.gguf
-               backend=MTL0  ctx=4096  tools=7  preset=balanced
+               backend=MTL0  ctx=4096  tools=7  preset=precise
                type '/help' for commands, '/quit' to exit
 > what's 2+2
 2 + 2 equals 4.
@@ -2751,12 +2751,15 @@ systemd unit (the installer sets this).
 
 ### 8.5 Sampling
 
-Presets order:
-* `deterministic`  — temp 0.0, greedy.  Best for code / format-strict.
-* `precise`        — temp 0.2.  Default for tool-call workloads.
-* `balanced`       — temp 0.7.  Good general default.
-* `creative`       — temp 1.0, top_p 0.95.  Open-ended writing.
-* `wild`           — temp 1.4 + relaxed.  Brainstorming, comedy.
+Presets order (project-wide default is **`precise`**):
+* `deterministic`  — temp 0.0, greedy.  Same prompt → byte-identical reply. Reproducibility / CI / eval harnesses.
+* `precise`        — temp 0.2, min_p 0.10.  **Default.** Code, math, factual Q&A, tool-call workloads, structured output.
+* `balanced`       — temp 0.7.  General-purpose chat, summarisation, casual Q&A.
+* `creative`       — temp 1.0, top_p 0.95.  Brainstorming, fiction, marketing copy.
+* `wild`           — temp 1.4 + relaxed.  Pure exploration; don't ship it.
+
+See [`README.md` §Sampling presets](README.md#sampling-presets) for
+the full Behaviour / Pick when… table.
 
 Per-request: pin temp + top_p + top_k + min_p in the request body
 (via the `--temperature` / `--top-p` / etc. flags on cli-remote, or
