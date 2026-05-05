@@ -88,7 +88,7 @@ on the command line and stdin.
 | **REPL** | No `-p`, no positional prompt, stdin is a TTY | Interactive prompt loop. `Ctrl-D` to exit. History persists during the session. |
 | **One-shot** | `-p <text>` OR a positional argument | Send the single prompt, stream the reply, exit. |
 | **Piped** | stdin is a pipe (anything redirected in) | Reads stdin into the prompt and runs once. Same as one-shot. |
-| **Management** | `--list-models`, `--list-tools`, `--list-remote-tools`, `--health`, `--props`, `--metrics`, `--set-preset` | Hits the named endpoint, prints the result, exits. No chat. See [§12](#12-management-subcommands). |
+| **Management** | `--list-models`, `--list-tools`, `--list-remote-tools`, `--health`, `--props`, `--metrics`, `--set-preset`, `--show-system-prompt` | Hits the named endpoint (or, for `--show-system-prompt`, just resolves locally), prints the result, exits. No chat. See [§12](#12-management-subcommands). |
 
 The four are mutually exclusive: passing `-p` AND a management flag is
 an error.
@@ -178,6 +178,7 @@ See [§12](#12-management-subcommands) for the full picture.
 | `--props` | `GET /props`. |
 | `--metrics` | `GET /metrics` (Prometheus text). |
 | `--set-preset NAME` | `POST /v1/preset {preset:NAME}`. |
+| `--show-system-prompt` | Print the **resolved** system prompt (built-in `[environment]` + `[guidance]` injection PLUS `--system` / `--system-file` content) and exit. Does NOT contact the server — useful for confirming what the model would see, including without a working `--url`. |
 
 ### Misc
 
@@ -419,10 +420,12 @@ runs.
 | `--props` | `GET /props`. Server-side configuration dump. |
 | `--metrics` | `GET /metrics`. Prometheus exposition. |
 | `--set-preset NAME` | `POST /v1/preset {preset:NAME}`. Switches the server's ambient sampling preset (easyai-server extension). |
+| `--show-system-prompt` | Resolve and print the system prompt the CLI would send on the next turn — built-in `[environment]` + `[guidance]` injection plus any `--system` / `--system-file` content. Does NOT contact the server, so it works without a reachable `--url`. The fastest way to verify "is the model actually seeing my persona / sandbox / guidance?". |
 
 The connection flags (`--url`, `--api-key`, `--insecure-tls`,
 `--ca-cert`) apply to management subcommands the same way they apply to
-chat.
+chat. `--show-system-prompt` is the one exception — it never makes a
+network call and works without `--url`.
 
 ---
 
@@ -475,25 +478,27 @@ the rest of the catalog is whatever's in the explicit list.
 ### Confirming the system prompt
 
 ```bash
-easyai-cli --url http://ai.local:8080 \
-           --sandbox /tmp/foo --log-file /tmp/run.log \
-           "say hello"
-python3 -c "
-import json, re
-text = open('/tmp/run.log').read()
-for line in text.splitlines():
-    idx = line.find('{\"messages\"')
-    if idx < 0: continue
-    body = json.loads(line[idx:][:line.rfind('}')+1] if False else line[idx:line.rfind('}')+1])
-    for m in body.get('messages', []):
-        if m['role'] == 'system':
-            print(m['content']); break
-    break
-"
+easyai-cli --sandbox /tmp/foo --allow-bash --show-system-prompt
 ```
 
-Prints exactly what the model received, including the [environment] +
-[guidance] injection.
+Prints exactly what the model would receive on the next turn,
+including the resolved absolute path in `[environment]` and the
+`[guidance]` block. Doesn't contact the server — works without
+`--url`. Use this whenever you tweak `--system` / `--system-file` /
+`--sandbox` / `--allow-bash` and want to confirm the result before
+the chat starts.
+
+Equivalent `--system` overlay:
+
+```bash
+easyai-cli --sandbox /tmp/foo --allow-bash \
+           --system "You are a senior C++ engineer." \
+           --show-system-prompt
+```
+
+Output: `[environment]` block, `[guidance]` block, blank line, then
+your `You are a senior C++ engineer.` — same order the model sees them
+in the next request.
 
 ### Pipe a prompt
 

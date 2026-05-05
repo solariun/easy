@@ -47,7 +47,10 @@ bool LocalBackend::init(std::string & err) {
     for (const auto & ov : cfg.kv_overrides) engine.add_kv_override(ov);
 
     if (cfg.preset.name.empty()) {
-        if (const auto * p = find_preset("balanced")) cfg.preset = *p;
+        // Default to "precise" — tuned for code, math, factual Q&A, the
+        // dominant use case for an embedded agent. Override via cfg.preset
+        // before constructing the backend if you want looser sampling.
+        if (const auto * p = find_preset("precise")) cfg.preset = *p;
     }
     engine.temperature(cfg.preset.temperature)
           .top_p      (cfg.preset.top_p)

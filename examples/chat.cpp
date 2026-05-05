@@ -14,19 +14,31 @@
 int main(int argc, char ** argv) {
     std::string model_path, url;
     std::string system_prompt = "You are a helpful, concise assistant.";
+    bool show_system_prompt = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if      (a == "-m"       && i + 1 < argc) model_path     = argv[++i];
         else if (a == "--url"    && i + 1 < argc) url            = argv[++i];
         else if (a == "--system" && i + 1 < argc) system_prompt  = argv[++i];
+        else if (a == "--show-system-prompt")     show_system_prompt = true;
         else {
             std::fprintf(stderr,
-                "usage: %s (-m model.gguf | --url base) [--system PROMPT]\n",
+                "usage: %s (-m model.gguf | --url base) [--system PROMPT] "
+                "[--show-system-prompt]\n",
                 argv[0]);
             return 1;
         }
     }
+
+    // --show-system-prompt: dump the resolved prompt and exit before any
+    // backend is loaded or any network call is made. Doesn't need -m / --url.
+    if (show_system_prompt) {
+        std::fputs(system_prompt.c_str(), stdout);
+        std::fputc('\n', stdout);
+        return 0;
+    }
+
     if (model_path.empty() && url.empty()) {
         std::fprintf(stderr, "need -m model.gguf or --url base\n");
         return 1;

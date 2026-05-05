@@ -186,7 +186,9 @@ struct RemoteBackend::Impl {
 RemoteBackend::RemoteBackend(Config c) : p_(std::make_unique<Impl>()) {
     p_->cfg = std::move(c);
     if (p_->cfg.preset.name.empty()) {
-        if (const auto * pr = find_preset("balanced")) p_->cfg.preset = *pr;
+        // Default to "precise" (matches LocalBackend + easyai-server +
+        // easyai-local + easyai-cli — see src/presets.cpp for values).
+        if (const auto * pr = find_preset("precise")) p_->cfg.preset = *pr;
     }
     p_->rebuild();
 }

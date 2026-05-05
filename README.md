@@ -308,7 +308,7 @@ has a matching INI key (see [`easyai-server.md`](easyai-server.md) §1).
 | `--split-rag` | off | Opt back into the legacy seven `rag_*` tools instead of the default single `rag(action=…)` dispatcher. |
 | `--external-tools DIR` | — | Load every `EASYAI-*.tools` manifest in `DIR`. |
 | `--RAG DIR` | — | Enable RAG (default: one `rag(action=…)` tool; with `--split-rag`: seven `rag_*` tools). Persistent memory. |
-| `--preset NAME` | `balanced` | Ambient sampling preset. |
+| `--preset NAME` | `precise` | Ambient sampling preset. See [Sampling presets](#sampling-presets) for what each implies. |
 | `--temperature F` | per preset | Override temperature (0.0–2.0). |
 | `--top-p F` | per preset | Nucleus sampling p. |
 | `--top-k N` | per preset | Top-k cutoff. |
@@ -587,21 +587,44 @@ pattern. Header: [`include/easyai/cli.hpp`](include/easyai/cli.hpp).
 ### Sampling presets
 
 Named profiles applied via `--preset NAME` (binaries) or
-`Engine::set_sampling()` / `easyai::find_preset()` (lib).
-Numbers are baselines; `<preset> <number>` overrides
-temperature only.
+`Engine::set_sampling()` / `easyai::find_preset()` (lib). Numbers are
+baselines; `<preset> <number>` overrides temperature only. The
+project-wide **default is `precise`** — tuned for code, math, and
+factual Q&A, the dominant use case for a tool-calling agent. Override
+when you need looser sampling.
 
-| Name | temp | top_p | top_k | min_p | Use for |
-|---|---|---|---|---|---|
-| `deterministic` | 0.0 | 1.0 | 1 | 0.00 | Greedy decoding — same prompt always gives the same answer. |
-| `precise` | 0.2 | 0.95 | 40 | 0.10 | Code, math, factual Q&A. |
-| `balanced` | 0.7 | 0.95 | 40 | 0.05 | Default chat. |
-| `creative` | 1.0 | 0.95 | 40 | 0.05 | Brainstorm, fiction, surprising phrasing. |
-| `wild` | 1.4 | 0.98 | 60 | 0.00 | Maximum entropy, exploration. |
+| Name | temp | top_p | top_k | min_p | Behaviour | Pick when… |
+|---|---|---|---|---|---|---|
+| `deterministic` | 0.0 | 1.0 | 1 | 0.00 | Greedy: always picks the single most likely token. Same prompt → byte-identical answer every time. No randomness, no exploration. | You need reproducibility (CI, benchmarks, eval harnesses), or when even tiny variation breaks downstream parsing. |
+| `precise` (default) | 0.2 | 0.95 | 40 | 0.10 | Sticks to high-confidence tokens. Concise, follows instructions tightly, rarely contradicts itself or invents facts. min_p of 0.10 aggressively prunes low-probability tokens — good for stable tool calls and structured output. | Code generation, math, factual Q&A, RAG, tool-calling agents, structured output (JSON/SQL/cypher), anything you'd want to be "right" rather than "interesting". |
+| `balanced` | 0.7 | 0.95 | 40 | 0.05 | A bit of variety while still mostly committing to the most-likely answer. Phrasing varies between runs; the substance shouldn't. | General-purpose chat, summarisation, casual Q&A, anywhere you want natural-sounding prose without surprises. |
+| `creative` | 1.0 | 0.95 | 40 | 0.05 | More phrasing variety, occasional surprising word choices, willingness to take a less-obvious angle. | Brainstorming, fiction, marketing copy, ideation, anything where "interesting" beats "literal". |
+| `wild` | 1.4 | 0.98 | 60 | 0.00 | Maximum entropy. Frequently picks low-probability tokens; can wander off-topic, contradict itself, hallucinate. | Pure exploration, "show me something I wouldn't have thought of", stylistic experiments. Don't ship it. |
 
 Aliases (case-insensitive) recognised by `find_preset()`:
 `exact`→`precise`, `default`→`balanced`, `fun`→`creative`,
 `chaos`→`wild`, `greedy`→`deterministic`.
+
+Switching at runtime — three paths, same effect:
+
+```bash
+# CLI flag (start or restart)
+easyai-server --preset creative
+easyai-local  --preset balanced
+
+# Server endpoint (live, no restart)
+curl -s -X POST http://localhost:8080/v1/preset \
+     -H 'Content-Type: application/json' \
+     -d '{"preset":"creative"}'
+
+# easyai-cli helper
+easyai-cli --url $URL --set-preset creative
+```
+
+The webui's preset bar uses the same endpoint — clicking a button
+shifts every subsequent request server-wide. INI form for persistence
+is `[ENGINE] preset = precise` (see
+[`easyai-server.md`](easyai-server.md) §1).
 
 Header: [`include/easyai/presets.hpp`](include/easyai/presets.hpp).
 

@@ -90,7 +90,11 @@ struct CliArgs {
     // common config
     std::string system_path;
     std::string system_inline;
-    std::string preset = "balanced";
+    // Default preset: "precise" (temp=0.2, top_p=0.95, top_k=40, min_p=0.10).
+    // Tuned for code, math, and factual Q&A — the dominant use case for
+    // a local agent. Override with --preset (e.g. --preset balanced for
+    // looser sampling, --preset creative for brainstorming).
+    std::string preset = "precise";
     std::string prompt;          // -p one-shot mode; empty => REPL
     bool        no_think = false;
     bool        quiet    = false;   // --quiet/-q: disable spinner + ctx-% gauge
@@ -114,6 +118,7 @@ struct CliArgs {
     bool load_tools = true;
     std::string sandbox;        // empty = fs_* tools NOT registered
     bool allow_bash = false;    // explicit opt-in for `bash`
+    bool show_system_prompt = false;  // --show-system-prompt: dump and exit
     std::string external_tools_dir;     // optional external-tools dir (EASYAI-*.tools)
     std::string rag_dir;                 // optional RAG persistent-registry dir
     bool        split_rag = false;       // opt back into the legacy seven rag_*
@@ -139,7 +144,15 @@ struct CliArgs {
         "  -p, --prompt <text>           One-shot: run prompt, print, exit\n"
         "  -s, --system-file <path>      Read system prompt from file\n"
         "      --system <text>           Inline system prompt\n"
-        "      --preset <name>           Initial preset (default 'balanced')\n"
+        "      --show-system-prompt      Print the resolved system prompt\n"
+        "                                 (built-in default OR --system OR\n"
+        "                                  --system-file content) and exit.\n"
+        "                                 Doesn't load the model — useful for\n"
+        "                                 confirming what the model would see.\n"
+        "      --preset <name>           Initial preset (default 'precise').\n"
+        "                                 Choices: deterministic, precise,\n"
+        "                                 balanced, creative, wild. See\n"
+        "                                 README.md for what each implies.\n"
         "      --no-think                Strip <think>...</think> from output\n"
         "                                 (thinking is shown by default)\n"
         "  -q, --quiet                   Disable the spinner glyph + ctx-fill\n"
@@ -243,6 +256,7 @@ static CliArgs parse(int argc, char ** argv) {
         else if (s == "--external-tools")             a.external_tools_dir = need(i, "--external-tools");
         else if (s == "--RAG")                        a.rag_dir            = need(i, "--RAG");
         else if (s == "--split-rag")                  a.split_rag          = true;
+        else if (s == "--show-system-prompt")         a.show_system_prompt = true;
         // KV controls
         else if (s == "-ctk" || s == "--cache-type-k") a.cache_type_k = need(i, "-ctk");
         else if (s == "-ctv" || s == "--cache-type-v") a.cache_type_v = need(i, "-ctv");
@@ -252,7 +266,9 @@ static CliArgs parse(int argc, char ** argv) {
         else if (s == "-h" || s == "--help")          die_usage(argv[0]);
         else { std::fprintf(stderr, "unknown arg: %s\n", s.c_str()); die_usage(argv[0]); }
     }
-    if (a.model_path.empty()) {
+    // --show-system-prompt is a pure diagnostic: it doesn't load the
+    // model, so don't insist on -m for that path.
+    if (a.model_path.empty() && !a.show_system_prompt) {
         std::fprintf(stderr, "error: -m <model> is required\n\n");
         die_usage(argv[0]);
     }
@@ -318,8 +334,17 @@ int main(int argc, char ** argv) {
     }
     if (system_prompt.empty() && args.load_tools) system_prompt = kBuiltinSystem;
 
+    // --show-system-prompt: dump the resolved prompt to stdout and exit
+    // before any model is loaded. Doesn't need -m / a working sandbox /
+    // anything else — purely a "what would the model see?" diagnostic.
+    if (args.show_system_prompt) {
+        std::fputs(system_prompt.c_str(), stdout);
+        std::fputc('\n', stdout);
+        return 0;
+    }
+
     const easyai::Preset * p0 = easyai::find_preset(args.preset);
-    easyai::Preset preset = p0 ? *p0 : *easyai::find_preset("balanced");
+    easyai::Preset preset = p0 ? *p0 : *easyai::find_preset("precise");
     // Overlay any explicit --temperature/--top-p/--top-k/--min-p on top of the
     // chosen preset so the user's flags always win.
     if (args.temperature >= 0) preset.temperature = args.temperature;

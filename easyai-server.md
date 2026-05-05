@@ -133,7 +133,7 @@ Model loading and inference tunables.
 | `threads_batch` | int | `-tb`, `--threads-batch` | `0` (lib default) | CPU threads for batched inference. |
 | `batch` | int | `--batch` | `0` (follows ctx) | Logical batch size. |
 | `parallel` | int | `-np`, `--parallel` | `1` | Llama-server compat. |
-| `preset` | string | `--preset` | `balanced` | `deterministic` / `precise` / `balanced` / `creative` / `wild`. |
+| `preset` | string | `--preset` | `precise` | `deterministic` / `precise` / `balanced` / `creative` / `wild`. See [`README.md` §Sampling presets](README.md#sampling-presets) for what each implies. The installer drops `preset = precise` in the generated INI. |
 | `flash_attn` | bool | `-fa`, `--flash-attn` | `off` | Free perf on every backend that supports it. |
 | `mlock` | bool | `--mlock` | `off` | Pin model weights in RAM. Needs `LimitMEMLOCK=infinity` on the unit. |
 | `no_mmap` | bool | `--no-mmap` | `off` | Required with `mlock` for portability. |
@@ -210,7 +210,7 @@ port  = 8080
 [ENGINE]
 context = 32768
 ngl     = -1
-preset  = balanced
+preset = precise
 ```
 
 Runs on localhost only. MCP open (no `[MCP_USER]`). Auto-fit GPU.
@@ -237,7 +237,7 @@ context         = 128000
 ngl             = -1
 threads         = 16
 threads_batch   = 16
-preset          = balanced
+preset = precise
 flash_attn      = on
 cache_type_k    = q8_0
 cache_type_v    = q8_0
@@ -306,6 +306,7 @@ Binary-only flags (no INI equivalent):
 | --- | --- |
 | `--config <path>` | Override the default INI path (`/etc/easyai/easyai.ini`). |
 | `--no-mcp-auth` | Force `/mcp` open even if `[MCP_USER]` populated. Emergency override. |
+| `--show-system-prompt` | Resolve and print the persona (built-in `Deep` default OR `--system` OR `--system-file`, in the same precedence the running server uses) and exit before any port is bound or any model loads. Useful for operators inspecting the persona without bouncing the service. |
 | `-h`, `--help` | Print usage and exit. |
 
 ---

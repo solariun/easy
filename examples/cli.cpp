@@ -332,6 +332,7 @@ struct Options {
     bool        props             = false;
     bool        metrics           = false;
     std::string set_preset;
+    bool        show_system_prompt = false;   // print resolved prompt and exit
 };
 
 void usage(const char * argv0) {
@@ -497,6 +498,11 @@ void usage(const char * argv0) {
 "    --props                    GET /props\n"
 "    --metrics                  GET /metrics (Prometheus text)\n"
 "    --set-preset NAME          POST /v1/preset {preset:NAME}\n"
+"    --show-system-prompt       print the resolved system prompt (built-in\n"
+"                                injection PLUS --system / --system-file\n"
+"                                content) and exit. Doesn't need --url —\n"
+"                                useful for confirming the [environment] /\n"
+"                                [guidance] blocks landed.\n"
 "\n"
 "  Misc:\n"
 "    -h, --help                 this help\n",
@@ -575,6 +581,7 @@ bool parse_args(int argc, char ** argv, Options & o) {
         else if (a == "--props")          o.props       = true;
         else if (a == "--metrics")        o.metrics     = true;
         else if (a == "--set-preset")     o.set_preset  = need(i, "--set-preset");
+        else if (a == "--show-system-prompt") o.show_system_prompt = true;
         else if (a == "-h" || a == "--help") { usage(argv[0]); std::exit(0); }
         else if (!a.empty() && a[0] != '-' && o.prompt.empty()) {
             // Positional argument is treated as the one-shot prompt, so
@@ -1062,6 +1069,13 @@ int run_repl(easyai::Client & cli, easyai::Plan & plan,
 int main(int argc, char ** argv) {
     Options o;
     if (!parse_args(argc, argv, o)) { usage(argv[0]); return 2; }
+
+    // --show-system-prompt is a pure diagnostic — it never makes a
+    // network call. Suppress libeasyai-cli's auto-log open so we don't
+    // leave an empty /tmp/easyai-client-*.log behind on every invocation.
+    if (o.show_system_prompt && std::getenv("EASYAI_NO_AUTO_LOG") == nullptr) {
+        ::setenv("EASYAI_NO_AUTO_LOG", "1", /*overwrite=*/0);
+    }
     Style st = easyai::ui::detect_style();
 
     // Validate --sandbox up front so the user gets a clear error
@@ -1207,6 +1221,30 @@ int main(int argc, char ** argv) {
                                   : prefix + "\n" + o.system_prompt;
         }
     }
+
+    // --show-system-prompt: dump the resolved prompt (built-in injection
+    // + user --system / --system-file content) and exit before any HTTP
+    // call. Doesn't need a working --url. The output is exactly what
+    // would be sent to the server in the first request body's system
+    // message — useful for confirming that the [environment] /
+    // [guidance] blocks landed and that the user's persona is appended
+    // correctly.
+    if (o.show_system_prompt) {
+        if (o.system_prompt.empty()) {
+            std::fprintf(stderr,
+                "(no system prompt — neither --system, --system-file, "
+                "nor any tool that triggers the [environment] / [guidance] "
+                "injection. The server's default persona handles this turn.)\n");
+        } else {
+            std::fputs(o.system_prompt.c_str(), stdout);
+            std::fputc('\n', stdout);
+        }
+        // Tear down the log file if the libeasyai-cli auto-log path
+        // opened one — we made no HTTP call, so the log is empty noise.
+        if (log_fp) easyai::cli::close_log_tee(log_fp);
+        return 0;
+    }
+
     if (!o.system_prompt.empty())      cli.system(o.system_prompt);
     if (o.temperature       >= 0.0f)   cli.temperature(o.temperature);
     if (o.top_p             >= 0.0f)   cli.top_p(o.top_p);

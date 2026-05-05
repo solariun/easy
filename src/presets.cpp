@@ -131,8 +131,9 @@ PresetResult parse_preset(std::string_view line) {
         float v = 0.7f;
         if (!take_number(line, j, v)) return r;
         v = std::clamp(v, 0.0f, 2.0f);
-        // baseline = balanced, then override temperature
-        const Preset * b = find_preset("balanced");
+        // baseline = precise (matches the project-wide default), then
+        // override only temperature from the user's "temp <n>" line.
+        const Preset * b = find_preset("precise");
         r.temperature = v;
         r.top_p       = b->top_p;
         r.top_k       = b->top_k;

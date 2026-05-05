@@ -440,8 +440,8 @@ header.topbar h1 { font-size: 1rem; margin: 0; font-weight: 600; letter-spacing:
         <h3>preset</h3>
         <div class="preset-row" id="presetRow">
           <button data-p="deterministic">deterministic</button>
-          <button data-p="precise">precise</button>
-          <button data-p="balanced" class="active">balanced</button>
+          <button data-p="precise" class="active">precise</button>
+          <button data-p="balanced">balanced</button>
           <button data-p="creative">creative</button>
           <button data-p="wild">wild</button>
         </div>
@@ -628,17 +628,17 @@ function loadSettings(){
   try {
     const j = JSON.parse(localStorage.getItem('easyai-settings') || '{}');
     return Object.assign({
-      preset:       'balanced',
-      temperature:  PRESETS.balanced.temperature,
-      top_p:        PRESETS.balanced.top_p,
-      top_k:        PRESETS.balanced.top_k,
-      min_p:        PRESETS.balanced.min_p,
+      preset:       'precise',
+      temperature:  PRESETS.precise.temperature,
+      top_p:        PRESETS.precise.top_p,
+      top_k:        PRESETS.precise.top_k,
+      min_p:        PRESETS.precise.min_p,
       max_tokens:   0,            // 0 = no client cap
     }, j);
   } catch { return loadDefaultSettings(); }
 }
 function loadDefaultSettings(){
-  return Object.assign({ preset:'balanced', max_tokens: 0 }, PRESETS.balanced);
+  return Object.assign({ preset:'precise', max_tokens: 0 }, PRESETS.precise);
 }
 function saveSettings(){ localStorage.setItem('easyai-settings', JSON.stringify(state.settings)); }
 
@@ -2874,7 +2874,7 @@ static void route_preset(ServerCtx & ctx, const httplib::Request & req,
                          httplib::Response & res) {
     try {
         json b = json::parse(req.body);
-        std::string name = b.value("preset", "balanced");
+        std::string name = b.value("preset", "precise");
         const easyai::Preset * p = easyai::find_preset(name);
         if (!p) {
             res.status = 400;
@@ -3088,7 +3088,10 @@ static bool require_auth(const ServerCtx & ctx, const httplib::Request & req,
         "                                invocations need it explicitly. See\n"
         "                                RAG.md.\n"
         "\nModel tuning (apply on top of --preset):\n"
-        "      --preset <name>          Ambient preset (default 'balanced')\n"
+        "      --preset <name>          Ambient preset (default 'precise').\n"
+        "                                Choices: deterministic, precise,\n"
+        "                                balanced, creative, wild. See\n"
+        "                                README.md for what each implies.\n"
         "      --temperature <f>        Override temperature (0.0-2.0)\n"
         "      --top-p <f>              Override nucleus sampling p\n"
         "      --top-k <n>              Override top-k\n"
@@ -3147,6 +3150,13 @@ static bool require_auth(const ServerCtx & ctx, const httplib::Request & req,
         "  -v,  --verbose               Engine logs raw model output + parser\n"
         "                                 actions to stderr — useful for debugging\n"
         "                                 'why did it stop?' moments\n"
+        "       --show-system-prompt    Print the resolved persona (built-in\n"
+        "                                Deep default OR --system OR --system-\n"
+        "                                file content, in the same precedence\n"
+        "                                the running server uses) and exit\n"
+        "                                before any port is bound. Useful for\n"
+        "                                operators inspecting the persona\n"
+        "                                without bouncing the service.\n"
         "\nWebui:\n"
         "       --webui <mode>          'modern' (default — embedded llama-server-\n"
         "                                derived bundle) or 'minimal' (small inline UI)\n"
@@ -3202,7 +3212,11 @@ struct ServerArgs {
                                           // `rag(action=...)` dispatcher.
     std::string external_tools_dir; // optional: dir of EASYAI-*.tools files
     std::string rag_dir;             // optional: RAG persistent-registry dir
-    std::string preset     = "balanced";
+    // Default preset: "precise" (temp=0.2, top_p=0.95, top_k=40, min_p=0.10).
+    // Tuned for code, math, and factual Q&A — the dominant use case for
+    // a tool-calling agent. Override with --preset / `[ENGINE] preset` /
+    // POST /v1/preset (the webui's preset bar) at runtime.
+    std::string preset     = "precise";
     size_t      max_body   = 8u * 1024u * 1024u;
 
     // Authoritative date/time injection — see build_authoritative_preamble
@@ -3252,6 +3266,7 @@ struct ServerArgs {
     bool        reasoning      = true;   // enable_thinking flag default ON
     bool        no_think       = false;  // strip <think>…</think> from /v1 responses
     bool        verbose        = false;  // engine.verbose(true) — log model raw output
+    bool        show_system_prompt = false;  // print resolved persona and exit
 
     // webui rebrand
     std::string webui_title    = "Deep";   // the assistant's default name
@@ -3408,6 +3423,7 @@ static const std::vector<FlagDef> & kFlags() {
         // ----- toggles (SERVER) -----
         { {"--metrics"},           "SERVER", "metrics",        "metrics",        false, SET_BOOL_TRUE(&ServerArgs::metrics) },
         { {"-v","--verbose"},      "SERVER", "verbose",        "verbose",        false, SET_BOOL_TRUE(&ServerArgs::verbose) },
+        { {"--show-system-prompt"},"",       "",               "show_system_prompt", false, SET_BOOL_TRUE(&ServerArgs::show_system_prompt) },
         { {"--allow-fs"},          "SERVER", "allow_fs",       "allow_fs",       false, SET_BOOL_TRUE(&ServerArgs::allow_fs) },
         { {"--allow-bash"},        "SERVER", "allow_bash",     "allow_bash",     false, SET_BOOL_TRUE(&ServerArgs::allow_bash) },
         { {"--use-google"},        "SERVER", "use_google",     "use_google",     false, SET_BOOL_TRUE(&ServerArgs::use_google) },
@@ -3640,6 +3656,17 @@ int main(int argc, char ** argv) {
     }
     if (default_system.empty()) default_system = kBuiltinSystem;
 
+    // --show-system-prompt: dump the resolved persona and exit before
+    // any model loads or any port binds. Resolves --system / --system-file
+    // / built-in default in the same precedence the running server would.
+    // Useful for operators inspecting their persona without bouncing the
+    // service.
+    if (args.show_system_prompt) {
+        std::fputs(default_system.c_str(), stdout);
+        std::fputc('\n', stdout);
+        return 0;
+    }
+
     // Anchor process cwd to --sandbox before loading the external-tools
     // manifest: $SANDBOX placeholders in the manifest are resolved
     // against getcwd at load time, so chdir-ing here makes those
@@ -3674,7 +3701,10 @@ int main(int argc, char ** argv) {
 
     // Start with ambient preset, then overlay any explicit numeric overrides.
     {
-        easyai::Preset base = *easyai::find_preset("balanced");
+        // Fallback baseline matches args.preset's default ("precise") so an
+        // unknown preset name still lands somewhere sensible without
+        // diverging from the documented default.
+        easyai::Preset base = *easyai::find_preset("precise");
         if (const easyai::Preset * pp = easyai::find_preset(args.preset)) base = *pp;
         if (args.temperature >= 0) base.temperature = args.temperature;
         if (args.top_p       >= 0) base.top_p       = args.top_p;
