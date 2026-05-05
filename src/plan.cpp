@@ -122,6 +122,8 @@ Tool Plan::tool() {
         R"("items":{"type":"array","maxItems":20,)"
             R"("description":"Batch mode: real JSON array (NOT a string). )"
             R"(add  example: [{\"text\":\"step one\"},{\"text\":\"step two\"}]. )"
+            R"(add  may include optional status, e.g. )"
+            R"([{\"text\":\"first\",\"status\":\"working\"},{\"text\":\"next\"}]. )"
             R"(update example: [{\"id\":\"1\",\"status\":\"done\"}]. )"
             R"(delete example: [{\"id\":\"2\"}].",)"
             R"("items":{"type":"object","properties":{)"
@@ -155,8 +157,50 @@ Tool Plan::tool() {
         "Never re-add an existing step — use update to change its text or status.",
         kSchema,
         [self](const ToolCall & call) -> ToolResult {
-            const std::string action = args::get_string_or(
+            std::string action = args::get_string_or(
                 call.arguments_json, "action", "");
+
+            // Synonym tolerance — small models often pick a near-miss verb.
+            if      (action == "create" || action == "append" ||
+                     action == "insert" || action == "new")    action = "add";
+            else if (action == "modify" || action == "change" ||
+                     action == "edit"   || action == "set")    action = "update";
+            else if (action == "remove" || action == "rm")     action = "delete";
+            else if (action == "show"   || action == "get" ||
+                     action == "view")                         action = "list";
+
+            // Inference — many smaller models omit 'action' and rely on
+            // 'items' to convey intent. Disambiguate via plan state:
+            //   id missing or unknown    → add
+            //   id known + text/status   → update
+            //   id known, no text/status → delete
+            // Top-level fields fall back to the same heuristic.
+            if (action.empty()) {
+                std::vector<std::string> probe;
+                if (args::get_array(call.arguments_json, "items", probe) &&
+                    !probe.empty()) {
+                    std::string first_id = args::get_string_or(probe[0], "id", "");
+                    bool it_text   = args::has(probe[0], "text");
+                    bool it_status = args::has(probe[0], "status");
+                    bool id_known = false;
+                    if (!first_id.empty()) {
+                        for (const auto & it : self->items()) {
+                            if (it.id == first_id) { id_known = true; break; }
+                        }
+                    }
+                    if (!id_known)                action = "add";
+                    else if (it_text || it_status) action = "update";
+                    else                           action = "delete";
+                } else if (args::has(call.arguments_json, "text")) {
+                    action = "add";
+                } else if (args::has(call.arguments_json, "status")) {
+                    action = "update";
+                } else if (args::has(call.arguments_json, "id")) {
+                    action = "delete";
+                } else {
+                    action = "list";
+                }
+            }
 
             // ---- add ----
             if (action == "add") {
@@ -171,6 +215,11 @@ Tool Plan::tool() {
                         std::string t = args::get_string_or(e, "text", "");
                         if (t.empty()) continue;
                         std::string id = self->add(std::move(t));
+                        // Honor an optional per-item status so models can
+                        // create + mark "working" in one call.
+                        std::string s = args::get_string_or(e, "status", "");
+                        if (!s.empty() && s != "pending")
+                            self->update(id, "", s);
                         if (!ids.empty()) ids += ",";
                         ids += id;
                     }
