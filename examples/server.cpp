@@ -3557,6 +3557,21 @@ int main(int argc, char ** argv) {
         "the user steer. Lead with the answer; show work only when the user\n"
         "would need it.\n"
         "\n"
+        "## Think SHARP, not LONG\n"
+        "Reasoning is for deciding the next move, not for rehearsing the\n"
+        "answer or exploring tangents. Hard caps on the reasoning phase:\n"
+        "  - 3-5 short sentences before the first tool call or final\n"
+        "    answer; up to ~10 short bullets for genuinely complex tasks.\n"
+        "    Never paragraphs.\n"
+        "  - Telegraph style — drop \"I think\", \"Let me consider\",\n"
+        "    \"It seems\". One claim or decision per line.\n"
+        "  - Don't enumerate options you immediately reject. Pick the\n"
+        "    move and go; wrong moves get corrected from tool results.\n"
+        "  - Don't pre-compute the answer in reasoning then restate it\n"
+        "    visibly. Reasoning is for the agent loop; the visible reply\n"
+        "    is for the user.\n"
+        "  - More than ~5 sentences without a decision → STOP and act.\n"
+        "\n"
         "Answer directly for greetings, chitchat, math, and anything you\n"
         "already know — no tool needed.\n"
         "\n"
@@ -3581,6 +3596,10 @@ int main(int argc, char ** argv) {
         "  - Commands: bash (when registered).\n"
         "  - Host metrics: system_meminfo / loadavg / cpu_usage / swaps.\n"
         "  - Long-term memory: rag(action=…) save / append / search / load.\n"
+        "  - plan: action='add' (text or items[] up to 20), action='update'\n"
+        "    (id + status='working'|'done'|'error') to advance a step,\n"
+        "    action='delete' (id, or id='all') to retire one. NEVER re-add\n"
+        "    to mutate a step — use update.\n"
         "  - Cite URLs you actually fetched. Attach dates to dated facts\n"
         "    (\"released April 2026\" beats \"recently released\").\n"
         "\n"
@@ -5358,6 +5377,125 @@ int main(int argc, char ** argv) {
                   << "}"
                 << "});"
                 << "})();</script>";
+
+            // ----- block7: reasoning panel — kill double scrollbar +
+            //               auto-pin to bottom while streaming -----------
+            // The bundle's Reasoning collapsible nests two overflow:auto
+            // boxes (the Radix [data-slot="collapsible-content"] outer
+            // wrapper AND a content-block child with max-height). Both
+            // were rendering scrollbars at the same time, so the user
+            // saw a stacked pair on the right edge.
+            //
+            // Fix: force overflow:hidden on the OUTER (defence-in-depth
+            // on top of the CSS rule in webui/index.html — the
+            // bundle's class hashes change every rebuild and the static
+            // selector doesn't always win), find the inner scrollable
+            // by walking the subtree for the deepest element whose
+            // computed overflow-y is auto/scroll AND whose scrollHeight
+            // genuinely exceeds clientHeight, and pin it to the bottom
+            // on every content mutation.  User-initiated scroll-up
+            // pauses the auto-pin (typical chat-app behaviour: respect
+            // the reader who wants to look at older reasoning); coming
+            // back near the bottom resumes it.
+            inj <<
+              "<script>(()=>{"
+                "console.log('[easyai-inject] block7 reasoning-autoscroll');"
+                // Walk the panel subtree, return the innermost element
+                // whose computed overflow-y is auto/scroll AND has more
+                // content than fits.  Skips the panel itself when we've
+                // forced overflow:hidden on it (the OUTER fix).
+                "const findScrollable=(root)=>{"
+                  "if(!root)return null;"
+                  "const all=[root,...root.querySelectorAll('*')];"
+                  "let chosen=null;"
+                  "for(const el of all){"
+                    "const cs=getComputedStyle(el);"
+                    "const oy=cs.overflowY;"
+                    "if((oy==='auto'||oy==='scroll')"
+                      "&&el.scrollHeight>el.clientHeight+1){"
+                      "chosen=el;"           // innermost wins
+                    "}"
+                  "}"
+                  "return chosen;"
+                "};"
+                "const STATE=new WeakMap();"
+                "const NEAR_BOTTOM=24;"      // px tolerance
+                "const nearBottom=(el)=>"
+                  "(el.scrollHeight-el.scrollTop-el.clientHeight)<=NEAR_BOTTOM;"
+                "const wireOnce=(el)=>{"
+                  "if(STATE.has(el))return;"
+                  "STATE.set(el,{pinned:true});"
+                  // Track whether user wants to follow the bottom.
+                  // wheel/touch/key events flip pinned=false; once they
+                  // scroll back near the bottom we resume auto-pinning.
+                  "el.addEventListener('scroll',()=>{"
+                    "const st=STATE.get(el);"
+                    "if(!st)return;"
+                    "st.pinned=nearBottom(el);"
+                  "},{passive:true});"
+                  "el.scrollTop=el.scrollHeight;"
+                "};"
+                "const stick=(el)=>{"
+                  "const st=STATE.get(el);"
+                  "if(!st||st.pinned){"
+                    "el.scrollTop=el.scrollHeight;"
+                  "}"
+                "};"
+                "const seen=new WeakSet();"
+                "const isReasoningPanel=(panel)=>{"
+                  // Match by the trigger sibling/ancestor's text — only
+                  // touch reasoning collapsibles, leave any unrelated
+                  // ones (tools panel, citations, etc.) alone.
+                  "let p=panel;"
+                  "for(let i=0;i<5&&p;i++){"
+                    "const tr=p.querySelector"
+                      "?p.querySelector('[data-slot=\"collapsible-trigger\"]')"
+                      ":null;"
+                    "const t=tr?(tr.innerText||tr.textContent||'').trim():'';"
+                    "if(/^Reasoning/i.test(t))return true;"
+                    "p=p.parentElement;"
+                  "}"
+                  "return false;"
+                "};"
+                "const handle=(panel)=>{"
+                  "if(seen.has(panel))return;"
+                  "if(!isReasoningPanel(panel))return;"
+                  "seen.add(panel);"
+                  // Defence-in-depth: outer wrapper must not scroll.
+                  // The CSS rule in webui/index.html does the same job
+                  // statically; this inline fallback survives bundle
+                  // rebuilds that reshuffle the class names.
+                  "panel.style.setProperty('overflow','hidden','important');"
+                  "let tries=0;"
+                  "const tryWire=()=>{"
+                    "const sc=findScrollable(panel);"
+                    "if(sc&&sc!==panel){"
+                      "wireOnce(sc);"
+                      // Stick to bottom on any subsequent mutation.
+                      // Includes characterData so per-token text inserts
+                      // (the streaming case) trigger the pin.
+                      "new MutationObserver(()=>stick(sc)).observe(panel,{"
+                        "childList:true,subtree:true,characterData:true"
+                      "});"
+                      "stick(sc);"
+                      "return;"
+                    "}"
+                    "if(++tries<40)setTimeout(tryWire,150);"
+                  "};"
+                  "tryWire();"
+                "};"
+                "const sweep=()=>{"
+                  "document.querySelectorAll("
+                    "'[data-slot=\"collapsible-content\"]'"
+                  ").forEach(handle);"
+                "};"
+                "document.addEventListener('DOMContentLoaded',()=>{"
+                  "sweep();"
+                  "new MutationObserver(sweep).observe(document.body,"
+                    "{childList:true,subtree:true});"
+                "});"
+                "sweep();"
+              "})();</script>";
 
             // Splice immediately after <head>.
             const std::string head_open = "<head>";

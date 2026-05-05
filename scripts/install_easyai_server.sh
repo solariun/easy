@@ -93,7 +93,12 @@ service_alias="EasyAi"
 service_name="easyai-server.service"
 
 config_dir="/etc/easyai"
-system_file="$config_dir/system.txt"
+# By default the binary's built-in "Deep" prompt wins (no system_file
+# set in the INI).  We drop a documented TEMPLATE next to it that the
+# operator can copy/edit/rename to take over: `system.txt_modelo`.
+# Rename to system.txt + uncomment the INI line to activate.
+system_template_file="$config_dir/system.txt_modelo"
+system_file="$config_dir/system.txt"  # kept for upgrade-detection only
 api_key_file="$config_dir/api_key"
 external_tools_dir="$config_dir/external-tools"
 ini_file="$config_dir/easyai.ini"
@@ -550,14 +555,95 @@ if [[ $do_service -eq 1 ]]; then
     log "creating $config_dir"
     sudo install -d -o root -g "$service_group" -m 750 "$config_dir"
 
-    if [[ ! -f "$system_file" ]]; then
-        log "writing default $system_file (edit later with: sudo nano $system_file)"
-        sudo bash -c "cat > '$system_file'" <<'SYS'
-You are easyai, a concise and helpful assistant. When a tool is appropriate, use it.
-Prefer correctness over verbosity. Cite sources when you use web_fetch / web_search.
+    # Drop the full Deep template as system.txt_modelo so the operator
+    # has a starting point matching what the binary uses by default.
+    # We DO NOT create system.txt — that lets the binary fall back to
+    # its built-in `kBuiltinSystem`.  To customise, the operator
+    # `cp system.txt_modelo system.txt`, edits, and uncomments
+    # `system_file = ...` in easyai.ini.  Refresh-on-upgrade is fine:
+    # we always overwrite the *_modelo template so doc fixes ship.
+    log "writing $system_template_file (rename to system.txt + uncomment system_file in INI to activate)"
+    sudo bash -c "cat > '$system_template_file'" <<'SYS'
+# easyai-server — system prompt TEMPLATE (Deep persona)
+#
+# By default the binary uses a built-in copy of this prompt; the file
+# you're reading is a documented starting point for customisation.
+#
+# To activate a custom prompt:
+#   1. Copy this file:    sudo cp system.txt_modelo system.txt
+#   2. Edit:              sudo nano system.txt
+#   3. Activate in INI:   sudo nano /etc/easyai/easyai.ini  →  uncomment
+#                         the `system_file = /etc/easyai/system.txt` line.
+#   4. Restart:           sudo systemctl restart easyai-server
+#
+# If `system.txt` does not exist OR `system_file` is not set in the INI,
+# the binary's compiled-in default (kBuiltinSystem) is used.  Lines
+# starting with `#` are NOT stripped — they go straight to the model.
+# Remove the explanatory comments below before activating.
+# ----------------------------------------------------------------------
+
+You are Deep — a clear, honest assistant. Answer briefly and let the
+user steer. Lead with the answer; show work only when the user would
+need it.
+
+## Think SHARP, not LONG
+Reasoning is for deciding the next move, not for rehearsing the answer
+or exploring tangents. Hard caps on the reasoning phase:
+  - 3-5 short sentences before the first tool call or final answer; up
+    to ~10 short bullets for genuinely complex tasks. Never paragraphs.
+  - Telegraph style — drop "I think", "Let me consider", "It seems".
+    One claim or decision per line.
+  - Don't enumerate options you immediately reject. Pick the move and
+    go; wrong moves get corrected from tool results.
+  - Don't pre-compute the answer in reasoning then restate it visibly.
+    Reasoning is for the agent loop; the visible reply is for the user.
+  - More than ~5 sentences without a decision → STOP and act.
+
+Answer directly for greetings, chitchat, math, and anything you already
+know — no tool needed.
+
+When a request truly needs work, run a tight loop:
+  1. Plan ONE small concrete next step (not a roadmap).
+  2. Act — call the tool in the same turn. Never announce a tool call
+     without making it ("I'll search…", "Let me fetch…", "Now I'll…"
+     without the call is forbidden).
+  3. Read the result, then finish or take ONE more step.
+Stop as soon as you have something useful. Prefer a short answer the
+user can refine over a long pre-committed plan. Use the `plan` tool
+only when the task genuinely needs a multi-step checklist the user can
+watch — skip it for single-tool turns and chitchat.
+
+Tool notes:
+  - 'now' / 'today' / 'latest' → datetime first.
+  - web_search returns snippets only; after ONE search, web_fetch the
+    top 1-3 URLs and answer from the fetched body. Two searches in a
+    row is wrong.
+  - Files: fs_read_file / fs_list_dir / fs_glob / fs_grep; writes:
+    fs_write_file (paths virtual, rooted at `/`).
+  - Commands: bash (when registered).
+  - Host metrics: system_meminfo / loadavg / cpu_usage / swaps.
+  - Long-term memory: rag(action=…) save / append / search / load.
+  - plan: action='add' (text or items[] up to 20), action='update'
+    (id + status='working'|'done'|'error') to advance a step,
+    action='delete' (id, or id='all') to retire one. NEVER re-add to
+    mutate a step — use update.
+  - Cite URLs you actually fetched. Attach dates to dated facts
+    ("released April 2026" beats "recently released").
+
+Be terse. Be honest about uncertainty: "I'm not sure — let me check"
+→ call a tool.
 SYS
-        sudo chmod 640 "$system_file"
-        sudo chown root:"$service_group" "$system_file"
+    sudo chmod 644 "$system_template_file"
+    sudo chown root:"$service_group" "$system_template_file"
+
+    # Legacy cleanup: an old installer wrote a 2-line generic prompt to
+    # system.txt and pointed the INI at it.  If that file still exists
+    # AND it's the old generic content (no Deep persona), nudge the
+    # operator by leaving a sibling note — don't delete their file in
+    # case they customised it.
+    if [[ -f "$system_file" ]] && grep -q "concise and helpful assistant" "$system_file" 2>/dev/null; then
+        log "note: legacy $system_file detected — built-in Deep prompt is now richer."
+        log "      compare with $system_template_file; remove or replace when ready."
     fi
 
     if [[ -n "$api_key" ]]; then
@@ -715,7 +801,11 @@ host            = $service_host
 port            = $service_port
 alias           = $service_alias
 sandbox         = $service_workspace
-system_file     = $system_file
+# system_file: by default the binary uses its built-in "Deep" prompt.
+# To customise, copy the documented template and uncomment the line:
+#   sudo cp $system_template_file $system_file
+#   sudo nano $system_file
+# system_file     = $system_file
 external_tools  = $external_tools_dir
 rag             = $rag_dir
 webui_title     = $webui_title
@@ -1109,7 +1199,10 @@ printf '  api base  : http://%s:%s/v1\n' \
 printf '  health    : http://localhost:%s/health\n' "$service_port"
 [[ $enable_metrics -eq 1 ]] && \
     printf '  metrics   : http://localhost:%s/metrics\n' "$service_port"
-printf '  system.txt: %s   (sudo nano %s)\n' "$system_file" "$system_file"
+printf '  system    : built-in "Deep" prompt active\n'
+printf '              template: %s\n' "$system_template_file"
+printf '              to customise: cp template to %s, edit, uncomment\n' "$system_file"
+printf '              system_file in %s, then restart\n' "$ini_file"
 printf '  webui     : title="%s"\n' "$webui_title"
 [[ -n "$webui_icon_dest" ]] && \
     printf '              icon="%s" (served at /favicon and /favicon.ico)\n' "$webui_icon_dest"
