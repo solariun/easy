@@ -4,10 +4,15 @@
 // manipulate via one Tool with sub-actions.  When wired into either an
 // Engine or a Client, the model can:
 //
-//   plan(action="add",   text="...")    → adds a pending item, returns id
-//   plan(action="start", id="...")      → marks doing
-//   plan(action="done",  id="...")      → marks done
-//   plan(action="list")                 → returns the markdown checklist
+//   plan(action="add",    text="...")                 → new pending step
+//   plan(action="add",    items=[{text}, ...])        → batch add (max 20)
+//   plan(action="update", id="...", status="done")    → change status/text
+//   plan(action="update", items=[{id,status?,...}])   → batch update
+//   plan(action="delete", id="..." | id="all")        → mark deleted / clear
+//   plan(action="delete", items=[{id}, ...])          → batch delete
+//   plan(action="list")                               → return checklist
+//
+// Statuses: pending, working, done, error, deleted.
 //
 // The Plan owns an in-memory vector and fires on_change after every
 // mutation so the UI / stdout can re-render the checklist live.
@@ -25,7 +30,7 @@ namespace easyai {
 struct PlanItem {
     std::string id;       // monotonic "1", "2", ...
     std::string text;
-    std::string status;   // "pending" | "doing" | "done"
+    std::string status;   // "pending" | "working" | "done" | "error" | "deleted"
 };
 
 class Plan {
@@ -44,23 +49,29 @@ public:
     // long as the Engine / Client holds the Tool.
     Tool tool();
 
-    // Subscribers fire on every mutation (add/start/done/clear).
+    // Subscribers fire on every mutation (add/update/delete/clear).
     void on_change(ChangeCallback cb);
 
     // Read-only access.
     const std::vector<PlanItem> & items() const;
     bool empty() const;
 
-    // Render as a GitHub-style markdown checklist (`- [ ] / [~] / [x]`).
-    void render(std::ostream & out) const;
-    std::string render_string() const;
+    // Render as a GitHub-style markdown checklist.
+    // When color=true, emits ANSI codes: bold for active items, dim for
+    // done, red for error, strikethrough+dim for deleted.
+    void render(std::ostream & out, bool color = false) const;
+    std::string render_string(bool color = false) const;
 
     // Manual mutation (for callers that want to seed items before the
     // model takes over, or reset between runs).
-    std::string add  (std::string text);     // returns the new id
-    bool        start(const std::string & id);
-    bool        done (const std::string & id);
-    void        clear();
+    std::string add   (std::string text);     // returns the new id
+    bool        update(const std::string & id,
+                       const std::string & text,
+                       const std::string & status);
+    bool        remove(const std::string & id);  // marks as "deleted"
+    bool        start (const std::string & id);  // shorthand → "working"
+    bool        done  (const std::string & id);  // shorthand → "done"
+    void        clear ();
 
 private:
     std::vector<PlanItem>          items_;

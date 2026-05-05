@@ -175,7 +175,7 @@ void print_presets(const Style & st, std::FILE * out) {
 void render_plan(const Plan & plan, const Style & st, std::FILE * out) {
     std::fprintf(out, "\n%s── plan ──%s\n", st.yellow(), st.reset());
     std::ostringstream ss;
-    plan.render(ss);
+    plan.render(ss, st.color);
     std::fputs(ss.str().c_str(), out);
     std::fputc('\n', out);
     std::fflush(out);
@@ -388,7 +388,7 @@ Streaming & Streaming::attach(Plan & plan) {
     plan.on_change([this](const Plan & p){
         std::ostringstream ss;
         ss << "\n" << style_.yellow() << "── plan ──" << style_.reset() << "\n";
-        p.render(ss);
+        p.render(ss, style_.color);
         ss << "\n";
         spinner_.write(ss.str());
     });

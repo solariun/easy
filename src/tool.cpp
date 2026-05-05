@@ -267,5 +267,53 @@ bool has(const std::string & json, const std::string & key) {
     return find_key(json, key) != std::string::npos;
 }
 
+bool get_array(const std::string & json, const std::string & key,
+               std::vector<std::string> & out) {
+    size_t i = find_key(json, key);
+    if (i == std::string::npos) return false;
+    i = skip_ws(json, i);
+    if (i >= json.size() || json[i] != '[') return false;
+    ++i;
+    out.clear();
+    i = skip_ws(json, i);
+    if (i < json.size() && json[i] == ']') return true;
+
+    while (i < json.size()) {
+        i = skip_ws(json, i);
+        if (i >= json.size()) return false;
+        if (json[i] == ']') return true;
+
+        size_t start = i;
+        int depth = 0;
+        bool in_str = false;
+        while (i < json.size()) {
+            char c = json[i];
+            if (in_str) {
+                if (c == '\\') { i += 2; continue; }
+                if (c == '"') in_str = false;
+                ++i;
+                continue;
+            }
+            if (c == '"')            { in_str = true; ++i; continue; }
+            if (c == '{' || c == '[') { ++depth; ++i; continue; }
+            if (c == '}' || c == ']') {
+                if (depth == 0) break;
+                --depth; ++i; continue;
+            }
+            if (c == ',' && depth == 0) break;
+            ++i;
+        }
+
+        size_t end = i;
+        while (end > start &&
+               std::isspace(static_cast<unsigned char>(json[end - 1]))) --end;
+        if (end > start) out.push_back(json.substr(start, end - start));
+
+        if (i >= json.size()) return false;
+        if (json[i] == ',') { ++i; continue; }
+    }
+    return true;
+}
+
 }  // namespace args
 }  // namespace easyai

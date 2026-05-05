@@ -106,6 +106,12 @@ namespace args {
     // True when `key` appears at top level with any value (string, number,
     // bool, null, array, object).  Useful for "did the model fill this in?".
     bool has(const std::string & json, const std::string & key);
+
+    // Extract elements of a JSON array at `key` into `out`.
+    // Each element is returned as a raw JSON substring (e.g. the full
+    // object text for [{...}, {...}]).  Handles nested brackets/strings.
+    bool get_array(const std::string & json, const std::string & key,
+                   std::vector<std::string> & out);
 }
 
 }  // namespace easyai
