@@ -37,10 +37,12 @@
 #   ./install_easyai_server.sh --backend vulkan      # force backend
 #   ./install_easyai_server.sh --service-port 8080
 #   ./install_easyai_server.sh --service-host 0.0.0.0
-#   ./install_easyai_server.sh --ctx-size 32768   # default 65536 (64 K)
+#   ./install_easyai_server.sh --ctx-size 32768   # default 100000 (100 K)
 #   ./install_easyai_server.sh --ngl 99            # GPU layers (-1=auto, 0=CPU)
 #   ./install_easyai_server.sh --no-mlock --use-mmap
-#   ./install_easyai_server.sh --repeat-penalty 1.15  # default 1.15 (anti-loop)
+#   ./install_easyai_server.sh --temperature 0.7 --top-k 40 --min-p 0.05
+#   ./install_easyai_server.sh --repeat-penalty 1.15  # default 1.0 (off; min_p handles it)
+#   ./install_easyai_server.sh --http-timeout 86400   # default 24h, matches cli
 #   ./install_easyai_server.sh --webui-title "AI Box"
 #   ./install_easyai_server.sh --webui-icon /path/to/logo.svg   # ico|png|svg|gif|jpg|webp
 #   ./install_easyai_server.sh --upgrade             # git pull + rebuild
@@ -116,12 +118,10 @@ ini_file="$config_dir/easyai.ini"
 # in /etc, agent-generated state goes in /var/lib (FHS).
 rag_dir="/var/lib/easyai/rag"
 
-# 64 K context — generous for any single conversation (multi-hour bash /
-# coding sessions rarely accumulate beyond ~30 K useful tokens before the
-# model loses coherence).  Was 128 K; lowered to free GTT for more headroom
-# on iGPU systems (KV cache shrinks ~2× per halved context).  Override with
-# --ctx-size for very long agentic flows that need it.
-ctx_size=65536
+# 100 K context — generous for any single conversation while still leaving
+# headroom on iGPU systems (KV cache scales linearly with context).
+# Override with --ctx-size for very long agentic flows that need it.
+ctx_size=100000
 # --ngl: -1 = auto-fit (llama.cpp picks how many layers fit, leaving ≥1 GiB
 # of GPU memory free).  On iGPUs with sufficient GTT this offloads ALL
 # layers including KV cache, so CPU-side RSS stays small (<1 GiB).
@@ -133,25 +133,45 @@ webui_icon=""                                 # --webui-icon <path/to/.ico|.png|
 webui_icon_dest="$config_dir/favicon"         # final installed path under /etc/easyai
 n_threads_default="$jobs"
 n_threads_batch_default="$jobs"
-preset="precise"
+preset="precise"                              # written commented in the INI; engine
+                                              # picks "precise" when no preset is set
 thinking="on"
 enable_metrics=1
 enable_flash_attn=1
-enable_verbose=0                              # adds --verbose to ExecStart (noisy)
-cache_type_k="q8_0"
-cache_type_v="q8_0"
+enable_verbose=1                              # writes verbose=on into the INI;
+                                              # operator's primary debug switch
+cache_type_k="q8_0"                           # K cache: q8_0 — attention scores
+                                              # need precision; quantizing K hurts
+                                              # more than V
+cache_type_v="q4_0"                           # V cache: q4_0 — values are softmax-
+                                              # weighted-summed so quantization
+                                              # noise gets smoothed.  Asymmetric
+                                              # split saves ~25 % of KV memory at
+                                              # near-zero quality cost on chat /
+                                              # short-context workloads
 mlock=1                                       # pin small CPU residue (embeddings,
                                               # scratch) — most weights are on GPU.
 # no_mmap=0 lets the kernel mmap the GGUF.  With full GPU offload the file
 # is only read at LOAD time, after which weights live on GPU; mmap'ing it
 # means the load-time RSS peak drops by several GB (no anonymous-copy
-# transient).  Was 1; flipped to 0 because GPU offload makes the
-# "keep weights resident on CPU" rationale moot.  Override with --no-mmap.
+# transient).  Override with --no-mmap.
 no_mmap=0
-# Anti-loop sampler floor.  1.15 breaks the "I'll write types.h / Let me
-# write types.h / OK creating types.h" mode-collapse pattern that
-# thinking models slip into when temperature is low.  1.0 disables.
-repeat_penalty="1.15"
+# HTTP read+write timeout for the listen socket AND the MCP-client connection.
+# 86400 (24 h) matches easyai-cli's default --timeout, so multi-hour agentic
+# sessions don't get cut by either side.  Reduce for public-facing servers
+# where slow-loris resilience matters more than long-thinking-turn support.
+http_timeout=86400
+# Sampling defaults written into [ENGINE] ACTIVE (not commented).  Tuned for
+# code / agent workloads on this hardware: low temperature for determinism,
+# top-* for some tail diversity, min_p as the adaptive cutoff for confident
+# tokens, repeat_penalty=1.0 (no penalty — paired with min_p=0.10, the model
+# has enough sampling discipline that the anti-loop floor is unnecessary).
+temperature="0.3"
+top_p="0.95"
+top_k=64
+min_p="0.10"
+repeat_penalty="1.0"
+max_tokens=-1
 api_key=""                                    # leave empty to skip auth (open server)
 
 model_src=""                                  # required when --no-model NOT passed
@@ -205,6 +225,12 @@ while [[ $# -gt 0 ]]; do
         --use-mmap)         no_mmap=0; shift ;;
         --no-mmap)          no_mmap=1; shift ;;
         --repeat-penalty)   repeat_penalty="$2"; shift 2 ;;
+        --temperature)      temperature="$2"; shift 2 ;;
+        --top-p)            top_p="$2"; shift 2 ;;
+        --top-k)            top_k="$2"; shift 2 ;;
+        --min-p)            min_p="$2"; shift 2 ;;
+        --max-tokens)       max_tokens="$2"; shift 2 ;;
+        --http-timeout)     http_timeout="$2"; shift 2 ;;
         --api-key)          api_key="$2"; shift 2 ;;
         --model)            model_src="$2"; shift 2 ;;
         --copy-model)       copy_model=1; shift ;;
@@ -315,7 +341,10 @@ printf '    threads / batch  = %s / %s\n' "$n_threads_default" "$n_threads_batch
 printf '    preset           = %s  thinking=%s\n' "$preset" "$thinking"
 printf '    KV cache         = K=%s  V=%s  flash_attn=%s\n' "$cache_type_k" "$cache_type_v" "$enable_flash_attn"
 printf '    memory           = mlock=%s  no_mmap=%s\n' "$mlock" "$no_mmap"
-printf '    repeat_penalty   = %s   (1.15 = anti-loop default; 1.0 disables)\n' "$repeat_penalty"
+printf '    http_timeout     = %ss\n' "$http_timeout"
+printf '    sampling         = temp=%s top_p=%s top_k=%s min_p=%s\n' \
+                                 "$temperature" "$top_p" "$top_k" "$min_p"
+printf '                       repeat_penalty=%s  max_tokens=%s\n' "$repeat_penalty" "$max_tokens"
 printf '    metrics          = %s\n' "$enable_metrics"
 printf '    verbose          = %s\n' "$enable_verbose"
 printf '    webui_title      = %s\n' "$webui_title"
@@ -575,33 +604,17 @@ if [[ $do_service -eq 1 ]]; then
     log "creating $config_dir"
     sudo install -d -o root -g "$service_group" -m 750 "$config_dir"
 
-    # Drop the full Deep template as system.txt_modelo so the operator
-    # has a starting point matching what the binary uses by default.
-    # We DO NOT create system.txt — that lets the binary fall back to
-    # its built-in `kBuiltinSystem`.  To customise, the operator
-    # `cp system.txt_modelo system.txt`, edits, and uncomments
-    # `system_file = ...` in easyai.ini.  Refresh-on-upgrade is fine:
-    # we always overwrite the *_modelo template so doc fixes ship.
-    log "writing $system_template_file (rename to system.txt + uncomment system_file in INI to activate)"
-    sudo bash -c "cat > '$system_template_file'" <<'SYS'
-# easyai-server — system prompt TEMPLATE (Deep persona)
-#
-# By default the binary uses a built-in copy of this prompt; the file
-# you're reading is a documented starting point for customisation.
-#
-# To activate a custom prompt:
-#   1. Copy this file:    sudo cp system.txt_modelo system.txt
-#   2. Edit:              sudo nano system.txt
-#   3. Activate in INI:   sudo nano /etc/easyai/easyai.ini  →  uncomment
-#                         the `system_file = /etc/easyai/system.txt` line.
-#   4. Restart:           sudo systemctl restart easyai-server
-#
-# If `system.txt` does not exist OR `system_file` is not set in the INI,
-# the binary's compiled-in default (kBuiltinSystem) is used.  Lines
-# starting with `#` are NOT stripped — they go straight to the model.
-# Remove the explanatory comments below before activating.
-# ----------------------------------------------------------------------
-
+    # We drop TWO files:
+    #   * system.txt_modelo — refreshed on every upgrade, the canonical
+    #     reference operators can always restore from
+    #   * system.txt       — created on FIRST INSTALL only.  Operators
+    #     edit it without losing their changes on --upgrade.  The INI
+    #     `system_file = …` line points here.
+    #
+    # The Deep prompt lives in $system_prompt_body (defined below);
+    # both files share the same content but the *_modelo file gets a
+    # short header explaining how to restore.
+    system_prompt_body=$(cat <<'PROMPT'
 You are Deep — a clear, honest assistant. Answer briefly and let the
 user steer. Lead with the answer; show work only when the user would
 need it.
@@ -652,18 +665,44 @@ Tool notes:
 
 Be terse. Be honest about uncertainty: "I'm not sure — let me check"
 → call a tool.
-SYS
+PROMPT
+)
+
+    # Always refresh the *_modelo reference (the operator's "factory reset" copy).
+    log "writing $system_template_file (reference / restore-from copy, refreshed on upgrade)"
+    sudo bash -c "cat > '$system_template_file'" <<MODELO
+# easyai-server — system prompt TEMPLATE (Deep persona)
+#
+# This file is REFRESHED on every --upgrade.  It's the canonical copy
+# of the default Deep prompt — restore from here if you ever need to
+# undo edits to system.txt:
+#
+#     sudo cp $system_template_file $system_file
+#     sudo systemctl restart easyai-server
+#
+# The active prompt is /etc/easyai/system.txt (referenced from
+# easyai.ini's [SERVER] system_file).  Edit that one — your changes
+# survive --upgrade.  Lines starting with # are NOT stripped; they go
+# straight to the model.
+# ----------------------------------------------------------------------
+
+$system_prompt_body
+MODELO
     sudo chmod 644 "$system_template_file"
     sudo chown root:"$service_group" "$system_template_file"
 
-    # Legacy cleanup: an old installer wrote a 2-line generic prompt to
-    # system.txt and pointed the INI at it.  If that file still exists
-    # AND it's the old generic content (no Deep persona), nudge the
-    # operator by leaving a sibling note — don't delete their file in
-    # case they customised it.
-    if [[ -f "$system_file" ]] && grep -q "concise and helpful assistant" "$system_file" 2>/dev/null; then
-        log "note: legacy $system_file detected — built-in Deep prompt is now richer."
-        log "      compare with $system_template_file; remove or replace when ready."
+    # Drop system.txt only on FIRST INSTALL.  Operators editing the
+    # active prompt keep their changes through --upgrade; if they want
+    # the new defaults they `cp system.txt_modelo system.txt` manually.
+    if [[ ! -f "$system_file" ]]; then
+        log "writing $system_file (active system prompt; safe to edit, survives --upgrade)"
+        sudo bash -c "cat > '$system_file'" <<SYS
+$system_prompt_body
+SYS
+        sudo chmod 640 "$system_file"
+        sudo chown root:"$service_group" "$system_file"
+    else
+        log "preserving existing $system_file (operator edits kept through --upgrade)"
     fi
 
     if [[ -n "$api_key" ]]; then
@@ -821,19 +860,26 @@ host            = $service_host
 port            = $service_port
 alias           = $service_alias
 sandbox         = $service_workspace
-# system_file: by default the binary uses its built-in "Deep" prompt.
-# To customise, copy the documented template and uncomment the line:
-#   sudo cp $system_template_file $system_file
-#   sudo nano $system_file
-# system_file     = $system_file
+system_file     = $system_file
 external_tools  = $external_tools_dir
 rag             = $rag_dir
 webui_title     = $webui_title
 metrics         = $([[ "$enable_metrics" -eq 1 ]] && echo on || echo off)
-verbose         = $([[ "$enable_verbose" -eq 1 ]] && echo on || echo off)
 allow_fs        = off
 allow_bash      = off
 max_body        = 8388608
+
+# HTTP read+write timeout for BOTH the listen socket AND the MCP-client
+# connection. 86400 (24 h) matches easyai-cli's --timeout default, so
+# multi-hour agentic sessions don't get cut by either side. Reduce for
+# public-facing servers where slow-loris resilience matters more than
+# long-thinking-turn support.
+http_timeout    = $http_timeout
+
+# Verbose: ON by default in the installer so the journal carries enough
+# detail to diagnose model misbehaviour, retries, and tool failures.
+# Switch to off if the journalctl noise is a problem in production.
+verbose         = $([[ "$enable_verbose" -eq 1 ]] && echo on || echo off)
 
 # /mcp authentication
 # ----------------------------------------------------------------
@@ -850,48 +896,25 @@ mcp_auth        = off
 # [ENGINE] — model loading and inference tunables
 # ============================================================
 [ENGINE]
-# Context window.  64 K is generous for any conversation; bump to 128 K /
-# 250 K only if you genuinely need it (KV cache eats GTT proportionally).
 context         = $ctx_size
-# ngl=-1 → auto-fit.  llama.cpp tries to offload every layer (incl. KV
-# cache) to GPU and reduces only if it doesn't fit, leaving ≥ 1 GiB free
-# device memory.  On iGPUs with enough GTT this means CPU-side RSS stays
-# under 1 GiB after load.
 ngl             = $ngl
 threads         = $n_threads_default
 threads_batch   = $n_threads_batch_default
-preset          = $preset
-# Flash attention reduces KV memory + speeds up prompt eval.  Free perf
-# on every backend that supports it (Vulkan / CUDA / Metal — all do).
+
+#preset          = $preset
 flash_attn      = $([[ "$enable_flash_attn" -eq 1 ]] && echo on || echo off)
-# KV cache quant: q8_0 keeps accuracy ~indistinguishable from f16 at half
-# the memory.  Drop to q4_0 if you need to squeeze more context into a
-# tight GTT budget — ~10 % accuracy hit on long-range recall.
 cache_type_k    = $cache_type_k
 cache_type_v    = $cache_type_v
-# mlock pins the small CPU-side residue (embeddings + scratch) so the
-# kernel doesn't page it out under pressure.  With full GPU offload this
-# is typically <1 GiB.
 mlock           = $([[ "$mlock" -eq 1 ]] && echo on || echo off)
-# no_mmap=off lets the kernel mmap the GGUF.  With full offload the file
-# is only read at load time; mmap drops the load-time RSS peak by several
-# GB.  Set on if you observe page-cache eviction churn under heavy load.
 no_mmap         = $([[ "$no_mmap" -eq 1 ]] && echo on || echo off)
 
-# Sampling overrides.
-#
-# repeat_penalty = 1.15 is the anti-loop default — breaks the
-# "I'll write types.h / Let me write types.h / OK creating types.h"
-# mode-collapse pattern that thinking models slip into with low
-# temperature.  Set to 1.0 to disable; raise above 1.2 only for
-# repeating output you can't fix with a prompt.
-repeat_penalty  = $repeat_penalty
-# Other knobs — uncomment to override the preset baseline:
-# temperature   = 0.7
-# top_p         = 0.95
-# top_k         = 40
-# min_p         = 0.05
-# max_tokens    = -1
+# Sampling overrides — leave commented for engine defaults.
+temperature    = $temperature
+top_p          = $top_p
+top_k          = $top_k
+min_p          = $min_p
+repeat_penalty = $repeat_penalty
+max_tokens     = $max_tokens
 
 # ============================================================
 # [MCP_USER] — Bearer-token auth for POST /mcp
@@ -1244,10 +1267,8 @@ printf '  api base  : http://%s:%s/v1\n' \
 printf '  health    : http://localhost:%s/health\n' "$service_port"
 [[ $enable_metrics -eq 1 ]] && \
     printf '  metrics   : http://localhost:%s/metrics\n' "$service_port"
-printf '  system    : built-in "Deep" prompt active\n'
-printf '              template: %s\n' "$system_template_file"
-printf '              to customise: cp template to %s, edit, uncomment\n' "$system_file"
-printf '              system_file in %s, then restart\n' "$ini_file"
+printf '  system    : %s   (active; safe to edit — survives --upgrade)\n' "$system_file"
+printf '              %s   (factory copy; refreshed every --upgrade)\n' "$system_template_file"
 printf '  webui     : title="%s"\n' "$webui_title"
 [[ -n "$webui_icon_dest" ]] && \
     printf '              icon="%s" (served at /favicon and /favicon.ico)\n' "$webui_icon_dest"
