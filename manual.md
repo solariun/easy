@@ -2175,7 +2175,7 @@ cli.endpoint("http://ai.local:8080")     // any /v1/chat/completions URL
    .api_key(std::getenv("OPENAI_API_KEY") ? std::getenv("OPENAI_API_KEY") : "")
    .model("EasyAi")                       // request body 'model' field
    .system("You are a planning agent. Be concise.")
-   .timeout_seconds(1800)                 // connect + read (30 min — safe for thinking models)
+   .timeout_seconds(86400)                // connect + read (24 h — multi-hour agentic sessions)
    .http_retries(5)                       // extra attempts on transient failures (default 5; 0 disables)
    .verbose(false);                       // true = log SSE traffic to stderr
 ```
@@ -2792,7 +2792,7 @@ No more dual-mode flag juggling on a single binary.
 |------------------|---------|-----------------------------------------------------------------------|
 | `--insecure-tls` | off | Skip peer certificate verification (DEV ONLY, https only). |
 | `--ca-cert <path>` | system | Trust a custom CA bundle (PEM) for `https://` endpoints. |
-| `--timeout SECONDS` | 1800 | Read+write timeout. Bumped from llama-server's 600 s default for thinking models. `EASYAI_TIMEOUT` env. |
+| `--timeout SECONDS` | 86400 (24h) | Read+write timeout — sized for multi-hour agentic sessions. The timer only fires on TRUE silence; every SSE delta resets it, so the value isn't a wall-clock budget on the turn, just a "no progress for X seconds" cutoff. `EASYAI_TIMEOUT` env. |
 | `--http-retries N` | 5 | Extra attempts on transient HTTP failures (connect refused, read timeout, 5xx). 0 disables. Logged on stderr. `EASYAI_HTTP_RETRIES` env. |
 
 Both binaries share the same preset commands, the same `/help`, and the
@@ -3052,7 +3052,7 @@ If you see the budget-exhausted line, the underlying cause is one of:
   matches what you're connecting to, the chain is complete, and that
   your client's CA store has the issuer (or pass `--ca-cert`).
 * `read timeout` / `Failed to read connection` — the model is taking
-  longer than `--timeout`.  Default is now 1800 s (30 min), raised
+  longer than `--timeout`.  Default is now 86400 s (24 h), raised
   from the older 600 s default specifically to accommodate thinking
   models with long deliberation phases.  Bump further if needed
   (`--timeout 3600` or `cli.timeout_seconds(3600)`); also bump the

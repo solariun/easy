@@ -236,11 +236,14 @@ struct Client::Impl {
     // Transport / auth.
     std::string endpoint;
     std::string api_key;
-    // 1800s (30 min) — generous default for thinking models that may
-    // hold a stream open for many minutes between visible tokens while
-    // emitting only delta.reasoning_content. The previous 600s default
-    // was tripping on long deliberation turns.
-    int         timeout_seconds = 1800;
+    // 86400s (24 hours) — sized for multi-hour agentic sessions where
+    // the model spends long stretches in tool dispatch / reasoning
+    // without producing visible bytes.  Long-running agent flows
+    // (Tetris-from-scratch, codebase rewrites, multi-source research)
+    // routinely run for hours; 30-minute defaults trip mid-session.
+    // Set lower (e.g. 1800) for short interactive turns; the read
+    // timeout only fires on TRUE silence — every SSE delta resets it.
+    int         timeout_seconds = 86400;
     bool        verbose         = false;
     bool        tls_insecure    = false;   // skip peer cert verification
     std::string tls_ca_path;                // PEM bundle for custom CAs

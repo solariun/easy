@@ -58,7 +58,7 @@ public:
     // ----- transport / auth (fluent) ---------------------------------------
     Client & endpoint        (std::string url);             // http(s)://host[:port]
     Client & api_key         (std::string key);             // Bearer
-    Client & timeout_seconds (int  s);                      // connect+read; default 1800
+    Client & timeout_seconds (int  s);                      // connect+read; default 86400 (24h)
     Client & verbose         (bool v);                      // log SSE lines to stderr
 
     // Number of EXTRA attempts on transport failures (connect refused,

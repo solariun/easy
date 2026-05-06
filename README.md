@@ -460,7 +460,7 @@ upstream `llama-server`, OpenAI itself, etc.).
 | `--url URL` | `$EASYAI_URL` | OpenAI-compat endpoint. |
 | `--api-key KEY` | `$EASYAI_API_KEY` | Bearer auth. |
 | `--model NAME` | `$EASYAI_MODEL` | Request body `model` field. |
-| `--timeout SECONDS` | 1800 | Read+write timeout (30 min — generous for thinking models). `EASYAI_TIMEOUT` env also accepted. |
+| `--timeout SECONDS` | 86400 (24h) | Read+write timeout — sized for multi-hour agentic sessions. Only fires on TRUE silence (every SSE delta resets it). `EASYAI_TIMEOUT` env also accepted. |
 | `--http-retries N` | 5 | Extra attempts on transient HTTP failures (connect refused, read timeout, 5xx). 0 disables. Logged on stderr without `--verbose`. `EASYAI_HTTP_RETRIES` env also accepted. |
 | `--insecure-tls` | off | Skip peer cert check (DEV ONLY). |
 | `--ca-cert PATH` | system | Custom CA bundle (PEM). |
@@ -620,7 +620,7 @@ consumer process. Header:
 |---|---|---|---|
 | `.endpoint(url)` | `string` | — | `http(s)://host[:port]`. |
 | `.api_key(key)` | `string` | — | Bearer token. |
-| `.timeout_seconds(s)` | `int` | 1800 | Connect+read timeout (30 min — long enough for thinking models). |
+| `.timeout_seconds(s)` | `int` | 86400 (24h) | Connect+read timeout — sized for multi-hour agentic sessions. |
 | `.http_retries(n)` | `int` | 5 | Extra attempts on transient HTTP failures (pre-stream only — never retries mid-stream). 0 disables. Each retry logs to stderr. |
 | `.verbose(v)` | `bool` | off | Log SSE lines to stderr. |
 | `.log_file(fp)` | `FILE*` | — | Tee every HTTP transaction. |

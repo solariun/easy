@@ -311,7 +311,7 @@ struct Options {
     int                      max_tokens        = -1;
     std::vector<std::string> stop_sequences;
     std::string              extra_body;       // JSON object literal
-    int                      timeout           = 1800;  // 30 min — generous for thinking models
+    int                      timeout           = 86400;  // 24 hours — multi-hour agentic sessions
     int                      http_retries      = 5;     // extra attempts on transient HTTP fails
     bool        show_reasoning   = true;   // default ON; --no-reasoning to opt out
     bool        verbose          = false;
@@ -343,10 +343,13 @@ void usage(const char * argv0) {
 "    --url URL                  OpenAI-compat endpoint (EASYAI_URL)\n"
 "    --api-key KEY              Bearer auth (EASYAI_API_KEY)\n"
 "    --model NAME               request body 'model' field (EASYAI_MODEL)\n"
-"    --timeout SECONDS          read+write timeout (default 1800 = 30 min,\n"
-"                                tuned for thinking models with long\n"
-"                                reasoning streams). EASYAI_TIMEOUT env\n"
-"                                also accepted.\n"
+"    --timeout SECONDS          read+write timeout (default 86400 = 24h,\n"
+"                                sized for multi-hour agentic sessions —\n"
+"                                Tetris-from-scratch, codebase rewrites,\n"
+"                                multi-source research). The timer only\n"
+"                                fires on TRUE silence; every SSE delta\n"
+"                                resets it. Set lower for short turns.\n"
+"                                EASYAI_TIMEOUT env also accepted.\n"
 "    --http-retries N           extra attempts on transient HTTP failures\n"
 "                                (connect refused, read timeout, 5xx) per\n"
 "                                request. 0 disables. Default 5. Each retry\n"
