@@ -37,9 +37,10 @@
 #   ./install_easyai_server.sh --backend vulkan      # force backend
 #   ./install_easyai_server.sh --service-port 8080
 #   ./install_easyai_server.sh --service-host 0.0.0.0
-#   ./install_easyai_server.sh --ctx-size 32768
+#   ./install_easyai_server.sh --ctx-size 32768   # default 65536 (64 K)
 #   ./install_easyai_server.sh --ngl 99            # GPU layers (-1=auto, 0=CPU)
 #   ./install_easyai_server.sh --no-mlock --use-mmap
+#   ./install_easyai_server.sh --repeat-penalty 1.15  # default 1.15 (anti-loop)
 #   ./install_easyai_server.sh --webui-title "AI Box"
 #   ./install_easyai_server.sh --webui-icon /path/to/logo.svg   # ico|png|svg|gif|jpg|webp
 #   ./install_easyai_server.sh --upgrade             # git pull + rebuild
@@ -115,11 +116,17 @@ ini_file="$config_dir/easyai.ini"
 # in /etc, agent-generated state goes in /var/lib (FHS).
 rag_dir="/var/lib/easyai/rag"
 
-ctx_size=128000
-# --ngl: -1 = auto-fit (llama.cpp picks how many layers fit), 0 = CPU only,
-# 99 = force all layers on GPU (will OOM if it doesn't fit; auto-fit refuses
-# to reduce a user-pinned value).  Default is -1 so a fresh install never
-# hits the "n_gpu_layers already set by user, abort" failure mode.
+# 64 K context — generous for any single conversation (multi-hour bash /
+# coding sessions rarely accumulate beyond ~30 K useful tokens before the
+# model loses coherence).  Was 128 K; lowered to free GTT for more headroom
+# on iGPU systems (KV cache shrinks ~2× per halved context).  Override with
+# --ctx-size for very long agentic flows that need it.
+ctx_size=65536
+# --ngl: -1 = auto-fit (llama.cpp picks how many layers fit, leaving ≥1 GiB
+# of GPU memory free).  On iGPUs with sufficient GTT this offloads ALL
+# layers including KV cache, so CPU-side RSS stays small (<1 GiB).
+# 0 = CPU only; 99 = force all layers (OOMs if it doesn't fit).
+# -1 is the default so a fresh install never hits OOM at startup.
 ngl=-1
 webui_title="EasyAi"                          # --webui-title <text>
 webui_icon=""                                 # --webui-icon <path/to/.ico|.png|.svg|.gif|.jpg|.webp>
@@ -133,8 +140,18 @@ enable_flash_attn=1
 enable_verbose=0                              # adds --verbose to ExecStart (noisy)
 cache_type_k="q8_0"
 cache_type_v="q8_0"
-mlock=1
-no_mmap=1
+mlock=1                                       # pin small CPU residue (embeddings,
+                                              # scratch) — most weights are on GPU.
+# no_mmap=0 lets the kernel mmap the GGUF.  With full GPU offload the file
+# is only read at LOAD time, after which weights live on GPU; mmap'ing it
+# means the load-time RSS peak drops by several GB (no anonymous-copy
+# transient).  Was 1; flipped to 0 because GPU offload makes the
+# "keep weights resident on CPU" rationale moot.  Override with --no-mmap.
+no_mmap=0
+# Anti-loop sampler floor.  1.15 breaks the "I'll write types.h / Let me
+# write types.h / OK creating types.h" mode-collapse pattern that
+# thinking models slip into when temperature is low.  1.0 disables.
+repeat_penalty="1.15"
 api_key=""                                    # leave empty to skip auth (open server)
 
 model_src=""                                  # required when --no-model NOT passed
@@ -186,6 +203,8 @@ while [[ $# -gt 0 ]]; do
         --cache-type-v)     cache_type_v="$2"; shift 2 ;;
         --no-mlock)         mlock=0; shift ;;
         --use-mmap)         no_mmap=0; shift ;;
+        --no-mmap)          no_mmap=1; shift ;;
+        --repeat-penalty)   repeat_penalty="$2"; shift 2 ;;
         --api-key)          api_key="$2"; shift 2 ;;
         --model)            model_src="$2"; shift 2 ;;
         --copy-model)       copy_model=1; shift ;;
@@ -296,6 +315,7 @@ printf '    threads / batch  = %s / %s\n' "$n_threads_default" "$n_threads_batch
 printf '    preset           = %s  thinking=%s\n' "$preset" "$thinking"
 printf '    KV cache         = K=%s  V=%s  flash_attn=%s\n' "$cache_type_k" "$cache_type_v" "$enable_flash_attn"
 printf '    memory           = mlock=%s  no_mmap=%s\n' "$mlock" "$no_mmap"
+printf '    repeat_penalty   = %s   (1.15 = anti-loop default; 1.0 disables)\n' "$repeat_penalty"
 printf '    metrics          = %s\n' "$enable_metrics"
 printf '    verbose          = %s\n' "$enable_verbose"
 printf '    webui_title      = %s\n' "$webui_title"
@@ -830,22 +850,47 @@ mcp_auth        = off
 # [ENGINE] — model loading and inference tunables
 # ============================================================
 [ENGINE]
+# Context window.  64 K is generous for any conversation; bump to 128 K /
+# 250 K only if you genuinely need it (KV cache eats GTT proportionally).
 context         = $ctx_size
+# ngl=-1 → auto-fit.  llama.cpp tries to offload every layer (incl. KV
+# cache) to GPU and reduces only if it doesn't fit, leaving ≥ 1 GiB free
+# device memory.  On iGPUs with enough GTT this means CPU-side RSS stays
+# under 1 GiB after load.
 ngl             = $ngl
 threads         = $n_threads_default
 threads_batch   = $n_threads_batch_default
 preset          = $preset
+# Flash attention reduces KV memory + speeds up prompt eval.  Free perf
+# on every backend that supports it (Vulkan / CUDA / Metal — all do).
 flash_attn      = $([[ "$enable_flash_attn" -eq 1 ]] && echo on || echo off)
+# KV cache quant: q8_0 keeps accuracy ~indistinguishable from f16 at half
+# the memory.  Drop to q4_0 if you need to squeeze more context into a
+# tight GTT budget — ~10 % accuracy hit on long-range recall.
 cache_type_k    = $cache_type_k
 cache_type_v    = $cache_type_v
+# mlock pins the small CPU-side residue (embeddings + scratch) so the
+# kernel doesn't page it out under pressure.  With full GPU offload this
+# is typically <1 GiB.
 mlock           = $([[ "$mlock" -eq 1 ]] && echo on || echo off)
+# no_mmap=off lets the kernel mmap the GGUF.  With full offload the file
+# is only read at load time; mmap drops the load-time RSS peak by several
+# GB.  Set on if you observe page-cache eviction churn under heavy load.
 no_mmap         = $([[ "$no_mmap" -eq 1 ]] && echo on || echo off)
-# Sampling overrides — leave commented for engine defaults.
+
+# Sampling overrides.
+#
+# repeat_penalty = 1.15 is the anti-loop default — breaks the
+# "I'll write types.h / Let me write types.h / OK creating types.h"
+# mode-collapse pattern that thinking models slip into with low
+# temperature.  Set to 1.0 to disable; raise above 1.2 only for
+# repeating output you can't fix with a prompt.
+repeat_penalty  = $repeat_penalty
+# Other knobs — uncomment to override the preset baseline:
 # temperature   = 0.7
 # top_p         = 0.95
 # top_k         = 40
 # min_p         = 0.05
-# repeat_penalty = 1.0
 # max_tokens    = -1
 
 # ============================================================
