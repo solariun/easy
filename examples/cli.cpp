@@ -340,6 +340,12 @@ struct Options {
     bool        metrics           = false;
     std::string set_preset;
     bool        show_system_prompt = false;   // print resolved prompt and exit
+    // unattended: tells the model there is no human at the terminal —
+    // it cannot ask clarifying questions, request approval, or present
+    // a numbered choice and wait. Auto-set when a prompt is given on
+    // the command line (one-shot mode, including `-p`, positional arg,
+    // and stdin pipe); --unattended forces it on regardless.
+    bool        unattended       = false;
 
     // INI overlay (CLI > INI > hardcoded). Default path mirrors the
     // server / mcp-server convention; missing file = use defaults.
@@ -526,6 +532,17 @@ void usage(const char * argv0) {
 "                                NOT an error (just keeps hardcoded\n"
 "                                defaults). Today the [cli] section\n"
 "                                supports: show_bash = true|false.\n"
+"    --unattended               inject an [unattended] block into the system\n"
+"                                prompt: tells the model there is no human at\n"
+"                                the terminal, so it cannot ask clarifying\n"
+"                                questions, request approval, or present a\n"
+"                                numbered menu and wait. The model picks the\n"
+"                                most reasonable interpretation and drives\n"
+"                                the task to completion in this turn.\n"
+"                                Auto-set whenever a prompt is given on the\n"
+"                                command line (-p / positional / piped\n"
+"                                stdin). Has no effect in interactive REPL\n"
+"                                mode unless passed explicitly.\n"
 "\n"
 "  Management subcommands (use one, no chat):\n"
 "    --list-tools               list LOCAL tools (registered in this CLI)\n"
@@ -602,6 +619,7 @@ bool parse_args(int argc, char ** argv, Options & o) {
             o.show_bash_cli_set = true;
         }
         else if (a == "--config")         o.config_path   = need(i, "--config");
+        else if (a == "--unattended")     o.unattended    = true;
         else if (a == "--use-google")     o.use_google    = true;
         else if (a == "--split-rag")        o.split_rag        = true;
         else if (a == "--external-tools") o.external_tools_dir = need(i, "--external-tools");
@@ -1283,6 +1301,12 @@ int main(int argc, char ** argv) {
         if (!buf.empty()) o.prompt = std::move(buf);
     }
 
+    // One-shot runs (--prompt / positional / piped stdin) imply
+    // unattended: no human is at the REPL to answer a clarifying
+    // question or pick from a menu. Explicit --unattended already won;
+    // this just covers the common case where the operator forgot.
+    if (!o.prompt.empty()) o.unattended = true;
+
     // Some diagnostics are purely LOCAL — no network call, so they
     // shouldn't require --url:
     //   --list-tools         (prints the tools registered in this CLI)
@@ -1377,6 +1401,30 @@ int main(int argc, char ** argv) {
                 "The user's request is the ceiling, not a starting "
                 "point. They steer; you implement what they pick. "
                 "Refinement is a dialogue, not a monologue.\n";
+        }
+        // [unattended] — emitted on --unattended OR any one-shot mode
+        // (--prompt / positional / piped stdin). Overrides the "ask
+        // the user" parts of [guidance]: there's no REPL on the other
+        // side to answer, so the model has to commit to a choice and
+        // drive the task to completion in this turn.
+        if (o.unattended) {
+            if (!prefix.empty()) prefix += "\n";
+            prefix +=
+                "[unattended]\n"
+                "This run is UNATTENDED — no human is at the terminal. "
+                "You CANNOT ask clarifying questions, request approval "
+                "before tool calls, present a numbered menu and wait, "
+                "or pause for confirmation. The user has delegated full "
+                "authority for this turn; nobody will read a follow-up "
+                "question or pick an option.\n"
+                "\n"
+                "When the request is ambiguous, PICK the most reasonable "
+                "interpretation, briefly note the choice in your final "
+                "answer, and execute. Do not stop after a draft to ask "
+                "\"should I continue?\" — carry the task to completion in "
+                "this turn. This OVERRIDES step 3 of [guidance] above: "
+                "instead of asking which next-step the user wants, list "
+                "any ideas in your final answer and stop.\n";
         }
         if (!prefix.empty()) {
             o.system_prompt = o.system_prompt.empty()
