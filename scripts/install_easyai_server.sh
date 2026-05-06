@@ -46,6 +46,13 @@
 #   ./install_easyai_server.sh --webui-title "AI Box"
 #   ./install_easyai_server.sh --webui-icon /path/to/logo.svg   # ico|png|svg|gif|jpg|webp
 #   ./install_easyai_server.sh --upgrade             # git pull + rebuild
+#   ./install_easyai_server.sh --force               # also rewrite easyai.ini
+#                                                    # AND system.txt AND
+#                                                    # systemd unit (use after
+#                                                    # changing installer
+#                                                    # defaults to push them
+#                                                    # to the box).  Backs up
+#                                                    # easyai.ini → .bak first.
 #   ./install_easyai_server.sh --enable-now          # systemctl start now
 #   ./install_easyai_server.sh --enable-verbose      # bake --verbose into ExecStart (noisy)
 #   ./install_easyai_server.sh --no-service          # build/install only
@@ -76,6 +83,13 @@ do_swap="off"                                 # off|tune|"" (keep)
 do_kernel=1                                   # AMD iGPU GTT cmdline
 do_service=1
 do_force_service=0
+do_force=0                                    # --force: superset of
+                                              # --force-service; also rewrites
+                                              # /etc/easyai/easyai.ini AND
+                                              # /etc/easyai/system.txt even if
+                                              # they already exist.  Use after
+                                              # changing installer defaults to
+                                              # propagate them to the box.
 do_enable_now=0
 do_avahi=1
 do_presets=1                                  # symlink easyai-cli → /usr/bin/ai
@@ -206,6 +220,7 @@ while [[ $# -gt 0 ]]; do
         --enable-now)       do_enable_now=1; shift ;;
         --no-enable)        do_enable_now=0; shift ;;
         --force-service)    do_force_service=1; shift ;;
+        --force)            do_force=1; do_force_service=1; shift ;;
         --service-host)     service_host="$2"; shift 2 ;;
         --service-port)     service_port="$2"; shift 2 ;;
         --alias)            service_alias="$2"; shift 2 ;;
@@ -691,18 +706,24 @@ MODELO
     sudo chmod 644 "$system_template_file"
     sudo chown root:"$service_group" "$system_template_file"
 
-    # Drop system.txt only on FIRST INSTALL.  Operators editing the
-    # active prompt keep their changes through --upgrade; if they want
-    # the new defaults they `cp system.txt_modelo system.txt` manually.
-    if [[ ! -f "$system_file" ]]; then
-        log "writing $system_file (active system prompt; safe to edit, survives --upgrade)"
+    # Drop system.txt only on FIRST INSTALL — or when --force is set,
+    # which is the explicit "yes, blow away my edits" gesture.
+    # Operators normally edit the active prompt and keep their changes
+    # through --upgrade; if they want the new defaults they
+    # `cp system.txt_modelo system.txt` manually OR run with --force.
+    if [[ ! -f "$system_file" || $do_force -eq 1 ]]; then
+        if [[ -f "$system_file" && $do_force -eq 1 ]]; then
+            log "rewriting $system_file (--force)"
+        else
+            log "writing $system_file (active system prompt; safe to edit, survives --upgrade)"
+        fi
         sudo bash -c "cat > '$system_file'" <<SYS
 $system_prompt_body
 SYS
         sudo chmod 640 "$system_file"
         sudo chown root:"$service_group" "$system_file"
     else
-        log "preserving existing $system_file (operator edits kept through --upgrade)"
+        log "preserving existing $system_file (operator edits kept through --upgrade; pass --force to overwrite)"
     fi
 
     if [[ -n "$api_key" ]]; then
@@ -836,9 +857,17 @@ RAG_README
     # don't overwrite operator edits. The operator has to manually
     # incorporate any new keys we ship in subsequent versions (we
     # may at some point grow a more polite "upsert" but for now,
-    # leave-alone is the safe default).
-    if [[ ! -f "$ini_file" ]]; then
-        log "writing $ini_file (central config)"
+    # leave-alone is the safe default).  Pass --force to override and
+    # regenerate from current installer defaults; the previous file is
+    # backed up to easyai.ini.bak before the rewrite.
+    if [[ ! -f "$ini_file" || $do_force -eq 1 ]]; then
+        if [[ -f "$ini_file" && $do_force -eq 1 ]]; then
+            log "backing up existing $ini_file → ${ini_file}.bak (--force)"
+            sudo cp -f "$ini_file" "${ini_file}.bak"
+            log "rewriting $ini_file (--force)"
+        else
+            log "writing $ini_file (central config)"
+        fi
         sudo bash -c "cat > '$ini_file'" <<INI_FILE
 # easyai-server central configuration — every flag the binary
 # understands has a corresponding entry here. Lines starting with
@@ -950,7 +979,7 @@ INI_FILE
         sudo chmod 640 "$ini_file"
         sudo chown root:"$service_group" "$ini_file"
     else
-        log "$ini_file exists — leaving operator edits in place"
+        log "$ini_file exists — leaving operator edits in place (pass --force to overwrite)"
     fi
 
     # ---- favicon: copy operator-supplied icon to /etc/easyai/favicon
