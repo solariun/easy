@@ -26,6 +26,7 @@ namespace easyai::cli {
 Toolbelt & Toolbelt::sandbox    (std::string dir) { sandbox_     = std::move(dir); return *this; }
 Toolbelt & Toolbelt::allow_fs   (bool on)         { allow_fs_    = on;             return *this; }
 Toolbelt & Toolbelt::allow_bash (bool on)         { allow_bash_  = on;             return *this; }
+Toolbelt & Toolbelt::show_bash  (bool on)         { show_bash_   = on;             return *this; }
 Toolbelt & Toolbelt::with_plan  (Plan & plan)     { plan_        = &plan;          return *this; }
 Toolbelt & Toolbelt::no_web     (bool on)         { no_web_      = on;             return *this; }
 Toolbelt & Toolbelt::no_datetime(bool on)         { no_datetime_ = on;             return *this; }
@@ -70,7 +71,7 @@ std::vector<Tool> Toolbelt::tools() const {
         out.push_back(easyai::tools::fs_write_file(fs_root));
     }
     if (bash_on) {
-        out.push_back(easyai::tools::bash(fs_root));
+        out.push_back(easyai::tools::bash(fs_root, show_bash_));
     }
     // get_current_dir + get_sandbox_path register whenever ANY
     // filesystem-flavoured tool is on. Both are parameter-free and

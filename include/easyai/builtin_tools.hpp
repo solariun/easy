@@ -79,6 +79,14 @@ Tool get_sandbox_path(std::string root = ".");
 // Caller is responsible for deciding whether bash is appropriate for
 // their threat model — we surface it only when the user opts in
 // (e.g. --allow-bash in cli-remote).
-Tool bash         (std::string root = ".");
+//
+// `show_output`: when true, the merged child stdout/stderr is also
+// mirrored to the parent's stderr in real time as it drains. The model
+// still receives the full captured buffer as the tool result; the
+// stderr mirror is a diagnostic aid for the operator watching the
+// terminal so a long-running command (build, test suite) doesn't look
+// like a stalled session. Off by default to keep tool output strictly
+// in-band; the CLI flips it on unless --no-show-bash is passed.
+Tool bash         (std::string root = ".", bool show_output = false);
 
 }  // namespace easyai::tools

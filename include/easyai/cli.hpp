@@ -51,6 +51,12 @@ public:
     Toolbelt & sandbox      (std::string dir);   // "" stays the default (no fs_*)
     Toolbelt & allow_fs     (bool on = true);    // gate fs_* registration
     Toolbelt & allow_bash   (bool on = true);
+    // Mirror the bash subprocess's merged stdout+stderr to the parent's
+    // stderr in real time. The model still receives the full captured
+    // buffer as the tool result; this is a parallel diagnostic channel
+    // for the operator. Off by default to keep stderr clean for callers
+    // that haven't opted in.
+    Toolbelt & show_bash    (bool on = true);
     Toolbelt & with_plan    (Plan & plan);
     Toolbelt & no_web       (bool on = true);    // drop web_search/web_fetch
     Toolbelt & no_datetime  (bool on = true);    // drop datetime
@@ -83,6 +89,7 @@ private:
     // enables fs_*" behaviour.  Server flips it OFF unless --allow-fs.
     bool        allow_fs_    = true;
     bool        allow_bash_  = false;
+    bool        show_bash_   = false;
     bool        no_web_      = false;
     bool        no_datetime_ = false;
     bool        use_google_  = false;

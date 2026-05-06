@@ -1621,7 +1621,7 @@ Tool get_sandbox_path(std::string root) {
         .build();
 }
 
-Tool bash(std::string root) {
+Tool bash(std::string root, bool show_output) {
     auto sb = std::make_shared<Sandbox>(std::move(root));
     return Tool::builder("bash")
         .describe(
@@ -1670,7 +1670,7 @@ Tool bash(std::string root) {
         .param("timeout_sec", "integer",
                "Max seconds to run before SIGTERM/SIGKILL. Default 30, max 300.",
                false)
-        .handle([sb](const ToolCall & c) {
+        .handle([sb, show_output](const ToolCall & c) {
             std::string cmd;
             long long timeout_sec = 30;
             if (!args::get_string(c.arguments_json, "command", cmd) || cmd.empty())
@@ -1678,6 +1678,14 @@ Tool bash(std::string root) {
             args::get_int(c.arguments_json, "timeout_sec", timeout_sec);
             if (timeout_sec < 1)   timeout_sec = 1;
             if (timeout_sec > 300) timeout_sec = 300;
+
+            // Diagnostic banner: surface the command being run before
+            // the first line of output drains. Operator-facing only —
+            // the model sees the unchanged ToolResult string.
+            if (show_output) {
+                std::fprintf(stderr, "\n[bash] $ %s\n", cmd.c_str());
+                std::fflush(stderr);
+            }
 
             int pipefd[2];
             if (::pipe(pipefd) < 0)
@@ -1777,6 +1785,16 @@ Tool bash(std::string root) {
                         size_t take = std::min((size_t) n, kCap - out.size());
                         out.append(buf, take);
                     }
+                    // Live mirror: every byte the child writes (stdout
+                    // and stderr were dup2'd onto the same pipe in the
+                    // child) goes to the parent's stderr so the operator
+                    // can watch a long-running build / test suite scroll
+                    // by. The model still receives the full captured
+                    // buffer; this is a parallel "human-facing" channel.
+                    if (show_output) {
+                        ::fwrite(buf, 1, (size_t) n, stderr);
+                        std::fflush(stderr);
+                    }
                 }
             };
 
@@ -1836,6 +1854,14 @@ Tool bash(std::string root) {
             }
             std::string body = std::move(out);
             if (body.size() >= kCap) body += "\n[truncated at 32 KB]\n";
+            // Closing banner mirrors the opening one: the operator sees
+            // the exit status and a trailing newline so the next agent
+            // line doesn't run into the bash output. Newline first in
+            // case the child's last byte wasn't a '\n'.
+            if (show_output) {
+                std::fprintf(stderr, "\n[bash] %s", oss.str().c_str());
+                std::fflush(stderr);
+            }
             return ToolResult::ok(oss.str() + body);
         })
         .build();

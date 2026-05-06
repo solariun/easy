@@ -39,6 +39,7 @@
 #include "easyai/builtin_tools.hpp"
 #include "easyai/cli.hpp"
 #include "easyai/client.hpp"
+#include "easyai/config.hpp"
 #include "easyai/external_tools.hpp"
 #include "easyai/log.hpp"
 #include "easyai/plan.hpp"
@@ -282,6 +283,12 @@ struct Options {
     std::string system_file;
     std::string sandbox;
     bool        allow_bash      = false;       // opt-in: register `bash` tool
+    // show_bash: mirror the bash subprocess's merged stdout+stderr to
+    // the parent's stderr in real time so the operator can watch a
+    // long-running build / test scroll by. Default ON when --allow-bash
+    // is given; --no-show-bash opts out (or set show_bash=false in the
+    // INI's [cli] section).
+    bool        show_bash       = true;
     bool        use_google      = false;       // opt-in: register `web_google`
                                                 // (also needs GOOGLE_API_KEY +
                                                 // GOOGLE_CSE_ID env vars)
@@ -333,6 +340,14 @@ struct Options {
     bool        metrics           = false;
     std::string set_preset;
     bool        show_system_prompt = false;   // print resolved prompt and exit
+
+    // INI overlay (CLI > INI > hardcoded). Default path mirrors the
+    // server / mcp-server convention; missing file = use defaults.
+    std::string config_path = "/etc/easyai/easyai-cli.ini";
+    // Whether show_bash was explicitly set by the user on the command
+    // line — distinguishes "user wants the default" from "user passed
+    // --no-show-bash" so the INI can fill the gap when CLI is silent.
+    bool        show_bash_cli_set = false;
 };
 
 void usage(const char * argv0) {
@@ -414,6 +429,16 @@ void usage(const char * argv0) {
 "                                 (network, full FS, etc). cwd is set to\n"
 "                                 --sandbox DIR if given, otherwise the\n"
 "                                 current working dir.\n"
+"    --no-show-bash             suppress the live mirror of bash output to\n"
+"                                 stderr. By default, when the model calls\n"
+"                                 `bash`, the merged child stdout+stderr is\n"
+"                                 also written to the parent's stderr in real\n"
+"                                 time so the operator can watch a long build\n"
+"                                 / test scroll by. The model still receives\n"
+"                                 the full captured buffer either way; this\n"
+"                                 flag only silences the diagnostic mirror.\n"
+"                                 Override the default in the INI's [cli]\n"
+"                                 section: show_bash = false.\n"
 "    --use-google               register the `web_google` tool (Google\n"
 "                                 Custom Search JSON API). Requires both\n"
 "                                 GOOGLE_API_KEY and GOOGLE_CSE_ID env\n"
@@ -496,6 +521,11 @@ void usage(const char * argv0) {
 "    --log-file PATH            write the raw transaction log here instead\n"
 "                                of the auto-generated /tmp path.  Implies\n"
 "                                --verbose if --verbose wasn't passed.\n"
+"    --config PATH              INI overlay (CLI > INI > hardcoded). Default\n"
+"                                /etc/easyai/easyai-cli.ini; missing file is\n"
+"                                NOT an error (just keeps hardcoded\n"
+"                                defaults). Today the [cli] section\n"
+"                                supports: show_bash = true|false.\n"
 "\n"
 "  Management subcommands (use one, no chat):\n"
 "    --list-tools               list LOCAL tools (registered in this CLI)\n"
@@ -563,6 +593,15 @@ bool parse_args(int argc, char ** argv, Options & o) {
         else if (a == "--system-file")    o.system_file   = need(i, "--system-file");
         else if (a == "--sandbox")        o.sandbox       = need(i, "--sandbox");
         else if (a == "--allow-bash")     o.allow_bash    = true;
+        else if (a == "--no-show-bash") {
+            o.show_bash         = false;
+            o.show_bash_cli_set = true;
+        }
+        else if (a == "--show-bash") {
+            o.show_bash         = true;
+            o.show_bash_cli_set = true;
+        }
+        else if (a == "--config")         o.config_path   = need(i, "--config");
         else if (a == "--use-google")     o.use_google    = true;
         else if (a == "--split-rag")        o.split_rag        = true;
         else if (a == "--external-tools") o.external_tools_dir = need(i, "--external-tools");
@@ -639,6 +678,40 @@ bool parse_args(int argc, char ** argv, Options & o) {
         }
         std::stringstream ss; ss << f.rdbuf();
         o.system_prompt = ss.str();
+    }
+
+    // INI overlay: precedence is CLI > INI > hardcoded. A missing INI
+    // file is NOT an error — load_ini_file returns an empty Ini and
+    // we simply keep the hardcoded defaults. Today only [cli]
+    // show_bash flows through here; future keys add a single
+    // `if (!o.<flag>_cli_set)` block each.
+    {
+        std::string ini_err;
+        easyai::config::Ini ini =
+            easyai::config::load_ini_file(o.config_path, ini_err);
+        if (!ini_err.empty()) {
+            std::fprintf(stderr,
+                "easyai-cli: %s warnings:\n%s\n",
+                o.config_path.c_str(), ini_err.c_str());
+        }
+        if (!o.show_bash_cli_set) {
+            const std::string v = ini.get("cli", "show_bash");
+            if (!v.empty()) {
+                std::string lc; lc.reserve(v.size());
+                for (char ch : v) lc.push_back((char) std::tolower((unsigned char) ch));
+                if (lc == "false" || lc == "no" || lc == "off" || lc == "0") {
+                    o.show_bash = false;
+                } else if (lc == "true" || lc == "yes" || lc == "on" || lc == "1") {
+                    o.show_bash = true;
+                } else {
+                    std::fprintf(stderr,
+                        "easyai-cli: %s [cli] show_bash=%s — "
+                        "expected true/false; keeping default %s\n",
+                        o.config_path.c_str(), v.c_str(),
+                        o.show_bash ? "true" : "false");
+                }
+            }
+        }
     }
     return true;
 }
@@ -725,7 +798,12 @@ void register_tools(easyai::Client & cli,
 
     // bash — same root as fs_*; opt-in via --allow-bash or --tools bash.
     if (wants("bash")) {
-        cli.add_tool(easyai::tools::bash(root));
+        // o.show_bash mirrors merged child stdout+stderr to our stderr
+        // in real time so a long build / test scroll is visible to the
+        // operator. Default ON; --no-show-bash (or [cli] show_bash=false
+        // in the INI) silences the mirror without affecting what the
+        // model sees.
+        cli.add_tool(easyai::tools::bash(root, o.show_bash));
         // Bash flows naturally span many hops (compile → run → fix →
         // re-run → grep logs → …); the default 8-hop cap chokes them.
         // Bump to effectively-unlimited.  Other safety nets (per-tool
