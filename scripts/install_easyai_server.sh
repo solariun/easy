@@ -72,7 +72,7 @@ llama_ref=""                                  # empty = main; pass --llama-ref
 
 install_prefix="/usr"
 backend="auto"                                # auto|vulkan|cuda|hip|cpu
-gtt_gb=28                                     # AMD iGPU GTT (only used by RDNA2/iGPU)
+gtt_gb=29                                     # AMD iGPU GTT (only used by RDNA2/iGPU)
 jobs="$(nproc 2>/dev/null || echo 4)"
 
 do_install=1                                  # apt-get install deps
