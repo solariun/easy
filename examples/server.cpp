@@ -3029,18 +3029,20 @@ static bool require_auth(const ServerCtx & ctx, const httplib::Request & req,
         "                                [SERVER] http_timeout. Logged\n"
         "                                unconditionally at startup.\n"
         "      --sandbox <dir>          Set the working root for fs_* and\n"
-        "                                bash. Implies --allow-fs (the fs_*\n"
-        "                                tools register automatically). Bash\n"
-        "                                still requires --allow-bash. Without\n"
-        "                                --sandbox the tools default to the\n"
-        "                                server's cwd.\n"
+        "                                bash AND the cwd / external-tools\n"
+        "                                root / get_sandbox_path target.\n"
+        "                                Setting --sandbox alone does NOT\n"
+        "                                register fs_* / bash — pass\n"
+        "                                --allow-fs / --allow-bash for that.\n"
+        "                                Without --sandbox the tools default\n"
+        "                                to the server's cwd.\n"
         "      --allow-fs               Register the fs_* tools (fs_read_file,\n"
         "                                fs_list_dir, fs_glob, fs_grep,\n"
         "                                fs_write_file). Scoped to --sandbox\n"
         "                                dir if given, otherwise the server's\n"
-        "                                cwd. Implied by --sandbox and by\n"
-        "                                --allow-bash; pass it explicitly to\n"
-        "                                register fs_* alone.\n"
+        "                                cwd. Required even when --sandbox is\n"
+        "                                set; INI [SERVER] allow_fs=on is\n"
+        "                                equivalent.\n"
         "      --allow-bash             Register the `bash` tool (run shell\n"
         "                                commands). cwd = --sandbox dir if\n"
         "                                given, otherwise the server's cwd.\n"
@@ -3722,13 +3724,11 @@ int main(int argc, char ** argv) {
 
     // Default toolbelt — opt-out via --no-local-tools.
     //
-    // fs_* and bash are SHIPPED OFF by default. Either --sandbox <dir>,
-    // --allow-fs, or --allow-bash registers fs_* (any one of them is
-    // enough — they all imply file work). bash additionally requires
-    // --allow-bash. Without any of these flags the model — and the
-    // webui's "tools" listing — never sees the corresponding tools, so
-    // a fresh easyai-server install can't accidentally expose shell or
-    // write access.
+    // fs_* and bash are SHIPPED OFF by default. The server requires
+    // explicit opt-in: --allow-fs registers fs_*, --allow-bash adds
+    // bash on top. --sandbox alone DOES NOT imply fs_* — the sandbox
+    // is also the cwd / external-tools root / get_sandbox_path target,
+    // so operators legitimately set it while keeping fs_*/bash off.
     if (args.local_tools) {
         // Determine the working root: --sandbox if given, else cwd
         // when ANY filesystem-flavoured tool is on. We only pass a
@@ -3736,17 +3736,13 @@ int main(int argc, char ** argv) {
         // so the engine doesn't spuriously hold onto a sandbox dir the
         // operator never intended to use.
         std::string sb = args.sandbox;
-        const bool any_fs_like = args.allow_fs || args.allow_bash || !sb.empty();
+        const bool any_fs_like = args.allow_fs || args.allow_bash;
         if (sb.empty() && any_fs_like) sb = ".";
         auto tb = easyai::cli::Toolbelt()
                       .sandbox   (sb)
+                      .allow_fs  (args.allow_fs)
                       .allow_bash(args.allow_bash)
                       .use_google(args.use_google);
-        // We deliberately don't propagate args.allow_fs as a hard gate
-        // anymore: the Toolbelt's predicate (sandbox set OR bash on)
-        // covers it. Operators who want fs_* WITHOUT bash still get
-        // them — passing --allow-fs sets sb="." above and the Toolbelt
-        // registers fs_* against that root.
         for (auto & t : tb.tools()) ctx->default_tools.push_back(std::move(t));
     }
 
