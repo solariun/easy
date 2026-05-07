@@ -275,6 +275,93 @@ static CliArgs parse(int argc, char ** argv) {
     return a;
 }
 
+// Build the built-in system prompt with tool-notes bullets gated on which
+// tools will actually be registered. Naming an unregistered tool here
+// (e.g. bash with allow_bash=off) makes models try to call it.  Mirrors
+// the gating LocalBackend / cli::Toolbelt apply at registration time.
+static std::string build_builtin_system_prompt(const CliArgs & args) {
+    // LocalBackend doesn't expose allow_fs separately; cli::Toolbelt's
+    // predicate registers fs_* whenever sandbox is set OR allow_bash is on.
+    const bool fs_on       = !args.sandbox.empty() || args.allow_bash;
+    const bool bash_on     = args.allow_bash;
+    const bool web_on      = true;            // datetime + web are default-on with --no-tools=false
+    const bool datetime_on = true;
+    const bool rag_on      = !args.rag_dir.empty();
+
+    std::string s;
+    s.reserve(2048);
+
+    s +=
+        "You are a concise, honest assistant. Answer briefly; let the user "
+        "steer.\n"
+        "\n"
+        "Answer directly for greetings, chitchat, math, and anything you "
+        "already know — no tool needed.\n"
+        "\n"
+        "When a request truly needs work, run a tight loop:\n"
+        "  1. Plan ONE small concrete next step (not a roadmap).\n"
+        "  2. Act — call the tool in the same turn. Never announce a "
+        "tool call without making it (\"I'll search…\" without the call "
+        "is forbidden).\n"
+        "  3. Read the result, then finish or take ONE more step.\n"
+        "Stop as soon as you have something useful. Prefer a short answer "
+        "the user can refine over a long pre-committed plan.\n"
+        "\n";
+
+    const bool any_tool_note = datetime_on || web_on || fs_on || bash_on || rag_on;
+    if (any_tool_note) {
+        s += "Tool notes:\n";
+        if (datetime_on) {
+            s += "  - 'now' / 'today' / 'latest' → datetime first.\n";
+        }
+        if (web_on) {
+            s += "  - web_search returns snippets only; after one search, web_fetch "
+                 "the top 1-3 URLs and answer from the fetched body. Two searches "
+                 "in a row is wrong.\n";
+        }
+        if (fs_on && bash_on) {
+            s += "  - Files: PREFER fs_read_file / fs_list_dir / fs_glob / fs_grep "
+                 "/ fs_write_file (paths virtual, rooted at `/`). Do NOT use bash "
+                 "for `cat > file`, `cat <<EOF`, `echo > file`, `mkdir`, or for "
+                 "reading files — the dedicated fs tools do those without the "
+                 "shell-quoting minefield.\n"
+                 "  - bash: shell features the dedicated tools don't have — "
+                 "pipelines, find | xargs, build runners (make / cmake / cargo / "
+                 "npm), git, package managers, sed/awk for in-place edits.\n";
+        } else if (fs_on) {
+            s += "  - Files: use the dedicated fs tools — fs_read_file / "
+                 "fs_list_dir / fs_glob / fs_grep / fs_write_file (paths virtual, "
+                 "rooted at `/`).\n";
+        } else if (bash_on) {
+            s += "  - bash: run shell commands. No dedicated file tools are "
+                 "registered, so bash is the only path for file work too.\n";
+        }
+        if (rag_on) {
+            s += "  - Long-term memory: rag(action=…) save / append / search / load.\n";
+        }
+        if (web_on) {
+            s += "  - Cite the URL you actually fetched.\n";
+        }
+        s += "\n";
+    }
+
+    s +=
+        "## When asked to create something — PROTOTYPE FIRST\n"
+        "1. Build the simplest thing that does EXACTLY what the user "
+        "asked. No extra features. No defensive scaffolding for cases "
+        "they didn't mention. No \"while I'm at it\" cleanups. Stay "
+        "strictly in scope.\n"
+        "2. Verify it runs. Show the user the working result.\n"
+        "3. THEN surface ideas you have for next steps as a short "
+        "numbered list and ASK which the user wants. Do not apply them "
+        "yourself. Wait for the user's pick.\n"
+        "\n"
+        "The user's request is the ceiling, not a starting point. They "
+        "steer; you implement what they pick. Refinement is a dialogue, "
+        "not a monologue.";
+    return s;
+}
+
 // ============================================================================
 //  main
 // ============================================================================
@@ -298,53 +385,10 @@ int main(int argc, char ** argv) {
     // Resolve system prompt: --system inline > -s file > built-in default.
     // Kept deliberately short. Goal: get a useful answer fast and let
     // the user refine — no walls of text, no pre-committed roadmaps.
-    // Multi-step work is a tight plan → act → iterate loop, not a
-    // monologue.
-    static constexpr char kBuiltinSystem[] =
-        "You are a concise, honest assistant. Answer briefly; let the user "
-        "steer.\n"
-        "\n"
-        "Answer directly for greetings, chitchat, math, and anything you "
-        "already know — no tool needed.\n"
-        "\n"
-        "When a request truly needs work, run a tight loop:\n"
-        "  1. Plan ONE small concrete next step (not a roadmap).\n"
-        "  2. Act — call the tool in the same turn. Never announce a "
-        "tool call without making it (\"I'll search…\" without the call "
-        "is forbidden).\n"
-        "  3. Read the result, then finish or take ONE more step.\n"
-        "Stop as soon as you have something useful. Prefer a short answer "
-        "the user can refine over a long pre-committed plan.\n"
-        "\n"
-        "Tool notes:\n"
-        "  - 'now' / 'today' / 'latest' → datetime first.\n"
-        "  - web_search returns snippets only; after one search, web_fetch "
-        "the top 1-3 URLs and answer from the fetched body. Two searches "
-        "in a row is wrong.\n"
-        "  - Files: PREFER fs_read_file / fs_list_dir / fs_glob / fs_grep "
-        "/ fs_write_file (paths virtual, rooted at `/`). Do NOT use bash "
-        "for `cat > file`, `cat <<EOF`, `echo > file`, `mkdir`, or for "
-        "reading files — the dedicated fs tools do those without the "
-        "shell-quoting minefield.\n"
-        "  - bash: shell features the dedicated tools don't have — "
-        "pipelines, find | xargs, build runners (make / cmake / cargo / "
-        "npm), git, package managers, sed/awk for in-place edits.\n"
-        "  - Cite the URL you actually fetched.\n"
-        "\n"
-        "## When asked to create something — PROTOTYPE FIRST\n"
-        "1. Build the simplest thing that does EXACTLY what the user "
-        "asked. No extra features. No defensive scaffolding for cases "
-        "they didn't mention. No \"while I'm at it\" cleanups. Stay "
-        "strictly in scope.\n"
-        "2. Verify it runs. Show the user the working result.\n"
-        "3. THEN surface ideas you have for next steps as a short "
-        "numbered list and ASK which the user wants. Do not apply them "
-        "yourself. Wait for the user's pick.\n"
-        "\n"
-        "The user's request is the ceiling, not a starting point. They "
-        "steer; you implement what they pick. Refinement is a dialogue, "
-        "not a monologue.";
-
+    // The "Tool notes:" section only mentions tools that will actually
+    // be registered for THIS invocation — naming an unregistered tool
+    // (e.g. bash with allow_bash=off) makes models hallucinate calls
+    // to it. Mirrors the gating in LocalBackend / cli::Toolbelt.
     std::string system_prompt = args.system_inline;
     if (system_prompt.empty() && !args.system_path.empty()) {
         easyai::text::slurp_file(args.system_path, system_prompt);
@@ -353,7 +397,9 @@ int main(int argc, char ** argv) {
                          args.system_path.c_str());
         }
     }
-    if (system_prompt.empty() && args.load_tools) system_prompt = kBuiltinSystem;
+    if (system_prompt.empty() && args.load_tools) {
+        system_prompt = build_builtin_system_prompt(args);
+    }
 
     // --show-system-prompt: dump the resolved prompt to stdout and exit
     // before any model is loaded. Doesn't need -m / a working sandbox /

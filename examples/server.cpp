@@ -3549,34 +3549,23 @@ static void on_signal(int) {
     if (s) s->stop();
 }
 
-int main(int argc, char ** argv) {
-    ServerArgs args = parse_args(argc, argv);
+// Build the built-in system prompt with tool-notes bullets gated on which
+// tools will actually be registered. Naming an unregistered tool here makes
+// models try to call it ("bash"/"fs_write_file" hallucinations), so each
+// bullet is conditional on the same flag that controls registration.
+static std::string build_builtin_system_prompt(const ServerArgs & args) {
+    const bool tools_on    = args.local_tools;
+    const bool fs_on       = tools_on && args.allow_fs;
+    const bool bash_on     = tools_on && args.allow_bash;
+    const bool sandbox_path_on = tools_on && (args.allow_fs || args.allow_bash);
+    const bool web_on      = tools_on;        // web_search/web_fetch are default-on
+    const bool datetime_on = tools_on;        // datetime is default-on
+    const bool rag_on      = !args.rag_dir.empty();
 
-    // -------- INI overlay (CLI > INI > hardcoded) ------------------------
-    // Load early so EVERY downstream `args.*` read already has the merged
-    // value. The INI section/key declared in `kFlags()` is the contract:
-    // any flag present there picks up its INI default unless the operator
-    // also passed it on the command line. The merged `Ini` is preserved
-    // for use below (MCP auth user table) and for any future code that
-    // needs to introspect a non-flag-mapped section.
-    easyai::config::Ini ini_config;
-    {
-        std::string ini_err;
-        ini_config = easyai::config::load_ini_file(args.config_path, ini_err);
-        if (!ini_err.empty()) {
-            std::fprintf(stderr,
-                "easyai-server: %s warnings:\n%s\n",
-                args.config_path.c_str(), ini_err.c_str());
-        }
-        apply_ini_to_args(ini_config, args);
-    }
+    std::string s;
+    s.reserve(4096);
 
-    // -------- resolve system prompt --------------------------------------
-    // Precedence: --system inline > -s file > built-in default. The default
-    // exists because a *small* model with NO system prompt and a tool list
-    // is very likely to over-eagerly call tools on simple greetings ("hi"
-    // → web_search).  Operators can fully replace it via -s.
-    static constexpr char kBuiltinSystem[] =
+    s +=
         "You are Deep — a clear, honest assistant. Answer briefly and let\n"
         "the user steer. Lead with the answer; show work only when the user\n"
         "would need it.\n"
@@ -3606,37 +3595,63 @@ int main(int argc, char ** argv) {
         "     \"Now I'll…\" without the call is forbidden).\n"
         "  3. Read the result, then finish or take ONE more step.\n"
         "Stop as soon as you have something useful. Prefer a short answer\n"
-        "the user can refine over a long pre-committed plan. Use the `plan`\n"
-        "tool only when the task genuinely needs a multi-step checklist the\n"
-        "user can watch — skip it for single-tool turns and chitchat.\n"
-        "\n"
-        "Tool notes:\n"
-        "  - 'now' / 'today' / 'latest' → datetime first.\n"
-        "  - web_search returns snippets only; after ONE search, web_fetch\n"
-        "    the top 1-3 URLs and answer from the fetched body. Two searches\n"
-        "    in a row is wrong.\n"
-        "  - Files: PREFER the dedicated tools — fs_read_file /\n"
-        "    fs_list_dir / fs_glob / fs_grep / fs_write_file (paths\n"
-        "    virtual, rooted at `/`). Do NOT use bash for `cat > file`,\n"
-        "    `cat <<EOF`, `echo > file`, `mkdir`, or for reading files —\n"
-        "    fs_write_file / fs_read_file / fs_list_dir do those without\n"
-        "    the shell-quoting minefield.\n"
-        "  - bash (when registered): for shell features the dedicated\n"
-        "    fs tools don't have — pipelines, `find | xargs`, build\n"
-        "    runners (make / cmake / cargo / npm), git, package\n"
-        "    managers, sed/awk for in-place edits.\n"
-        "  - get_sandbox_path: returns the absolute path of your sandbox\n"
-        "    root. Use it once if you need to mention the real on-disk\n"
-        "    path; fs_* otherwise speak a virtual `/`.\n"
-        "  - Host metrics: system_meminfo / loadavg / cpu_usage / swaps.\n"
-        "  - Long-term memory: rag(action=…) save / append / search / load.\n"
-        "  - plan: action='add' (text or items[] up to 20), action='update'\n"
-        "    (id + status='working'|'done'|'error') to advance a step,\n"
-        "    action='delete' (id, or id='all') to retire one. NEVER re-add\n"
-        "    to mutate a step — use update.\n"
-        "  - Cite URLs you actually fetched. Attach dates to dated facts\n"
-        "    (\"released April 2026\" beats \"recently released\").\n"
-        "\n"
+        "the user can refine over a long pre-committed plan.\n"
+        "\n";
+
+    const bool any_tool_note = datetime_on || web_on || fs_on || bash_on
+                            || sandbox_path_on || rag_on;
+    if (any_tool_note) {
+        s += "Tool notes:\n";
+        if (datetime_on) {
+            s += "  - 'now' / 'today' / 'latest' → datetime first.\n";
+        }
+        if (web_on) {
+            s +=
+                "  - web_search returns snippets only; after ONE search, web_fetch\n"
+                "    the top 1-3 URLs and answer from the fetched body. Two searches\n"
+                "    in a row is wrong.\n";
+        }
+        if (fs_on && bash_on) {
+            s +=
+                "  - Files: PREFER the dedicated tools — fs_read_file /\n"
+                "    fs_list_dir / fs_glob / fs_grep / fs_write_file (paths\n"
+                "    virtual, rooted at `/`). Do NOT use bash for `cat > file`,\n"
+                "    `cat <<EOF`, `echo > file`, `mkdir`, or for reading files —\n"
+                "    fs_write_file / fs_read_file / fs_list_dir do those without\n"
+                "    the shell-quoting minefield.\n"
+                "  - bash: for shell features the dedicated fs tools don't\n"
+                "    have — pipelines, `find | xargs`, build runners (make /\n"
+                "    cmake / cargo / npm), git, package managers, sed/awk for\n"
+                "    in-place edits.\n";
+        } else if (fs_on) {
+            s +=
+                "  - Files: use the dedicated fs tools — fs_read_file /\n"
+                "    fs_list_dir / fs_glob / fs_grep / fs_write_file (paths\n"
+                "    virtual, rooted at `/`).\n";
+        } else if (bash_on) {
+            s +=
+                "  - bash: run shell commands. No dedicated file tools are\n"
+                "    registered, so bash is the only path for file work too —\n"
+                "    use heredocs / cat / sed for edits.\n";
+        }
+        if (sandbox_path_on) {
+            s +=
+                "  - get_sandbox_path: returns the absolute path of your\n"
+                "    sandbox root. Use it once if you need to mention the\n"
+                "    real on-disk path; fs_* otherwise speak a virtual `/`.\n";
+        }
+        if (rag_on) {
+            s += "  - Long-term memory: rag(action=…) save / append / search / load.\n";
+        }
+        if (web_on) {
+            s +=
+                "  - Cite URLs you actually fetched. Attach dates to dated\n"
+                "    facts (\"released April 2026\" beats \"recently released\").\n";
+        }
+        s += "\n";
+    }
+
+    s +=
         "## When asked to create something — PROTOTYPE FIRST\n"
         "1. Build the simplest thing that does EXACTLY what the user\n"
         "   asked. No extra features. No defensive scaffolding for cases\n"
@@ -3653,8 +3668,43 @@ int main(int argc, char ** argv) {
         "comparison of three abstractions every time.\n"
         "\n"
         "Be terse. Be honest about uncertainty: \"I'm not sure — let me\n"
-        "check\" → call a tool.";
+        "check\"";
+    s += any_tool_note ? " → call a tool." : ".";
+    return s;
+}
 
+int main(int argc, char ** argv) {
+    ServerArgs args = parse_args(argc, argv);
+
+    // -------- INI overlay (CLI > INI > hardcoded) ------------------------
+    // Load early so EVERY downstream `args.*` read already has the merged
+    // value. The INI section/key declared in `kFlags()` is the contract:
+    // any flag present there picks up its INI default unless the operator
+    // also passed it on the command line. The merged `Ini` is preserved
+    // for use below (MCP auth user table) and for any future code that
+    // needs to introspect a non-flag-mapped section.
+    easyai::config::Ini ini_config;
+    {
+        std::string ini_err;
+        ini_config = easyai::config::load_ini_file(args.config_path, ini_err);
+        if (!ini_err.empty()) {
+            std::fprintf(stderr,
+                "easyai-server: %s warnings:\n%s\n",
+                args.config_path.c_str(), ini_err.c_str());
+        }
+        apply_ini_to_args(ini_config, args);
+    }
+
+    // -------- resolve system prompt --------------------------------------
+    // Precedence: --system inline > -s file > built-in default. The default
+    // exists because a *small* model with NO system prompt and a tool list
+    // is very likely to over-eagerly call tools on simple greetings ("hi"
+    // → web_search).  Operators can fully replace it via -s.
+    //
+    // The built-in prompt only mentions tools that are actually registered
+    // for THIS server invocation. Listing names of unregistered tools (e.g.
+    // bash with allow_bash=off) makes models hallucinate calls to them, so
+    // each "Tool notes:" bullet is gated on the corresponding flag.
     std::string default_system = args.system_inline;
     if (default_system.empty() && !args.system_path.empty()) {
         default_system = read_text_file(args.system_path);
@@ -3663,7 +3713,7 @@ int main(int argc, char ** argv) {
                          args.system_path.c_str());
         }
     }
-    if (default_system.empty()) default_system = kBuiltinSystem;
+    if (default_system.empty()) default_system = build_builtin_system_prompt(args);
 
     // --show-system-prompt: dump the resolved persona and exit before
     // any model loads or any port binds. Resolves --system / --system-file
