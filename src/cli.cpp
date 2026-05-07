@@ -69,6 +69,10 @@ std::vector<Tool> Toolbelt::tools() const {
         out.push_back(easyai::tools::fs_glob      (fs_root));
         out.push_back(easyai::tools::fs_grep      (fs_root));
         out.push_back(easyai::tools::fs_write_file(fs_root));
+        // fs_check_path — the authoritative pre-flight that every other
+        // fs_* / bash description tells the model to call first. Always
+        // ships with the rest of the fs_* group; pinned to the same root.
+        out.push_back(easyai::tools::fs_check_path(fs_root));
     }
     if (bash_on) {
         out.push_back(easyai::tools::bash(fs_root, show_bash_));

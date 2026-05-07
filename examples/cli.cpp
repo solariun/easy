@@ -19,8 +19,8 @@
 //   datetime, plan          (always)
 //   web_search, web_fetch   (when libeasyai was built with curl — runtime
 //                            check via the tool returning an error if not)
-//   fs_list_dir, fs_read_file, fs_glob, fs_grep
-//                           (only when --sandbox DIR is given; root scoped)
+//   fs_list_dir, fs_read_file, fs_glob, fs_grep, fs_write_file,
+//   fs_check_path           (only when --sandbox DIR is given; root scoped)
 //
 // REPL specials:
 //   /exit, /quit       leave
@@ -404,7 +404,8 @@ void usage(const char * argv0) {
 "                                 web_google (also needs --use-google),\n"
 "                                 get_current_dir, get_sandbox_path,\n"
 "                                 fs_read_file, fs_list_dir, fs_glob,\n"
-"                                 fs_grep, fs_write_file, bash,\n"
+"                                 fs_grep, fs_write_file, fs_check_path,\n"
+"                                 bash,\n"
 "                                 system_meminfo, system_loadavg,\n"
 "                                 system_cpu_usage, system_swaps,\n"
 "                                 rag (default RAG layout — single tool;\n"
@@ -422,10 +423,11 @@ void usage(const char * argv0) {
 "                                  registered instead)\n"
 "    --sandbox DIR              enable file work scoped to DIR.\n"
 "                                 Auto-registers fs_list_dir, fs_read_file,\n"
-"                                 fs_glob, fs_grep, fs_write_file AND\n"
-"                                 get_sandbox_path. Without --sandbox\n"
-"                                 (and without --allow-bash) the model has\n"
-"                                 no file access.\n"
+"                                 fs_glob, fs_grep, fs_write_file,\n"
+"                                 fs_check_path AND get_sandbox_path.\n"
+"                                 Without --sandbox (and without\n"
+"                                 --allow-bash) the model has no file\n"
+"                                 access.\n"
 "    --allow-bash               register the `bash` tool (run shell\n"
 "                                 commands). Implies fs_* tool registration\n"
 "                                 (bash subsumes them; without fs_* the\n"
@@ -760,6 +762,7 @@ const std::vector<std::string> kDefaultTools = {
 // on-disk path of its working root (fs_* otherwise speak a virtual `/`).
 const std::vector<std::string> kSandboxFsTools = {
     "fs_list_dir", "fs_read_file", "fs_glob", "fs_grep", "fs_write_file",
+    "fs_check_path",
     "get_sandbox_path",
 };
 
@@ -809,6 +812,9 @@ void register_tools(easyai::Client & cli,
     if (wants("fs_glob"))       cli.add_tool(easyai::tools::fs_glob(root));
     if (wants("fs_grep"))       cli.add_tool(easyai::tools::fs_grep(root));
     if (wants("fs_write_file")) cli.add_tool(easyai::tools::fs_write_file(root));
+    // fs_check_path — pre-flight stat + access probe; the other fs_*/bash
+    // descriptions tell the model to call this before any read/write.
+    if (wants("fs_check_path")) cli.add_tool(easyai::tools::fs_check_path(root));
     // get_sandbox_path — pinned to the same root as fs_*/bash. Lets
     // the model resolve the absolute on-disk path of where its work
     // is landing, without depending on the process's cwd matching.

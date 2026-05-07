@@ -1040,16 +1040,17 @@ struct Sandbox {
         out = (root / rel).lexically_normal();
         return true;
     }
-    // Render a real on-disk path back into the model's "/"-rooted view.
-    // The sandbox base is hidden; the model only ever sees /file.md,
-    // /subdir/file.md, etc.  This is the inverse of resolve() for display.
+    // Render a real on-disk path back into the model's relative view.
+    // The sandbox base is hidden; the model sees `report.md`,
+    // `src/main.cpp`, `.` for the root itself.  Relative form matches
+    // what every fs_* / bash description tells the model to USE as
+    // input — so grep/glob output can be fed straight back into
+    // read_file without a leading-slash dance.
     std::string virtual_path(const fs::path & real) const {
         std::error_code ec;
         fs::path rel = fs::relative(real, root, ec);
-        if (ec || rel.empty() || rel == ".") return "/";
-        std::string s = rel.generic_string();
-        if (s.front() != '/') s.insert(0, "/");
-        return s;
+        if (ec || rel.empty() || rel == ".") return ".";
+        return rel.generic_string();
     }
     // Belt-and-braces containment check, called at file-access time.
     // resolve() mechanically anchors the input under root; this method
@@ -1057,25 +1058,47 @@ struct Sandbox {
     // so a malicious symlink already inside the sandbox (e.g. planted
     // by the bash tool) cannot redirect a follow-up open() outside.
     //
-    // weakly_canonical resolves symlinks for the existing prefix and
-    // appends the trailing components verbatim — so it works for both
-    // existing files (read) and not-yet-existing files (write).
+    // Two-layer strategy:
+    //   1. Lexical containment — cheap, no FS access. resolve() always
+    //      anchors its output under root by construction, so any path
+    //      we got from resolve() passes this. Required: false here is
+    //      a definitive "not under root, not even on paper".
+    //   2. Symlink-safe canonical check via weakly_canonical. Catches
+    //      symlinks anywhere in the path that would redirect us out of
+    //      root. When canonicalisation FAILS (typically EACCES on a
+    //      0000 parent dir, or ENOENT racing rmdir), we fall back to
+    //      the lexical answer instead of rejecting — failing closed
+    //      here used to break fs_check_path on exactly the paths the
+    //      operator most wanted to probe (e.g. files inside an
+    //      0000-perm parent that the model wants to know about).
     bool inside_sandbox(const fs::path & p) const {
+        // Path-component prefix match — avoids the string-prefix bug
+        // where "/srv/user" prefix-matches "/srv/userMALICIOUS/secret".
+        auto component_prefix = [](const fs::path & prefix,
+                                   const fs::path & full) {
+            auto it_pre = prefix.begin();
+            auto it_ful = full.begin();
+            for (; it_pre != prefix.end(); ++it_pre, ++it_ful) {
+                if (it_ful == full.end() || *it_ful != *it_pre) return false;
+            }
+            return true;
+        };
+        // Layer 1: lexical containment. Fail-closed if the path on
+        // paper is outside the sandbox (would only happen if a caller
+        // constructed `p` themselves rather than going through resolve()).
+        if (!component_prefix(root, p.lexically_normal())) return false;
+
+        // Layer 2: bonus symlink defence. If canonicalisation fails
+        // (perm error, race), trust layer 1 — we know the path is
+        // lexically inside, and the subsequent open() / lstat() will
+        // surface the real errno far more usefully than a blanket
+        // "escapes sandbox" rejection.
         std::error_code ec;
         fs::path canon_p = fs::weakly_canonical(p, ec);
-        if (ec) return false;
+        if (ec) return true;
         fs::path canon_r = fs::weakly_canonical(root, ec);
-        if (ec) return false;
-        // Path-component prefix match: every component of canon_r must
-        // appear at the start of canon_p, in order. Avoids the
-        // string-prefix bug ("/srv/user" prefix-matches
-        // "/srv/userMALICIOUS/secret").
-        auto it_r = canon_r.begin();
-        auto it_p = canon_p.begin();
-        for (; it_r != canon_r.end(); ++it_r, ++it_p) {
-            if (it_p == canon_p.end() || *it_p != *it_r) return false;
-        }
-        return true;
+        if (ec) return true;
+        return component_prefix(canon_r, canon_p);
     }
 };
 
@@ -1125,21 +1148,29 @@ Tool fs_read_file(std::string root) {
         .describe(
             "Read a UTF-8 text file from disk and return its contents.\n"
             "\n"
-            "The filesystem you see is rooted at `/`; use paths like "
-            "`/report.md` or `/docs/spec.md`. Required: path. Optional: "
-            "offset, limit (default returns the first 64 KB; pass offset to "
-            "page through larger files).\n"
+            "AUTHORITATIVE SANDBOX RULE — before your first fs_*/bash "
+            "call in a task, run `get_sandbox_path` (the absolute on-disk "
+            "root, pinned at registration; this is the truth) and then "
+            "`fs_check_path` against the file you intend to read so you "
+            "have confirmed it exists and is readable. Skipping this is "
+            "the most common cause of avoidable error loops.\n"
+            "\n"
+            "PATHS ARE RELATIVE to the sandbox root. Use `report.md`, "
+            "`docs/spec.md`, `src/main.cpp` — NEVER prefix with `/`. "
+            "Required: path. Optional: offset, limit (default returns the "
+            "first 64 KB; pass offset to page through larger files).\n"
             "\n"
             "Examples:\n"
-            "  {path:\"/report.md\"}\n"
-            "  {path:\"/docs/spec.md\", offset:65536, limit:65536}\n"
+            "  {path:\"report.md\"}\n"
+            "  {path:\"docs/spec.md\", offset:65536, limit:65536}\n"
             "\n"
             "Errors return a single-line message starting with `error:`. "
             "Reading a binary file returns the raw bytes — prefer the "
             "dedicated tools or `bash` (e.g. `file <path>`) for those.")
         .param("path",   "string",
-               "Required. File path under the sandbox root, e.g. "
-               "`/report.md` or `/docs/spec.md`.", true)
+               "Required. RELATIVE file path under the sandbox root, e.g. "
+               "`report.md` or `docs/spec.md`. No leading `/`. Confirm with "
+               "`fs_check_path` first.", true)
         .param("offset", "integer",
                "Optional. Skip this many bytes from the start of the file "
                "before reading. Default 0. Use the previous read's "
@@ -1202,20 +1233,28 @@ Tool fs_write_file(std::string root) {
             "existing content; pass append=true to extend instead. Missing "
             "parent directories are created automatically.\n"
             "\n"
-            "The filesystem you see is rooted at `/`; use paths like "
-            "`/report.md` or `/docs/notes.md`. Required: path, content. "
-            "Optional: append.\n"
+            "AUTHORITATIVE SANDBOX RULE — before your first fs_*/bash "
+            "call in a task, run `get_sandbox_path` (the absolute on-disk "
+            "root, pinned at registration; this is the truth) and then "
+            "`fs_check_path` with `touch:true` for the destination so "
+            "you have confirmed write access in the sandbox. Skipping "
+            "this turns permission errors into surprises.\n"
+            "\n"
+            "PATHS ARE RELATIVE to the sandbox root. Use `report.md`, "
+            "`docs/notes.md`, `src/main.cpp` — NEVER prefix with `/`. "
+            "Required: path, content. Optional: append.\n"
             "\n"
             "Examples:\n"
-            "  {path:\"/report.md\", content:\"# Title\\n\\nBody...\"}\n"
-            "  {path:\"/log.txt\", content:\"line\\n\", append:true}\n"
+            "  {path:\"report.md\", content:\"# Title\\n\\nBody...\"}\n"
+            "  {path:\"log.txt\", content:\"line\\n\", append:true}\n"
             "\n"
             "On success returns `wrote N bytes to <path>`. Errors return a "
             "single-line message starting with `error:`.")
         .param("path",    "string",
-               "Required. Destination file path under the sandbox root. "
-               "Parent directories are created if missing. Examples: "
-               "`/report.md`, `/docs/notes.md`.", true)
+               "Required. RELATIVE destination file path under the sandbox "
+               "root. No leading `/`. Parent directories are created if "
+               "missing. Examples: `report.md`, `docs/notes.md`. Validate "
+               "writability with `fs_check_path` first.", true)
         .param("content", "string",
                "Required. UTF-8 text to write. Use `\\n` for newlines. "
                "Binary content is not supported — use bash for that.", true)
@@ -1282,20 +1321,29 @@ Tool fs_list_dir(std::string root) {
             "List the entries (files and directories) inside one directory, "
             "non-recursively. Use `glob` for recursive / pattern matching.\n"
             "\n"
+            "AUTHORITATIVE SANDBOX RULE — before your first fs_*/bash "
+            "call in a task, run `get_sandbox_path` (the absolute on-disk "
+            "root, pinned at registration; this is the truth) and then "
+            "`fs_check_path` against the directory you intend to list so "
+            "you have confirmed it exists and is readable.\n"
+            "\n"
             "Output is one entry per line, sorted, with a trailing `/` on "
-            "directories. Hidden entries (dotfiles) are included. The "
-            "filesystem is rooted at `/`. Required: path.\n"
+            "directories. Hidden entries (dotfiles) are included. PATHS "
+            "ARE RELATIVE to the sandbox root — use `.` for the root "
+            "itself, `subdir` / `src/headers` for nested. NEVER prefix "
+            "with `/`. Required: path.\n"
             "\n"
             "Examples:\n"
-            "  {path:\"/\"}            # top-level entries\n"
-            "  {path:\"/src\"}         # one nested level\n"
+            "  {path:\".\"}              # sandbox root entries\n"
+            "  {path:\"src\"}            # one nested level\n"
             "\n"
             "Errors (path missing, not a directory) return a single-line "
             "message starting with `error:`.")
         .param("path", "string",
-               "Required. Directory path under the sandbox root. Use `/` "
-               "for the top, `/subdir` for nested paths. Trailing slashes "
-               "are accepted.", true)
+               "Required. RELATIVE directory path under the sandbox root. "
+               "Use `.` for the root, `subdir` for nested paths. No leading "
+               "`/`. Trailing slashes accepted. Validate with `fs_check_path` "
+               "first.", true)
         .handle([sb](const ToolCall & c) {
             std::string path;
             if (!args::get_string(c.arguments_json, "path", path))
@@ -1329,17 +1377,28 @@ Tool fs_glob(std::string root) {
     auto sb = std::make_shared<Sandbox>(std::move(root));
     return Tool::builder("glob")
         .describe(
-            "Find files by wildcard pattern. Recursive by default.\n"
+            "Find files by wildcard pattern. Recursive by default. The "
+            "`path` argument names a STARTING DIRECTORY (or is omitted, "
+            "defaulting to the sandbox root). Pointing it at a single "
+            "file is an error — globs scan trees, not files.\n"
+            "\n"
+            "AUTHORITATIVE SANDBOX RULE — before your first fs_*/bash "
+            "call in a task, run `get_sandbox_path` (the absolute on-disk "
+            "root, pinned at registration; this is the truth) and then "
+            "`fs_check_path` against the starting directory so you have "
+            "confirmed it exists, is readable, and is `type: directory` "
+            "before you scan it.\n"
             "\n"
             "Pattern grammar: `*` matches any run of characters except `/`; "
             "`**` matches across directory boundaries; `?` matches one "
             "character; `[abc]` matches one of a set. Required: pattern. "
-            "Optional: path (the starting directory; defaults to `/`).\n"
+            "Optional: path (the starting directory; defaults to `.`, the "
+            "sandbox root).\n"
             "\n"
-            "Output is one matching path per line, sorted, rooted at `/`. "
-            "Examples:\n"
+            "PATHS ARE RELATIVE to the sandbox root. Output is one matching "
+            "RELATIVE path per line, sorted. Examples:\n"
             "  {pattern:\"*.cpp\"}                       # any .cpp anywhere\n"
-            "  {pattern:\"**/*.hpp\", path:\"/src\"}      # .hpp under /src\n"
+            "  {pattern:\"**/*.hpp\", path:\"src\"}       # .hpp under src/\n"
             "  {pattern:\"src/**/*.{c,cc,cpp}\"}          # multiple suffixes\n"
             "\n"
             "Use `grep` to search file contents; use `list_dir` to browse "
@@ -1349,8 +1408,9 @@ Tool fs_glob(std::string root) {
                "`/`, `**` crosses directory boundaries, `?` matches one "
                "char, `[abc]` matches a character class.", true)
         .param("path",    "string",
-               "Optional. Starting directory under the sandbox root. "
-               "Default `/`. Example: `/src`.", false)
+               "Optional. RELATIVE starting directory under the sandbox "
+               "root. Default `.` (the root). No leading `/`. Example: "
+               "`src`.", false)
         .handle([sb](const ToolCall & c) {
             std::string pattern, sub;
             if (!args::get_string(c.arguments_json, "pattern", pattern))
@@ -1364,6 +1424,16 @@ Tool fs_glob(std::string root) {
                 return ToolResult::error("start dir escapes sandbox via symlink: "
                                          + sb->virtual_path(start));
             }
+            // Precheck: a clear `error:` line beats a stray
+            // `filesystem_error` exception when the model passes a path
+            // that doesn't exist or names a regular file.
+            std::error_code ec_pre;
+            if (!fs::is_directory(start, ec_pre)) {
+                return ToolResult::error(
+                    std::string("not a directory: ") + sb->virtual_path(start)
+                    + (ec_pre ? std::string(" (") + ec_pre.message() + ")"
+                              : std::string()));
+            }
 
             std::regex rx;
             try { rx = std::regex(glob_to_regex(pattern)); }
@@ -1371,17 +1441,58 @@ Tool fs_glob(std::string root) {
                 return ToolResult::error(std::string("bad glob pattern: ") + e.what());
             }
 
+            // skip_permission_denied lets the iterator silently step
+            // past 0700/0000 subdirs the running user can't enumerate
+            // instead of throwing mid-loop. Combined with the ec
+            // constructor and the ec-overloads on per-entry queries
+            // below, glob now degrades gracefully across mixed-perms
+            // sandboxes (e.g. a `--sandbox $HOME` with a ~/.gnupg in
+            // it).
+            constexpr auto kIterOpts =
+                fs::directory_options::skip_permission_denied;
+            std::error_code ec_it;
+            fs::recursive_directory_iterator it(start, kIterOpts, ec_it);
+            if (ec_it) {
+                return ToolResult::error(
+                    std::string("cannot iterate: ") + sb->virtual_path(start)
+                    + " (" + ec_it.message() + ")");
+            }
+            const fs::recursive_directory_iterator end;
+
             std::ostringstream o;
             int n = 0;
-            for (auto & e : fs::recursive_directory_iterator(start)) {
-                if (!e.is_regular_file()) continue;
-                std::string rel = fs::relative(e.path(), sb->root).generic_string();
-                bool m = false;
-                try { m = std::regex_match(rel, rx); }
-                catch (const std::regex_error &) { /* unsupported; skip entry */ }
-                if (m) {
-                    o << sb->virtual_path(e.path()) << "\n";
-                    if (++n >= 500) { o << "...[stopped at 500 matches]\n"; break; }
+            // Hand-rolled loop with an ec-aware increment so a flake
+            // mid-traversal (vanished entry, race) skips the bad
+            // subtree instead of tearing down the whole call. Ranged-
+            // for would call the throwing operator++ overload.
+            for (; it != end; ) {
+                std::error_code ec_q;
+                if (it->is_regular_file(ec_q) && !ec_q) {
+                    std::string rel =
+                        fs::relative(it->path(), sb->root, ec_q).generic_string();
+                    if (!ec_q) {
+                        bool m = false;
+                        try { m = std::regex_match(rel, rx); }
+                        catch (const std::regex_error &) { /* skip entry */ }
+                        if (m) {
+                            o << sb->virtual_path(it->path()) << "\n";
+                            if (++n >= 500) {
+                                o << "...[stopped at 500 matches]\n";
+                                break;
+                            }
+                        }
+                    }
+                }
+                std::error_code ec_step;
+                it.increment(ec_step);
+                if (ec_step) {
+                    // Drop the offending subtree and keep going. We
+                    // already opted into skip_permission_denied so
+                    // this branch is reserved for genuinely flaky
+                    // errors (vanished entries on a busy FS, etc.).
+                    if (it == end) break;
+                    it.pop();
+                    if (it == end) break;
                 }
             }
             if (n == 0) return ToolResult::ok("No matches.");
@@ -1394,22 +1505,35 @@ Tool fs_grep(std::string root) {
     auto sb = std::make_shared<Sandbox>(std::move(root));
     return Tool::builder("grep")
         .describe(
-            "Search file contents for a regular expression, recursively.\n"
+            "Search file contents for a regular expression, recursively "
+            "across a DIRECTORY TREE. The `path` argument MUST name a "
+            "directory (or be omitted, defaulting to the sandbox root). "
+            "Passing a single file's path is an error — to search within "
+            "one file, call `read_file` and look directly, or use `bash` "
+            "(`grep PATTERN file.txt`).\n"
+            "\n"
+            "AUTHORITATIVE SANDBOX RULE — before your first fs_*/bash "
+            "call in a task, run `get_sandbox_path` (the absolute on-disk "
+            "root, pinned at registration; this is the truth) and then "
+            "`fs_check_path` against the starting directory so you have "
+            "confirmed it exists, is readable, and is `type: directory` "
+            "before you scan it.\n"
             "\n"
             "Regex flavor is ECMAScript (same as JavaScript / std::regex): "
             "`.`, `*`, `+`, `?`, `()`, `|`, `[]`, `\\d`, `\\w`, `\\s`, "
             "anchors `^`/`$`. Each line is matched independently.\n"
             "\n"
             "Output: one match per line as `<path>:<lineno>:<line>`, paths "
-            "rooted at `/`, sorted by path. Stops after `max_matches` "
-            "(default 100).\n"
+            "RELATIVE to the sandbox root, sorted by path. Stops after "
+            "`max_matches` (default 100).\n"
             "\n"
-            "Required: pattern. Optional: path (start dir, default `/`), "
-            "file_glob (limit by filename), max_matches, case_insensitive.\n"
+            "Required: pattern. Optional: path (start dir, default `.` — "
+            "the sandbox root), file_glob (limit by filename), "
+            "max_matches, case_insensitive. NEVER prefix paths with `/`.\n"
             "\n"
             "Examples:\n"
             "  {pattern:\"TODO\"}\n"
-            "  {pattern:\"class\\\\s+\\\\w+\", path:\"/src\", file_glob:\"*.hpp\"}\n"
+            "  {pattern:\"class\\\\s+\\\\w+\", path:\"src\", file_glob:\"*.hpp\"}\n"
             "  {pattern:\"error\", case_insensitive:true, max_matches:50}\n"
             "\n"
             "Use `glob` to find files by name; use `read_file` to read one.")
@@ -1418,8 +1542,9 @@ Tool fs_grep(std::string root) {
                "tested with regex_search (substring match), so anchor with "
                "`^` / `$` if you want full-line matches.", true)
         .param("path",          "string",
-               "Optional. Starting directory under the sandbox root. "
-               "Default `/`. Example: `/src`.", false)
+               "Optional. RELATIVE starting directory under the sandbox "
+               "root. Default `.` (the root). No leading `/`. Example: "
+               "`src`.", false)
         .param("file_glob",     "string",
                "Optional. Wildcard pattern restricting which filenames are "
                "searched (matched against the basename). Examples: "
@@ -1447,6 +1572,18 @@ Tool fs_grep(std::string root) {
             if (!sb->inside_sandbox(start)) {
                 return ToolResult::error("start dir escapes sandbox via symlink: "
                                          + sb->virtual_path(start));
+            }
+            // Precheck: a clear `error:` line beats a stray
+            // `filesystem_error` exception when the model passes a path
+            // that doesn't exist or names a regular file. Without this,
+            // `recursive_directory_iterator` throws on construction
+            // and the exception escapes the handler.
+            std::error_code ec_pre;
+            if (!fs::is_directory(start, ec_pre)) {
+                return ToolResult::error(
+                    std::string("not a directory: ") + sb->virtual_path(start)
+                    + (ec_pre ? std::string(" (") + ec_pre.message() + ")"
+                              : std::string()));
             }
 
             std::regex::flag_type rf = std::regex::ECMAScript;
@@ -1477,35 +1614,273 @@ Tool fs_grep(std::string root) {
                 }
             }
 
+            // Mixed-perms sandboxes (e.g. `--sandbox $HOME` with a
+            // ~/.gnupg or ~/.cache somewhere underneath) used to
+            // crash grep mid-walk; skip_permission_denied silently
+            // steps past unreadable subtrees, and the ec-aware
+            // increment below catches any other flakes without
+            // tearing down the call.
+            constexpr auto kIterOpts =
+                fs::directory_options::skip_permission_denied;
+            std::error_code ec_it;
+            fs::recursive_directory_iterator it(start, kIterOpts, ec_it);
+            if (ec_it) {
+                return ToolResult::error(
+                    std::string("cannot iterate: ") + sb->virtual_path(start)
+                    + " (" + ec_it.message() + ")");
+            }
+            const fs::recursive_directory_iterator end;
+
             std::ostringstream o;
             int n = 0;
-            for (auto & e : fs::recursive_directory_iterator(start)) {
-                if (!e.is_regular_file()) continue;
-                if (e.file_size() > 4 * 1024 * 1024) continue;  // skip huge files
-                std::string fname = e.path().filename().string();
-                if (!file_glob.empty() && !std::regex_match(fname, glob_rx)) continue;
-                std::ifstream f(e.path());
-                if (!f) continue;
-                std::string line; int lineno = 0;
-                std::string vpath = sb->virtual_path(e.path());
-                while (std::getline(f, line)) {
-                    ++lineno;
-                    // libstdc++'s regex engine is recursive; running a
-                    // user-supplied pattern against a multi-megabyte
-                    // single line (binary blob, minified JS, base64
-                    // dump) is a DoS vector via catastrophic
-                    // backtracking. 64 KiB is plenty for source code
-                    // and short of the failure regime.
-                    if (line.size() > 64 * 1024) continue;
-                    if (std::regex_search(line, rx)) {
-                        o << vpath << ":" << lineno << ": " << clip(line, 240) << "\n";
-                        if (++n >= max_matches) goto done;
+            // Hand-rolled loop using ec-overloads everywhere so a
+            // single bad entry (vanished, racy, exotic permission
+            // flavor) skips that subtree instead of throwing.
+            for (; it != end; ) {
+                std::error_code ec_q;
+                const bool is_reg = it->is_regular_file(ec_q);
+                if (ec_q || !is_reg) goto step;
+                {
+                    const auto sz = it->file_size(ec_q);
+                    if (ec_q || sz > 4 * 1024 * 1024) goto step;
+                    std::string fname = it->path().filename().string();
+                    if (!file_glob.empty() && !std::regex_match(fname, glob_rx))
+                        goto step;
+                    std::ifstream f(it->path());
+                    if (!f) goto step;
+                    std::string line; int lineno = 0;
+                    std::string vpath = sb->virtual_path(it->path());
+                    while (std::getline(f, line)) {
+                        ++lineno;
+                        // libstdc++'s regex engine is recursive;
+                        // running a user-supplied pattern against a
+                        // multi-megabyte single line (binary blob,
+                        // minified JS, base64 dump) is a DoS vector
+                        // via catastrophic backtracking. 64 KiB is
+                        // plenty for source code and short of the
+                        // failure regime.
+                        if (line.size() > 64 * 1024) continue;
+                        if (std::regex_search(line, rx)) {
+                            o << vpath << ":" << lineno << ": "
+                              << clip(line, 240) << "\n";
+                            if (++n >= max_matches) goto done;
+                        }
                     }
+                }
+            step:
+                std::error_code ec_step;
+                it.increment(ec_step);
+                if (ec_step) {
+                    // Drop the offending subtree (typically a flaky
+                    // entry the iterator can't even step over) and
+                    // keep going.
+                    if (it == end) break;
+                    it.pop();
+                    if (it == end) break;
                 }
             }
         done:
             if (n == 0) return ToolResult::ok("No matches.");
             return ToolResult::ok(clip(o.str(), 32 * 1024));
+        })
+        .build();
+}
+
+// ============================================================================
+// fs_check_path — sandbox-relative stat + access-rights probe.
+// ============================================================================
+//
+// The "look before you leap" tool. Other fs_* tools and bash all tell
+// the model (in their descriptions) to call fs_check_path before any
+// read/write so the sandbox boundary, file existence, and effective
+// r/w/x rights are confirmed up-front instead of discovered through
+// open() failures.
+//
+// Behaviour:
+//   - resolve(path) → real fs::path inside the sandbox (same anchoring
+//     as every other fs_* tool, so paths can never escape the root);
+//   - inside_sandbox() check protects against symlinks-to-outside;
+//   - if the path doesn't exist and `touch=true`, create an empty
+//     file there (parent dirs auto-created, mode 0600, O_NOFOLLOW so
+//     a planted symlink at the leaf can't redirect us out);
+//   - stat() the resolved path;
+//   - access() with R_OK / W_OK / X_OK for effective rights of the
+//     running process — these answer "can I really read/write/exec
+//     this *as me*", which is what the model actually wants.
+//
+// Output is multi-line key:value, with one mandatory `error:` line
+// surfaced on failure (consistent with the other fs_* tools).
+Tool fs_check_path(std::string root) {
+    auto sb = std::make_shared<Sandbox>(std::move(root));
+    return Tool::builder("fs_check_path")
+        .describe(
+            "AUTHORITATIVE PRE-FLIGHT — call this BEFORE any read_file, "
+            "write_file, list_dir, glob, grep, or bash command that "
+            "touches a path. It confirms the path is inside the "
+            "sandbox AND that the running process has the read / write "
+            "/ execute rights it needs. Skipping it causes the model to "
+            "trip on permission errors mid-task; running it once at the "
+            "start of every fs/bash subtask is the contract.\n"
+            "\n"
+            "Paths are RELATIVE to the sandbox root (e.g. `report.md`, "
+            "`src/main.cpp`, `docs`). Call `get_sandbox_path` first if "
+            "you need the absolute on-disk root — that path is the "
+            "authoritative anchor the fs_*/bash tools resolve against.\n"
+            "\n"
+            "Required: path. Optional: touch (default false). When "
+            "`touch=true` and the path doesn't exist, an empty file is "
+            "created there (parent directories auto-created) so you "
+            "can probe write access without committing real content.\n"
+            "\n"
+            "Output is multi-line key:value:\n"
+            "  path: <relative path you passed>\n"
+            "  absolute: <full on-disk path under the sandbox>\n"
+            "  exists: yes|no|unknown    (unknown = can't tell, e.g. parent\n"
+            "                             dir blocks lstat with EACCES)\n"
+            "  type: file|directory|symlink|other|missing|unknown\n"
+            "  size: <bytes>           (files only)\n"
+            "  mode: 0NNN              (octal permission bits)\n"
+            "  readable: yes|no        (effective R_OK for this process)\n"
+            "  writable: yes|no        (effective W_OK for this process)\n"
+            "  executable: yes|no      (effective X_OK for this process)\n"
+            "  mtime: <ISO-8601 UTC>   (last modification)\n"
+            "  created: yes            (only when touch=true created the file)\n"
+            "  error: <message>        (only when exists is unknown)\n"
+            "\n"
+            "Examples:\n"
+            "  {path:\"report.md\"}                        # exists? readable? writable?\n"
+            "  {path:\"src/main.cpp\"}                     # before read_file / grep\n"
+            "  {path:\"build/output.log\", touch:true}     # confirm write access\n"
+            "  {path:\".\"}                                # the sandbox root itself")
+        .param("path",  "string",
+               "Required. Sandbox-relative path. Use `.` for the sandbox root, "
+               "`subdir` for a directory, `subdir/file.ext` for a file. Absolute "
+               "or `..`-bearing inputs are re-anchored under the sandbox.", true)
+        .param("touch", "boolean",
+               "Optional. If true and the path does NOT yet exist, create an "
+               "empty file at that path (parent dirs auto-created, mode 0600). "
+               "Lets you probe write rights without writing real content. "
+               "Default false.", false)
+        .handle([sb](const ToolCall & c) {
+            std::string path; bool touch = false;
+            if (!args::get_string(c.arguments_json, "path", path))
+                return ToolResult::error("missing arg: path");
+            args::get_bool(c.arguments_json, "touch", touch);
+
+            fs::path p; std::string err;
+            if (!sb->resolve(path, p, err)) return ToolResult::error(err);
+            if (!sb->inside_sandbox(p)) {
+                return ToolResult::error("path escapes sandbox via symlink: "
+                                         + sb->virtual_path(p));
+            }
+
+            // Touch path if requested AND it doesn't exist.
+            // Symmetric with fs_write_file: O_NOFOLLOW guards against a
+            // last-component symlink, parent dirs are created, and the
+            // mode is the same 0600 we use for model-written files.
+            bool created = false;
+            std::error_code ec_exist;
+            const bool exists_pre = fs::exists(p, ec_exist);
+            if (touch && !exists_pre) {
+                std::error_code ec_mk;
+                if (!p.parent_path().empty()) {
+                    fs::create_directories(p.parent_path(), ec_mk);
+                }
+                int fd = ::open(p.c_str(),
+                                O_WRONLY | O_CREAT | O_EXCL
+                                  | O_NOFOLLOW | O_CLOEXEC,
+                                0600);
+                if (fd < 0) {
+                    return ToolResult::error(
+                        std::string("touch failed: ") + sb->virtual_path(p)
+                        + " (" + std::strerror(errno) + ")");
+                }
+                ::close(fd);
+                created = true;
+            }
+
+            // lstat — we want the truth about the leaf, not whatever a
+            // symlink at the leaf points to. inside_sandbox above
+            // canonicalised, so we won't mis-report a symlink-to-
+            // outside as if it were the target.
+            struct stat st {};
+            const int    lstat_rc  = ::lstat(p.c_str(), &st);
+            const int    lstat_err = (lstat_rc == 0) ? 0 : errno;
+            const bool   exists_now = (lstat_rc == 0);
+
+            std::ostringstream o;
+            // Echo the relative path the caller passed AND the absolute
+            // resolved path. Two anchors so the model can quote either
+            // back without recomputing.
+            o << "path: "     << path << "\n";
+            o << "absolute: " << p.string() << "\n";
+
+            if (!exists_now) {
+                // ENOENT really is "no such file"; anything else
+                // (typically EACCES on a 0000-perm parent dir) is
+                // "we can't tell — the FS won't let us look". Lying
+                // and saying `exists: no` for the latter would steer
+                // the model into creating a duplicate at a different
+                // path or giving up entirely; surface the truth.
+                if (lstat_err == ENOENT) {
+                    o << "exists: no\n";
+                    o << "type: missing\n";
+                } else {
+                    o << "exists: unknown\n";
+                    o << "type: unknown\n";
+                    o << "error: lstat: " << std::strerror(lstat_err) << "\n";
+                }
+                if (touch && !created && lstat_err == ENOENT) {
+                    // Touch was requested but the file already existed
+                    // pre-call; the missing branch can only be reached
+                    // if a concurrent rmdir raced us. Surface that
+                    // honestly so the model retries instead of looping.
+                    o << "note: vanished between exists check and lstat\n";
+                }
+                return ToolResult::ok(o.str());
+            }
+
+            o << "exists: yes\n";
+            const mode_t m = st.st_mode;
+            const char * type_str = "other";
+            if      (S_ISREG (m)) type_str = "file";
+            else if (S_ISDIR (m)) type_str = "directory";
+            else if (S_ISLNK (m)) type_str = "symlink";
+            else if (S_ISCHR (m)) type_str = "char-device";
+            else if (S_ISBLK (m)) type_str = "block-device";
+            else if (S_ISFIFO(m)) type_str = "fifo";
+            else if (S_ISSOCK(m)) type_str = "socket";
+            o << "type: " << type_str << "\n";
+
+            if (S_ISREG(m)) {
+                o << "size: " << (long long) st.st_size << "\n";
+            }
+            // Permission bits — the low 12 bits cover suid/sgid/sticky
+            // plus owner/group/other rwx. Mask off file-type bits so
+            // the model sees a pure mode.
+            char modebuf[8];
+            std::snprintf(modebuf, sizeof(modebuf), "0%o",
+                          (unsigned) (m & 07777));
+            o << "mode: " << modebuf << "\n";
+
+            // Effective access — answers "as me, right now". This is
+            // what actually matters for the next read/write call.
+            o << "readable: "   << (::access(p.c_str(), R_OK) == 0 ? "yes" : "no") << "\n";
+            o << "writable: "   << (::access(p.c_str(), W_OK) == 0 ? "yes" : "no") << "\n";
+            o << "executable: " << (::access(p.c_str(), X_OK) == 0 ? "yes" : "no") << "\n";
+
+            // mtime as ISO-8601 UTC. gmtime_r is reentrant; strftime's
+            // size cap is comfortably under 32 bytes for this format.
+            char tbuf[40] = {0};
+            struct tm tmv;
+            const time_t mt = (time_t) st.st_mtime;
+            if (::gmtime_r(&mt, &tmv) != nullptr) {
+                std::strftime(tbuf, sizeof(tbuf), "%Y-%m-%dT%H:%M:%SZ", &tmv);
+            }
+            if (tbuf[0]) o << "mtime: " << tbuf << "\n";
+
+            if (created) o << "created: yes\n";
+            return ToolResult::ok(o.str());
         })
         .build();
 }
@@ -1591,17 +1966,29 @@ Tool get_sandbox_path(std::string root) {
     // Capture by value into the closure; std::string move keeps it cheap.
     return Tool::builder("get_sandbox_path")
         .describe(
-            "Returns the absolute filesystem path of your sandbox root. "
-            "All filesystem tools (read_file, write_file, list_dir, "
-            "glob, grep) operate inside this directory; bash also runs "
-            "with this as its working directory. The fs tools' virtual "
-            "`/` maps here.\n"
+            "AUTHORITATIVE SANDBOX ROOT — read this BEFORE anything "
+            "else when a task involves the filesystem or shell. The "
+            "value is pinned at tool registration and is the single "
+            "source of truth for where every fs_* tool resolves its "
+            "RELATIVE paths and where `bash` has its cwd. Do NOT "
+            "guess, do NOT extrapolate from `get_current_dir`, do "
+            "NOT trust prior turns — call this tool fresh whenever "
+            "you start touching files, then pair with `fs_check_path` "
+            "to confirm read/write rights at your target before "
+            "issuing any read/write operation.\n"
             "\n"
-            "Use this when you need to mention the real path in your "
-            "output (e.g. \"I created the file at <sandbox>/main.cpp\") "
-            "or when invoking bash with absolute paths. For everyday "
-            "file work prefer the dedicated fs tools' virtual `/` "
-            "addressing — you don't need this path for them.\n"
+            "Returns the absolute filesystem path of your sandbox "
+            "root. All filesystem tools (read_file, write_file, "
+            "list_dir, glob, grep, fs_check_path) operate inside "
+            "this directory; bash runs with this as its cwd. Their "
+            "RELATIVE paths anchor here.\n"
+            "\n"
+            "Use this when you need to mention the real on-disk path "
+            "in user-facing output (e.g. \"I created the file at "
+            "<sandbox>/main.cpp\") or in commands handed to external "
+            "tools that don't share our cwd. For day-to-day file "
+            "work, you DON'T paste this path into fs_*/bash arguments "
+            "— those expect relative paths.\n"
             "\n"
             "No parameters. Example call: {}."
         )
@@ -1628,6 +2015,23 @@ Tool bash(std::string root, bool show_output) {
             "Run a shell command via `/bin/sh -c`. Output is stdout and "
             "stderr merged.\n"
             "\n"
+            "AUTHORITATIVE SANDBOX RULE — before your first fs_*/bash "
+            "call in a task, run `get_sandbox_path` (the absolute on-disk "
+            "root, pinned at registration; this is the truth) and then "
+            "`fs_check_path` against any file the command will read from "
+            "or write to. The command runs with cwd PINNED to the "
+            "sandbox root, so the path you probe with `fs_check_path` "
+            "is the same path the shell will see. Skipping the precheck "
+            "is the most common cause of avoidable error loops.\n"
+            "\n"
+            "WORKING DIRECTORY & PATHS — cwd is the sandbox root. USE "
+            "RELATIVE PATHS in your commands: `ls`, `cat report.md`, "
+            "`./build/run`, `src/main.cpp`. Do NOT type absolute paths "
+            "for sandbox files — they break portability across "
+            "sandboxes. If you need the absolute root for a log line "
+            "or an external command, fetch it once via "
+            "`get_sandbox_path` and quote that.\n"
+            "\n"
             "FILE WORK — PREFER THE DEDICATED TOOLS. For reading, "
             "writing, listing, finding, or searching files use "
             "`read_file`, `write_file`, `list_dir`, `glob`, and `grep`. "
@@ -1652,12 +2056,6 @@ Tool bash(std::string root, bool show_output) {
             "instead — it does the same thing without the shell-quoting "
             "minefield.\n"
             "\n"
-            "WORKING DIRECTORY — bash runs with cwd pinned to the "
-            "sandbox root. Relative paths in your command (e.g. "
-            "`./build`, `src/main.cpp`) resolve there. Call "
-            "`get_sandbox_path` once at the start of a task if you "
-            "need the absolute path.\n"
-            "\n"
             "WARNING: this is NOT a hardened sandbox — the command "
             "runs with the caller's full uid/gid and can read/write "
             "files, hit the network, spawn long-lived processes, etc. "
@@ -1665,8 +2063,9 @@ Tool bash(std::string root, bool show_output) {
             "(default 30s, max 300s) bounds the runtime."
         )
         .param("command", "string",
-               "Shell command line. Quoted, piped, redirected etc. as you would "
-               "type it in a terminal. Example: `ls -la | head -20`.", true)
+               "Shell command line. Quoted, piped, redirected etc. as you "
+               "would type it in a terminal. Use RELATIVE paths under the "
+               "sandbox cwd. Example: `ls -la src | head -20`.", true)
         .param("timeout_sec", "integer",
                "Max seconds to run before SIGTERM/SIGKILL. Default 30, max 300.",
                false)

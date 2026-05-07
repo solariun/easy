@@ -320,21 +320,32 @@ static std::string build_builtin_system_prompt(const CliArgs & args) {
                  "in a row is wrong.\n";
         }
         if (fs_on && bash_on) {
-            s += "  - Files: PREFER fs_read_file / fs_list_dir / fs_glob / fs_grep "
-                 "/ fs_write_file (paths virtual, rooted at `/`). Do NOT use bash "
+            s += "  - SANDBOX PRE-FLIGHT (authoritative): on the first turn that "
+                 "touches files, call `get_sandbox_path` to anchor the absolute "
+                 "root, then `fs_check_path` against the file/dir you're about "
+                 "to read or write. Skipping this causes avoidable error loops.\n"
+                 "  - Files: PREFER fs_read_file / fs_list_dir / fs_glob / fs_grep "
+                 "/ fs_write_file. Use RELATIVE paths (`report.md`, `src/main.cpp`, "
+                 "`.` for the root) — NEVER prefix with `/`. Do NOT use bash "
                  "for `cat > file`, `cat <<EOF`, `echo > file`, `mkdir`, or for "
                  "reading files — the dedicated fs tools do those without the "
                  "shell-quoting minefield.\n"
-                 "  - bash: shell features the dedicated tools don't have — "
+                 "  - bash: cwd is the sandbox root; use RELATIVE paths. Reach "
+                 "for bash for shell features the dedicated tools don't have — "
                  "pipelines, find | xargs, build runners (make / cmake / cargo / "
                  "npm), git, package managers, sed/awk for in-place edits.\n";
         } else if (fs_on) {
-            s += "  - Files: use the dedicated fs tools — fs_read_file / "
-                 "fs_list_dir / fs_glob / fs_grep / fs_write_file (paths virtual, "
-                 "rooted at `/`).\n";
+            s += "  - SANDBOX PRE-FLIGHT (authoritative): on the first turn that "
+                 "touches files, call `get_sandbox_path`, then `fs_check_path` "
+                 "against the target before any read/write.\n"
+                 "  - Files: use the dedicated fs tools — fs_read_file / "
+                 "fs_list_dir / fs_glob / fs_grep / fs_write_file. Use RELATIVE "
+                 "paths (`report.md`, `src/main.cpp`, `.` for the root) — NEVER "
+                 "prefix with `/`.\n";
         } else if (bash_on) {
-            s += "  - bash: run shell commands. No dedicated file tools are "
-                 "registered, so bash is the only path for file work too.\n";
+            s += "  - bash: run shell commands. cwd is the sandbox root; use "
+                 "RELATIVE paths. No dedicated file tools are registered, so "
+                 "bash is the only path for file work too.\n";
         }
         if (rag_on) {
             s += "  - Long-term memory: rag(action=…) save / append / search / load.\n";

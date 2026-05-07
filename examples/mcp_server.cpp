@@ -380,6 +380,7 @@ const std::vector<FlagDef> & kFlags() {
         "                                tools $SANDBOX placeholder.\n"
         "      --allow-fs               Register fs_read_file, fs_write_file,\n"
         "                                fs_list_dir, fs_glob, fs_grep,\n"
+        "                                fs_check_path, get_sandbox_path,\n"
         "                                get_current_dir.\n"
         "      --allow-bash             Register `bash`. NOT a hardened\n"
         "                                sandbox — runs with this process's\n"

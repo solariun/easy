@@ -3038,11 +3038,12 @@ static bool require_auth(const ServerCtx & ctx, const httplib::Request & req,
         "                                to the server's cwd.\n"
         "      --allow-fs               Register the fs_* tools (fs_read_file,\n"
         "                                fs_list_dir, fs_glob, fs_grep,\n"
-        "                                fs_write_file). Scoped to --sandbox\n"
-        "                                dir if given, otherwise the server's\n"
-        "                                cwd. Required even when --sandbox is\n"
-        "                                set; INI [SERVER] allow_fs=on is\n"
-        "                                equivalent.\n"
+        "                                fs_write_file, fs_check_path) plus\n"
+        "                                get_sandbox_path. Scoped to\n"
+        "                                --sandbox dir if given, otherwise the\n"
+        "                                server's cwd. Required even when\n"
+        "                                --sandbox is set; INI [SERVER]\n"
+        "                                allow_fs=on is equivalent.\n"
         "      --allow-bash             Register the `bash` tool (run shell\n"
         "                                commands). cwd = --sandbox dir if\n"
         "                                given, otherwise the server's cwd.\n"
@@ -3613,32 +3614,49 @@ static std::string build_builtin_system_prompt(const ServerArgs & args) {
         }
         if (fs_on && bash_on) {
             s +=
+                "  - SANDBOX PRE-FLIGHT (authoritative): on the first turn\n"
+                "    that touches files, call `get_sandbox_path` to anchor\n"
+                "    the absolute root, then `fs_check_path` against the\n"
+                "    file/dir you're about to read or write. Skipping this\n"
+                "    causes avoidable error loops.\n"
                 "  - Files: PREFER the dedicated tools — fs_read_file /\n"
-                "    fs_list_dir / fs_glob / fs_grep / fs_write_file (paths\n"
-                "    virtual, rooted at `/`). Do NOT use bash for `cat > file`,\n"
-                "    `cat <<EOF`, `echo > file`, `mkdir`, or for reading files —\n"
-                "    fs_write_file / fs_read_file / fs_list_dir do those without\n"
-                "    the shell-quoting minefield.\n"
-                "  - bash: for shell features the dedicated fs tools don't\n"
-                "    have — pipelines, `find | xargs`, build runners (make /\n"
-                "    cmake / cargo / npm), git, package managers, sed/awk for\n"
-                "    in-place edits.\n";
+                "    fs_list_dir / fs_glob / fs_grep / fs_write_file. Use\n"
+                "    RELATIVE paths under the sandbox root (`report.md`,\n"
+                "    `src/main.cpp`, `.` for the root) — NEVER prefix with\n"
+                "    `/`. Do NOT use bash for `cat > file`, `cat <<EOF`,\n"
+                "    `echo > file`, `mkdir`, or for reading files —\n"
+                "    fs_write_file / fs_read_file / fs_list_dir do those\n"
+                "    without the shell-quoting minefield.\n"
+                "  - bash: cwd is the sandbox root; use RELATIVE paths in\n"
+                "    your commands. Reach for bash for shell features the\n"
+                "    dedicated tools don't have — pipelines, `find | xargs`,\n"
+                "    build runners (make / cmake / cargo / npm), git,\n"
+                "    package managers, sed/awk for in-place edits.\n";
         } else if (fs_on) {
             s +=
+                "  - SANDBOX PRE-FLIGHT (authoritative): on the first turn\n"
+                "    that touches files, call `get_sandbox_path` to anchor\n"
+                "    the absolute root, then `fs_check_path` against the\n"
+                "    target before any read/write.\n"
                 "  - Files: use the dedicated fs tools — fs_read_file /\n"
-                "    fs_list_dir / fs_glob / fs_grep / fs_write_file (paths\n"
-                "    virtual, rooted at `/`).\n";
+                "    fs_list_dir / fs_glob / fs_grep / fs_write_file. Use\n"
+                "    RELATIVE paths under the sandbox root (`report.md`,\n"
+                "    `src/main.cpp`, `.` for the root) — NEVER prefix with\n"
+                "    `/`.\n";
         } else if (bash_on) {
             s +=
-                "  - bash: run shell commands. No dedicated file tools are\n"
-                "    registered, so bash is the only path for file work too —\n"
-                "    use heredocs / cat / sed for edits.\n";
+                "  - bash: run shell commands. cwd is the sandbox root;\n"
+                "    use RELATIVE paths. No dedicated file tools are\n"
+                "    registered, so bash is the only path for file work\n"
+                "    too — use heredocs / cat / sed for edits.\n";
         }
         if (sandbox_path_on) {
             s +=
-                "  - get_sandbox_path: returns the absolute path of your\n"
-                "    sandbox root. Use it once if you need to mention the\n"
-                "    real on-disk path; fs_* otherwise speak a virtual `/`.\n";
+                "  - get_sandbox_path: AUTHORITATIVE absolute root of your\n"
+                "    sandbox. Read it BEFORE any fs_*/bash work. The fs_*\n"
+                "    tools take RELATIVE paths anchored here; you only\n"
+                "    paste the absolute root into user-facing output or\n"
+                "    external commands that don't share our cwd.\n";
         }
         if (rag_on) {
             s += "  - Long-term memory: rag(action=…) save / append / search / load.\n";

@@ -36,11 +36,32 @@ Tool web_google();
 // ---------- filesystem --------------------------------------------------
 // All filesystem tools sandbox to a root directory you provide.
 // Pass "" or "." to allow the current working directory tree.
+//
+// Path convention surfaced to the model: RELATIVE paths under the
+// sandbox root (e.g. `report.md`, `src/main.cpp`). Absolute / `..`-laden
+// inputs are silently re-anchored under the root for safety, but the
+// tool descriptions tell the model to use relatives only — it makes
+// the boundary obvious and matches what bash with the pinned cwd sees.
 Tool fs_read_file (std::string root = ".");
 Tool fs_write_file(std::string root = ".");
 Tool fs_list_dir  (std::string root = ".");
 Tool fs_glob      (std::string root = ".");
 Tool fs_grep      (std::string root = ".");
+
+// fs_check_path: pre-flight stat + access-rights probe at a sandbox-
+// relative path. The model is told (via every fs_*/bash description)
+// to call this BEFORE attempting any read/write so the sandbox
+// boundary, file existence, and effective r/w/x rights for the
+// running process are all confirmed up-front. With `touch=true` the
+// tool also creates an empty file at the path (parent dirs created
+// as needed) when nothing exists there yet — the equivalent of
+// `mkdir -p && touch` for cheap "can I write here?" probing.
+//
+// Output is a short multi-line block (path, absolute, exists, type,
+// size, mode, readable, writable, executable, mtime) — easy for the
+// model to parse and quote back. Errors return a single-line
+// `error:` message just like the other fs_* tools.
+Tool fs_check_path(std::string root = ".");
 
 // get_current_dir: returns the absolute path of the process's current
 // working directory at call time (not at registration time — getcwd is
