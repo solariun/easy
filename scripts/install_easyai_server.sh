@@ -132,10 +132,10 @@ ini_file="$config_dir/easyai.ini"
 # in /etc, agent-generated state goes in /var/lib (FHS).
 rag_dir="/var/lib/easyai/rag"
 
-# 100 K context — generous for any single conversation while still leaving
+# 128 K context — generous for any single conversation while still leaving
 # headroom on iGPU systems (KV cache scales linearly with context).
 # Override with --ctx-size for very long agentic flows that need it.
-ctx_size=100000
+ctx_size=128000
 # --ngl: -1 = auto-fit (llama.cpp picks how many layers fit, leaving ≥1 GiB
 # of GPU memory free).  On iGPUs with sufficient GTT this offloads ALL
 # layers including KV cache, so CPU-side RSS stays small (<1 GiB).
@@ -145,8 +145,12 @@ ngl=-1
 webui_title="EasyAi"                          # --webui-title <text>
 webui_icon=""                                 # --webui-icon <path/to/.ico|.png|.svg|.gif|.jpg|.webp>
 webui_icon_dest="$config_dir/favicon"         # final installed path under /etc/easyai
-n_threads_default="$jobs"
-n_threads_batch_default="$jobs"
+# Threads: hardcoded to 16 (matches the production AI box). Over-
+# subscribing on smaller hosts hurts throughput more than it helps —
+# operators on different hardware override with --threads /
+# --threads-batch (or edit easyai.ini after install).
+n_threads_default=16
+n_threads_batch_default=16
 preset="precise"                              # written commented in the INI; engine
                                               # picks "precise" when no preset is set
 thinking="on"
@@ -157,35 +161,43 @@ enable_verbose=1                              # writes verbose=on into the INI;
 cache_type_k="q8_0"                           # K cache: q8_0 — attention scores
                                               # need precision; quantizing K hurts
                                               # more than V
-cache_type_v="q4_0"                           # V cache: q4_0 — values are softmax-
-                                              # weighted-summed so quantization
-                                              # noise gets smoothed.  Asymmetric
-                                              # split saves ~25 % of KV memory at
-                                              # near-zero quality cost on chat /
-                                              # short-context workloads
+cache_type_v="q8_0"                           # V cache: q8_0 too — symmetric with K.
+                                              # The asymmetric q8/q4 split saves
+                                              # ~25 % KV memory but loses quality
+                                              # on long agentic flows; production
+                                              # tuning on the AI box settled on
+                                              # symmetric q8 for both halves
 mlock=1                                       # pin small CPU residue (embeddings,
                                               # scratch) — most weights are on GPU.
-# no_mmap=0 lets the kernel mmap the GGUF.  With full GPU offload the file
-# is only read at LOAD time, after which weights live on GPU; mmap'ing it
-# means the load-time RSS peak drops by several GB (no anonymous-copy
-# transient).  Override with --no-mmap.
-no_mmap=0
+# no_mmap=1 forces an anonymous-memory load of the GGUF (no kernel
+# mmap).  Paired with mlock=1, every weight page is pinned in RAM with
+# no file-backing — eliminates the kernel's hint-driven eviction
+# during long-running agentic sessions on the production AI box.
+# Costs a few GB of load-time RSS peak but stabilises latency once
+# warm.  Set no_mmap=0 to reclaim that peak on hosts where RAM is
+# tight or the model is loaded from a slow disk.
+no_mmap=1
 # HTTP read+write timeout for the listen socket AND the MCP-client connection.
 # 86400 (24 h) matches easyai-cli's default --timeout, so multi-hour agentic
 # sessions don't get cut by either side.  Reduce for public-facing servers
 # where slow-loris resilience matters more than long-thinking-turn support.
 http_timeout=86400
 # Sampling defaults written into [ENGINE] ACTIVE (not commented).  Tuned for
-# code / agent workloads on this hardware: low temperature for determinism,
-# top-* for some tail diversity, min_p as the adaptive cutoff for confident
-# tokens, repeat_penalty=1.0 (no penalty — paired with min_p=0.10, the model
-# has enough sampling discipline that the anti-loop floor is unnecessary).
-temperature="0.3"
+# code / agent workloads on the production AI box: temperature 0.5 trades a
+# bit of determinism for richer tool-use phrasing, top-* for some tail
+# diversity, min_p=0.09 as the adaptive cutoff for confident tokens,
+# repeat_penalty=1.0 (no penalty — paired with presence_penalty=1.5, the
+# anti-loop floor moved from token-history slope to fixed-cost-per-seen-
+# token, which is gentler on long agentic flows). max_tokens=81920 is the
+# per-turn cap; any single response longer than that is almost certainly
+# a runaway loop.
+temperature="0.5"
 top_p="0.95"
 top_k=64
-min_p="0.10"
+min_p="0.09"
 repeat_penalty="1.0"
-max_tokens=-1
+presence_penalty="1.5"
+max_tokens=81920
 api_key=""                                    # leave empty to skip auth (open server)
 
 model_src=""                                  # required when --no-model NOT passed
@@ -946,25 +958,26 @@ mcp_auth        = off
 # [ENGINE] — model loading and inference tunables
 # ============================================================
 [ENGINE]
-context         = $ctx_size
-ngl             = $ngl
-threads         = $n_threads_default
-threads_batch   = $n_threads_batch_default
+context          = $ctx_size
+ngl              = $ngl
+threads          = $n_threads_default
+threads_batch    = $n_threads_batch_default
 
 #preset          = $preset
-flash_attn      = $([[ "$enable_flash_attn" -eq 1 ]] && echo on || echo off)
-cache_type_k    = $cache_type_k
-cache_type_v    = $cache_type_v
-mlock           = $([[ "$mlock" -eq 1 ]] && echo on || echo off)
-no_mmap         = $([[ "$no_mmap" -eq 1 ]] && echo on || echo off)
+flash_attn       = $([[ "$enable_flash_attn" -eq 1 ]] && echo on || echo off)
+cache_type_k     = $cache_type_k
+cache_type_v     = $cache_type_v
+mlock            = $([[ "$mlock" -eq 1 ]] && echo on || echo off)
+no_mmap          = $([[ "$no_mmap" -eq 1 ]] && echo on || echo off)
 
 # Sampling overrides — leave commented for engine defaults.
-temperature    = $temperature
-top_p          = $top_p
-top_k          = $top_k
-min_p          = $min_p
-repeat_penalty = $repeat_penalty
-max_tokens     = $max_tokens
+temperature      = $temperature
+top_p            = $top_p
+top_k            = $top_k
+min_p            = $min_p
+repeat_penalty   = $repeat_penalty
+presence_penalty = $presence_penalty
+max_tokens       = $max_tokens
 
 # ============================================================
 # [MCP_USER] — Bearer-token auth for POST /mcp
