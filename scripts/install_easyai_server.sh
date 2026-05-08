@@ -657,26 +657,30 @@ When a request truly needs work, run a tight loop:
      without the call is forbidden).
   3. Read the result, then finish or take ONE more step.
 Stop as soon as you have something useful. Prefer a short answer the
-user can refine over a long pre-committed plan. Use the `plan` tool
-only when the task genuinely needs a multi-step checklist the user can
-watch — skip it for single-tool turns and chitchat.
+user can refine over a long pre-committed plan.
 
 Tool notes:
   - 'now' / 'today' / 'latest' → datetime first.
   - web_search returns snippets only; after ONE search, web_fetch the
     top 1-3 URLs and answer from the fetched body. Two searches in a
     row is wrong.
-  - Files: fs_read_file / fs_list_dir / fs_glob / fs_grep; writes:
-    fs_write_file (paths virtual, rooted at `/`).
-  - Commands: bash (when registered).
-  - Host metrics: system_meminfo / loadavg / cpu_usage / swaps.
   - Long-term memory: rag(action=…) save / append / search / load.
-  - plan: action='add' (text or items[] up to 20), action='update'
-    (id + status='working'|'done'|'error') to advance a step,
-    action='delete' (id, or id='all') to retire one. NEVER re-add to
-    mutate a step — use update.
   - Cite URLs you actually fetched. Attach dates to dated facts
     ("released April 2026" beats "recently released").
+
+## When asked to create something — PROTOTYPE FIRST
+1. Build the simplest thing that does EXACTLY what the user asked.
+   No extra features. No defensive scaffolding for cases they didn't
+   mention. No "while I'm at it" cleanups. Stay strictly in scope.
+2. Verify it runs. Show the user the working result.
+3. THEN surface ideas you have for next steps as a short numbered
+   list and ASK which the user wants. Do not apply them yourself.
+   Wait for the user's pick.
+
+The user's request is the ceiling, not a starting point. They steer;
+you implement what they pick. Refinement is a dialogue, not a
+monologue. A concrete in-scope result beats a thorough comparison of
+three abstractions every time.
 
 Be terse. Be honest about uncertainty: "I'm not sure — let me check"
 → call a tool.
@@ -690,15 +694,22 @@ PROMPT
 #
 # This file is REFRESHED on every --upgrade.  It's the canonical copy
 # of the default Deep prompt — restore from here if you ever need to
-# undo edits to system.txt:
+# reset $system_file:
 #
 #     sudo cp $system_template_file $system_file
 #     sudo systemctl restart easyai-server
 #
-# The active prompt is /etc/easyai/system.txt (referenced from
-# easyai.ini's [SERVER] system_file).  Edit that one — your changes
-# survive --upgrade.  Lines starting with # are NOT stripped; they go
-# straight to the model.
+# By default $system_file is DORMANT — easyai.ini ships with
+# [SERVER] system_file commented out, so the binary's built-in prompt
+# (gated on actually-registered tools) is what the model sees.
+# Uncomment system_file in easyai.ini to take over with $system_file.
+# Lines starting with # are NOT stripped from the prompt; they go
+# straight to the model — keep edits clean.
+#
+# This template lists ONLY tools the default install registers
+# (datetime / web_* / rag).  If you flip allow_fs=on or allow_bash=on
+# in easyai.ini, also paste the matching tool bullets back into
+# $system_file — operator-supplied prompts are NOT auto-gated.
 # ----------------------------------------------------------------------
 
 $system_prompt_body
@@ -889,7 +900,17 @@ host            = $service_host
 port            = $service_port
 alias           = $service_alias
 sandbox         = $service_workspace
-system_file     = $system_file
+
+# system_file: path to a custom persona that REPLACES the binary's
+# built-in. Commented OUT by default — the built-in prompt is gated
+# on actually-registered tools (allow_fs / allow_bash / rag), so it
+# never advertises tools that aren't there. The shipped
+# /etc/easyai/system.txt is a starting template; uncomment the line
+# below to take over with it. If you do, AND you flip allow_fs=on or
+# allow_bash=on below, also paste the matching tool bullets back into
+# system.txt — the operator-supplied prompt is NOT auto-gated.
+# system_file     = $system_file
+
 external_tools  = $external_tools_dir
 rag             = $rag_dir
 webui_title     = $webui_title
@@ -1296,7 +1317,7 @@ printf '  api base  : http://%s:%s/v1\n' \
 printf '  health    : http://localhost:%s/health\n' "$service_port"
 [[ $enable_metrics -eq 1 ]] && \
     printf '  metrics   : http://localhost:%s/metrics\n' "$service_port"
-printf '  system    : %s   (active; safe to edit — survives --upgrade)\n' "$system_file"
+printf '  system    : %s   (dormant by default — uncomment SERVER.system_file in easyai.ini to activate)\n' "$system_file"
 printf '              %s   (factory copy; refreshed every --upgrade)\n' "$system_template_file"
 printf '  webui     : title="%s"\n' "$webui_title"
 [[ -n "$webui_icon_dest" ]] && \
