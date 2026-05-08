@@ -3102,6 +3102,11 @@ static bool require_auth(const ServerCtx & ctx, const httplib::Request & req,
         "      --repeat-penalty <f>     Repetition penalty (default 1.15 —\n"
         "                                anti-loop safety net; pass 1.0 to\n"
         "                                disable).  INI: [ENGINE] repeat_penalty.\n"
+        "      --presence-penalty <f>   Presence penalty ([-2.0, 2.0]; OpenAI\n"
+        "                                semantics — fixed amount per token\n"
+        "                                that has already appeared at all,\n"
+        "                                regardless of frequency). Default 0.0\n"
+        "                                (disabled). INI: [ENGINE] presence_penalty.\n"
         "      --max-tokens <n>         Cap tokens generated per request\n"
         "      --seed <u32>             RNG seed (0 = random)\n"
         "      --max-incomplete-retries <n>\n"
@@ -3246,6 +3251,12 @@ struct ServerArgs {
     // X / OK, creating X" forever). Set repeat_penalty = 1.0 in the INI
     // (or pass --repeat-penalty 1.0) to disable.
     float       repeat_penalty = 1.15f;
+    // Presence penalty (OpenAI semantics: fixed token-already-seen
+    // penalty, range [-2.0, 2.0], default 0.0 = disabled). Sentinel
+    // -2.0f leaves the engine default (no penalty); any value strictly
+    // greater than -2.0 wins (so -2.0 itself is treated as "unset" —
+    // matches the Client's convention in src/client.cpp).
+    float       presence_penalty = -2.0f;
     int         max_tokens     = -1;
     uint32_t    seed           = 0u;
 
@@ -3487,6 +3498,7 @@ static const std::vector<FlagDef> & kFlags() {
         { {"--top-k"},             "ENGINE", "top_k",          "top_k",          true,  SET_INT(&ServerArgs::top_k) },
         { {"--min-p"},             "ENGINE", "min_p",          "min_p",          true,  SET_FLOAT(&ServerArgs::min_p) },
         { {"--repeat-penalty"},    "ENGINE", "repeat_penalty", "repeat_penalty", true,  SET_FLOAT(&ServerArgs::repeat_penalty) },
+        { {"--presence-penalty"},  "ENGINE", "presence_penalty","presence_penalty",true, SET_FLOAT(&ServerArgs::presence_penalty) },
         { {"--max-tokens"},        "ENGINE", "max_tokens",     "max_tokens",     true,  SET_INT(&ServerArgs::max_tokens) },
         { {"--max-incomplete-retries"}, "ENGINE", "max_incomplete_retries", "max_incomplete_retries", true, SET_INT(&ServerArgs::max_incomplete_retries) },
         { {"--seed"},              "ENGINE", "seed",           "seed",           true,  SET_UINT32(&ServerArgs::seed) },
@@ -5687,6 +5699,7 @@ int main(int argc, char ** argv) {
     if (args.seed      > 0)  ctx->engine.seed   (args.seed);
     if (args.max_tokens >= 0) ctx->engine.max_tokens(args.max_tokens);
     if (args.repeat_penalty > 0) ctx->engine.repeat_penalty(args.repeat_penalty);
+    if (args.presence_penalty > -2.0f) ctx->engine.presence_penalty(args.presence_penalty);
     if (!args.cache_type_k.empty()) ctx->engine.cache_type_k(args.cache_type_k);
     if (!args.cache_type_v.empty()) ctx->engine.cache_type_v(args.cache_type_v);
     if (args.no_kv_offload)  ctx->engine.no_kv_offload(true);

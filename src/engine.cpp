@@ -917,6 +917,7 @@ Engine & Engine::top_p(float v)                 { p_->params.sampling.top_p = v;
 Engine & Engine::top_k(int v)                   { p_->params.sampling.top_k = v; return *this; }
 Engine & Engine::min_p(float v)                 { p_->params.sampling.min_p = v; return *this; }
 Engine & Engine::repeat_penalty(float v)        { p_->params.sampling.penalty_repeat = v; return *this; }
+Engine & Engine::presence_penalty(float v)      { p_->params.sampling.penalty_present = v; return *this; }
 Engine & Engine::max_tokens(int n)              { p_->max_new_tokens = n; return *this; }
 Engine & Engine::tool_choice_auto()             { p_->tool_choice = COMMON_CHAT_TOOL_CHOICE_AUTO;     return *this; }
 Engine & Engine::tool_choice_required()         { p_->tool_choice = COMMON_CHAT_TOOL_CHOICE_REQUIRED; return *this; }
