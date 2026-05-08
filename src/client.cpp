@@ -186,6 +186,28 @@ int retry_backoff_ms(int attempt) {
     return ms > 4000 ? 4000 : ms;
 }
 
+// Cancellable sleep used between retry attempts.  Polls the caller's
+// cancel flag every 50ms instead of one long blocking sleep, so a
+// Ctrl-C during a 4s backoff escalates within ~50ms instead of
+// waiting out the full delay.  Returns true when the full duration
+// elapsed naturally; false when cancel fired.
+bool cancellable_sleep_ms(int total_ms,
+                          const std::atomic<bool> & cancel_flag) {
+    constexpr int kPollMs = 50;
+    auto deadline = std::chrono::steady_clock::now()
+                  + std::chrono::milliseconds(total_ms);
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (cancel_flag.load(std::memory_order_relaxed)) return false;
+        auto now = std::chrono::steady_clock::now();
+        auto remaining_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - now).count();
+        if (remaining_ms <= 0) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(
+            remaining_ms < kPollMs ? remaining_ms : kPollMs));
+    }
+    return !cancel_flag.load(std::memory_order_relaxed);
+}
+
 // Decide whether a cpp-httplib failure is worth retrying.  Pre-stream
 // connect/read/write failures and 5xx responses qualify; 4xx (auth /
 // bad request) does not.  `received_anything` short-circuits to false:
@@ -651,7 +673,12 @@ struct Client::Impl {
                 res ? ("HTTP " + std::to_string(res->status)).c_str()
                     : httplib::to_string(res.error()).c_str(),
                 backoff);
-            std::this_thread::sleep_for(std::chrono::milliseconds(backoff));
+            // Cancellable so a Ctrl-C during the backoff escalates
+            // within ~50ms instead of waiting the full delay.
+            if (!cancellable_sleep_ms(backoff, cancel_requested)) {
+                last_error = "cancelled";
+                return false;
+            }
         }
 
         if (reasoning_aborted) {
@@ -989,7 +1016,10 @@ struct Client::Impl {
                 res ? ("HTTP " + std::to_string(res->status)).c_str()
                     : httplib::to_string(res.error()).c_str(),
                 backoff);
-            std::this_thread::sleep_for(std::chrono::milliseconds(backoff));
+            if (!cancellable_sleep_ms(backoff, cancel_requested)) {
+                last_error = "cancelled";
+                return false;
+            }
         }
         if (!res) {
             last_error = "HTTP request failed: "
@@ -1026,7 +1056,10 @@ struct Client::Impl {
                 res ? ("HTTP " + std::to_string(res->status)).c_str()
                     : httplib::to_string(res.error()).c_str(),
                 backoff);
-            std::this_thread::sleep_for(std::chrono::milliseconds(backoff));
+            if (!cancellable_sleep_ms(backoff, cancel_requested)) {
+                last_error = "cancelled";
+                return false;
+            }
         }
         if (!res) {
             last_error = "HTTP request failed: "
@@ -1060,14 +1093,43 @@ Client::~Client() = default;
 Client::Client(Client &&) noexcept = default;
 Client & Client::operator=(Client &&) noexcept = default;
 
-Client & Client::endpoint        (std::string url) { p_->endpoint        = std::move(url); return *this; }
+// Setters that affect the persistent httplib::Client's configuration
+// invalidate the cached connection so the next request rebuilds it
+// with the new settings. Without this the persistent-Client
+// optimization (one TCP connection across an N-hop session) silently
+// pinned whatever endpoint / TLS posture / timeout was in force at the
+// FIRST request and ignored any later mutation — a dev who flipped
+// `tls_insecure(false)` mid-session would still reach the staging
+// server with verification off. Drop http_ here and let get_http()
+// re-create cleanly.
+Client & Client::endpoint(std::string url) {
+    std::lock_guard<std::mutex> lk(p_->http_mu_);
+    if (p_->endpoint != url) p_->http_.reset();
+    p_->endpoint = std::move(url);
+    return *this;
+}
 Client & Client::api_key         (std::string key) { p_->api_key         = std::move(key); return *this; }
-Client & Client::timeout_seconds (int  s)          { p_->timeout_seconds = s;   return *this; }
+Client & Client::timeout_seconds (int s) {
+    std::lock_guard<std::mutex> lk(p_->http_mu_);
+    if (p_->timeout_seconds != s) p_->http_.reset();
+    p_->timeout_seconds = s;
+    return *this;
+}
 Client & Client::verbose         (bool v)          { p_->verbose         = v;   return *this; }
 Client & Client::http_retries    (int  n)          { p_->http_retries    = n < 0 ? 0 : n; return *this; }
 Client & Client::log_file        (std::FILE * fp)  { p_->log_fp          = fp;  return *this; }
-Client & Client::tls_insecure    (bool v)          { p_->tls_insecure    = v;   return *this; }
-Client & Client::ca_cert_path    (std::string p)   { p_->tls_ca_path     = std::move(p); return *this; }
+Client & Client::tls_insecure(bool v) {
+    std::lock_guard<std::mutex> lk(p_->http_mu_);
+    if (p_->tls_insecure != v) p_->http_.reset();
+    p_->tls_insecure = v;
+    return *this;
+}
+Client & Client::ca_cert_path(std::string path) {
+    std::lock_guard<std::mutex> lk(p_->http_mu_);
+    if (p_->tls_ca_path != path) p_->http_.reset();
+    p_->tls_ca_path = std::move(path);
+    return *this;
+}
 Client & Client::max_reasoning_chars(int n)        { p_->max_reasoning_chars = n; return *this; }
 Client & Client::retry_on_incomplete(bool v)       { p_->retry_on_incomplete = v; return *this; }
 Client & Client::max_tool_hops      (int n)         { if (n > 0) p_->max_tool_hops = n; return *this; }

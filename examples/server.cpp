@@ -58,6 +58,7 @@
 #include <cctype>
 #include <cerrno>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <csignal>
 #include <cstdio>
@@ -3397,7 +3398,19 @@ auto SET_SIZE(size_t ServerArgs::* f) {
 auto SET_FLOAT(float ServerArgs::* f) {
     return [f](ServerArgs & a, const std::string & v) {
         if (v.empty()) return;
-        try { a.*f = std::stof(v); } catch (...) {}
+        // std::stof accepts "nan", "inf", "+inf", "-inf" without throwing.
+        // Those values (passed straight through to llama.cpp's sampler)
+        // are out-of-spec for every float knob we expose (temperature,
+        // top_p, min_p, repeat/presence/frequency_penalty), and silently
+        // taking them would let a malformed INI / typo'd CLI flag put
+        // the sampler in an undefined state. Reject non-finite — the
+        // INI key is then dropped (default stays in effect) and the
+        // operator sees no surprise.
+        try {
+            float parsed = std::stof(v);
+            if (!std::isfinite(parsed)) return;
+            a.*f = parsed;
+        } catch (...) {}
     };
 }
 // SET_BOOL_TRUE: CLI no-value → field=true; INI/value → parse string.

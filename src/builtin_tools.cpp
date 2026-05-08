@@ -1311,6 +1311,22 @@ Tool fs_write_file(std::string root) {
             std::error_code ec;
             fs::create_directories(p.parent_path(), ec);
 
+            // Re-check sandbox containment AFTER create_directories. The
+            // pre-check above runs against the canonical path of `p`;
+            // create_directories follows symlinks in existing parents and
+            // could have materialised intermediate dirs along a path that
+            // — racing with concurrent symlink creation, or via a parent
+            // whose canonicalisation just failed-open in inside_sandbox()
+            // — actually points outside root.  The lstat below + O_NOFOLLOW
+            // already protect the leaf write; this second containment
+            // check rejects the rare case where a parent dir was just
+            // created outside the sandbox before we open the leaf.
+            if (!sb->inside_sandbox(p)) {
+                return ToolResult::error(
+                    "path escapes sandbox via symlink (post-mkdir): "
+                    + sb->virtual_path(p));
+            }
+
             // Open with O_NOFOLLOW so a symlink at the leaf cannot
             // redirect the write outside the sandbox. O_CLOEXEC keeps
             // the fd off subsequently-spawned children. Mode 0600 —
@@ -1816,6 +1832,16 @@ Tool fs_check_path(std::string root) {
                 std::error_code ec_mk;
                 if (!p.parent_path().empty()) {
                     fs::create_directories(p.parent_path(), ec_mk);
+                }
+                // Re-check containment after create_directories — same
+                // rationale as fs_write_file: closes a narrow TOCTOU
+                // window where a concurrent symlink swap could have
+                // pulled the parent path outside the sandbox between
+                // the pre-check and the open.
+                if (!sb->inside_sandbox(p)) {
+                    return ToolResult::error(
+                        "path escapes sandbox via symlink (post-mkdir): "
+                        + sb->virtual_path(p));
                 }
                 int fd = ::open(p.c_str(),
                                 O_WRONLY | O_CREAT | O_EXCL

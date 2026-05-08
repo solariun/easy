@@ -1418,3 +1418,187 @@ The fifth pass also examined and found no actionable issues in:
   _certificate_verification`, `set_ca_cert_path`) are set once
   before the loop. No silent downgrade window.
 
+---
+
+## 21. SIXTH PASS — 2026-05-08 (post-merge)
+
+A targeted review of the new surfaces landed in the 19 commits that
+preceded this audit pass — chiefly the persistent `httplib::Client`
+fix (TIME_WAIT exhaustion), the `VerboseServer` observability stack
+(HTTP per-request log + periodic METRICS line + `/proc` parsing),
+the `fs_check_path` builtin, the 3-stage Ctrl-C state machine, and
+the `presence_penalty` knob. One HIGH, three MEDIUM, one LOW
+finding — all closed in this commit.  Public interface unchanged.
+
+### 21.1 HIGH — `presence_penalty` (and every other float knob)
+        accepts NaN / ±Inf unchecked
+
+**File:** `examples/server.cpp` — `SET_FLOAT(...)` lambda factory.
+
+**Issue.** `std::stof("nan")`, `std::stof("inf")`, `std::stof("-inf")`,
+and `std::stof("+inf")` all return the corresponding non-finite IEEE
+value WITHOUT throwing.  The previous `SET_FLOAT` factory caught
+exceptions but had no `isfinite()` guard, so a malformed INI value
+(`presence_penalty = nan`) or a typo'd CLI flag silently set the
+sampler to NaN.  The value flows straight into llama.cpp's
+sampler — non-finite floats there are undefined behaviour (NaN
+breaks every comparison, Inf can mask all probability mass).
+Same risk for every other float knob the server exposes:
+`temperature`, `top_p`, `min_p`, `repeat_penalty`,
+`frequency_penalty`, `presence_penalty`.
+
+**Fix.** Add an `std::isfinite(parsed)` check inside the `SET_FLOAT`
+lambda; reject non-finite values silently (the INI key is dropped,
+the default stays in effect).  One change, blanket coverage of every
+float knob. Operators see the failure indirectly via the startup
+banner showing the default value rather than what they typed.
+
+**Verification.** Standalone test:
+- `1.5 / -2.0 / 0` → ACCEPT
+- `nan / inf / -inf / +inf / foo / ""` → REJECT
+
+### 21.2 MEDIUM — Persistent `httplib::Client` ignored later setter mutations
+
+**File:** `src/client.cpp` — `Client::endpoint`, `tls_insecure`,
+`ca_cert_path`, `timeout_seconds` setters.
+
+**Issue.** Commit `841dd47` introduced a single persistent
+`httplib::Client` on `Impl::http_` to fix TIME_WAIT exhaustion (one
+TCP connection per agentic session instead of N).  Correct fix; new
+hazard: the setter chain wires settings into `Impl::*` fields, but
+once `get_http()` had already lazy-initialised `http_`, none of those
+mutations propagated to the live socket.  Concrete failure mode:
+
+```cpp
+client.endpoint("https://prod.example/v1").chat("hi");
+// First call materialises http_ pointing at prod.
+client.tls_insecure(true).endpoint("https://staging.example/v1");
+client.chat("hi");
+// SECOND call STILL hits prod (cached http_), with secure TLS
+// rather than the operator's intended insecure-staging posture.
+```
+
+This isn't an MITM enabler in production (TLS verify only goes
+*more* permissive, not less, in the common dev → prod direction),
+but a dev who flipped to a staging endpoint with a self-signed cert
+would silently keep talking to prod. Symmetric problems with
+endpoint and timeout: a session that bumps timeout 30s → 300s
+mid-session keeps hitting the original 30s read deadline.
+
+**Fix.** The four setters that affect transport-level state
+(`endpoint`, `tls_insecure`, `ca_cert_path`, `timeout_seconds`) now
+take `http_mu_`, drop `http_` if the new value differs, and let
+`get_http()` rebuild fresh on the next request.  `verbose`,
+`http_retries`, `api_key`, `log_file`, `max_reasoning_chars`,
+`retry_on_incomplete`, `max_tool_hops` don't affect the cached
+Client and are unchanged.
+
+### 21.3 MEDIUM — `fs_write_file` + `fs_check_path(touch=true)` —
+        post-mkdir containment recheck
+
+**File:** `src/builtin_tools.cpp` — `fs_write_file` + `fs_check_path`
+touch path.
+
+**Issue.** Both functions:
+1. validate the resolved path with `inside_sandbox()`
+2. call `fs::create_directories(p.parent_path(), ec)` to materialise
+   parent dirs
+3. open the leaf with `O_CREAT|O_NOFOLLOW|O_CLOEXEC`
+
+`inside_sandbox()` uses `weakly_canonical()` to resolve symlinks, so
+an existing parent that's a symlink-to-outside is correctly rejected
+at step 1.  But two narrow windows remain:
+- `weakly_canonical()` can fail (perm error, race) and the helper
+  fails OPEN (returns true) so the subsequent `open()` can surface
+  a real errno instead of a generic "escapes sandbox".
+- A concurrent attacker with sandbox write access could swap a
+  parent component to a symlink between steps 1 and 2.
+
+In both cases `create_directories()` may follow a symlink and
+materialise dirs outside the sandbox before the `open(O_NOFOLLOW)`
+step catches the leaf.
+
+**Fix.** Defence-in-depth: re-call `inside_sandbox()` after
+`create_directories()` and reject with a "(post-mkdir)" message if
+the canonical answer changed.  Closes the race window completely;
+trades a second `weakly_canonical()` call (cheap) for a clean answer
+on the rare adversarial case.
+
+### 21.4 MEDIUM — installer didn't validate `--presence-penalty`
+
+**File:** `scripts/install_easyai_server.sh` — `require_numeric`
+roster.
+
+**Issue.** The 5th pass added `require_numeric` validation for every
+sampling/timeout flag flowing into the INI heredoc, closing a
+defence-in-depth gap where a value like `$'0.3\nallow_bash = on'`
+could inject extra INI keys.  The roster missed `--presence-penalty`,
+which was added by commit `56835c5` after that audit and goes into
+the INI via heredoc the same way.
+
+**Fix.** Add `require_numeric "--presence-penalty" "$presence_penalty"`
+to the validator chain.  No-op today (the value is hardcoded to
+`1.5` upstream of the chain), but defends against any future commit
+that adds a CLI flag without remembering to wire validation.
+
+### 21.5 LOW — HTTP retry backoff sleep ignored cancel
+
+**File:** `src/client.cpp` — three retry loops in `stream_chat()`,
+`simple_get()`, `simple_post()`.
+
+**Issue.** When a retry was scheduled, the code did
+`std::this_thread::sleep_for(backoff)`.  A Ctrl-C arriving during a
+4-second backoff queued the cancel flag but the process slept the
+full 4 s before checking it again — and across 5 retries with
+4 s caps that's up to ~20 s of unresponsive REPL after the
+operator hit Ctrl-C.
+
+**Fix.** New `cancellable_sleep_ms(total_ms, cancel_flag)` helper
+polls the atomic cancel flag every 50 ms instead of one long
+blocking sleep.  All three retry-loop sleep sites now call it and
+return early (with `last_error = "cancelled"`) when the flag fires.
+Worst-case wakeup latency: 50 ms.  No change to the happy path
+duration (the helper sleeps the full requested interval if no
+cancel arrives).
+
+### 21.6 Audit-cleared this pass
+
+The sixth pass also examined and found no actionable concerns in:
+
+- **`VerboseServer` HTTP per-request log + METRICS thread.**
+  Format strings are literals; `req.method`, `req.path`,
+  `req.remote_addr` are passed as `%s` arguments (no log injection).
+  `/proc/net/tcp{,6}`, `/proc/<pid>/status`, `/proc/loadavg`,
+  `/proc/stat`, `/sys/class/drm/card*/device/mem_info_gtt_*` reads
+  use `std::getline` into `std::string` (unbounded but correct), with
+  bounded `sscanf("%2X", …)` field widths.  Counters are
+  `std::atomic<uint64_t>` with relaxed ordering — overflow hits ~584
+  years on a 1 Gbps link.  Metrics-thread shutdown uses a condition
+  variable + `joinable()` guard.  `--metrics-interval 0` short-circuits
+  thread spawn entirely (no busy spin).  `[CRITICAL/HIGH/elevated]`
+  TIME_WAIT pressure tags are compile-time string literals.  No
+  `#define private protected` or `httplib.h` patch remains in tree
+  (commit `793ebfb` reverted those experiments).
+- **3-stage Ctrl-C state machine** (`examples/cli.cpp`
+  `on_terminating_signal`).  Uses only async-signal-safe primitives
+  (atomic load/store, `::write`, `::_exit(130)` not `exit()`).
+  `fetch_add(1)` makes the stage transition race-free.
+  `g_active_client` is set before `install_cancel_handlers` and
+  cleared after the main loop exits; the null check before
+  `request_cancel()` is preserved.  `request_cancel()` itself is a
+  single relaxed atomic store — async-signal-safe.
+- **Engine API for `presence_penalty`** mirrors `repeat_penalty`'s
+  pattern exactly (same setter shape, same field path into
+  `params.sampling`).  No inconsistency that could create wiring
+  drift.
+- **Empty-INI-value handling** in `SET_FLOAT` short-circuits before
+  the `std::stof` call, so a `presence_penalty =` line with no
+  value leaves the default in place rather than crashing.
+- **Sandbox containment in fs_* tools** — verified path-component
+  prefix match plus `weakly_canonical()` resolve, both layers
+  consistent across `fs_read_file`, `fs_write_file`, `fs_list_dir`,
+  `fs_glob`, `fs_grep`, `fs_check_path`. The `O_NOFOLLOW` posture
+  is uniform on every leaf open.
+
+
+
