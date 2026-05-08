@@ -58,6 +58,7 @@
 #include <cctype>
 #include <cerrno>
 #include <chrono>
+#include <condition_variable>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
@@ -68,7 +69,13 @@
 #include <mutex>
 #include <sstream>
 #include <string>
-#include <unistd.h>     // chdir
+#include <thread>
+#include <dirent.h>      // opendir/readdir for fd-count
+#include <netdb.h>       // getnameinfo, NI_*
+#include <sys/resource.h>// getrusage, RLIMIT_NOFILE
+#include <sys/socket.h>  // getpeername, sockaddr_storage
+#include <sys/time.h>    // gettimeofday for /proc/stat deltas
+#include <unistd.h>      // chdir
 #include <vector>
 
 // (chat.h pulls in nlohmann::json + a `using json = nlohmann::ordered_json`
@@ -1377,6 +1384,12 @@ struct ServerCtx {
     std::atomic<uint64_t>      n_requests{0};
     std::atomic<uint64_t>      n_errors{0};
     std::atomic<uint64_t>      n_tool_calls{0};
+    std::atomic<uint64_t>      n_in_flight{0};   // currently being served
+    std::atomic<uint64_t>      n_bytes_in{0};    // total request bodies received
+    std::atomic<uint64_t>      n_bytes_out{0};   // total response bodies sent (streamed = 0)
+    std::atomic<uint64_t>      n_connections{0}; // total TCP connections accepted
+    std::atomic<uint64_t>      n_open_conns{0};  // currently-open TCP connections (HTTP keep-alive aware)
+    std::atomic<uint64_t>      n_open_conns_peak{0};  // high-water mark of n_open_conns
 
     // sampling defaults that survive across requests (set via /v1/preset)
     float def_temperature = 0.7f;
@@ -3146,6 +3159,14 @@ static bool require_auth(const ServerCtx & ctx, const httplib::Request & req,
         "       --no-mmap               Disable mmap (read GGUF straight in)\n"
         "       --numa <strategy>       distribute|isolate|numactl|mirror\n"
         "       --metrics               Expose Prometheus /metrics endpoint\n"
+        "       --metrics-interval SECS Verbose-mode periodic METRICS log\n"
+        "                                line every SECS seconds (CPU%%, mem,\n"
+        "                                GPU GTT, load avg, iowait, open conns,\n"
+        "                                fd usage, TCP states incl. explicit\n"
+        "                                TIME_WAIT count + %% of ephemeral port\n"
+        "                                range with elevated/HIGH/CRITICAL tag).\n"
+        "                                0 disables. Default 60. INI:\n"
+        "                                [SERVER] metrics_interval.\n"
         "       --reasoning <on|off>    Enable model thinking (default on)\n"
         "       --no-think              Strip <think>...</think> from replies\n"
         "       --inject-datetime <on|off>\n"
@@ -3159,7 +3180,12 @@ static bool require_auth(const ServerCtx & ctx, const httplib::Request & req,
         "                               --inject-datetime.  Default '2024-10'.\n"
         "  -v,  --verbose               Engine logs raw model output + parser\n"
         "                                 actions to stderr — useful for debugging\n"
-        "                                 'why did it stop?' moments\n"
+        "                                 'why did it stop?' moments. Also logs\n"
+        "                                 TCP-level ⇐ accept / ⇒ close lines per\n"
+        "                                 connection AND HTTP-level → arrival /\n"
+        "                                 ← completion lines per request, with\n"
+        "                                 running totals (open conns, in-flight,\n"
+        "                                 bytes in/out, errors).\n"
         "       --show-system-prompt    Print the resolved persona (built-in\n"
         "                                Deep default OR --system OR --system-\n"
         "                                file content, in the same precedence\n"
@@ -3208,6 +3234,10 @@ struct ServerArgs {
                                      // timeout in seconds.  Bumped from
                                      // llama-server's 60 s default to give
                                      // long-thinking models room to breathe
+    int         metrics_interval = 60; // verbose-mode periodic metrics tick
+                                       // (seconds). 0 disables. CLI:
+                                       // --metrics-interval N. INI:
+                                       // [SERVER] metrics_interval.
                                      // before the network drops them.
     std::string sandbox;            // optional: scope fs_* / bash to this dir
     bool        allow_fs   = false; // explicit opt-in for the fs_* tools
@@ -3453,6 +3483,7 @@ static const std::vector<FlagDef> & kFlags() {
         { {"--mcp-token"},         "SERVER", "mcp_token",      "mcp_token",      true,  SET_STR(&ServerArgs::mcp_token) },
         { {"--http-retries"},      "SERVER", "http_retries",   "http_retries",   true,  SET_INT(&ServerArgs::http_retries) },
         { {"--http-timeout"},      "SERVER", "http_timeout",   "http_timeout",   true,  SET_INT(&ServerArgs::http_timeout) },
+        { {"--metrics-interval"},  "SERVER", "metrics_interval","metrics_interval",true, SET_INT(&ServerArgs::metrics_interval) },
         { {"--no-think"},          "SERVER", "no_think",       "no_think",       false, SET_BOOL_TRUE(&ServerArgs::no_think) },
         { {"--inject-datetime"},   "SERVER", "inject_datetime","inject_datetime",true,  SET_BOOL_TRUE(&ServerArgs::inject_datetime) },
         { {"--knowledge-cutoff"},  "SERVER", "knowledge_cutoff","knowledge_cutoff",true, SET_STR(&ServerArgs::knowledge_cutoff) },
@@ -3563,6 +3594,296 @@ static void on_signal(int) {
     httplib::Server * s = g_server.load();
     if (s) s->stop();
 }
+
+// Resolve the peer (remote IP:port) of an accepted socket. Used by the
+// verbose TCP-level logger to tag connect/disconnect lines. Returns "?"
+// on failure — we never want to fail a connection just because we couldn't
+// name the peer.
+static std::string peer_addr_of(int sock) {
+    struct sockaddr_storage addr {};
+    socklen_t addrlen = sizeof(addr);
+    if (::getpeername(sock, (struct sockaddr *) &addr, &addrlen) != 0) {
+        return "?";
+    }
+    char host[NI_MAXHOST] = {0};
+    char port_s[NI_MAXSERV] = {0};
+    if (::getnameinfo((struct sockaddr *) &addr, addrlen,
+                      host, sizeof(host),
+                      port_s, sizeof(port_s),
+                      NI_NUMERICHOST | NI_NUMERICSERV) != 0) {
+        return "?";
+    }
+    std::string s = host;
+    s += ":";
+    s += port_s;
+    return s;
+}
+
+// VerboseServer — httplib::Server subclass that, in --verbose mode, logs
+// every accepted TCP connection plus its eventual close, with running
+// totals. One log pair per TCP socket regardless of how many HTTP
+// keep-alive requests it carries — complements the per-request
+// pre_routing/set_logger lines wired below.
+//
+// Why this matters: when a client (easyai-cli, VSCode, etc.) hangs and
+// retries, set_logger only fires AFTER a response is sent.  Hung / dropped
+// connections never reach it.  process_and_close_socket() runs once per
+// TCP lifetime, so we see the socket open AND the eventual close even
+// when no HTTP request ever completes — exactly the case we want to
+// debug.
+//
+// Requires the [easyai-patch] in vendored httplib.h that moves
+// process_and_close_socket from private: to protected:.
+// ---------------------------------------------------------------------------
+// Periodic metrics sampler — verbose-mode-only.
+//
+// One background thread that wakes every `interval_s` seconds and prints
+// a single line summarising:
+//   - CPU memory: process RSS + peak (VmHWM), system used / total / pct
+//   - GPU memory: AMD GTT used + peak / total (Linux + AMD only); skipped
+//                 on systems without /sys/class/drm/card*/device/mem_info_*
+//   - CPU usage: process %, system % (from /proc/stat deltas)
+//   - I/O wait: system iowait %
+//   - Load average: 1 / 5 / 15 min
+//   - TCP: open_conns now / peak, total accepted, in_flight, fd usage
+//
+// All sources are best-effort POSIX; missing files yield "n/a" rather
+// than aborting the tick. The thread joins on g_metrics_stop.
+// ---------------------------------------------------------------------------
+namespace metrics {
+
+struct CpuTicks {
+    uint64_t user = 0, nice = 0, system = 0, idle = 0, iowait = 0;
+    uint64_t irq = 0,  softirq = 0, steal = 0;
+    uint64_t total() const {
+        return user + nice + system + idle + iowait + irq + softirq + steal;
+    }
+    uint64_t busy()  const { return total() - idle - iowait; }
+};
+
+static bool read_proc_stat(CpuTicks & out) {
+    std::ifstream f("/proc/stat");
+    if (!f) return false;
+    std::string label;
+    f >> label;
+    if (label != "cpu") return false;
+    f >> out.user >> out.nice >> out.system >> out.idle >> out.iowait
+      >> out.irq >> out.softirq >> out.steal;
+    return f.good() || f.eof();
+}
+
+static void read_meminfo(uint64_t & total_kb, uint64_t & avail_kb) {
+    total_kb = 0; avail_kb = 0;
+    std::ifstream f("/proc/meminfo");
+    if (!f) return;
+    std::string key;
+    uint64_t val;
+    std::string unit;
+    while (f >> key >> val >> unit) {
+        if (key == "MemTotal:")     total_kb = val;
+        else if (key == "MemAvailable:") { avail_kb = val; break; }
+    }
+}
+
+static void read_proc_self_status(uint64_t & rss_kb, uint64_t & hwm_kb) {
+    rss_kb = 0; hwm_kb = 0;
+    std::ifstream f("/proc/self/status");
+    if (!f) return;
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.compare(0, 6, "VmRSS:") == 0) {
+            sscanf(line.c_str() + 6, " %llu",
+                   (unsigned long long *) &rss_kb);
+        } else if (line.compare(0, 6, "VmHWM:") == 0) {
+            sscanf(line.c_str() + 6, " %llu",
+                   (unsigned long long *) &hwm_kb);
+        }
+    }
+}
+
+// AMD iGPU: /sys/class/drm/card*/device/mem_info_gtt_used and _total.
+// Picks the first card found. Returns false if no AMD card is exposed.
+static bool read_amd_gtt(uint64_t & used_b, uint64_t & total_b) {
+    used_b = 0; total_b = 0;
+    for (int i = 0; i < 4; ++i) {
+        char p1[128], p2[128];
+        std::snprintf(p1, sizeof(p1),
+            "/sys/class/drm/card%d/device/mem_info_gtt_used", i);
+        std::snprintf(p2, sizeof(p2),
+            "/sys/class/drm/card%d/device/mem_info_gtt_total", i);
+        std::ifstream fu(p1), ft(p2);
+        if (!fu || !ft) continue;
+        fu >> used_b;
+        ft >> total_b;
+        if (total_b > 0) return true;
+    }
+    return false;
+}
+
+static double load_avg_1() {
+    double l[3] = {0,0,0};
+    if (::getloadavg(l, 3) > 0) return l[0];
+    return -1.0;
+}
+
+static void load_avg_3(double out[3]) {
+    out[0] = out[1] = out[2] = -1.0;
+    ::getloadavg(out, 3);
+}
+
+static uint64_t open_fd_count() {
+    // /proc/self/fd entries; falls back to 0 if unreadable.
+    DIR * d = ::opendir("/proc/self/fd");
+    if (!d) return 0;
+    uint64_t n = 0;
+    while (::readdir(d) != nullptr) ++n;
+    ::closedir(d);
+    return n > 2 ? n - 2 : 0;  // skip "." and ".."
+}
+
+static uint64_t fd_soft_limit() {
+    struct rlimit rl{};
+    if (::getrlimit(RLIMIT_NOFILE, &rl) == 0) return (uint64_t) rl.rlim_cur;
+    return 0;
+}
+
+// TCP state breakdown from /proc/net/tcp and /proc/net/tcp6.
+// State codes (kernel hex):  01=ESTABLISHED  06=TIME_WAIT  08=CLOSE_WAIT
+// 0A=LISTEN  others=transition.  Counted system-wide because TIME_WAIT
+// pressure on the host is what exhausts the ephemeral-port range, not
+// just our process's slice.
+struct TcpStates {
+    uint64_t established = 0;
+    uint64_t time_wait   = 0;
+    uint64_t close_wait  = 0;
+    uint64_t fin_wait    = 0;   // FIN_WAIT1 + FIN_WAIT2
+    uint64_t listen      = 0;
+    uint64_t total       = 0;
+    bool     have        = false;
+};
+
+static void count_tcp_states_one(const char * path, TcpStates & out) {
+    std::ifstream f(path);
+    if (!f) return;
+    std::string line;
+    std::getline(f, line);  // header
+    while (std::getline(f, line)) {
+        // Format: "sl local_address rem_address st ..."
+        // Find the 4th whitespace-separated column, which is the state.
+        const char * p = line.c_str();
+        // Skip leading spaces.
+        while (*p == ' ' || *p == '\t') ++p;
+        // Walk 3 fields.
+        for (int i = 0; i < 3 && *p; ++i) {
+            while (*p && *p != ' ' && *p != '\t') ++p;
+            while (*p == ' ' || *p == '\t') ++p;
+        }
+        if (!*p) continue;
+        unsigned st = 0;
+        if (std::sscanf(p, "%2X", &st) != 1) continue;
+        ++out.total;
+        out.have = true;
+        switch (st) {
+            case 0x01: ++out.established; break;
+            case 0x04:  // FIN_WAIT1
+            case 0x05:  // FIN_WAIT2
+                ++out.fin_wait; break;
+            case 0x06: ++out.time_wait;  break;
+            case 0x08: ++out.close_wait; break;
+            case 0x0A: ++out.listen;     break;
+            default: break;
+        }
+    }
+}
+
+static TcpStates count_tcp_states() {
+    TcpStates s;
+    count_tcp_states_one("/proc/net/tcp",  s);
+    count_tcp_states_one("/proc/net/tcp6", s);
+    return s;
+}
+
+// Linux ephemeral port range (used by outbound connect()s — web_fetch,
+// MCP client, etc.).  TIME_WAIT pressure is meaningful as a percentage
+// of THIS range, not of the full 65535 port space, because that's what
+// the kernel actually pulls from for ephemeral allocations.
+static uint64_t ephemeral_port_range() {
+    std::ifstream f("/proc/sys/net/ipv4/ip_local_port_range");
+    if (!f) return 28232;  // typical default 32768..60999 = 28232
+    uint64_t lo = 0, hi = 0;
+    f >> lo >> hi;
+    return hi > lo ? hi - lo + 1 : 28232;
+}
+
+static std::string fmt_bytes(uint64_t b) {
+    char buf[32];
+    if (b >= (1ull << 30)) {
+        std::snprintf(buf, sizeof(buf), "%.2fGiB", (double) b / (1ull << 30));
+    } else if (b >= (1ull << 20)) {
+        std::snprintf(buf, sizeof(buf), "%.1fMiB", (double) b / (1ull << 20));
+    } else if (b >= (1ull << 10)) {
+        std::snprintf(buf, sizeof(buf), "%.1fKiB", (double) b / (1ull << 10));
+    } else {
+        std::snprintf(buf, sizeof(buf), "%lluB", (unsigned long long) b);
+    }
+    return buf;
+}
+
+}  // namespace metrics
+
+// Background ticker — set true on shutdown so the thread joins promptly.
+static std::atomic<bool>        g_metrics_stop{false};
+static std::condition_variable  g_metrics_cv;
+static std::mutex               g_metrics_mu;
+
+class VerboseServer : public httplib::Server {
+public:
+    VerboseServer(ServerCtx & ctx, bool verbose)
+        : ctx_(ctx), verbose_(verbose) {}
+
+protected:
+    bool process_and_close_socket(socket_t sock) override {
+        if (!verbose_) {
+            return httplib::Server::process_and_close_socket(sock);
+        }
+        const std::string peer = peer_addr_of(sock);
+        const auto t0 = std::chrono::steady_clock::now();
+        const auto conn_n = ctx_.n_connections.fetch_add(1, std::memory_order_relaxed) + 1;
+        const auto live   = ctx_.n_open_conns .fetch_add(1, std::memory_order_relaxed) + 1;
+        // Track high-water mark for the periodic metrics report.
+        uint64_t prev_peak = ctx_.n_open_conns_peak.load(std::memory_order_relaxed);
+        while (live > prev_peak &&
+               !ctx_.n_open_conns_peak.compare_exchange_weak(
+                   prev_peak, live, std::memory_order_relaxed)) {}
+        std::fprintf(stderr,
+            "[easyai-server] \xe2\x87\x90 accept #%llu  from=%s  open_conns=%llu\n",
+            (unsigned long long) conn_n,
+            peer.c_str(),
+            (unsigned long long) live);
+        std::fflush(stderr);
+
+        const bool ok = httplib::Server::process_and_close_socket(sock);
+
+        const auto dur_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+        const auto live_after = ctx_.n_open_conns.fetch_sub(1, std::memory_order_relaxed) - 1;
+        std::fprintf(stderr,
+            "[easyai-server] \xe2\x87\x92 close   #%llu  from=%s  dur=%lldms  ok=%d  open_conns=%llu  total_conns=%llu\n",
+            (unsigned long long) conn_n,
+            peer.c_str(),
+            (long long) dur_ms,
+            ok ? 1 : 0,
+            (unsigned long long) live_after,
+            (unsigned long long) ctx_.n_connections.load(std::memory_order_relaxed));
+        std::fflush(stderr);
+        return ok;
+    }
+
+private:
+    ServerCtx & ctx_;
+    bool        verbose_;
+};
+
 
 // Build the built-in system prompt with tool-notes bullets gated on which
 // tools will actually be registered. Naming an unregistered tool here makes
@@ -5749,11 +6070,18 @@ int main(int argc, char ** argv) {
         std::fprintf(stderr,
             "[easyai-server] VERBOSE: per-request POST line + per-hop "
             "generate_one/chat_continue dumps + thought-only retry "
-            "trace will appear in this stream.\n");
+            "trace + HTTP connect/disconnect lines (\xe2\x86\x92 arrival "
+            "with client IP / body size; \xe2\x86\x90 completion with "
+            "status / duration / running totals) will appear in this "
+            "stream.\n");
     }
 
     // -------- http server -------------------------------------------------
-    httplib::Server svr;
+    // VerboseServer subclasses httplib::Server.  In --verbose mode it logs
+    // ⇐ accept / ⇒ close lines per TCP connection (catches hung sockets
+    // that set_logger never sees because no response was ever sent).
+    // Outside verbose mode it's identical to the base — zero overhead.
+    VerboseServer svr(*ctx, args.verbose);
     svr.set_payload_max_length(args.max_body);
     // Apply the configured HTTP timeout to BOTH directions.  Default is
     // 600 s (10 min) so long thinking turns don't trip a mid-stream cut
@@ -5781,6 +6109,212 @@ int main(int argc, char ** argv) {
     // Routes — every handler captures `ctx_ref` by reference.  Lifetime is
     // safe because main() does not return until svr.listen() exits.
     auto & ctx_ref = *ctx;
+
+    // ---- verbose connection log -------------------------------------------
+    // In --verbose mode, log a `→` line on request arrival and a `←` line on
+    // completion.  The `←` line carries per-request stats (status, duration,
+    // bytes) plus running totals so an operator tailing journalctl can see
+    // load + per-request behaviour without enabling /metrics.  Streaming
+    // responses (chat completions) write bytes through chunked transfer and
+    // bypass res.body — those show `out=streamed` instead of a byte count.
+    //
+    // Per-request start time lives in a thread_local; each cpp-httplib
+    // worker thread serves one request at a time, so this correlates the
+    // pre-routing arrival with the post-response logger callback without
+    // a per-socket map.
+    if (args.verbose) {
+        struct ReqTiming {
+            std::chrono::steady_clock::time_point start;
+        };
+        static thread_local ReqTiming t_req{};
+
+        svr.set_pre_routing_handler(
+            [&ctx_ref](const httplib::Request & req, httplib::Response &) {
+                t_req.start = std::chrono::steady_clock::now();
+                ctx_ref.n_in_flight.fetch_add(1, std::memory_order_relaxed);
+                ctx_ref.n_bytes_in.fetch_add(req.body.size(),
+                                             std::memory_order_relaxed);
+                std::fprintf(stderr,
+                    "[easyai-server] → %s %s  from=%s:%d  body=%zuB  in_flight=%llu\n",
+                    req.method.c_str(),
+                    req.path.c_str(),
+                    req.remote_addr.c_str(),
+                    req.remote_port,
+                    req.body.size(),
+                    (unsigned long long) ctx_ref.n_in_flight.load(
+                        std::memory_order_relaxed));
+                std::fflush(stderr);
+                return httplib::Server::HandlerResponse::Unhandled;
+            });
+
+        svr.set_logger(
+            [&ctx_ref](const httplib::Request & req, const httplib::Response & res) {
+                const auto dur_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - t_req.start).count();
+                const std::size_t out_bytes = res.body.size();
+                ctx_ref.n_bytes_out.fetch_add(out_bytes, std::memory_order_relaxed);
+                const auto in_flight_after = ctx_ref.n_in_flight.fetch_sub(
+                    1, std::memory_order_relaxed) - 1;
+                char out_buf[32];
+                if (out_bytes == 0) {
+                    std::snprintf(out_buf, sizeof(out_buf), "streamed");
+                } else {
+                    std::snprintf(out_buf, sizeof(out_buf), "%zuB", out_bytes);
+                }
+                std::fprintf(stderr,
+                    "[easyai-server] ← %s %s  status=%d  dur=%lldms  out=%s  "
+                    "totals: req=%llu err=%llu tools=%llu in_flight=%llu  "
+                    "bytes: in=%lluB out=%lluB\n",
+                    req.method.c_str(),
+                    req.path.c_str(),
+                    res.status,
+                    (long long) dur_ms,
+                    out_buf,
+                    (unsigned long long) ctx_ref.n_requests.load(std::memory_order_relaxed),
+                    (unsigned long long) ctx_ref.n_errors.load(std::memory_order_relaxed),
+                    (unsigned long long) ctx_ref.n_tool_calls.load(std::memory_order_relaxed),
+                    (unsigned long long) in_flight_after,
+                    (unsigned long long) ctx_ref.n_bytes_in.load(std::memory_order_relaxed),
+                    (unsigned long long) ctx_ref.n_bytes_out.load(std::memory_order_relaxed));
+                std::fflush(stderr);
+            });
+    }
+
+    // ---- periodic metrics ticker (verbose only) -------------------------
+    // Wakes every args.metrics_interval seconds and emits one METRICS line
+    // covering CPU/GPU/mem/load/iowait/net.  Joined cleanly via
+    // g_metrics_stop + g_metrics_cv so SIGINT/SIGTERM doesn't leave a
+    // dangling worker.
+    std::thread metrics_thread;
+    if (args.verbose && args.metrics_interval > 0) {
+        const int interval_s = args.metrics_interval;
+        metrics_thread = std::thread([&ctx_ref, interval_s]() {
+            using namespace metrics;
+            const auto t_start = std::chrono::steady_clock::now();
+            CpuTicks prev{};
+            bool have_prev = read_proc_stat(prev);
+            while (!g_metrics_stop.load(std::memory_order_relaxed)) {
+                std::unique_lock<std::mutex> lk(g_metrics_mu);
+                if (g_metrics_cv.wait_for(
+                        lk, std::chrono::seconds(interval_s),
+                        []{ return g_metrics_stop.load(std::memory_order_relaxed); })) {
+                    break;
+                }
+                lk.unlock();
+
+                // CPU + iowait deltas
+                double cpu_pct = -1.0, iowait_pct = -1.0;
+                CpuTicks cur{};
+                if (read_proc_stat(cur) && have_prev) {
+                    const auto dt = cur.total() > prev.total() ? cur.total() - prev.total() : 0;
+                    if (dt > 0) {
+                        const auto db = cur.busy() > prev.busy() ? cur.busy() - prev.busy() : 0;
+                        const auto dw = cur.iowait > prev.iowait ? cur.iowait - prev.iowait : 0;
+                        cpu_pct    = 100.0 * (double) db / (double) dt;
+                        iowait_pct = 100.0 * (double) dw / (double) dt;
+                    }
+                    prev = cur;
+                }
+                // Mem
+                uint64_t total_kb = 0, avail_kb = 0;
+                read_meminfo(total_kb, avail_kb);
+                double sys_mem_pct = -1.0;
+                uint64_t used_kb = 0;
+                if (total_kb > 0) {
+                    used_kb = total_kb > avail_kb ? total_kb - avail_kb : 0;
+                    sys_mem_pct = 100.0 * (double) used_kb / (double) total_kb;
+                }
+                uint64_t rss_kb = 0, hwm_kb = 0;
+                read_proc_self_status(rss_kb, hwm_kb);
+                // GPU (AMD GTT)
+                uint64_t gpu_used = 0, gpu_total = 0;
+                const bool have_gpu = read_amd_gtt(gpu_used, gpu_total);
+                // Load
+                double load[3] = {-1, -1, -1};
+                load_avg_3(load);
+                // FD / TCP
+                const uint64_t fd_open = open_fd_count();
+                const uint64_t fd_lim  = fd_soft_limit();
+                const TcpStates tcp    = count_tcp_states();
+                const uint64_t eph_range = ephemeral_port_range();
+                const auto open_now    = ctx_ref.n_open_conns.load(std::memory_order_relaxed);
+                const auto open_peak   = ctx_ref.n_open_conns_peak.load(std::memory_order_relaxed);
+                const auto in_flight   = ctx_ref.n_in_flight.load(std::memory_order_relaxed);
+                const auto total_conns = ctx_ref.n_connections.load(std::memory_order_relaxed);
+                const auto reqs        = ctx_ref.n_requests.load(std::memory_order_relaxed);
+                const auto errs        = ctx_ref.n_errors.load(std::memory_order_relaxed);
+                const auto uptime_s    = std::chrono::duration_cast<std::chrono::seconds>(
+                                             std::chrono::steady_clock::now() - t_start).count();
+
+                std::fprintf(stderr,
+                    "[easyai-server] METRICS uptime=%llds  "
+                    "cpu: usage=%.1f%% iowait=%.1f%% load=%.2f %.2f %.2f  "
+                    "mem: rss=%s peak=%s sys=%.1f%% (%s/%s)  ",
+                    (long long) uptime_s,
+                    cpu_pct, iowait_pct, load[0], load[1], load[2],
+                    fmt_bytes(rss_kb << 10).c_str(),
+                    fmt_bytes(hwm_kb << 10).c_str(),
+                    sys_mem_pct,
+                    fmt_bytes(used_kb << 10).c_str(),
+                    fmt_bytes(total_kb << 10).c_str());
+                if (have_gpu) {
+                    const double gpu_pct = gpu_total > 0
+                        ? 100.0 * (double) gpu_used / (double) gpu_total : 0;
+                    std::fprintf(stderr, "gpu: gtt=%s/%s (%.1f%%)  ",
+                        fmt_bytes(gpu_used).c_str(),
+                        fmt_bytes(gpu_total).c_str(),
+                        gpu_pct);
+                } else {
+                    std::fprintf(stderr, "gpu: n/a  ");
+                }
+                std::fprintf(stderr,
+                    "net: open=%llu peak=%llu total=%llu in_flight=%llu reqs=%llu err=%llu  "
+                    "fd: %llu/%llu (%.1f%%)",
+                    (unsigned long long) open_now,
+                    (unsigned long long) open_peak,
+                    (unsigned long long) total_conns,
+                    (unsigned long long) in_flight,
+                    (unsigned long long) reqs,
+                    (unsigned long long) errs,
+                    (unsigned long long) fd_open,
+                    (unsigned long long) fd_lim,
+                    fd_lim > 0 ? 100.0 * (double) fd_open / (double) fd_lim : 0.0);
+                if (tcp.have) {
+                    // System-wide TCP state breakdown.  TIME_WAIT counted
+                    // against the ephemeral port range — that's what the
+                    // kernel allocates from for outbound connect()s, so
+                    // it's the actual choke-point. >50% sustained means
+                    // SO_REUSEADDR / shorter tcp_fin_timeout / connection
+                    // pooling on the calling side is overdue.
+                    const double tw_pct = eph_range > 0
+                        ? 100.0 * (double) tcp.time_wait / (double) eph_range : 0.0;
+                    const char * pressure =
+                        tw_pct >= 80.0 ? " CRITICAL" :
+                        tw_pct >= 50.0 ? " HIGH"     :
+                        tw_pct >= 20.0 ? " elevated" : "";
+                    std::fprintf(stderr,
+                        "  tcp: estab=%llu time_wait=%llu close_wait=%llu fin_wait=%llu "
+                        "listen=%llu  TIME_WAIT %llu/%llu ephemeral ports (%.1f%%%s)",
+                        (unsigned long long) tcp.established,
+                        (unsigned long long) tcp.time_wait,
+                        (unsigned long long) tcp.close_wait,
+                        (unsigned long long) tcp.fin_wait,
+                        (unsigned long long) tcp.listen,
+                        (unsigned long long) tcp.time_wait,
+                        (unsigned long long) eph_range,
+                        tw_pct,
+                        pressure);
+                } else {
+                    std::fprintf(stderr, "  tcp: n/a");
+                }
+                std::fputc('\n', stderr);
+                std::fflush(stderr);
+            }
+        });
+        std::fprintf(stderr,
+            "[easyai-server] verbose metrics ticker every %ds (set --metrics-interval N or [SERVER] metrics_interval, 0 disables)\n",
+            interval_s);
+    }
 
     // ---- webui routes ---------------------------------------------------
     // We serve the embedded llama-server-derived bundle by default. The
@@ -5996,6 +6530,12 @@ int main(int argc, char ** argv) {
 
     bool ok = svr.listen(args.host.c_str(), args.port);
     g_server.store(nullptr);
+
+    // Wake the metrics ticker so it exits its wait_for promptly, then join.
+    g_metrics_stop.store(true, std::memory_order_relaxed);
+    g_metrics_cv.notify_all();
+    if (metrics_thread.joinable()) metrics_thread.join();
+
     std::fprintf(stderr, "[easyai-server] %s\n", ok ? "stopped cleanly" : "listen failed");
     return ok ? 0 : 1;
 }

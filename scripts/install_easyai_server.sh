@@ -951,6 +951,16 @@ http_timeout    = $http_timeout
 # Switch to off if the journalctl noise is a problem in production.
 verbose         = $([[ "$enable_verbose" -eq 1 ]] && echo on || echo off)
 
+# Verbose-only periodic METRICS line: every metrics_interval seconds, log
+# CPU%, iowait, load, process mem (rss + peak), system mem, GPU GTT (AMD),
+# open TCP connections (now / peak), in-flight requests, total requests /
+# errors, fd usage, TCP state breakdown (ESTABLISHED / TIME_WAIT / CLOSE_WAIT
+# / FIN_WAIT / LISTEN) with explicit TIME_WAIT-vs-ephemeral-port-range
+# percentage tagged "elevated" / "HIGH" / "CRITICAL" so socket exhaustion
+# shows up before connections start failing. 0 disables. Lives outside
+# /metrics so you can read it from journalctl without standing up Prometheus.
+metrics_interval = 60
+
 # /mcp authentication
 # ----------------------------------------------------------------
 # off     : open (anyone reaching /mcp can dispatch any tool) — DEFAULT
