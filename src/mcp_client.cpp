@@ -339,6 +339,17 @@ std::vector<Tool> fetch_remote_tools(const ClientOptions & opts,
         err = "mcp client: url is empty";
         return out;
     }
+    // Defence-in-depth: libcurl's CURLOPT_PROTOCOLS_STR also blocks
+    // non-http(s) schemes at transport time, but rejecting here gives
+    // every caller (server.cpp, future callers, embedders) a uniform
+    // "scheme must be http(s)://" error instead of a curl diagnostic
+    // that varies by version.
+    if (opts.url.compare(0, 7,  "http://")  != 0
+     && opts.url.compare(0, 8,  "https://") != 0) {
+        err = "mcp client: url must start with http:// or https:// (got: "
+            + opts.url + ")";
+        return out;
+    }
 
     auto conn = std::make_shared<Conn>();
     conn->url             = normalize_url(opts.url);

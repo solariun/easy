@@ -45,6 +45,7 @@
 //     request can never tear down the server.
 // =============================================================================
 
+#include "easyai/builtin_tools.hpp"     // tool_lookup
 #include "easyai/cli.hpp"               // Toolbelt
 #include "easyai/config.hpp"            // INI parser
 #include "easyai/external_tools.hpp"    // EASYAI-*.tools loader
@@ -895,6 +896,23 @@ int main(int argc, char ** argv) {
             "easyai-mcp-server: loaded %zu external tool(s) from %zu file(s) in %s\n",
             loaded.tools.size(), loaded.loaded_files.size(),
             args.external_tools_dir.c_str());
+    }
+
+    // tool_lookup MUST be added last so its snapshot covers every
+    // other tool registered above (built-ins, RAG, external).  Same
+    // ctx-pointer-capture trick as easyai-server; ctx outlives every
+    // request handler.
+    {
+        auto * tools_ptr = &ctx->default_tools;
+        ctx->default_tools.push_back(easyai::tools::tool_lookup(
+            [tools_ptr]() {
+                std::vector<std::pair<std::string, std::string>> v;
+                v.reserve(tools_ptr->size());
+                for (const auto & t : *tools_ptr) {
+                    v.emplace_back(t.name, t.description);
+                }
+                return v;
+            }));
     }
 
     // -------- MCP auth user table from already-loaded INI -----------------

@@ -15,6 +15,28 @@ namespace easyai {
 
 static constexpr int kMaxBatch = 20;
 
+// Strip C0 control bytes (incl. ESC, 0x1b) and DEL from model-supplied
+// plan-item text before we render it. Preserves UTF-8 multi-byte
+// sequences (all 0x80+ bytes pass through). Without this guard a model
+// could emit "\x1b]0;HACKED\a" or "\x1b[2J" inside `text` and hijack
+// the operator's terminal — the plan render path uses our own ANSI
+// codes for status colouring, so we hand the terminal escapes-by-trust
+// only for our literal box brackets.  Tabs, CR, and LF are also
+// stripped because plan items are conceptually one-line — preserving
+// them would break the `- [x] N. text` row layout.
+static std::string sanitize_plan_text(const std::string & in) {
+    std::string out;
+    out.reserve(in.size());
+    for (unsigned char c : in) {
+        if (c < 0x20 || c == 0x7f) {
+            // Drop. (Whitespace already collapsed; see comment above.)
+        } else {
+            out += static_cast<char>(c);
+        }
+    }
+    return out;
+}
+
 Plan::Plan() = default;
 
 void Plan::on_change(ChangeCallback cb) { on_change_ = std::move(cb); }
@@ -25,17 +47,20 @@ bool                          Plan::empty() const { return items_.empty(); }
 void Plan::render(std::ostream & out, bool color) const {
     if (items_.empty()) { out << "(plan is empty)\n"; return; }
     for (const auto & it : items_) {
+        // Strip control bytes from model-supplied text — see
+        // sanitize_plan_text() for rationale (terminal-escape injection).
+        const std::string text = sanitize_plan_text(it.text);
         if (color) {
             if (it.status == "deleted") {
-                out << "\033[2;9m- [-] " << it.id << ". " << it.text << "\033[0m\n";
+                out << "\033[2;9m- [-] " << it.id << ". " << text << "\033[0m\n";
             } else if (it.status == "error") {
-                out << "\033[31m- [!] " << it.id << ". " << it.text << "\033[0m\n";
+                out << "\033[31m- [!] " << it.id << ". " << text << "\033[0m\n";
             } else if (it.status == "done") {
-                out << "\033[2m- [x] " << it.id << ". " << it.text << "\033[0m\n";
+                out << "\033[2m- [x] " << it.id << ". " << text << "\033[0m\n";
             } else if (it.status == "working") {
-                out << "\033[1;36m- [~] " << it.id << ". " << it.text << "\033[0m\n";
+                out << "\033[1;36m- [~] " << it.id << ". " << text << "\033[0m\n";
             } else {
-                out << "\033[1m- [ ] " << it.id << ". " << it.text << "\033[0m\n";
+                out << "\033[1m- [ ] " << it.id << ". " << text << "\033[0m\n";
             }
         } else {
             const char * box =
@@ -44,7 +69,7 @@ void Plan::render(std::ostream & out, bool color) const {
                 it.status == "error"   ? "[!]" :
                 it.status == "deleted" ? "[-]" :
                                          "[ ]";
-            out << "- " << box << " " << it.id << ". " << it.text << "\n";
+            out << "- " << box << " " << it.id << ". " << text << "\n";
         }
     }
 }

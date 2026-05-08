@@ -136,6 +136,17 @@ int main(int argc, char ** argv) {
                   "help and cite the tool's reply in your answer.")
           .add_tool(today_is())
           .add_tool(weather())
+          .add_tool(easyai::tools::tool_lookup([&engine]() {
+              // Last-registered: snapshot includes today_is, weather,
+              // and tool_lookup itself.  Lets the model verify what's
+              // wired up before guessing tool names.
+              std::vector<std::pair<std::string, std::string>> v;
+              v.reserve(engine.tools().size());
+              for (const auto & t : engine.tools()) {
+                  v.emplace_back(t.name, t.description);
+              }
+              return v;
+          }))
           .on_token([](const std::string & piece) {
               std::cout << piece << std::flush;
           });

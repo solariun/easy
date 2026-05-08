@@ -267,8 +267,14 @@ bool has(const std::string & json, const std::string & key) {
     return find_key(json, key) != std::string::npos;
 }
 
-bool get_array(const std::string & json, const std::string & key,
-               std::vector<std::string> & out) {
+// Internal: stringified-array unwrap is recursive (it re-enters get_array
+// with a synthetic wrapper). A hostile model could feed
+//     "items": "\"\\\"\\\\\\\"...\""
+// (a string-of-string-of-string-…) and blow the stack. Cap the depth.
+static bool get_array_impl(const std::string & json, const std::string & key,
+                           std::vector<std::string> & out, int depth) {
+    constexpr int kMaxUnwrapDepth = 4;
+    if (depth > kMaxUnwrapDepth) return false;
     size_t i = find_key(json, key);
     if (i == std::string::npos) return false;
     i = skip_ws(json, i);
@@ -283,7 +289,7 @@ bool get_array(const std::string & json, const std::string & key,
         std::string unwrapped;
         if (!read_json_string(json, i, unwrapped)) return false;
         std::string synthetic = "{\"_a\":" + unwrapped + "}";
-        return get_array(synthetic, "_a", out);
+        return get_array_impl(synthetic, "_a", out, depth + 1);
     }
 
     if (json[i] != '[') return false;
@@ -298,7 +304,7 @@ bool get_array(const std::string & json, const std::string & key,
         if (json[i] == ']') return true;
 
         size_t start = i;
-        int depth = 0;
+        int brace_depth = 0;
         bool in_str = false;
         while (i < json.size()) {
             char c = json[i];
@@ -309,12 +315,12 @@ bool get_array(const std::string & json, const std::string & key,
                 continue;
             }
             if (c == '"')            { in_str = true; ++i; continue; }
-            if (c == '{' || c == '[') { ++depth; ++i; continue; }
+            if (c == '{' || c == '[') { ++brace_depth; ++i; continue; }
             if (c == '}' || c == ']') {
-                if (depth == 0) break;
-                --depth; ++i; continue;
+                if (brace_depth == 0) break;
+                --brace_depth; ++i; continue;
             }
-            if (c == ',' && depth == 0) break;
+            if (c == ',' && brace_depth == 0) break;
             ++i;
         }
 
@@ -327,6 +333,11 @@ bool get_array(const std::string & json, const std::string & key,
         if (json[i] == ',') { ++i; continue; }
     }
     return true;
+}
+
+bool get_array(const std::string & json, const std::string & key,
+               std::vector<std::string> & out) {
+    return get_array_impl(json, key, out, 0);
 }
 
 }  // namespace args

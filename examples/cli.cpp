@@ -747,6 +747,7 @@ bool any_management(const Options & o) {
 const std::vector<std::string> kDefaultTools = {
     "datetime", "plan", "web_search", "web_fetch",
     "get_current_dir",
+    "tool_lookup",
     "system_meminfo", "system_loadavg", "system_cpu_usage", "system_swaps",
 };
 
@@ -910,6 +911,22 @@ void register_tools(easyai::Client & cli,
                     && o.tools_enabled.count(t.name) == 0) continue;
             cli.add_tool(std::move(t));
         }
+    }
+
+    // tool_lookup MUST be registered last so the snapshot it returns
+    // covers every other tool (built-ins, plan, fs_*, bash, RAG,
+    // external-tools manifests).  The factory captures a getter that
+    // re-reads cli.tools() at every call, so even tools registered
+    // dynamically (e.g. webui-side runtime additions) show up.
+    if (wants("tool_lookup")) {
+        cli.add_tool(easyai::tools::tool_lookup([&cli]() {
+            std::vector<std::pair<std::string, std::string>> v;
+            v.reserve(cli.tools().size());
+            for (const auto & t : cli.tools()) {
+                v.emplace_back(t.name, t.description);
+            }
+            return v;
+        }));
     }
 
     if (o.verbose) {
@@ -1448,6 +1465,33 @@ int main(int argc, char ** argv) {
                 "the ceiling, not a starting point — they steer, you "
                 "implement what they pick.\n";
         }
+        // [tools] — authoritative tool-discipline block. Always emitted
+        // (independent of fs_* / plan registration), because the
+        // hallucinated-tool failure mode is universal: a model with
+        // ONLY datetime + web_* still tries to call `write` and lands
+        // an "unknown tool" error mid-task. Pointing the model at
+        // tool_lookup gives it a one-hop verify path, and the
+        // imperative "do not invent names" closes the rest.
+        if (!prefix.empty()) prefix += "\n";
+        prefix +=
+            "[tools]\n"
+            "Only call tools that are actually registered in this "
+            "session. NEVER invent a tool name. NEVER assume a tool "
+            "exists because it would be useful. NEVER call a tool you "
+            "have not seen in the registered tool catalogue this "
+            "session.\n"
+            "\n"
+            "If you are unsure whether a specific tool is wired up, "
+            "call `tool_lookup` first. With no argument it returns the "
+            "complete numbered catalogue; with `name=\"<substring>\"` "
+            "it filters by partial name match. Use it BEFORE the call "
+            "you're about to make, not after a failure.\n"
+            "\n"
+            "If the affordance you need is genuinely missing, say so "
+            "in your reply and propose a path forward (write the code "
+            "as a response, ask the user to enable a tool, etc.). Do "
+            "not retry an unknown-tool call hoping for a different "
+            "outcome — the registry will not change mid-turn.\n";
         // [unattended] — emitted on --unattended OR any one-shot mode
         // (--prompt / positional / piped stdin). Overrides the "ask
         // the user" parts of [guidance]: there's no REPL on the other

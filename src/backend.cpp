@@ -118,6 +118,24 @@ bool LocalBackend::init(std::string & err) {
         }
         for (auto & t : loaded.tools) engine.add_tool(t);
     }
+
+    // tool_lookup — registered last so its snapshot covers everything
+    // above. Always on (no opt-out) when load_tools is enabled: the
+    // model uses it as a guard before assuming a tool exists. The
+    // getter re-reads engine.tools() at every call, so dynamic
+    // additions during a session (uncommon for LocalBackend, but
+    // possible) are still visible.
+    if (cfg.load_tools) {
+        engine.add_tool(tools::tool_lookup([&engine]() {
+            std::vector<std::pair<std::string, std::string>> v;
+            v.reserve(engine.tools().size());
+            for (const auto & t : engine.tools()) {
+                v.emplace_back(t.name, t.description);
+            }
+            return v;
+        }));
+    }
+
     engine.on_tool([](const ToolCall & c, const ToolResult & r){
         std::fprintf(stderr,
             "\n\033[36m[tool] %s -> %s%.200s%s\033[0m\n",

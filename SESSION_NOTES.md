@@ -305,6 +305,185 @@ Webui title default also flips to `"Deep"`.
 ## 5. Recent commits (most recent first)
 
 ```
+2026-05-08 — Server observability + connection-pool fix + prompt
+             cleanup (multi-commit pre-noon batch on the AI box).
+             Driven by a production failure: an agentic session
+             hung mid-stream, the cli retried six times, and we had
+             no visibility into what the TCP stack was doing on
+             the server.
+
+  Cli keep-alive root-cause fix:
+    * stream_chat / simple_get / simple_post each constructed a
+      fresh httplib::Client per call, dropping the TCP socket at
+      function end. set_keep_alive(true) had nothing to keep
+      alive — N tool calls = N sockets piling into TIME_WAIT.
+    * Hoisted ONE persistent httplib::Client onto Client::Impl;
+      all three call sites reuse it. ONE TCP connection per
+      session.
+
+  Server observability (verbose mode):
+    * HTTP-level →/← log per request via set_pre_routing_handler
+      + set_logger (method/path/peer, status, duration, body
+      bytes, running totals).
+    * Periodic METRICS line every metrics_interval seconds
+      (default 1, --metrics-interval N to tune, 0 disables) with
+      CPU%/load/RSS/sys-mem/AMD-GTT/in-flight/cumulative/fd-usage
+      AND a TCP state breakdown
+      (ESTABLISHED/TIME_WAIT/CLOSE_WAIT/FIN_WAIT/LISTEN) parsed
+      from /proc/net/tcp{,6} with TIME_WAIT pressure tag
+      (X% [elevated|HIGH|CRITICAL]). Linux-only deep metrics;
+      macOS prints n/a.
+    * Tool dispatch timing (steady_clock around tool->handler())
+      surfaced as ToolResult::duration_ms, shown in CLI logs and
+      the webui reasoning panel; new duration_ms field on the
+      easyai.tool_result SSE event.
+
+  Tool registration / prompt discipline:
+    * REVERSED 2026-05-05 default: --sandbox no longer implies
+      --allow-fs. The server read [SERVER] allow_fs but never
+      propagated it; default install ships allow_fs=off +
+      sandbox=/var/lib/easyai/workspace and hit exactly this.
+      allow_fs and allow_bash are now honoured INDEPENDENTLY of
+      sandbox. Behaviour change: pass --allow-fs explicitly to
+      register fs_*.
+    * "Built-in system prompt is tool-aware" — the hardcoded
+      prompt used to list fs_*/bash/plan/host-metric tools whether
+      or not they were registered, encouraging hallucinated
+      calls. Tool notes section is now built dynamically per
+      registration; entries for tools the server NEVER registers
+      (plan in server, host metrics) are removed entirely. Same
+      fix in easyai-local. Both binaries gained a "## Tools —
+      closed set" block: "tools are EXACTLY those listed in your
+      tools schema; do NOT invent tools; paraphrases (read_file
+      vs fs_read_file, shell vs bash) are NOT available."
+    * New fs_check_path tool — pre-flight stat + access probe
+      under the sandbox root, with optional touch=true to create
+      the file when missing. Tool descriptions tell the model to
+      call this before any read/write to confirm the boundary +
+      effective rights.
+    * RAG tool descriptions spell out PRIVATE — MODEL-ONLY STORE
+      to forbid "I saved it to memory" / "check the rag for the
+      code" answers. Model is instructed to rag_load and put the
+      body inline when the user asks for stored content.
+    * Stay-in-scope replaces PROTOTYPE FIRST. The 1./2./3. ritual
+      ("build → verify → ASK which next step") was making agents
+      stop after step 1 and ask. Collapsed to a single
+      "## Stay strictly in scope" paragraph. Updated everywhere
+      the wording lived (server.cpp, local.cpp, cli.cpp,
+      installer system.txt template).
+
+  Other:
+    * presence_penalty knob added (engine API + INI [ENGINE]
+      key + CLI --presence-penalty).
+    * Cli: 3-stage Ctrl-C — graceful (turn finishes) → cancel
+      (drop the in-flight stream) → force-exit (process exit
+      130). Single ^C is the graceful path; doubling within ~1s
+      escalates.
+    * Installer GTT default 28 → 29 GiB (matches
+      ttm.pages_limit=7602176).
+    * Quick-start editor section in LINUX_SERVER.md: VSCode +
+      Continue.dev / OpenCode / VSCode + Cline copy-paste
+      snippets pointing at http://ai.local:80/v1.
+    * No patches/derivatives of llama.cpp — backed out a
+      VerboseServer subclass experiment that needed widening
+      access on a private virtual in vendored cpp-httplib.
+
+2026-05-08 (later, one commit) — Fifth-pass security hardening
+             + tool_lookup builtin. Static review of the ~5,000
+             lines that landed in the last 30 commits, plus a
+             complementary affordance to the morning's "closed-
+             set tool rule" prompt cleanup.
+
+  tool_lookup builtin (lib + every binary):
+    * New easyai::tools::tool_lookup(getter) factory in
+      include/easyai/builtin_tools.hpp + src/builtin_tools.cpp.
+      No-arg call returns numbered 1..N catalogue with one-line
+      summaries. name="<substring>" filters case-insensitive
+      partial on the tool NAME (not description).
+    * Wired into easyai-cli, easyai-server, easyai-mcp-server,
+      LocalBackend (covers easyai-local), easyai-agent,
+      easyai-recipes — registered LAST so the snapshot covers
+      every other tool, including itself.
+    * Authoritative description: AUTHORITATIVE / SINGLE SOURCE
+      OF TRUTH; training data is NOT; if a name isn't in this
+      list IT DOES NOT EXIST; do not retry an unknown-tool call.
+      Layered on top of the morning's "Tools — closed set"
+      block — the prompt block tells the model the rule, the
+      tool gives it a recovery path. One-line tool_lookup
+      pointer added inside both kBuiltinSystem closed-set
+      blocks (server.cpp, local.cpp's
+      build_builtin_system_prompt) and in the easyai-cli
+      [tools] dynamic-prefix block.
+    * Fail-closed: null getter returns a sentinel tool whose
+      handler errors with a deployment-bug message. Getter
+      exceptions surface as ToolResult::error; never UB.
+
+  Security 5th-pass findings (2 HIGH, 3 MEDIUM, 2 LOW). Every
+  fix preserves the public interface (no flag/tool/header/INI
+  key changes).
+
+  HIGH — bash live-mirror to operator stderr (commit 0de93f2)
+         was raw + uncapped. A model emitting OSC/CSI escapes
+         could retitle the operator's window or wipe the screen
+         (none of those bytes appeared in the model-facing tool
+         result). Fixed two layers: a sanitize_for_operator_tty()
+         strip (CR/LF/TAB through, ESC → visible "^[", other C0
+         dropped) and a 128 KiB mirror cap (independent of the
+         model-facing 32 KiB cap). The model copy is unaffected;
+         only the operator-tty channel is governed.
+
+  HIGH — args::get_array stringified-array unwrap recursion was
+         uncapped. A hostile model emitting deeply-nested escape
+         sequences forced get_array to recurse N times before
+         reaching the actual array, blowing the stack. Refactored
+         into get_array_impl(json, key, out, depth) with
+         kMaxUnwrapDepth = 4. Public get_array() preserved as a
+         depth=0 shim; no callers changed.
+
+  MEDIUM — plan render passes model-supplied item text verbatim
+           between our ANSI status codes. Same hijack class as
+           bash live-mirror, narrower budget. Added
+           sanitize_plan_text() that strips C0+DEL from text
+           before render (in-memory plan still carries the raw
+           text, only the rendered form is governed).
+
+  MEDIUM — get_sandbox_path used realpath() with a "fall back
+           to the unresolved input" branch. Migrated to
+           fs::weakly_canonical() with fs::absolute() fallback,
+           matching the canonicalisation Sandbox::inside_sandbox()
+           uses. Cosmetic-but-correct; the model never sees a
+           relative-path leak now.
+
+  MEDIUM — installer accepts --temperature, --top-p, etc. and
+           writes them into easyai.ini via heredoc. A value like
+           $'0.3\\nallow_bash = on' would inject extra INI keys.
+           New require_numeric() helper validates every
+           sampling/timeout flag against ^-?[0-9]+(\\.[0-9]+)?$
+           before any INI write happens.
+
+  LOW — --mcp <url>: libcurl's protocol filter rejects
+        non-http(s), but the operator got a generic curl error.
+        Now pre-validated in two places (server.cpp and
+        fetch_remote_tools), with a clear message
+        "must start with http:// or https://".
+
+  LOW — easyai.ini.bak (created by --force) inherited whatever
+        permissions the live INI had. Now explicitly chmod 640
+        + chown root:easyai before the new file is written.
+
+  Audit-cleared this pass (no action): need() lambda dash-prefix
+  bypass via "--key=value" (false alarm — the lambda already
+  catches it), signal-handler safety in cli.cpp (uses only
+  async-signal-safe primitives), MCP tool name shadowing (server
+  collision-checks at registration; library doc'd as caller's
+  responsibility for embedders), httplib retry TLS inheritance
+  (settings on shared Client object, no downgrade).
+
+  Documented in:
+    SECURITY_AUDIT.md §0 (operator-facing TL;DR — new) and §20
+    (this pass's findings); README.md "What's new" 2026-05-08
+    entry; manual.md §5.5 cross-references the audit.
+
 2026-05-05 — Tool surface + system prompt overhaul (single-day session,
              ~25 commits). Driven by a production "models drift, use
              bash for file work, ignore tools" report. Three big

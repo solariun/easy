@@ -516,9 +516,16 @@ or "today".  Operators who want a different voice supply their own
 `--system "<text>"` or `-s persona.txt` — Deep is the default, not
 hardcoded.
 
-`--sandbox <dir>` enables fs_* tools scoped to `<dir>`; `--allow-bash`
-adds the shell tool.  Both default OFF — fresh installs don't expose
-write access or shell to the model until the operator opts in.
+`--allow-fs` enables fs_* tools (read_file / write_file / list_dir /
+glob / grep + fs_check_path); pair with `--sandbox <dir>` to scope
+them under `<dir>` (otherwise they operate against the process's
+cwd).  `--allow-bash` adds the shell tool, also pinned to `<dir>`
+when `--sandbox` is set.  All three default OFF — fresh installs
+don't expose write access or shell to the model until the operator
+opts in. Note that `--sandbox <dir>` alone does NOT register fs_*;
+prior versions implied it but as of 2026-05-08 the flags are
+honoured independently so an operator can run with a sandbox
+boundary and no fs_* registered.
 
 If you pass `-s system.txt`, that text becomes the default system
 prompt for any request that doesn't already include one.
@@ -2475,11 +2482,66 @@ Best practices:
 * Format errors as imperative ("missing 'path' argument") — the
   model will often retry with the fix.
 
+### 5.4b The `tool_lookup` builtin — let the model verify itself
+
+When the model emits `write(file_path=…)` and gets `unknown tool:
+write` back, the rest of the turn is usually wasted retrying the
+hallucinated name. `tool_lookup` is the read-only escape hatch:
+
+```cpp
+engine.add_tool(easyai::tools::tool_lookup([&engine]() {
+    std::vector<std::pair<std::string, std::string>> v;
+    for (const auto & t : engine.tools()) {
+        v.emplace_back(t.name, t.description);
+    }
+    return v;
+}));
+```
+
+Register it **last** so the snapshot it returns covers everything
+else. The lambda re-reads `engine.tools()` at every call, so even
+tools added dynamically after `tool_lookup` show up. (`Client` has
+the same `tools()` accessor, so the wiring is identical.)
+
+What the model sees:
+
+```
+1. datetime: Return the current wall-clock time. ...
+2. web_search: Search the web (DuckDuckGo). ...
+3. tool_lookup: Return the catalogue of tools currently available ...
+```
+
+`name="<substring>"` filters by partial, case-insensitive name
+match. `name=""` (or omitted) means "list everything." A no-match
+result returns a clear "(no tools match: …)" string rather than an
+empty list, so the model never confuses an empty filter with an
+empty catalogue.
+
+The companion is the `[tools]` system-prompt block — see the
+`kBuiltinSystem` strings in `examples/server.cpp` and
+`examples/local.cpp`, or the inline `[tools]` injection in
+`examples/cli.cpp::register_tools`. Together they take the model
+from "guess and retry" to "verify first."
+
 ### 5.5 Sandboxing
 
 The built-in `fs_*` family takes a root directory and refuses to
-escape it (`..` and absolute paths are rejected).  Pattern for your
-own filesystem-touching tools:
+escape it (`..` and absolute paths are rejected).  The check is
+**path-component aware** — a sandbox at `/srv/user` rejects
+`/srv/userMALICIOUS/secret` (no string-prefix match). Symlinks
+resolve through `fs::weakly_canonical` and the resolved path must
+contain the root as a prefix on path-component boundaries. Last-
+millisecond symlink swaps (TOCTOU) are defeated by `O_NOFOLLOW`
+on the open() call. Full details in
+[`SECURITY_AUDIT.md`](SECURITY_AUDIT.md) §1, §18.3.
+
+If you're new to easyai's threat model, the operator-facing
+60-second TL;DR lives at the top of the audit: what easyai blocks
+for you, what's your responsibility, and the three knobs that
+matter most. Read [`SECURITY_AUDIT.md`](SECURITY_AUDIT.md) §0
+before going to production.
+
+Pattern for your own filesystem-touching tools:
 
 ```cpp
 easyai::Tool::builder("read_log")

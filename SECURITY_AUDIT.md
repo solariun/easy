@@ -1,8 +1,65 @@
-# easyai — security audit (v0.1.0 + post-FUTURE pass)
+# easyai — security audit
 
-A static review pass over `src/` and `examples/` looking for memory
-overflow, injection, SSRF, regex DoS, TLS, and concurrency hazards.
-Fixes applied in this same commit are noted in-line.
+A standing static review of `src/` and `examples/` covering memory
+safety, injection, SSRF, regex DoS, TLS, sandboxing, and concurrency.
+Fixes are landed in the same commits as the findings; this file is the
+narrative record.
+
+## How to read this file
+
+- **In a hurry?** Read [§0 TL;DR — what to know in 60 seconds](#0-tldr--what-to-know-in-60-seconds) and stop. It's the operator-facing summary: what threats easyai blocks for you, what threats it doesn't, and the three knobs that matter most.
+- **Operator deploying in production?** Read §0, then [§14 Recommendations for high-trust deployments](#14-recommendations-for-high-trust-deployments) and [§17 MCP server endpoint](#17-mcp-server-endpoint--srcmcpcpp--route_mcp-new-surface-auth-open).
+- **Auditing the codebase?** Sections are roughly chronological by audit pass — older sections describe historical findings (already fixed), newer sections describe the latest pass. Latest pass is [§20 Fifth pass — 2026-05-08](#20-fifth-pass--2026-05-08) at the bottom.
+- **Looking for a specific class of issue?** Use the index below.
+
+## Section index
+
+| Topic | Section |
+| --- | --- |
+| Sandbox path traversal | [§1](#1-path-traversal--sandboxresolve-high-fixed), [§7](#7-path-injection-via-tool-arguments), [§18.3](#183-high-3--sandbox-symlink-escape--bash-hardening-fixed) |
+| SSRF / web fetch | [§2](#2-ssrf--web_fetch--ddg-web_search-high-fixed), [§14](#14-recommendations-for-high-trust-deployments) |
+| Regex DoS | [§3](#3-regex-dos--fs_glob-medium-fixed), [§4](#4-stdregex-in-strip_html--na-already-migrated), [§15.2](#152-regex-dos-in-fs_grep-medium-fixed) |
+| JSON / arg parsing | [§5](#5-json-parsing--injection-aware), [§18.4](#184-medium-batch-fixed-in-same-commit), [§20.2](#202-high--get_array-stack-bomb-via-stringified-array-recursion) |
+| Bash subprocess | [§15.3](#153-bash-command-runner-new-surface--by-design), [§18.3](#183-high-3--sandbox-symlink-escape--bash-hardening-fixed), [§20.1](#201-high--bash-live-mirror-terminal-escape--unbounded-flood) |
+| External tools manifest | [§16](#16-external-tools-manifest--srcexternal_toolscpp-new-surface) |
+| RAG persistent memory | [§16.6b](#166b-rag--persistent-registry-surface) |
+| MCP server (`POST /mcp`) | [§17](#17-mcp-server-endpoint--srcmcpcpp--route_mcp-new-surface-auth-open) |
+| MCP client (`--mcp <url>`) | [§20.6](#206-low--mcp-client-url-scheme-not-pre-validated) |
+| HTTP retries / amplification | [§12b](#12b-http-retry-layer--amplification-risk-note), [§20.7](#207-known-residual--http-retry-amplification-via-tool-call-fanout) |
+| TLS | [§13](#13-known-limitations--accepted-risk) |
+| HTTP server hardening | [§8](#8-http-server--examplesservercpp), [§18.1](#181-high-1--apply_ini_to_args-was-dead-code-fixed), [§18.2](#182-high-2---no-mcp-auth-and-server-mcp_auth-ignored-fixed) |
+| Predictable /tmp log | [§19](#19-fourth-pass--2026-05-02-predictable-tmp-log-path) |
+| Plan tool rendering | [§20.3](#203-medium--plan-render-passes-model-supplied-text-with-control-bytes-to-the-terminal) |
+| Tool catalogue introspection | [§20.9](#209-new-surface--tool_lookup-builtin-no-findings-audited-at-intro) |
+| Installer hardening | [§20.4](#204-medium--installer-numeric-flags-flow-into-ini-via-heredoc-without-validation), [§20.5](#205-low--easyai-ini-bak-could-inherit-loose-permissions) |
+| Concurrency | [§10](#10-concurrency) |
+| Memory ownership | [§11](#11-memory--resource-ownership) |
+
+---
+
+## 0. TL;DR — what to know in 60 seconds
+
+**What easyai blocks for you (default-on):**
+
+- **Sandbox escape** — fs_* tools cannot read or write outside `--sandbox <DIR>`. Symlinks, `..`, weird canonical-path tricks, and TOCTOU are all rejected. ([§1](#1-path-traversal--sandboxresolve-high-fixed), [§18.3](#183-high-3--sandbox-symlink-escape--bash-hardening-fixed))
+- **SSRF** — `web_fetch` and `web_search` only allow `http(s)://`. `file://`, `gopher://`, `ftp://` are blocked at the URL parser AND at the curl protocol filter. The `--mcp <url>` client gets the same gate. ([§2](#2-ssrf--web_fetch--ddg-web_search-high-fixed), [§20.6](#206-low--mcp-client-url-scheme-not-pre-validated))
+- **Process leakage** — `bash` and external-tool subprocesses inherit no fds beyond `/dev/null` on stdin and the captured stdout/stderr pipe. Linux gets `PR_SET_PDEATHSIG(SIGKILL)` so a crashed agent leaves no orphans. ([§15.3](#153-bash-command-runner-new-surface--by-design), [§16.2](#162-guarantees-enforced-at-call-time))
+- **Predictable-path attacks** — auto-generated `/tmp` log files use `O_EXCL | O_NOFOLLOW | O_CLOEXEC` mode 0600. A planted symlink at the predicted path causes the open to fail cleanly, not get followed. ([§19](#19-fourth-pass--2026-05-02-predictable-tmp-log-path))
+- **JSON depth bombs** — every JSON parser in the request path uses an iterative depth walk capped at 64 levels (`parse_chat_request`, `/mcp`). Stringified-array unwrap in tool-args is depth-capped at 4. ([§18.4](#184-medium-batch-fixed-in-same-commit), [§20.2](#202-high--get_array-stack-bomb-via-stringified-array-recursion))
+- **Terminal escape injection** — output the model emits via `bash` or the `plan` tool is stripped of C0 control bytes (incl. `ESC`) before it reaches the operator's terminal. A model cannot retitle the operator's window or wipe their screen. ([§20.1](#201-high--bash-live-mirror-terminal-escape--unbounded-flood), [§20.3](#203-medium--plan-render-passes-model-supplied-text-with-control-bytes-to-the-terminal))
+
+**What easyai does NOT block — your responsibility:**
+
+- **`bash` is not isolated.** It runs `/bin/sh -c …` with the agent process's full uid/gid. There's a 32 KiB output cap, a per-command timeout, an opt-in flag (`--allow-bash`, off by default), and signal-group teardown — but no namespacing, no seccomp, no chroot. **For untrusted prompts, run easyai inside a container, firejail, or a dedicated unprivileged user with disabled network egress.**
+- **Prompt injection is out of scope.** A determined attacker who controls the prompt body can steer the model into asking the agent to do things you didn't intend. Tool gating (`--allow-bash`, `--allow-fs`, `--sandbox <DIR>`) is the defence.
+- **`/mcp` is open by default.** A fresh install accepts MCP requests with no Bearer until you populate `[MCP_USER]` in `/etc/easyai/easyai.ini`. The startup banner says so loudly. Always populate `[MCP_USER]` (or set `--no-mcp-auth` deliberately) before exposing the port. ([§17](#17-mcp-server-endpoint--srcmcpcpp--route_mcp-new-surface-auth-open))
+- **TLS verification is on by default but `--insecure-tls` exists.** Don't pass it in production. Same for `--api-key '' ` on a public listener — the binary will start, but the chat endpoint is then unauthenticated.
+
+**The three knobs that matter most for safety:**
+
+1. `--sandbox /var/lib/easyai/workspace` — pins fs_* and bash calls inside this dir when those tools are enabled. Don't pass `.` (cwd) on a multi-tenant box. (As of 2026-05-08, `--sandbox` alone does NOT register fs_*; pair with `--allow-fs` to enable file tools.)
+2. `[MCP_USER]` in `/etc/easyai/easyai.ini` — at least one user with a long Bearer (`openssl rand -hex 32`) before exposing `/mcp` outside localhost.
+3. `--allow-bash` — leave OFF unless your agent genuinely needs shell. When ON, treat the easyai user as having shell on the box.
 
 ---
 
@@ -919,4 +976,445 @@ The third-party scanner that surfaced 19.1 also raised:
   `clip(o.str(), 16 KiB)` in `fs_list_dir`.
 - TOCTOU in `resolve_cwd` — load-time only and operator-controlled
   (already documented as accepted risk in §16.4).
+
+---
+
+## 20. FIFTH PASS — 2026-05-08
+
+A static review of the ~5,000 lines of code that landed in the 30
+commits since the fourth pass. New surface: bash live-mirror, the
+`plan` tool redesign, the `rag(action=…)` unified dispatcher, the
+HTTP retry layer, the `--mcp <url>` client, and the installer
+`--force` rewrite. Two HIGH, three MEDIUM, two LOW findings — all
+fixed in this commit.
+
+The fixes preserve every public interface: tool names, CLI flags,
+INI keys, library headers, the C++ API. Operators upgrade by
+rebuilding; no config changes required, no behavioural surprises
+beyond the documented hardening.
+
+### 20.1 HIGH — bash live-mirror: terminal-escape + unbounded flood
+
+**File:** `src/builtin_tools.cpp` — bash factory's `drain_pipe()` lambda.
+
+**Issue.** Commit `0de93f2` added a "live mirror" channel: when the
+model calls `bash`, the merged child stdout+stderr is now also
+written to the operator's stderr in real time so a long build / test
+suite scrolls visibly. Two problems with the original cut:
+
+1. **No byte cap on the mirror channel.** The model-facing buffer
+   (`out`) is capped at 32 KiB, but the `::fwrite(buf, 1, n, stderr)`
+   path was unbounded. A hostile (or just runaway) command —
+   `yes`, `cat /dev/urandom | base64`, `find / -ls 2>&1` — would
+   flood the operator's terminal indefinitely while the model only
+   ever saw the first 32 KiB. Operator denial-of-service: the
+   terminal becomes unusable, scrollback fills, the SSH session
+   stalls.
+
+2. **No control-byte stripping.** Whatever bytes the child wrote
+   went verbatim to the operator's terminal. A model that knows
+   it's running on a real TTY can emit:
+
+   ```
+   printf '\e]0;[ROOT@target] $ '   # OSC: rewrite window title
+   printf '\e[2J\e[H'                 # CSI: clear screen + home cursor
+   printf '\e]52;c;<base64>\a'       # OSC 52: write to clipboard
+   printf '\eP$qm\e\\'                 # iTerm2-specific: read terminal state
+   printf '\e[?1049h…fake_prompt…' # alt-screen masquerade
+   ```
+
+   None of those sequences appear in the model-facing `ToolResult`
+   (the model can't see the operator's terminal); they only land
+   on the operator. Net effect: a model with `bash` access can
+   hijack the human-facing channel — set the window title, wipe
+   the screen, write into the clipboard, redirect keystrokes via
+   key-rebinding sequences — without leaving any trace in the
+   conversation log.
+
+**Fix.** Two layers in `drain_pipe()`:
+
+1. **Mirror cap (`kMirrorCap = 128 KiB`).** Distinct from the
+   model-facing 32 KiB cap — the operator usually wants more
+   visible context than the model needs, but still bounded.
+   When the budget is exhausted, a single `[bash mirror
+   truncated …]` marker is emitted and further output is
+   silently dropped from the mirror. The model still receives
+   its own (capped) copy through `out`.
+
+2. **`sanitize_for_operator_tty()` strip.** Every chunk on its
+   way to the operator passes through a forward-only scanner
+   that:
+   - keeps `CR`, `LF`, `TAB` (formatting bytes the operator
+     legitimately wants to see);
+   - replaces `ESC` (`0x1b`) with the visible marker `^[` so
+     the operator notices the model emitted an escape — but
+     the terminal cannot interpret it;
+   - drops every other C0 control byte (`0x00`–`0x1f`) and
+     `DEL` (`0x7f`);
+   - passes 0x80+ bytes through verbatim, preserving UTF-8.
+
+The model's own copy of the output (the `out` buffer fed back
+into the conversation) is untouched — sanitization only governs
+what hits the operator's TTY.
+
+**Verification.** A bash command emitting `printf
+'\e]0;HACKED\a\nhello\n'` now:
+
+- The model receives `^]0;HACKED\ahello\n` in its tool result
+  (escape-bytes still in the model's view; the model can't be
+  fooled by them but the operator was the target audience for
+  the hijack anyway).
+- The operator sees `^[]0;HACKED^Ghello\n` on stderr — the
+  escape is visibly de-fanged with `^[` markers, the title
+  hijack does not happen, and `\a` (0x07) is dropped along
+  with the rest of the C0 set.
+
+### 20.2 HIGH — `get_array` stack bomb via stringified-array recursion
+
+**File:** `src/tool.cpp` — `easyai::args::get_array()`.
+
+**Issue.** Commit `7aa0ab3` added "stringified array tolerance" so
+small models that double-escape can still drive a tool call:
+
+```cpp
+if (json[i] == '"') {
+    std::string unwrapped;
+    if (!read_json_string(json, i, unwrapped)) return false;
+    std::string synthetic = "{\"_a\":" + unwrapped + "}";
+    return get_array(synthetic, "_a", out);   // ← recursion
+}
+```
+
+The recursion has no depth cap. A model that emits
+
+```json
+{"items": "\"\\\"\\\\\\\"…(N nested quotes)…\""}
+```
+
+forces `get_array` to recurse N times before reaching the actual
+array — `N=10000` blows the stack on every libc++/glibc deployment
+we tested. The plan tool, the rag dispatcher, and the external-tools
+loader all consume this helper, so a single hostile tool call would
+take the agent down.
+
+**Fix.** Refactor into `get_array_impl(json, key, out, depth)`
+with `kMaxUnwrapDepth = 4`. The legitimate "model double-escaped
+once" case stays at depth 1; depth 2–3 covers the rare "double-
+escaped twice" and an emergency margin; depth 4+ returns false
+cleanly (the tool reports "items: not an array" rather than
+crashing). Public `get_array(json, key, out)` is preserved as a
+thin shim that calls into the impl with depth=0; existing callers
+across the codebase need no change.
+
+**Verification.** A standalone test feeds:
+- 1 layer of stringification → succeeds, returns the parsed array.
+- 2 layers → succeeds (still under the cap).
+- 10 layers → returns false at depth 4. The agent reports a
+  clean "items: not an array" tool error and the engine continues.
+
+### 20.3 MEDIUM — plan render passes model-supplied text with control bytes to the terminal
+
+**File:** `src/plan.cpp` — `Plan::render()`.
+
+**Issue.** The plan tool renders model-authored items into the
+operator's terminal with ANSI colour codes for status (`\033[2;9m`
+strikethrough for deleted, `\033[1;36m` cyan-bold for working,
+etc.). The colour codes are framework-emitted; safe. **The item's
+`text` field, however, was inlined verbatim** between our open
+and close ANSI sequences. A model emitting
+
+```
+plan(action="add", text="Step 1\033[1;31m[CRITICAL]\033[0m extra")
+```
+
+would inject its own colour into the rendered plan; emitting
+
+```
+plan(action="add", text="x\033]0;HACKED\a")
+```
+
+would set the operator's window title — same hijack vector as
+§20.1, narrower budget but identical class.
+
+**Fix.** New `sanitize_plan_text()` (in plan.cpp) drops every
+control byte (0x00–0x1f and 0x7f) from the model-supplied `text`
+before render. UTF-8 multi-byte sequences (0x80+) pass through
+unchanged. Item `id` is integer-only by construction (assigned by
+`Plan::add` from `next_id_`) so no sanitization is needed there.
+Status is enum-checked against the string-comparison ladder
+(`"done"`, `"working"`, `"error"`, `"deleted"`, anything else →
+default).
+
+The strip is applied at render time, not at insert time, so the
+plan's in-memory model preserves whatever the agent emitted (good
+for diagnostics). The operator just never sees the unfiltered
+form.
+
+### 20.4 MEDIUM — installer numeric flags flow into INI via heredoc without validation
+
+**File:** `scripts/install_easyai_server.sh`.
+
+**Issue.** The installer accepts `--temperature`, `--top-p`,
+`--top-k`, `--min-p`, `--repeat-penalty`, `--max-tokens`,
+`--http-timeout`, and `--ctx-size` and writes them into
+`/etc/easyai/easyai.ini` via an unquoted heredoc:
+
+```bash
+sudo bash -c "cat > '$ini_file'" <<INI_FILE
+…
+temperature    = $temperature
+top_p          = $top_p
+…
+mcp_auth        = off
+allow_bash      = off
+…
+INI_FILE
+```
+
+Bash already disabled command substitution (the value reached
+`$temperature` as a literal string from `argv`), so there's no
+RCE here. But the value can contain a literal newline — e.g. an
+operator running:
+
+```bash
+./install_easyai_server.sh --temperature $'0.3\nallow_bash = on'
+```
+
+would produce an INI containing:
+
+```
+temperature    = 0.3
+allow_bash = on
+…
+allow_bash      = off
+```
+
+INI parsers usually let later keys override earlier ones, so the
+injected `allow_bash = on` is dominated by the genuine
+`allow_bash = off` further down — but this is brittle (the key
+order could change in a future installer revision) and not the
+correct posture for an installer that's run as the system
+administrator. Same vector for any other INI key the attacker
+wants to flip.
+
+**Fix.** A new `require_numeric()` bash helper validates every
+sampling/timeout argument against the regex `^-?[0-9]+(\.[0-9]+)?$`
+before any INI write happens:
+
+```bash
+require_numeric "--temperature"     "$temperature"
+require_numeric "--top-p"           "$top_p"
+…
+```
+
+Anything containing whitespace, `=`, `;`, `\n`, `$`, `(`, etc.
+fails fast with a `[x]` error and `exit 1`. The legitimate cases
+(integers, floats, leading minus for `max_tokens=-1`) all pass.
+This is defence-in-depth: the threat model is mostly "operator
+typo" rather than "operator-as-attacker", but a compromised CI
+job that calls the installer with crafted args would otherwise
+have a way to silently flip flags.
+
+### 20.5 LOW — `easyai.ini.bak` could inherit loose permissions
+
+**File:** `scripts/install_easyai_server.sh` — `--force` branch.
+
+**Issue.** `--force` (commit `f32c3ea`) backs up the live INI to
+`easyai.ini.bak` before rewriting:
+
+```bash
+sudo cp -f "$ini_file" "${ini_file}.bak"
+```
+
+The new INI is `chmod 640 root:easyai`. The backup inherited
+whatever the source had — usually 640, but if the operator had
+manually loosened the live INI for some reason (or if a future
+revision ever ships a wider mode), the backup would carry the
+looser bits. Since `[MCP_USER]` lives in this file (Bearer
+tokens for /mcp), a world-readable backup is a token leak.
+
+**Fix.** Explicitly chmod/chown the `.bak` to match the live
+file's posture:
+
+```bash
+sudo chmod 640 "${ini_file}.bak"
+sudo chown root:"$service_group" "${ini_file}.bak"
+```
+
+Trivial change; defence-in-depth.
+
+### 20.6 LOW — MCP-client URL scheme not pre-validated
+
+**File:** `examples/server.cpp` (`--mcp <url>`),
+`src/mcp_client.cpp` (`fetch_remote_tools`).
+
+**Issue.** The `--mcp <url>` flag (commit `51e4a8f`) passes the URL
+directly into `easyai::mcp::fetch_remote_tools()`, which calls
+libcurl with `CURLOPT_PROTOCOLS_STR = "http,https"`. That filter
+works — `--mcp file:///etc/passwd` is rejected at curl's transport
+layer — but the operator gets a generic curl error message, not a
+clear "scheme must be http(s)://" diagnostic. And if the curl filter
+ever regresses (different libcurl build, a future code path that
+forgets to set the option), the agent has no second layer.
+
+**Fix.** Pre-validate the scheme in two places:
+
+1. `examples/server.cpp` — when `--mcp` is set, check the URL
+   starts with `http://` or `https://` before constructing
+   `ClientOptions`. Bad scheme: print a clear error and exit
+   non-zero.
+2. `src/mcp_client.cpp::fetch_remote_tools()` — same check inside
+   the library, so embedders / future binaries that use the lib
+   directly inherit the protection.
+
+The libcurl protocol filter stays in place; we now have three
+layers (URL pre-check at server level, URL pre-check inside the
+library, libcurl protocol filter at transport level).
+
+**Verification.** `easyai-server --mcp ftp://internal.lan/foo`
+now exits 1 with `easyai-server: --mcp <url> must start with
+http:// or https:// (got: ftp://internal.lan/foo)`. Same for
+`file://`, `gopher://`, `dict://`, etc.
+
+### 20.7 Known residual — HTTP retry amplification via tool-call fanout
+
+**File:** `src/client.cpp` — `Client::stream_chat()` retry loop.
+
+**Status:** Documented, not patched.
+
+**Observation.** The per-call retry budget is `http_retries + 1`
+(default 6 attempts) with exponential backoff capped at 4 s, total
+upper bound ≈ 7.75 s per call. There is no per-turn or per-host
+budget across multiple `web_fetch` / `web_search` calls in the
+same agentic turn. A model that calls `web_fetch(target_url)` ten
+times in one turn can sustain ≈ 78 s of HTTP traffic against
+`target_url`.
+
+**Why we accept it.** The bound is finite (the engine's
+`max_tool_hops = 99999` in webui mode is bounded by the model
+ending its turn), the per-attempt timeout is 20 s, and the
+per-fetch response cap is 2 MiB. Total worst-case is well below
+levels that would reach a real abuse threshold against a third
+party. Operators concerned about this should run egress through a
+proxy that enforces destination policy or rate-limits per-host —
+the same recommendation as §14.
+
+**What would change this.** If the default `http_retries` ever
+moved above 5, or if `web_fetch`'s response cap moved above 2
+MiB, we'd revisit and add a per-turn budget. Today the math is
+comfortable.
+
+### 20.9b NEW SURFACE — `fs_check_path` builtin (no findings, audited at intro)
+
+Introduced same day by the prompt-cleanup batch. Pre-flight stat +
+access-rights probe at a sandbox-relative path; with `touch=true`
+also creates an empty file at the path (parent dirs as needed) when
+nothing exists there yet. Tool descriptions tell the model to call
+this BEFORE any read/write so the sandbox boundary, file existence,
+and effective r/w/x rights are confirmed up front.
+
+**Trust shape.** Goes through the same `Sandbox::resolve` +
+`inside_sandbox` containment check as every other fs_* tool — input
+paths are mechanically anchored under `root` and verified component-
+wise with `fs::weakly_canonical`. The `touch=true` create path
+opens with `O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC` mode 0600 and is
+identical in posture to `fs_write_file` (no symlink follow, no
+TOCTOU window). Parent-dir auto-creation uses `fs::create_directories`
+on the canonical path, so it cannot escape via a `..` segment in
+the input.
+
+No new vulnerability classes introduced; the tool's reads are
+strictly less powerful than `fs_read_file` (returns metadata only —
+size / mode / mtime / type — no content), and the writes are
+strictly equivalent to `fs_write_file` with empty content. Audit
+posture: covered by the existing fs_* audits in §1, §7, §18.3.
+
+### 20.9 NEW SURFACE — `tool_lookup` builtin (no findings, audited at intro)
+
+Introduced same commit. Read-only introspection over the live tool
+registry; no write path, no subprocess, no network.
+
+**Trust shape.** The factory takes a `std::function` getter the host
+provides at registration time. The getter returns a snapshot of
+`(name, description)` pairs — `std::function<...>` handlers are NOT
+included in the snapshot, so the lambda can't accidentally hand the
+model a callable into someone else's tool. The lambda is invoked at
+call time, never cached, so the answer always reflects the current
+registry. Standard wiring is `[&engine](){ … engine.tools() … }` or
+`[&cli](){ … cli.tools() … }`; both engines store tools in a vector
+that's mutated only on the registration thread (server-side: only
+during startup; CLI-side: between turns), so concurrent reads from
+worker threads never see a torn vector.
+
+**Failure modes covered:**
+
+- Null getter → factory returns a sentinel tool whose handler errors
+  cleanly with a deployment-bug message. Fail-closed; no UB.
+- Getter throws → caught and surfaced as a `ToolResult::error`.
+  Even an exotic `std::filesystem::filesystem_error` from a custom
+  getter doesn't tear down the agent.
+- Empty registry → returns `(no tools registered in this session)`,
+  not an empty string. The model can't confuse a wiring bug with
+  "I have no tools."
+- Filter matches nothing → returns `(no tools match: "<filter>")`
+  with a hint to call again with no name. The model doesn't loop
+  retrying random substrings.
+
+**What it deliberately doesn't do.**
+
+- No description-search. Only the tool *name* is matched. A model
+  searching for "search" gets `web_search`, not `web_fetch` (which
+  has the word in its description). Description-search would surface
+  noise.
+- No JSON output. The model reads the result as prose; numbered
+  text renders the same in every chat-template tool-result wrapper
+  with no parser fragility.
+- No write to the registry. Read-only by construction.
+- Doesn't include externally-fetched MCP tools that arrive on a
+  per-request basis (server-side); the snapshot is over the
+  server's stable `default_tools` list. By design — operators get
+  predictable behaviour from the model regardless of which client
+  hit the endpoint.
+
+### 20.8 Audit-cleared, no action
+
+The fifth pass also examined and found no actionable issues in:
+
+- **`Sandbox::resolve` + `inside_sandbox`** — path-component
+  containment check from §18.3 is preserved through the recent
+  edits. `O_NOFOLLOW | O_CLOEXEC` on `fs_read_file` /
+  `fs_write_file` still in place.
+- **`get_sandbox_path` builtin** — was using `realpath()` with
+  raw-input fallback (would have leaked relative paths when
+  realpath failed); migrated to `fs::weakly_canonical()` with
+  `fs::absolute()` fallback to match what `inside_sandbox()`
+  uses. Cosmetic-but-correct.
+- **`need()` lambda dash-prefix rejection** — a third-party
+  scanner suggested `--key=value` could bypass; it can't (the
+  lambda checks `next[0]=='-' && next[1]=='-'`, which catches
+  `--anything` including `--key=value`).
+- **Signal handler in `examples/cli.cpp`** — uses only async-
+  signal-safe primitives (`std::atomic<bool>::store`, `::write`
+  on `STDERR_FILENO`, a single pointer dereference of a global
+  the main thread set before chat began). The `request_cancel()`
+  call on a stuck `Client *` is correct: it sets an atomic flag
+  the chat loop polls; no allocator / mutex / stdio is touched.
+- **Plan batch ops** — `kMaxBatch = 20` enforced; on_change
+  coalescing is mutex-free and runs entirely on the dispatch
+  thread.
+- **rag_append atomicity** — preserves the tempfile + rename
+  pattern from §16.6b; tempfile gets `owner_read|owner_write`
+  before rename.
+- **MCP client tool name shadowing (`fetch_remote_tools`)** —
+  the upstream MCP server returns tool names verbatim. The
+  consumer-side filter is in `examples/server.cpp` (collision
+  with local tools is logged-and-skipped at registration time);
+  embedders using the library directly are documented as
+  responsible for their own collision policy. Treat
+  `--mcp <url>` as you'd treat `--external-tools DIR`: the
+  remote is a trusted partner, not adversarial.
+- **httplib retry TLS inheritance** — the same `httplib::Client`
+  object is reused across retries; TLS settings (`enable_server
+  _certificate_verification`, `set_ca_cert_path`) are set once
+  before the loop. No silent downgrade window.
 

@@ -258,6 +258,13 @@ while [[ $# -gt 0 ]]; do
         --min-p)            min_p="$2"; shift 2 ;;
         --max-tokens)       max_tokens="$2"; shift 2 ;;
         --http-timeout)     http_timeout="$2"; shift 2 ;;
+        # Numeric sampling/timeout values are written into easyai.ini
+        # via heredoc.  We interpolate them as-is, so anything other
+        # than a number could sneak a newline or extra "key = value"
+        # pair into the INI (e.g. injecting "allow_bash = on" via a
+        # crafted --temperature).  Validate up front; arg parsing
+        # already scoped each value to one argv slot, so we only need
+        # to constrain content shape here.
         --api-key)          api_key="$2"; shift 2 ;;
         --model)            model_src="$2"; shift 2 ;;
         --copy-model)       copy_model=1; shift ;;
@@ -308,8 +315,32 @@ warn() { printf '\033[1;33m[!]\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31m[x]\033[0m %s\n' "$*" >&2; exit 1; }
 ask()  { local r; read -rp "    $* [y/N] " r; [[ "$r" =~ ^[Yy]$ ]]; }
 
+# Validate that a sampling/timeout value is plain numeric (int or float,
+# optional leading minus).  We write these into easyai.ini via heredoc
+# expansion; a value containing a newline or "=" would inject extra INI
+# keys (e.g. an attacker passing --temperature $'0.3\nallow_bash = on'
+# would flip allow_bash on).  Reject anything that isn't a number.
+require_numeric() {
+    local name="$1" value="$2"
+    if [[ ! "$value" =~ ^-?[0-9]+(\.[0-9]+)?$ ]]; then
+        die "$name: must be numeric, got: $(printf '%q' "$value")"
+    fi
+}
+
 # ---------- pre-flight ------------------------------------------------------
 [[ $EUID -eq 0 ]] && die "do not run as root — script calls sudo as needed"
+
+# Validate numeric inputs before they flow into the INI heredoc.  The
+# arg-parser scoped each value to a single argv slot already; this layer
+# constrains the content shape.
+require_numeric "--temperature"     "$temperature"
+require_numeric "--top-p"           "$top_p"
+require_numeric "--top-k"           "$top_k"
+require_numeric "--min-p"           "$min_p"
+require_numeric "--repeat-penalty"  "$repeat_penalty"
+require_numeric "--max-tokens"      "$max_tokens"
+require_numeric "--http-timeout"    "$http_timeout"
+require_numeric "--ctx-size"        "$ctx_size"
 
 if [[ "$(uname -s)" != "Linux" ]]; then
     die "this installer targets Linux. On macOS, build manually — see README.md (Build for your hardware)."
@@ -895,6 +926,12 @@ RAG_README
         if [[ -f "$ini_file" && $do_force -eq 1 ]]; then
             log "backing up existing $ini_file → ${ini_file}.bak (--force)"
             sudo cp -f "$ini_file" "${ini_file}.bak"
+            # The original INI is mode 0640 (root:easyai); the backup
+            # could inherit looser permissions if cp ran with a wider
+            # umask.  The INI may contain MCP Bearer tokens, so pin
+            # the backup to the same posture as the live file.
+            sudo chmod 640 "${ini_file}.bak"
+            sudo chown root:"$service_group" "${ini_file}.bak"
             log "rewriting $ini_file (--force)"
         else
             log "writing $ini_file (central config)"

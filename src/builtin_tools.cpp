@@ -3,6 +3,7 @@
 #include "easyai/tool.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cerrno>
 #include <chrono>
 #include <climits>     // PATH_MAX
@@ -169,6 +170,36 @@ static std::string clip(std::string s, size_t n) {
         s += "\n…[truncated]";
     }
     return s;
+}
+
+// Sanitize one chunk of child-bash output for safe display on the
+// operator's terminal. We allow CR / LF / TAB through (formatting), but
+// strip every other control byte and the ESC character — preventing a
+// model's bash command from emitting ANSI/VT/iTerm2 escape sequences
+// that hijack the operator's terminal (window-title injection, screen
+// wipe, key-rebind, OSC payloads). The model's own copy of the output
+// is unaffected; this only governs what goes to fd=2.
+static std::string sanitize_for_operator_tty(const char * buf, size_t n) {
+    std::string out;
+    out.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+        unsigned char c = static_cast<unsigned char>(buf[i]);
+        if (c == '\n' || c == '\r' || c == '\t') {
+            out += static_cast<char>(c);
+        } else if (c == 0x1b) {
+            // Hard-strip ESC. Render a visible marker so the operator
+            // notices the model tried to emit an escape sequence
+            // (rather than silently swallowing — useful for debugging
+            // a misbehaving prompt).
+            out += "^[";
+        } else if (c < 0x20 || c == 0x7f) {
+            // Other C0 controls + DEL: drop. Keeping them risks
+            // partial-sequence reassembly into something hostile.
+        } else {
+            out += static_cast<char>(c);
+        }
+    }
+    return out;
 }
 
 static std::string url_encode(const std::string & v) {
@@ -1951,16 +1982,25 @@ Tool get_current_dir() {
 // parent component). We surface errno via strerror.
 Tool get_sandbox_path(std::string root) {
     // Resolve the configured root to an absolute path NOW, so registration
-    // pins the answer. realpath() returns nullptr on transient failures
-    // (e.g. relative path with stale cwd) — we keep the original string
-    // as a fallback in that case.
+    // pins the answer. We use fs::weakly_canonical() (matches the same
+    // canonicalisation the sandbox containment check uses in
+    // Sandbox::inside_sandbox(), so the answer the model sees is exactly
+    // the directory its fs_* tools operate against).
+    //
+    // Falls back to absolute(root) if weakly_canonical fails (transient
+    // ENOENT etc.); never falls back to the raw input because relative
+    // strings like "./" or "../foo" leak the operator's cwd shape into
+    // the model and break the model's "absolute path" expectation.
     std::string resolved;
     if (!root.empty() && root != ".") {
-        char buf[PATH_MAX];
-        if (::realpath(root.c_str(), buf) != nullptr) {
-            resolved.assign(buf);
-        } else {
-            resolved = root;
+        std::error_code ec;
+        fs::path canon = fs::weakly_canonical(fs::path(root), ec);
+        if (ec || canon.empty()) {
+            ec.clear();
+            canon = fs::absolute(fs::path(root), ec);
+        }
+        if (!ec && !canon.empty()) {
+            resolved = canon.string();
         }
     }
     // Capture by value into the closure; std::string move keeps it cheap.
@@ -2166,8 +2206,15 @@ Tool bash(std::string root, bool show_output) {
             ::fcntl(pipefd[0], F_SETFL, O_NONBLOCK);
 
             constexpr size_t kCap = 32 * 1024;
+            // Mirror cap is intentionally larger than the model-facing
+            // buffer (4×) so the operator still sees most of a long
+            // build's output, but bounded so a hostile/runaway command
+            // can't paint the operator's terminal indefinitely.
+            constexpr size_t kMirrorCap = 128 * 1024;
             std::string out;
             out.reserve(4096);
+            size_t mirror_written = 0;
+            bool   mirror_truncated_warned = false;
 
             auto deadline = std::chrono::steady_clock::now()
                           + std::chrono::seconds(timeout_sec);
@@ -2190,8 +2237,35 @@ Tool bash(std::string root, bool show_output) {
                     // can watch a long-running build / test suite scroll
                     // by. The model still receives the full captured
                     // buffer; this is a parallel "human-facing" channel.
-                    if (show_output) {
-                        ::fwrite(buf, 1, (size_t) n, stderr);
+                    //
+                    // Two safety layers before the bytes hit the operator's
+                    // terminal:
+                    //   1. byte-budget: cap at kMirrorCap so a runaway /
+                    //      hostile command can't flood the terminal
+                    //      indefinitely (the model itself is already capped
+                    //      at kCap; this limit is independent so the
+                    //      operator can still see most of a long build).
+                    //   2. control-byte strip: strip ESC and other C0
+                    //      control bytes so a malicious child cannot
+                    //      inject ANSI/OSC escape sequences (window-title
+                    //      hijack, screen wipe, iTerm2-specific payloads,
+                    //      key-rebinding, etc.) into the operator's
+                    //      terminal.  CR / LF / TAB are preserved.
+                    if (show_output && mirror_written < kMirrorCap) {
+                        std::string safe = sanitize_for_operator_tty(buf, (size_t) n);
+                        size_t room = kMirrorCap - mirror_written;
+                        size_t take = std::min(safe.size(), room);
+                        if (take > 0) {
+                            ::fwrite(safe.data(), 1, take, stderr);
+                            mirror_written += take;
+                        }
+                        if (mirror_written >= kMirrorCap && !mirror_truncated_warned) {
+                            const char trunc[] =
+                                "\n[bash mirror truncated at 128 KB; "
+                                "model still receives the captured output]\n";
+                            ::fwrite(trunc, 1, sizeof(trunc) - 1, stderr);
+                            mirror_truncated_warned = true;
+                        }
                         std::fflush(stderr);
                     }
                 }
@@ -2262,6 +2336,164 @@ Tool bash(std::string root, bool show_output) {
                 std::fflush(stderr);
             }
             return ToolResult::ok(oss.str() + body);
+        })
+        .build();
+}
+
+// tool_lookup — read-only introspection over the live tool registry.
+// See easyai/builtin_tools.hpp for the full contract.
+//
+// Implementation notes:
+//   - Match is case-insensitive substring on tool NAME only (not
+//     description).  Description-search would surface generic tools
+//     for keyword queries and confuse the model — the contract is
+//     "look up a name you think exists".
+//   - Output is plain numbered text, not JSON, because (a) the model
+//     reads it as prose and (b) numbers + colons render fine inside
+//     the chat-template tool-result wrapper.  No need for the model
+//     to parse anything structured.
+//   - The getter is invoked at every call so the snapshot always
+//     reflects whatever's currently registered (useful in webui
+//     deployments where remote MCP tools may have arrived after
+//     startup).
+Tool tool_lookup(ToolListGetter get_tools) {
+    if (!get_tools) {
+        // Fail-closed factory: a missing getter is a wiring bug, not a
+        // runtime condition.  Return a tool whose handler always errors
+        // so the model gets a clear signal instead of silent emptiness.
+        return Tool::builder("tool_lookup")
+            .describe("(disabled — host did not provide a tool registry getter)")
+            .handle([](const ToolCall &) {
+                return ToolResult::error(
+                    "tool_lookup is registered but the host didn't wire up "
+                    "a tool-list getter. This is a deployment bug; report it.");
+            })
+            .build();
+    }
+    return Tool::builder("tool_lookup")
+        .describe(
+            "AUTHORITATIVE registry of every tool wired up in THIS session. "
+            "This catalogue is the SINGLE SOURCE OF TRUTH for what you can "
+            "call. Your training data is NOT a source of truth for tool "
+            "availability — what you saw in pre-training does not exist "
+            "here unless it appears in this lookup's output.\n"
+            "\n"
+            "MANDATORY USE\n"
+            "Call tool_lookup BEFORE invoking any tool you have not seen "
+            "registered in this session. If you find yourself about to "
+            "emit a generic name (`write`, `read`, `ls`, `cat`, `curl`, "
+            "`python`, `sed`, `grep`, `find`, `mkdir`, etc.), STOP and "
+            "call tool_lookup first to confirm whether that exact name "
+            "is registered. Do NOT guess. Do NOT invent. Do NOT assume.\n"
+            "\n"
+            "BINDING RULE\n"
+            "If a tool is NOT in this list, IT DOES NOT EXIST in this "
+            "session. Period. There is no fallback registry, no implicit "
+            "import, no \"the host probably has it.\" Calling a name "
+            "absent from this list will fail every time and waste a hop. "
+            "When the affordance you need is missing, say so in your "
+            "reply and propose a path forward (write code as text, ask "
+            "the operator to enable it, use a present tool differently). "
+            "Never retry an unknown-tool call hoping for a different "
+            "outcome — the registry will not change mid-turn.\n"
+            "\n"
+            "USAGE\n"
+            "  - {} (no arguments) → returns every registered tool as a "
+            "numbered list 1..N with each tool's one-line summary. Use "
+            "this when you need a complete \"what can I do here?\" view.\n"
+            "  - {\"name\":\"<substring>\"} → returns only tools whose "
+            "NAME contains that substring (case-insensitive, partial). "
+            "Use this when you have a specific name in mind and just "
+            "need to confirm it. Examples: name=\"file\" finds "
+            "read_file / write_file / list_dir-style tools; name=\"web\" "
+            "finds web_search / web_fetch / web_google; name=\"rag\" "
+            "finds the rag store tool(s).\n"
+            "\n"
+            "OUTPUT SHAPE (what you'll see)\n"
+            "  1. <tool_name>: <one-line summary>\n"
+            "  2. <tool_name>: <one-line summary>\n"
+            "  ...\n"
+            "Filters that match nothing return `(no tools match: \"…\")` "
+            "explicitly — that means the registry does NOT have that "
+            "tool, full stop, do not retry with variations.\n"
+            "\n"
+            "READ-ONLY. tool_lookup never spawns a process, never writes "
+            "a file, never hits the network. It is cheap; call it freely "
+            "whenever you're uncertain. Calling tool_lookup once at the "
+            "start of a non-trivial task and once whenever you reach for "
+            "a name you haven't dispatched in THIS session is correct "
+            "discipline."
+        )
+        .param("name", "string",
+               "Optional. Case-insensitive substring filter over tool NAMES "
+               "(not descriptions). Use when confirming whether a specific "
+               "name is registered — e.g. {\"name\":\"write\"} to check if "
+               "any write-style tool exists. Omit or pass \"\" to receive "
+               "the full catalogue. A non-empty filter that matches nothing "
+               "is an authoritative \"that name is not registered here\" — "
+               "do not retry with variations of the same name.",
+               false)
+        .handle([get_tools](const ToolCall & c) -> ToolResult {
+            std::string filter = args::get_string_or(c.arguments_json, "name", "");
+            // Lower-case both sides for case-insensitive match.
+            auto lower = [](std::string s) {
+                for (auto & ch : s) {
+                    ch = static_cast<char>(std::tolower(
+                        static_cast<unsigned char>(ch)));
+                }
+                return s;
+            };
+            const std::string flt = lower(filter);
+
+            ToolCatalog catalog;
+            try {
+                catalog = get_tools();
+            } catch (const std::exception & e) {
+                return ToolResult::error(
+                    std::string("tool_lookup: registry getter threw: ") + e.what());
+            } catch (...) {
+                return ToolResult::error(
+                    "tool_lookup: registry getter threw a non-std exception");
+            }
+
+            if (catalog.empty()) {
+                return ToolResult::ok("(no tools registered in this session)");
+            }
+
+            std::ostringstream out;
+            int n = 0;
+            for (const auto & [name, desc] : catalog) {
+                if (!flt.empty() && lower(name).find(flt) == std::string::npos) {
+                    continue;
+                }
+                ++n;
+                // Compress the description's first paragraph so the
+                // output stays scannable when listing all tools.  Models
+                // that need the full description can call the tool again
+                // (and we can revisit if "summary mode by default" hurts
+                // recall), but in practice the first line is what they
+                // need to decide whether to dispatch.
+                std::string summary = desc;
+                size_t nl = summary.find('\n');
+                if (nl != std::string::npos) summary.erase(nl);
+                summary = trim(summary);
+                if (summary.empty()) summary = "(no description)";
+
+                out << n << ". " << name << ": " << summary << '\n';
+            }
+
+            if (n == 0) {
+                return ToolResult::ok(
+                    "(no tools match: \"" + filter + "\")\n"
+                    "(call tool_lookup with no `name` to see everything available)");
+            }
+            // Trailing context line so the model never confuses
+            // "filtered subset" with "complete list".
+            if (!flt.empty()) {
+                out << "\n(filtered by name=\"" << filter << "\"; "
+                    << "call tool_lookup with no `name` to see everything)";
+            }
+            return ToolResult::ok(out.str());
         })
         .build();
 }

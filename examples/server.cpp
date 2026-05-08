@@ -3854,6 +3854,12 @@ static std::string build_builtin_system_prompt(const ServerArgs & args) {
         "available — including paraphrases (`read_file` is not\n"
         "`fs_read_file`; `shell` is not `bash`).\n"
         "\n"
+        "Uncertain whether a name is registered? Call `tool_lookup`\n"
+        "first. With no argument it returns the full numbered\n"
+        "catalogue; with `name=\"<substring>\"` it confirms or denies a\n"
+        "specific name (case-insensitive partial match). A no-match\n"
+        "result is authoritative — do not retry with variations.\n"
+        "\n"
         "If a request needs a capability with no matching tool, do the\n"
         "work in your visible reply. Asked to write a file / save a\n"
         "document / produce a manual and you have no write tool? Put\n"
@@ -4122,6 +4128,22 @@ int main(int argc, char ** argv) {
     // a transient outage at the upstream shouldn't take down a chat
     // server, especially when the local tools alone are useful.
     if (!args.mcp_url.empty()) {
+        // Pre-validate the scheme.  libcurl's CURLOPT_PROTOCOLS_STR also
+        // pins http(s) inside fetch_remote_tools(), but rejecting the
+        // bad URL here lets us emit a clear operator-level error
+        // ("--mcp requires http:// or https://") instead of a curl
+        // diagnostic, AND closes a hypothetical defence-in-depth gap
+        // if the curl filter ever regresses on an exotic build.
+        const auto is_http_scheme = [](const std::string & u) {
+            return u.compare(0, 7,  "http://")  == 0
+                || u.compare(0, 8,  "https://") == 0;
+        };
+        if (!is_http_scheme(args.mcp_url)) {
+            std::fprintf(stderr,
+                "easyai-server: --mcp <url> must start with http:// or "
+                "https:// (got: %s)\n", args.mcp_url.c_str());
+            return 1;
+        }
         easyai::mcp::ClientOptions opts;
         opts.url             = args.mcp_url;
         opts.bearer_token    = args.mcp_token;
@@ -4201,6 +4223,28 @@ int main(int argc, char ** argv) {
             loaded.tools.size(), loaded.loaded_files.size(),
             args.external_tools_dir.c_str());
     }
+
+    // tool_lookup MUST be added last so its snapshot covers every other
+    // tool registered above (built-ins, RAG, MCP-fetched, external).
+    // The getter captures a pointer to ctx->default_tools, which is the
+    // authoritative server-side registry — copied into per-request
+    // engine state in handle_chat. Tools dynamically added by a client
+    // (`tools` field on the request body) are NOT seen by tool_lookup;
+    // that's deliberate — the model gets a stable view of what THIS
+    // server's deployment actually offers, not a per-request whim.
+    {
+        auto * tools_ptr = &ctx->default_tools;
+        ctx->default_tools.push_back(easyai::tools::tool_lookup(
+            [tools_ptr]() {
+                std::vector<std::pair<std::string, std::string>> v;
+                v.reserve(tools_ptr->size());
+                for (const auto & t : *tools_ptr) {
+                    v.emplace_back(t.name, t.description);
+                }
+                return v;
+            }));
+    }
+
     // The webui drives long agentic flows (search → fetch → search → fetch
     // → write_file → bash → …) and should never bump the per-turn safety
     // cap.  Lift the engine's hop limit unconditionally; we still get

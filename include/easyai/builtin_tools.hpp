@@ -3,7 +3,9 @@
 
 #include "tool.hpp"
 
+#include <functional>
 #include <string>
+#include <vector>
 
 namespace easyai::tools {
 
@@ -109,5 +111,52 @@ Tool get_sandbox_path(std::string root = ".");
 // like a stalled session. Off by default to keep tool output strictly
 // in-band; the CLI flips it on unless --no-show-bash is passed.
 Tool bash         (std::string root = ".", bool show_output = false);
+
+// ---------- introspection -----------------------------------------------
+// tool_lookup: return the currently-registered tool catalogue, optionally
+// filtered by a substring match on the tool name (case-insensitive,
+// partial). Format is a numbered list 1..N with each tool's name and its
+// declared description.
+//
+// The model uses this to verify what's actually wired up before it tries
+// to call something. Without this tool, smaller models hallucinate
+// "obvious" names (`write`, `read`, `ls`, `curl`, `python`) and produce
+// "unknown tool: …" errors mid-task. With it, the model can sanity-check
+// "is `write_file` actually available here?" in one hop, and only ever
+// dispatches names that exist.
+//
+// `get_tools` is a callable that returns a snapshot of the live tool
+// catalogue as (name, description) pairs.  Wire it at registration time
+// to your Engine's or Client's `tools()` accessor:
+//
+//     engine.add_tool(easyai::tools::tool_lookup([&engine]() {
+//         std::vector<std::pair<std::string,std::string>> v;
+//         for (const auto & t : engine.tools()) {
+//             v.emplace_back(t.name, t.description);
+//         }
+//         return v;
+//     }));
+//
+// (Handlers — `std::function<...>` — aren't part of the snapshot, so
+// no expensive closure copies. Add tool_lookup AFTER all other tools so
+// it sees the complete list. tool_lookup's own entry will appear in
+// the result, which is intentional: the model knows it has this
+// affordance.)
+//
+// Parameters (the model fills these in):
+//   `name` — string, optional. Substring; case-insensitive; matches the
+//            tool name. Empty / missing = "list everything".
+//
+// Output shape (what the model sees):
+//   - "1. <name>: <description>"
+//   - "2. ..."
+//   - "(no tools match: …)" when a filter found nothing
+//   - "(no tools registered)" when the registry is empty
+//
+// Read-only over the registry; never spawns a process or touches the
+// filesystem.
+using ToolCatalog    = std::vector<std::pair<std::string, std::string>>;
+using ToolListGetter = std::function<ToolCatalog()>;
+Tool tool_lookup(ToolListGetter get_tools);
 
 }  // namespace easyai::tools

@@ -50,6 +50,17 @@ int main(int argc, char ** argv) {
                       return easyai::ToolResult::ok((std::rand() & 1) ? "heads" : "tails");
                   })
                   .build())
+          // tool_lookup — last, so its snapshot covers everything above
+          // (including itself).  The lambda re-reads engine.tools() at
+          // every call, so no race with later additions.
+          .add_tool(easyai::tools::tool_lookup([&engine]() {
+              std::vector<std::pair<std::string, std::string>> v;
+              v.reserve(engine.tools().size());
+              for (const auto & t : engine.tools()) {
+                  v.emplace_back(t.name, t.description);
+              }
+              return v;
+          }))
           .on_token([](const std::string & p){ std::cout << p << std::flush; })
           .on_tool([](const easyai::ToolCall & c, const easyai::ToolResult & r) {
               std::fprintf(stderr, "\n\033[36m[tool] %s(%s) -> %s%s\033[0m\n",

@@ -141,6 +141,94 @@ and the build.
   including TIME_WAIT pressure) cover the same diagnostic ground
   using only public APIs and `/proc`.
 
+### 2026-05-08 — `tool_lookup` builtin + tool-discipline rule
+
+Builds on the same-day "Built-in system prompt is tool-aware" work
+above with a complementary affordance: the model gets a runtime
+introspection tool so it can verify what's wired up before
+dispatching, and an authoritative discipline rule that points at
+that tool. Driven by the same failure mode the prompt-cleanup
+addressed (`write` / `read` / `ls` etc. invented by the model);
+this layer makes the closure explicit and gives the model a
+recovery path when it's uncertain.
+
+* **New `tool_lookup` builtin.** Read-only introspection over the
+  agent's live tool registry. Call it with no args to get a numbered
+  catalogue of every registered tool (1..N), or pass
+  `name="<substring>"` to filter — case-insensitive, partial match.
+  Output is plain numbered text the model parses naturally; only
+  active tools are returned. Wired into every binary
+  (`easyai-cli`, `easyai-server`, `easyai-mcp-server`, `easyai-local`,
+  `easyai-agent`, `easyai-recipes`) and the `LocalBackend` library
+  wrapper. Always registered last so its snapshot covers every
+  other tool, including itself. Public C++ API:
+  `easyai::tools::tool_lookup(getter)` where `getter` is a callable
+  returning `std::vector<std::pair<std::string,std::string>>` of
+  (name, description) pairs.
+* **Authoritative `[tools]` / "Tool discipline" prompt block.**
+  Layered on top of the closed-set rule from the prompt-cleanup
+  commit: *"This catalogue is the SINGLE SOURCE OF TRUTH; training
+  data is NOT; if a name isn't in this list IT DOES NOT EXIST;
+  call `tool_lookup` first when uncertain; do not retry an
+  unknown-tool call."* Common hallucinated names called out by
+  example: `write`, `read`, `ls`, `cat`, `curl`, `python`, `sed`,
+  `grep`, `find`, `mkdir`. Same wording in `easyai-cli` (the
+  `[tools]` block injected into the dynamic prefix), `easyai-server`
+  and `easyai-local` (the `## Tool discipline` section in their
+  `kBuiltinSystem` strings).
+
+### 2026-05-08 — Fifth-pass security hardening (no behaviour change)
+
+A fresh static review of the ~5,000 lines that landed in the last 30
+commits. Two HIGH, three MEDIUM, two LOW findings — all closed in
+this commit; every public interface (CLI flags, tool names, library
+headers, INI keys) is unchanged.
+
+* **bash live-mirror is now control-byte stripped and byte-capped.**
+  When the model calls `bash`, the merged stdout/stderr was being
+  mirrored verbatim to the operator's terminal. A model could emit
+  `\e]0;HACKED\a` to retitle the operator's window or `\e[2J` to wipe
+  the screen — neither showed up in the model-facing tool result.
+  Now: ESC is rendered as a visible `^[`, all other C0 controls are
+  dropped, and the mirror channel is capped at 128 KiB (model still
+  gets the full 32 KiB it always did). Set `[cli] show_bash = false`
+  or `--no-show-bash` to silence the mirror entirely.
+* **`plan` tool render strips control bytes from item text.** Same
+  hijack class, narrower budget — a `plan add` with embedded `\e[…`
+  no longer reaches the operator's terminal raw.
+* **`get_array` parser now caps stringified-array recursion depth.**
+  Tool-args parsing tolerates `"items": "[…]"` (the array escaped
+  into a JSON string — small models double-escape sometimes). The
+  unwrap path was recursive without a depth cap; a hostile model
+  emitting deeply-nested escapes blew the stack. Capped at depth 4
+  (legitimate cases stay under depth 2).
+* **`get_sandbox_path` now uses `fs::weakly_canonical`.** Was using
+  `realpath()` with a "fall back to the unresolved input" branch
+  that could leak relative-path shape into the model on transient
+  errors. Cosmetic but correct; matches the canonicalisation the
+  sandbox containment check uses.
+* **`--mcp <url>` rejects non-`http(s)://` schemes up front.** The
+  libcurl protocol filter still blocks `file://`, `gopher://` etc.
+  at transport time, but the operator now gets a clear error
+  instead of a curl diagnostic, and embedders using
+  `easyai::mcp::fetch_remote_tools` get the same defence-in-depth.
+* **Installer validates numeric sampling/timeout flags.**
+  `--temperature`, `--top-p`, `--top-k`, `--min-p`,
+  `--repeat-penalty`, `--max-tokens`, `--http-timeout`, `--ctx-size`
+  must match `^-?[0-9]+(\.[0-9]+)?$` before they flow into the INI
+  via heredoc. Closes a defence-in-depth gap where a crafted value
+  containing `\n` could inject extra INI keys.
+* **`/etc/easyai/easyai.ini.bak` (created by `--force`) gets
+  explicit `chmod 640` and `chown root:easyai`.** Previously
+  inherited whatever the live INI had; matches the new file's
+  posture so a token leak via a backup with looser perms is
+  impossible.
+
+Full write-up: [`SECURITY_AUDIT.md`](SECURITY_AUDIT.md) §0 (operator
+TL;DR) and §20 (this pass's findings). Read §0 if you operate easyai
+in production — it's the 60-second summary of what easyai does and
+doesn't protect for you.
+
 ### 2026-05-05 — Tool surface + system prompt overhaul
 
 Driven by a production "models drift, use bash for file work, ignore
