@@ -2142,9 +2142,10 @@ static void handle_chat_stream(ServerCtx & ctx,
                     {"delta", json::object()},
                     {"finish_reason", nullptr},
                 }});
-                res_evt["name"]     = c.name;
-                res_evt["content"]  = r.content;
-                res_evt["is_error"] = r.is_error;
+                res_evt["name"]        = c.name;
+                res_evt["content"]     = r.content;
+                res_evt["is_error"]    = r.is_error;
+                res_evt["duration_ms"] = r.duration_ms;
                 emit_event("easyai.tool_result", safe_dump(res_evt));
 
                 // Tool-call status line goes into the reasoning channel
@@ -2184,6 +2185,7 @@ static void handle_chat_stream(ServerCtx & ctx,
 
                 std::ostringstream tlog;
                 tlog << "\n" << (r.is_error ? "❌ " : "🔧 ") << c.name;
+                tlog << " (" << r.duration_ms << "ms)";
                 if (!target.empty()) tlog << " " << target;
                 if (r.is_error) {
                     std::string reason = r.content;

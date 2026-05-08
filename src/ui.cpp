@@ -344,8 +344,12 @@ void Streaming::on_tool_(const ToolCall & call, const ToolResult & result) {
     const char * marker = result.is_error ? "✗" : "🔧";
     const char * color  = result.is_error ? style_.red() : style_.cyan();
     std::ostringstream ss;
-    ss << "\n" << color << marker << " " << call.name
-       << "(" << easyai::text::trim_for_log(call.arguments_json, 80) << ")"
+    ss << "\n" << color << marker << " " << call.name;
+    if (result.duration_ms >= 0) {
+        ss << " " << style_.dim() << "(" << result.duration_ms << "ms)" << style_.reset()
+           << color;
+    }
+    ss << "(" << easyai::text::trim_for_log(call.arguments_json, 80) << ")"
        << style_.reset();
     if (result.is_error) {
         ss << " " << style_.red()

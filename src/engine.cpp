@@ -1578,6 +1578,7 @@ std::string Engine::chat_continue() {
                 (int) std::min<size_t>(400, tc.arguments.size()),
                 tc.arguments.c_str());
 
+            const auto t_tool_begin = std::chrono::steady_clock::now();
             if (!tool) {
                 result = ToolResult::error("unknown tool: " + tc.name);
                 easyai::log::error(
@@ -1604,6 +1605,8 @@ std::string Engine::chat_continue() {
                         tc.id.empty() ? "(none)" : tc.id.c_str());
                 }
             }
+            result.duration_ms = (int) std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t_tool_begin).count();
 
             if (p_->on_tool) p_->on_tool(call, result);
 

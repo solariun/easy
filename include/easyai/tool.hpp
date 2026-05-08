@@ -11,12 +11,15 @@ namespace easyai {
 
 // ToolResult is what a handler returns. content goes back to the model;
 // is_error=true tags the message so the model knows the call failed.
+// duration_ms is filled in by the Engine after the handler returns —
+// it's purely a UI/telemetry field, handlers don't set it.
 struct ToolResult {
     std::string content;
-    bool        is_error = false;
+    bool        is_error    = false;
+    int         duration_ms = 0;   // wall-clock dispatch time, set by Engine
 
-    static ToolResult ok(std::string s)    { return { std::move(s), false }; }
-    static ToolResult error(std::string s) { return { std::move(s), true  }; }
+    static ToolResult ok(std::string s)    { return { std::move(s), false, 0 }; }
+    static ToolResult error(std::string s) { return { std::move(s), true,  0 }; }
 };
 
 // ToolCall is what easyai hands the handler. `arguments_json` is the raw JSON
