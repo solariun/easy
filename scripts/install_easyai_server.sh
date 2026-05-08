@@ -995,10 +995,11 @@ verbose         = $([[ "$enable_verbose" -eq 1 ]] && echo on || echo off)
 # state breakdown (ESTABLISHED / TIME_WAIT / CLOSE_WAIT / FIN_WAIT / LISTEN)
 # with explicit TIME_WAIT-vs-ephemeral-port-range percentage tagged
 # "elevated" / "HIGH" / "CRITICAL" so socket exhaustion shows up before
-# connections start failing. 0 disables. Default 1 — high-frequency
-# telemetry into journalctl is the whole point. Lives outside /metrics so
-# you can read it from journalctl without standing up Prometheus.
-metrics_interval = 1
+# connections start failing. 0 disables. Default 60 — one METRICS line
+# per minute is enough to watch slow-moving signals (RSS creep, TIME_WAIT
+# drift, GTT pressure) without flooding journalctl. Bump down (5, 10) for
+# active troubleshooting; raise (300+) for quiet long-running deploys.
+metrics_interval = 60
 
 # /mcp authentication
 # ----------------------------------------------------------------
