@@ -39,30 +39,7 @@
 #include "chat.h"
 #include "common.h"
 
-// VerboseServer (defined later in this file) overrides the
-// httplib::Server::process_and_close_socket(socket_t) method to log
-// per-TCP-connection accept/close events.  Upstream cpp-httplib
-// declares that virtual `private:`, which would refuse the override's
-// call to the base implementation — and we MUST call the base, that's
-// what runs the actual HTTP keep-alive / parse pipeline.
-//
-// The macro trick below widens `private` to `protected` for THIS
-// translation unit's view of httplib.h.  It changes only compile-time
-// access checks; vtable layout is unaffected, so linking against
-// cpp-httplib.a (compiled against the unmodified header) is safe.
-//
-// Strict scoping rules:
-//   - Wraps ONLY the httplib.h include, not any neighbouring headers.
-//   - httplib.h's include guard (CPPHTTPLIB_HTTPLIB_H) means any later
-//     #include "httplib.h" elsewhere is a no-op, so this redefinition
-//     can't leak into other TUs.
-//   - Verified that common.h / chat.h above do NOT transitively
-//     include httplib.h, so the order is correct.
-//   - Leaves no derivative copy of cpp-httplib in our build tree and
-//     does not modify llama.cpp's source on disk.
-#define private protected
 #include "httplib.h"          // vendored by llama.cpp
-#undef private
 #include "nlohmann/json.hpp"  // vendored by llama.cpp
 
 #if defined(EASYAI_BUILD_WEBUI)
@@ -94,9 +71,7 @@
 #include <string>
 #include <thread>
 #include <dirent.h>      // opendir/readdir for fd-count
-#include <netdb.h>       // getnameinfo, NI_*
 #include <sys/resource.h>// getrusage, RLIMIT_NOFILE
-#include <sys/socket.h>  // getpeername, sockaddr_storage
 #include <sys/time.h>    // gettimeofday for /proc/stat deltas
 #include <unistd.h>      // chdir
 #include <vector>
@@ -1410,9 +1385,6 @@ struct ServerCtx {
     std::atomic<uint64_t>      n_in_flight{0};   // currently being served
     std::atomic<uint64_t>      n_bytes_in{0};    // total request bodies received
     std::atomic<uint64_t>      n_bytes_out{0};   // total response bodies sent (streamed = 0)
-    std::atomic<uint64_t>      n_connections{0}; // total TCP connections accepted
-    std::atomic<uint64_t>      n_open_conns{0};  // currently-open TCP connections (HTTP keep-alive aware)
-    std::atomic<uint64_t>      n_open_conns_peak{0};  // high-water mark of n_open_conns
 
     // sampling defaults that survive across requests (set via /v1/preset)
     float def_temperature = 0.7f;
@@ -3184,11 +3156,11 @@ static bool require_auth(const ServerCtx & ctx, const httplib::Request & req,
         "       --metrics               Expose Prometheus /metrics endpoint\n"
         "       --metrics-interval SECS Verbose-mode periodic METRICS log\n"
         "                                line every SECS seconds (CPU%%, mem,\n"
-        "                                GPU GTT, load avg, iowait, open conns,\n"
-        "                                fd usage, TCP states incl. explicit\n"
-        "                                TIME_WAIT count + %% of ephemeral port\n"
-        "                                range with elevated/HIGH/CRITICAL tag).\n"
-        "                                0 disables. Default 60. INI:\n"
+        "                                GPU GTT, load avg, iowait, fd usage,\n"
+        "                                TCP states incl. explicit TIME_WAIT\n"
+        "                                count + %% of ephemeral port range\n"
+        "                                with elevated/HIGH/CRITICAL tag).\n"
+        "                                0 disables. Default 1. INI:\n"
         "                                [SERVER] metrics_interval.\n"
         "       --reasoning <on|off>    Enable model thinking (default on)\n"
         "       --no-think              Strip <think>...</think> from replies\n"
@@ -3204,11 +3176,11 @@ static bool require_auth(const ServerCtx & ctx, const httplib::Request & req,
         "  -v,  --verbose               Engine logs raw model output + parser\n"
         "                                 actions to stderr — useful for debugging\n"
         "                                 'why did it stop?' moments. Also logs\n"
-        "                                 TCP-level ⇐ accept / ⇒ close lines per\n"
-        "                                 connection AND HTTP-level → arrival /\n"
-        "                                 ← completion lines per request, with\n"
-        "                                 running totals (open conns, in-flight,\n"
-        "                                 bytes in/out, errors).\n"
+        "                                 HTTP-level → arrival / ← completion\n"
+        "                                 lines per request with running totals\n"
+        "                                 (in-flight, bytes in/out, errors), and\n"
+        "                                 a periodic METRICS line — see\n"
+        "                                 --metrics-interval.\n"
         "       --show-system-prompt    Print the resolved persona (built-in\n"
         "                                Deep default OR --system OR --system-\n"
         "                                file content, in the same precedence\n"
@@ -3257,8 +3229,10 @@ struct ServerArgs {
                                      // timeout in seconds.  Bumped from
                                      // llama-server's 60 s default to give
                                      // long-thinking models room to breathe
-    int         metrics_interval = 60; // verbose-mode periodic metrics tick
-                                       // (seconds). 0 disables. CLI:
+    int         metrics_interval = 1;  // verbose-mode periodic metrics tick
+                                       // (seconds). 0 disables. Default 1
+                                       // — high-frequency telemetry is the
+                                       // whole point. CLI:
                                        // --metrics-interval N. INI:
                                        // [SERVER] metrics_interval.
                                      // before the network drops them.
@@ -3618,45 +3592,6 @@ static void on_signal(int) {
     if (s) s->stop();
 }
 
-// Resolve the peer (remote IP:port) of an accepted socket. Used by the
-// verbose TCP-level logger to tag connect/disconnect lines. Returns "?"
-// on failure — we never want to fail a connection just because we couldn't
-// name the peer.
-static std::string peer_addr_of(int sock) {
-    struct sockaddr_storage addr {};
-    socklen_t addrlen = sizeof(addr);
-    if (::getpeername(sock, (struct sockaddr *) &addr, &addrlen) != 0) {
-        return "?";
-    }
-    char host[NI_MAXHOST] = {0};
-    char port_s[NI_MAXSERV] = {0};
-    if (::getnameinfo((struct sockaddr *) &addr, addrlen,
-                      host, sizeof(host),
-                      port_s, sizeof(port_s),
-                      NI_NUMERICHOST | NI_NUMERICSERV) != 0) {
-        return "?";
-    }
-    std::string s = host;
-    s += ":";
-    s += port_s;
-    return s;
-}
-
-// VerboseServer — httplib::Server subclass that, in --verbose mode, logs
-// every accepted TCP connection plus its eventual close, with running
-// totals. One log pair per TCP socket regardless of how many HTTP
-// keep-alive requests it carries — complements the per-request
-// pre_routing/set_logger lines wired below.
-//
-// Why this matters: when a client (easyai-cli, VSCode, etc.) hangs and
-// retries, set_logger only fires AFTER a response is sent.  Hung / dropped
-// connections never reach it.  process_and_close_socket() runs once per
-// TCP lifetime, so we see the socket open AND the eventual close even
-// when no HTTP request ever completes — exactly the case we want to
-// debug.
-//
-// Requires the [easyai-patch] in vendored httplib.h that moves
-// process_and_close_socket from private: to protected:.
 // ---------------------------------------------------------------------------
 // Periodic metrics sampler — verbose-mode-only.
 //
@@ -3668,7 +3603,12 @@ static std::string peer_addr_of(int sock) {
 //   - CPU usage: process %, system % (from /proc/stat deltas)
 //   - I/O wait: system iowait %
 //   - Load average: 1 / 5 / 15 min
-//   - TCP: open_conns now / peak, total accepted, in_flight, fd usage
+//   - TCP states (system-wide): ESTABLISHED / TIME_WAIT / CLOSE_WAIT /
+//                FIN_WAIT / LISTEN counts from /proc/net/tcp{,6}; the
+//                TIME_WAIT count is reported as a percentage of the
+//                kernel's ephemeral port range so socket exhaustion
+//                surfaces before connections start failing.
+//   - Process: in-flight requests, cumulative requests / errors / bytes.
 //
 // All sources are best-effort POSIX; missing files yield "n/a" rather
 // than aborting the tick. The thread joins on g_metrics_stop.
@@ -3858,55 +3798,6 @@ static std::string fmt_bytes(uint64_t b) {
 static std::atomic<bool>        g_metrics_stop{false};
 static std::condition_variable  g_metrics_cv;
 static std::mutex               g_metrics_mu;
-
-class VerboseServer : public httplib::Server {
-public:
-    VerboseServer(ServerCtx & ctx, bool verbose)
-        : ctx_(ctx), verbose_(verbose) {}
-
-protected:
-    bool process_and_close_socket(socket_t sock) override {
-        if (!verbose_) {
-            return httplib::Server::process_and_close_socket(sock);
-        }
-        const std::string peer = peer_addr_of(sock);
-        const auto t0 = std::chrono::steady_clock::now();
-        const auto conn_n = ctx_.n_connections.fetch_add(1, std::memory_order_relaxed) + 1;
-        const auto live   = ctx_.n_open_conns .fetch_add(1, std::memory_order_relaxed) + 1;
-        // Track high-water mark for the periodic metrics report.
-        uint64_t prev_peak = ctx_.n_open_conns_peak.load(std::memory_order_relaxed);
-        while (live > prev_peak &&
-               !ctx_.n_open_conns_peak.compare_exchange_weak(
-                   prev_peak, live, std::memory_order_relaxed)) {}
-        std::fprintf(stderr,
-            "[easyai-server] \xe2\x87\x90 accept #%llu  from=%s  open_conns=%llu\n",
-            (unsigned long long) conn_n,
-            peer.c_str(),
-            (unsigned long long) live);
-        std::fflush(stderr);
-
-        const bool ok = httplib::Server::process_and_close_socket(sock);
-
-        const auto dur_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - t0).count();
-        const auto live_after = ctx_.n_open_conns.fetch_sub(1, std::memory_order_relaxed) - 1;
-        std::fprintf(stderr,
-            "[easyai-server] \xe2\x87\x92 close   #%llu  from=%s  dur=%lldms  ok=%d  open_conns=%llu  total_conns=%llu\n",
-            (unsigned long long) conn_n,
-            peer.c_str(),
-            (long long) dur_ms,
-            ok ? 1 : 0,
-            (unsigned long long) live_after,
-            (unsigned long long) ctx_.n_connections.load(std::memory_order_relaxed));
-        std::fflush(stderr);
-        return ok;
-    }
-
-private:
-    ServerCtx & ctx_;
-    bool        verbose_;
-};
-
 
 // Build the built-in system prompt with tool-notes bullets gated on which
 // tools will actually be registered. Naming an unregistered tool here makes
@@ -6092,19 +5983,13 @@ int main(int argc, char ** argv) {
     if (args.verbose) {
         std::fprintf(stderr,
             "[easyai-server] VERBOSE: per-request POST line + per-hop "
-            "generate_one/chat_continue dumps + thought-only retry "
-            "trace + HTTP connect/disconnect lines (\xe2\x86\x92 arrival "
-            "with client IP / body size; \xe2\x86\x90 completion with "
-            "status / duration / running totals) will appear in this "
-            "stream.\n");
+            "generate_one/chat_continue dumps + thought-only retry trace + "
+            "HTTP \xe2\x86\x92 arrival / \xe2\x86\x90 completion lines per "
+            "request + periodic METRICS line will appear in this stream.\n");
     }
 
     // -------- http server -------------------------------------------------
-    // VerboseServer subclasses httplib::Server.  In --verbose mode it logs
-    // ⇐ accept / ⇒ close lines per TCP connection (catches hung sockets
-    // that set_logger never sees because no response was ever sent).
-    // Outside verbose mode it's identical to the base — zero overhead.
-    VerboseServer svr(*ctx, args.verbose);
+    httplib::Server svr;
     svr.set_payload_max_length(args.max_body);
     // Apply the configured HTTP timeout to BOTH directions.  Default is
     // 600 s (10 min) so long thinking turns don't trip a mid-stream cut
@@ -6260,12 +6145,11 @@ int main(int argc, char ** argv) {
                 const uint64_t fd_lim  = fd_soft_limit();
                 const TcpStates tcp    = count_tcp_states();
                 const uint64_t eph_range = ephemeral_port_range();
-                const auto open_now    = ctx_ref.n_open_conns.load(std::memory_order_relaxed);
-                const auto open_peak   = ctx_ref.n_open_conns_peak.load(std::memory_order_relaxed);
                 const auto in_flight   = ctx_ref.n_in_flight.load(std::memory_order_relaxed);
-                const auto total_conns = ctx_ref.n_connections.load(std::memory_order_relaxed);
                 const auto reqs        = ctx_ref.n_requests.load(std::memory_order_relaxed);
                 const auto errs        = ctx_ref.n_errors.load(std::memory_order_relaxed);
+                const auto bytes_in    = ctx_ref.n_bytes_in.load(std::memory_order_relaxed);
+                const auto bytes_out   = ctx_ref.n_bytes_out.load(std::memory_order_relaxed);
                 const auto uptime_s    = std::chrono::duration_cast<std::chrono::seconds>(
                                              std::chrono::steady_clock::now() - t_start).count();
 
@@ -6291,14 +6175,13 @@ int main(int argc, char ** argv) {
                     std::fprintf(stderr, "gpu: n/a  ");
                 }
                 std::fprintf(stderr,
-                    "net: open=%llu peak=%llu total=%llu in_flight=%llu reqs=%llu err=%llu  "
+                    "http: in_flight=%llu reqs=%llu err=%llu in=%lluB out=%lluB  "
                     "fd: %llu/%llu (%.1f%%)",
-                    (unsigned long long) open_now,
-                    (unsigned long long) open_peak,
-                    (unsigned long long) total_conns,
                     (unsigned long long) in_flight,
                     (unsigned long long) reqs,
                     (unsigned long long) errs,
+                    (unsigned long long) bytes_in,
+                    (unsigned long long) bytes_out,
                     (unsigned long long) fd_open,
                     (unsigned long long) fd_lim,
                     fd_lim > 0 ? 100.0 * (double) fd_open / (double) fd_lim : 0.0);

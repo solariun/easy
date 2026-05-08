@@ -76,6 +76,26 @@ dispatches any tool calls in-process, and posts the next turn.
 If `--url` is omitted and `EASYAI_URL` is unset, the binary errors out
 at startup with a usage hint.
 
+**Connection lifecycle (since 2026-05-08):** the cli holds a single
+persistent `httplib::Client` for the entire session — every agentic
+hop (chat completion + tool dispatch + chat completion + …) reuses
+the same TCP connection thanks to HTTP keep-alive. This was a real
+bug before that date: the cli rebuilt the Client per request, so
+each hop opened a fresh connection that piled up in `TIME_WAIT` for
+~60 s on the client. A 50-tool-call session opened 50 sockets and
+on long sessions exhausted the ephemeral-port range, surfacing as
+`Connection timed out` retry storms. The fix is purely on the cli
+side and transparent to anything connecting to easyai-cli's
+upstream. To confirm keep-alive is working in production, point the
+cli at an easyai-server with `[SERVER] verbose = on` and watch the
+`http: in_flight=...` field of the periodic METRICS line plus the
+per-request `→` / `←` log: a healthy session shows steady
+`reqs=N` increments with `in_flight=0..1` between hops, and the
+system-wide `tcp: time_wait` count stays low. Before the fix, every
+hop bumped `tcp: time_wait` and eventually drove the
+`TIME_WAIT N/M ephemeral ports (X.X% …)` indicator into the
+elevated / HIGH / CRITICAL bands.
+
 ---
 
 ## 3. Modes — REPL, one-shot, piped, management

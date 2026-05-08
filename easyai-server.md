@@ -18,8 +18,9 @@
 6. [The default persona — Deep](#6-the-default-persona--deep)
 7. [Webui customisation](#7-webui-customisation)
 8. [Performance tuning](#8-performance-tuning)
-9. [Hardening / security](#9-hardening--security)
-10. [Cross-references](#10-cross-references)
+9. [Verbose observability](#9-verbose-observability)
+10. [Hardening / security](#10-hardening--security)
+11. [Cross-references](#11-cross-references)
 
 ---
 
@@ -103,8 +104,9 @@ The HTTP layer, paths, tool gating, MCP auth.
 | `webui_mode` | enum | `--webui` | `modern` | `modern` (embedded llama-server bundle) or `minimal` (inline). |
 | `webui_placeholder` | string | `--webui-placeholder` | `Type a message…` | Input box hint. |
 | `metrics` | bool | `--metrics` | `off` | Expose Prometheus `/metrics`. |
-| `verbose` | bool | `-v`, `--verbose` | `off` | Noisy logs. |
-| `allow_fs` | bool | `--allow-fs` | `off` | Register `fs_read_file / fs_write_file / fs_list_dir / fs_glob / fs_grep` plus `get_sandbox_path`. **Implied by `--sandbox` and by `--allow-bash`** — pass it explicitly only to register `fs_*` alone (no sandbox dir, no shell). When neither sandbox nor bash is set, `--allow-fs` defaults the working root to `.` (cwd). |
+| `verbose` | bool | `-v`, `--verbose` | `off` | Noisy logs. Also enables: HTTP-level `→` / `←` lines per request (with status, duration, bytes, running totals) AND a periodic `METRICS` line every `metrics_interval` seconds. See §9. |
+| `metrics_interval` | int | `--metrics-interval` | `1` | Verbose-only periodic METRICS log line every N seconds (default `1` — high-frequency telemetry into journalctl is the whole point). Reports CPU%, iowait%, load avg, process RSS + peak, system mem, GPU GTT (Linux/AMD), HTTP in-flight + cumulative reqs / err / bytes, fd usage, AND TCP state breakdown with **explicit `TIME_WAIT N/M ephemeral ports (X.X% [elevated\|HIGH\|CRITICAL])`** so socket exhaustion shows up before connections fail. `0` disables. Lives outside Prometheus `/metrics` so you can tail it from journalctl. |
+| `allow_fs` | bool | `--allow-fs` | `off` | Register `fs_read_file / fs_write_file / fs_list_dir / fs_glob / fs_grep` plus `get_sandbox_path`. **`--sandbox` ALONE no longer implies `--allow-fs`** (the sandbox is also the cwd / external-tools root / `get_sandbox_path` target — operators legitimately set it while keeping fs_* off). Pass `--allow-fs` explicitly. `--allow-bash` still implies fs_* (bash strictly subsumes the file tools). |
 | `allow_bash` | bool | `--allow-bash` | `off` | Register the `bash` tool **and** the `fs_*` set (bash subsumes fs_*; without fs_* the model would use bash for ordinary file work). **Not** a hardened sandbox. |
 | `use_google` | bool | `--use-google` | `off` | Register the `web_google` tool (Google Custom Search JSON API). Requires `GOOGLE_API_KEY` and `GOOGLE_CSE_ID` env vars. Counts against your Google quota (free tier: 100 queries/day per key). When either env var is missing the tool is silently skipped. |
 | `split_rag` | bool | `--split-rag` | `off` | Opt back into the legacy seven-tool RAG layout (`rag_save`, `rag_append`, `rag_search`, `rag_load`, `rag_list`, `rag_delete`, `rag_keywords`). The DEFAULT is the single `rag(action=...)` dispatcher; flip this on if you're driving a weak / 1-bit-quant tool caller (Bonsai-class) that handles many flat schemas more reliably than one discriminated schema. On-disk format is byte-identical either way. |
@@ -389,8 +391,8 @@ opt-in is logged at startup with sanity warnings.
 | Flag / INI key | What it enables |
 | --- | --- |
 | (no flag) | `datetime`, `web_search`, `web_fetch`. |
-| `--sandbox <dir>` (`[SERVER] sandbox`) | Sets the root for filesystem-flavoured tools. The binary `chdir`s into `<dir>` and **auto-registers `fs_*` plus `get_sandbox_path`** scoped to it (no need for `--allow-fs`). `bash` still requires `--allow-bash`. |
-| `--allow-fs` (`[SERVER] allow_fs`) | `fs_read_file / fs_write_file / fs_list_dir / fs_glob / fs_grep` plus `get_current_dir` and `get_sandbox_path`. **Implied** by `--sandbox` and by `--allow-bash`; pass it explicitly only to register `fs_*` alone (no sandbox dir, no shell). The working root is `--sandbox <dir>` if given, else `.` (the server's cwd). |
+| `--sandbox <dir>` (`[SERVER] sandbox`) | Sets the working root: cwd for the server process, root for `fs_*` / `bash` when those are enabled, base for `$SANDBOX` placeholders in external-tool manifests, and target of `get_sandbox_path`. **`--sandbox` alone NO LONGER auto-registers `fs_*`** (operators legitimately set it for cwd / external-tools / get_sandbox_path while keeping the file tools off). Pass `--allow-fs` explicitly to register the file tools. `--allow-bash` still implies fs_*. |
+| `--allow-fs` (`[SERVER] allow_fs`) | `fs_read_file / fs_write_file / fs_list_dir / fs_glob / fs_grep` plus `get_current_dir` and `get_sandbox_path`. The working root is `--sandbox <dir>` if given, else `.` (the server's cwd). Implied by `--allow-bash`. **Honored independently of `sandbox`** since the 2026-05-08 fix — `allow_fs = off` in the INI now genuinely disables fs_*, even with a sandbox set. |
 | `--allow-bash` (`[SERVER] allow_bash`) | `bash` (run `/bin/sh -c`) **plus the `fs_*` set** (bash subsumes them). cwd = sandbox if given, else the binary's CWD. NOT a hardened sandbox — runs with this process's user privileges. Also bumps the agentic-loop `max_tool_hops` to 99999 (bash flows naturally span many turns). |
 | `--use-google` (`[SERVER] use_google`) | `web_google` (Google Custom Search JSON API). Requires `GOOGLE_API_KEY` and `GOOGLE_CSE_ID` env vars; tool is silently skipped if either is missing so a key rotation that briefly drops the env doesn't take down the server. Counts against your Google quota (free tier: 100 queries/day per key). |
 | `--external-tools <dir>` (`[SERVER] external_tools`) | Load every `EASYAI-<name>.tools` file in `<dir>` as an operator-defined tool pack. Per-file fault isolation. Spawns via `fork`+`execve` — never a shell. **The supported way to give the model focused powers without flipping `--allow-bash`.** See [`EXTERNAL_TOOLS.md`](EXTERNAL_TOOLS.md). |
@@ -626,7 +628,85 @@ panel as `↻ Retry N/max`.
 
 ---
 
-## 9. Hardening / security
+## 9. Verbose observability
+
+In `--verbose` mode (`[SERVER] verbose = on`) the server emits two
+families of diagnostic lines on stderr — they land in `journalctl -u
+easyai-server` for free. Both are gated on `verbose`; outside
+verbose mode there's zero logging overhead.
+
+### 9.1 HTTP request → / ← lines
+
+Per-request arrival + completion, wired via `set_pre_routing_handler`
++ `set_logger`:
+
+```
+[easyai-server] → POST /v1/chat/completions  from=192.168.1.42:51324  body=2417B  in_flight=1
+[easyai-server] ← POST /v1/chat/completions  status=200  dur=4823ms  out=streamed  totals: req=87 err=2 tools=143 in_flight=0  bytes: in=109218B out=148329B
+```
+
+Streaming responses (chat completions) write through chunked
+transfer and bypass `res.body` — they show `out=streamed` instead
+of a byte count. Running totals on the `←` line are cumulative
+since process start. Same atomics power Prometheus `/metrics`.
+
+There is intentionally **no per-TCP-connection accept/close
+log**. cpp-httplib's `process_and_close_socket` is `private virtual`
+upstream and we don't patch llama.cpp's vendored header. The
+periodic METRICS line below covers the same diagnostic territory
+(TIME_WAIT pressure, fd exhaustion, request throughput) using only
+public APIs and `/proc`.
+
+### 9.2 Periodic METRICS line
+
+A background ticker every `[SERVER] metrics_interval` seconds (CLI
+`--metrics-interval N`, **default `1`**, `0` disables) emits one
+line covering CPU / memory / GPU / load / HTTP / fd / TCP states:
+
+```
+[easyai-server] METRICS uptime=600s  cpu: usage=18.3% iowait=0.4% load=1.42 1.85 2.01  mem: rss=12.45GiB peak=12.51GiB sys=78.2% (28.3GiB/36.2GiB)  gpu: gtt=18.4GiB/29.0GiB (63.4%)  http: in_flight=1 reqs=87 err=2 in=109218B out=148329B  fd: 14/4096 (0.3%)  tcp: estab=24 time_wait=8123 close_wait=2 fin_wait=0 listen=4  TIME_WAIT 8123/28232 ephemeral ports (28.8% elevated)
+```
+
+Field by field:
+
+| Group | Source | Notes |
+|---|---|---|
+| `cpu: usage% iowait% load` | `/proc/stat` deltas + `getloadavg(3)` | system-wide; load is 1 / 5 / 15 min |
+| `mem: rss peak sys% (used/total)` | `/proc/self/status` (VmRSS, VmHWM) + `/proc/meminfo` | rss + peak are this process; sys is the host |
+| `gpu: gtt=USED/TOTAL (%)` | `/sys/class/drm/cardN/device/mem_info_gtt_*` | AMD only; shows `n/a` on NVIDIA / Intel |
+| `http: in_flight reqs err in=B out=B` | atomics in `ServerCtx` | `in_flight` = currently-being-served, `reqs` / `err` = cumulative HTTP, `in`/`out` = cumulative request/response body bytes |
+| `fd: N/M (%)` | `/proc/self/fd` + `getrlimit(RLIMIT_NOFILE)` | proxy for "how many more sockets can I accept" |
+| `tcp: estab time_wait close_wait fin_wait listen  TIME_WAIT N/M ephemeral ports (X.X%)` | `/proc/net/tcp` + `/proc/net/tcp6` + `/proc/sys/net/ipv4/ip_local_port_range` | **system-wide** TCP state breakdown. The `TIME_WAIT N/M` segment is the choke-point indicator: numerator is the count, denominator is the kernel's actual ephemeral-port range. Tagged `elevated` (≥20%), `HIGH` (≥50%), or `CRITICAL` (≥80%) so socket exhaustion shows up before connections start failing. |
+
+The deep metrics (cpu / mem / gpu / fd / tcp states) are Linux-only.
+On macOS the line still prints; the Linux-only fields show `n/a` or
+zeros and the server runs fine — `easyai-server`'s deploy target is
+Linux per the install scripts. macOS is the dev path.
+
+### What this catches in practice
+
+The 2026-05-08 incident: a long agentic run hung mid-stream and the
+cli failed with `Connection timed out` retries. The combined view
+surfaces:
+
+- `tcp: ... TIME_WAIT 27500/28232 ephemeral ports (97.4% CRITICAL)` —
+  the host has run out of ephemeral ports.
+- `http: in_flight=1 reqs=...` flat for minutes while the model
+  thinks (no completion event) — a hung stream, not a fast loop.
+
+The root cause was the cli's per-call `httplib::Client` construction
+(fixed in commit `841dd47`); the metrics now make that visible
+upstream of the symptoms. See README §What's new (2026-05-08) for
+the full incident write-up.
+
+The `metrics_interval` default of `1` second means high-frequency
+visibility into journalctl. Bump it (e.g. `metrics_interval = 5`)
+if the volume is too noisy in production; set `0` to disable
+entirely.
+
+---
+
+## 10. Hardening / security
 
 Highlights of the work documented in [`SECURITY_AUDIT.md`](SECURITY_AUDIT.md):
 
@@ -677,7 +757,7 @@ ask for; the OS bounds what the *agent process* can do.
 
 ---
 
-## 10. Cross-references
+## 11. Cross-references
 
 - [`README.md`](README.md) — sales overview + quickstart.
 - [`LINUX_SERVER.md`](LINUX_SERVER.md) — operator's guide for the

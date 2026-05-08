@@ -43,6 +43,104 @@ A running log of user-facing changes. Latest first — keep this list
 current as features land so anyone returning to the repo (or
 landing on it for the first time) sees what shipped recently.
 
+### 2026-05-08 — Server observability + connection-pool fix + prompt cleanup
+
+Driven by a real production failure: an agentic session hung mid-stream,
+the cli retried six times, and we had no visibility into what the
+TCP stack was doing on the server. Fixes landed across the cli's
+HTTP transport, the server's verbose logging, the system prompts,
+and the build.
+
+* **Cli keep-alive bug fixed (the actual root cause).**
+  `stream_chat()` / `simple_get()` / `simple_post()` were each
+  constructing a fresh `httplib::Client` per call. The Client's
+  TCP socket dropped at function end, so `set_keep_alive(true)` had
+  nothing to keep alive — every agentic hop opened a new connection.
+  An N-tool-call session piled up N sockets in `TIME_WAIT`,
+  eventually exhausting the client's ephemeral port range or
+  per-process fd ceiling. **Hoisted a single persistent `httplib::Client`
+  onto the `Impl` struct; all three call sites now reuse it.** ONE
+  TCP connection per session instead of N. Cancellation and
+  server-restart paths are preserved (cpp-httplib reconnects
+  internally on dead-socket errors).
+* **Server: HTTP-level `→` / `←` log per request (verbose mode).**
+  `set_pre_routing_handler` + `set_logger` emit arrival and
+  completion lines with method/path/peer/body size, status,
+  duration, response bytes (or `streamed` for SSE), and running
+  totals (req / err / tools / in_flight / bytes_in / bytes_out).
+* **Server: periodic `METRICS` line with TCP state breakdown
+  (verbose mode).** Background ticker every `metrics_interval`
+  seconds (**default 1**, `--metrics-interval N` or
+  `[SERVER] metrics_interval` to tune, `0` disables) emits one
+  line with: CPU% + iowait%, load 1/5/15, process RSS + peak,
+  system memory total/used/%, AMD GTT used/total/% (Linux + AMD
+  only), in-flight requests, cumulative requests / errors / bytes,
+  fd usage vs RLIMIT_NOFILE, AND an explicit TCP state breakdown
+  (ESTABLISHED / TIME_WAIT / CLOSE_WAIT / FIN_WAIT / LISTEN)
+  parsed from `/proc/net/tcp{,6}` with
+  `TIME_WAIT N/M ephemeral ports (X.X% [elevated|HIGH|CRITICAL])`
+  so socket exhaustion shows up in `journalctl` long before
+  connections start failing. Linux-only for the deep metrics;
+  macOS prints `n/a` and the server runs fine — easyai-server's
+  deploy target is Linux.
+* **Tool dispatch timing in every visible log.** Engine wraps
+  `tool->handler()` with `steady_clock` and writes `duration_ms`
+  into `ToolResult`. CLI shows `🔧 web_search (412ms)({"query":...})`
+  and the webui's reasoning panel shows the same. The
+  `easyai.tool_result` SSE event also gains a `duration_ms` field
+  so future external SSE consumers can render their own timing UI.
+* **`allow_fs = off` in the INI is now honoured.** The server read
+  the flag but never propagated it to the toolbelt — a non-empty
+  `[SERVER] sandbox` re-enabled `fs_*` regardless. Default install
+  ships `allow_fs = off` + `sandbox = /var/lib/easyai/workspace`,
+  which hit exactly this. Now `allow_fs` and `allow_bash` are
+  honoured independently of `sandbox`. **Behaviour change:**
+  `--sandbox /foo` alone NO LONGER implies `--allow-fs`; pass
+  `--allow-fs` explicitly to register fs_*.
+* **Built-in system prompt is tool-aware.** The hardcoded prompt
+  used to list `fs_*` / `bash` / `plan` / host-metric tools by name
+  whether or not they were registered. Models hallucinated calls to
+  unregistered tools (especially `bash` after the `allow_fs` fix
+  above). The `Tool notes:` section is now built dynamically:
+  each bullet is gated on the same flag that controls registration,
+  and the entries for tools the server NEVER registers (`plan`,
+  host metrics) are removed entirely. Same fix in
+  easyai-local's built-in prompt.
+* **RAG tool descriptions spell out "model-only store".** Added a
+  `PRIVATE — MODEL-ONLY STORE` paragraph to `rag_save` / `rag_append`
+  / the unified `rag` dispatcher, telling the model that the user
+  has no UI / command / API to read what's saved there. Forbids
+  `"check the rag for the code"` / `"I saved it to memory"` answers
+  and tells the model to `rag_load` and put the body inline when
+  the user asks for stored content.
+* **Stay-in-scope replaces "PROTOTYPE FIRST".** The old 1./2./3.
+  ritual ("build → verify → ASK which next step") was making the
+  agent stop after step 1 and ask, even when the user wanted the
+  simplest end-to-end thing. Collapsed to a single
+  `## Stay strictly in scope` paragraph that keeps the no-extras /
+  no-defensive-scaffolding / no-while-I'm-at-it-cleanups specifics
+  and drops the build-then-ask dance. Updated everywhere the
+  wording lived: server.cpp built-in prompt, local.cpp built-in
+  prompt, cli.cpp [guidance] block, installer's
+  `/etc/easyai/system.txt` template.
+* **Installer GTT default 28 → 29 GiB.** `gtt_gb=29` in
+  `scripts/install_easyai_server.sh`. Matches `ttm.pages_limit=7602176`.
+  Leaves headroom for a Q5_K_M / MXFP4_MOE 30B MoE plus a 32k KV
+  cache fully on the iGPU.
+* **Quick-start editor section added to `LINUX_SERVER.md`.** New
+  section 0 with copy-paste shell snippets for VSCode + Continue.dev,
+  OpenCode, and VSCode + Cline, all pointing at `http://ai.local:80/v1`.
+  Plus a quick-reference table for other OpenAI-compatible clients.
+* **No patches or derivatives of llama.cpp.** A short-lived
+  experiment subclassed `httplib::Server` to log per-TCP-connection
+  accept/close events — that needed widening the access on a
+  private virtual in the vendored cpp-httplib header. Backed out
+  entirely: no CMake patch script, no `#define private protected`
+  trick, no derivative copies. The HTTP `→`/`←` lines and the
+  periodic METRICS line (with system-wide TCP state breakdown
+  including TIME_WAIT pressure) cover the same diagnostic ground
+  using only public APIs and `/proc`.
+
 ### 2026-05-05 — Tool surface + system prompt overhaul
 
 Driven by a production "models drift, use bash for file work, ignore
