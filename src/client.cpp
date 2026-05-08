@@ -320,17 +320,31 @@ struct Client::Impl {
     std::atomic<bool> cancel_requested{false};
 
     // -----------------------------------------------------------------
-    // Transport helpers
-    // -----------------------------------------------------------------
-    std::unique_ptr<httplib::Client> make_http() {
+    // Transport — single persistent httplib::Client, lazy-initialised on
+    // first use. Reusing one Client across the whole agentic loop is the
+    // whole point: cpp-httplib keeps the underlying TCP socket between
+    // requests when set_keep_alive(true) is set, so a 50-tool-call agentic
+    // session uses ONE connection instead of 50 (each prior connection
+    // would otherwise pile up in TIME_WAIT for ~60 s, eventually exhausting
+    // the client's ephemeral-port range on long sessions).
+    //
+    // Thread-safety: cpp-httplib's Client serialises operations on its
+    // internal socket, so concurrent calls from cancellation handlers etc.
+    // are safe.  The mutex below only guards the lazy-init path.
+    std::unique_ptr<httplib::Client> http_;
+    std::mutex                        http_mu_;
+
+    httplib::Client * get_http() {
+        std::lock_guard<std::mutex> lk(http_mu_);
+        if (http_) return http_.get();
         ParsedUrl u = parse_url(endpoint);
         if (!u.ok) {
             last_error = "invalid endpoint URL: " + endpoint;
             return nullptr;
         }
-        // Build the authority-only URL httplib's URL constructor wants.
-        // (It dispatches internally to ClientImpl for http:// or to
-        // SSLClient for https:// when CPPHTTPLIB_OPENSSL_SUPPORT is on.)
+        // Authority-only URL httplib's Client constructor wants.  It
+        // dispatches internally to ClientImpl for http:// and to SSLClient
+        // for https:// when CPPHTTPLIB_OPENSSL_SUPPORT is on.
         std::string auth = u.scheme + "://" + u.host + ":"
                          + std::to_string(u.port);
         auto cli = std::make_unique<httplib::Client>(auth);
@@ -356,7 +370,8 @@ struct Client::Impl {
         cli->set_read_timeout (timeout_seconds, 0);
         cli->set_write_timeout(timeout_seconds, 0);
         cli->set_keep_alive(true);
-        return cli;
+        http_ = std::move(cli);
+        return http_.get();
     }
 
     httplib::Headers headers_with_auth(const std::string & accept) const {
@@ -452,7 +467,7 @@ struct Client::Impl {
 
     bool stream_chat(AssistantTurn & out) {
         out = AssistantTurn{};
-        auto cli = make_http();
+        auto * cli = get_http();
         if (!cli) return false;
 
         SseBuffer sse;
@@ -956,7 +971,7 @@ struct Client::Impl {
                     const std::string & accept,
                     std::string & out_body,
                     int *         out_status = nullptr) {
-        auto cli = make_http();
+        auto * cli = get_http();
         if (!cli) return false;
         auto headers = headers_with_auth(accept);
         const std::string full_path = base_path() + path;
@@ -993,7 +1008,7 @@ struct Client::Impl {
     bool simple_post(const std::string & path,
                      const std::string & body,
                      std::string & out_body) {
-        auto cli = make_http();
+        auto * cli = get_http();
         if (!cli) return false;
         auto headers = headers_with_auth("application/json");
         const std::string full_path = base_path() + path;
