@@ -576,10 +576,21 @@ trapping it into `cat > file` / `sed -i` for ordinary file work.
 `--allow-fs` still works (sets the working root to `.` if alone) but
 is redundant when `--sandbox` or `--allow-bash` is already given.
 
-The Toolbelt's `apply()` path also prepends two small in-binary blocks
-to the user's system prompt when the agent has any create/mutate
-affordance:
+The Toolbelt's `apply()` path also prepends three small in-binary
+blocks to the user's system prompt when the agent has any
+create/mutate affordance:
 
+* `[tool-discipline]` — "your tools are EXACTLY what's in your
+  schema; never invent tool names from training". Counters the
+  most expensive failure mode we see: models calling
+  `fs_write_file` / `bash` / `plan` / etc. when they aren't
+  registered, earning `unknown tool` and wasting the turn.  When
+  asked for a file/document with no write tool, the rule
+  redirects the model to deliver content directly in the chat
+  reply.  Same rule lives inside `build_builtin_system_prompt`
+  on `easyai-server` and `easyai-local`, so the discipline
+  reaches the model regardless of which surface the operator
+  drives.
 * `[environment]` — the absolute path of the sandbox root, so the
   model doesn't waste turn 1 on `get_current_dir` / `pwd`.
 * `[guidance]` — "pick one viable implementation and carry it through"
@@ -590,6 +601,33 @@ affordance:
 process cwd, can drift) — pinned at registration to the configured
 root so its answer is always the truth even if the process chdir's
 later.
+
+### Why the closed-set rule is in three places
+
+The `[tool-discipline]` rule appears in three independent prompt
+builders, which looks like duplication but is deliberate:
+
+1. **`build_builtin_system_prompt` (server.cpp + local.cpp)** —
+   carries the rule when the operator hasn't supplied a custom
+   prompt. The rule lives ABOVE the gated `Tool notes:` section,
+   so it applies whether or not any tools are registered.
+2. **`easyai-cli` prefix injection** — when the cli sends its
+   own system message (because `[environment]` / `[guidance]` /
+   `[unattended]` fired), it REPLACES whatever the server would
+   have used.  Without `[tool-discipline]` riding along, the
+   model stops seeing the rule and the failure mode returns.
+3. **`scripts/install_easyai_server.sh` system.txt template** —
+   when the operator un-comments `[SERVER] system_file` to take
+   over the persona, the operator's file replaces the binary's
+   built-in.  Shipping the rule in the template keeps that
+   take-over path safe.
+
+There's no shared file because the three surfaces have different
+formatting needs (C++ string-literal newlines vs heredoc), and
+the rule is short enough that drift cost is low.  If the rule
+ever grows, the right move is a shared `.txt` resource in
+`include/easyai/prompts/` consumed by all three — but until that
+pressure surfaces, three copies is cheaper than the abstraction.
 
 ### Tolerance shims — when the model goes off-spec anyway
 

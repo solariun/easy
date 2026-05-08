@@ -3609,6 +3609,20 @@ static std::string build_builtin_system_prompt(const ServerArgs & args) {
         "  3. Read the result, then finish or take ONE more step.\n"
         "Stop as soon as you have something useful. Prefer a short answer\n"
         "the user can refine over a long pre-committed plan.\n"
+        "\n"
+        "## Tools — closed set\n"
+        "Your tools are EXACTLY those listed in your tools schema for\n"
+        "this session. Do NOT invent tools. Anything you remember from\n"
+        "other AI systems or training that isn't in the schema is NOT\n"
+        "available — including paraphrases (`read_file` is not\n"
+        "`fs_read_file`; `shell` is not `bash`).\n"
+        "\n"
+        "If a request needs a capability with no matching tool, do the\n"
+        "work in your visible reply. Asked to write a file / save a\n"
+        "document / produce a manual and you have no write tool? Put\n"
+        "the content DIRECTLY in the chat response — never paste it\n"
+        "into a tool call that doesn't exist. Every hallucinated call\n"
+        "returns `unknown tool` and wastes the turn.\n"
         "\n";
 
     const bool any_tool_note = datetime_on || web_on || fs_on || bash_on

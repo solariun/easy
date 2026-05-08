@@ -1401,8 +1401,34 @@ int main(int argc, char ** argv) {
     // the guidance is irrelevant and we leave the prompt alone.
     {
         const bool any_fs_like = o.allow_bash || !o.sandbox.empty();
+        const bool any_prefix  = any_fs_like || !o.no_plan || o.unattended;
         std::string prefix;
+        // [tool-discipline] — first because hallucinated tool calls are
+        // the most expensive failure mode (every "unknown tool" reply
+        // wastes a turn). Only emitted when we already have a reason to
+        // inject *some* prefix block — without one, no system message
+        // is sent to the server and its built-in prompt (which carries
+        // its own version of this rule) wins.
+        if (any_prefix) {
+            prefix +=
+                "[tool-discipline]\n"
+                "Your tools are EXACTLY those listed in your tools "
+                "schema for this session. Do NOT invent tools. Anything "
+                "you remember from other AI systems or training that "
+                "isn't in the schema is NOT available — including "
+                "paraphrases (`read_file` is not `fs_read_file`; "
+                "`shell` is not `bash`).\n"
+                "\n"
+                "If a request needs a capability with no matching tool, "
+                "do the work in your visible reply. Asked to write a "
+                "file / save a document / produce a manual and you have "
+                "no write tool? Put the content DIRECTLY in the chat "
+                "response — never paste it into a tool call that "
+                "doesn't exist. Every hallucinated call returns "
+                "`unknown tool` and wastes the turn.\n";
+        }
         if (any_fs_like) {
+            if (!prefix.empty()) prefix += "\n";
             std::string abs_root = o.sandbox.empty() ? "." : o.sandbox;
             char rb[PATH_MAX];
             if (::realpath(abs_root.c_str(), rb) != nullptr) abs_root = rb;
