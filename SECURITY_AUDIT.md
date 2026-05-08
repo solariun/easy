@@ -1561,6 +1561,52 @@ Worst-case wakeup latency: 50 ms.  No change to the happy path
 duration (the helper sleeps the full requested interval if no
 cancel arrives).
 
+### 21.5b LOW — server-side keep-alive timeout was 5 s default
+
+**Files:** `examples/server.cpp`, `examples/mcp_server.cpp`.
+
+**Issue.** Commit `841dd47` made `libeasyai-cli`'s `httplib::Client`
+persistent (single TCP connection across an N-hop agentic session)
+to fix client-side TIME_WAIT exhaustion. The persistent client sets
+`set_keep_alive(true)`, but the SERVER side never called
+`set_keep_alive_timeout()` — so cpp-httplib's default
+`CPPHTTPLIB_KEEPALIVE_TIMEOUT_SECOND = 5` was in effect.
+
+Concrete failure: a chat session where the model emits a tool call,
+the cli runs the tool locally (a `web_fetch`, a `bash` build, an
+`fs_grep` over a big tree — anything that takes >5 s), then sends
+the next POST. Between the previous SSE end and this POST the
+server has already closed the keep-alive connection. The client
+opens a new TCP, server-side TIME_WAIT count rises one per hop —
+exactly the class of bug the original commit set out to avoid, just
+on the other end of the wire.
+
+**Fix.** `examples/server.cpp` now calls
+`svr.set_keep_alive_timeout(t)` with the same `t` it uses for
+`set_read_timeout` / `set_write_timeout` (default 600 s, configurable
+via `[SERVER] http_timeout` / `--http-timeout`). On a typical
+deploy with `http_timeout = 86400` (24 h, the installer default
+since the 5th-pass docs), the connection lives as long as the
+agentic session.  `examples/mcp_server.cpp` pins the keep-alive
+timeout to its `kReadTimeoutSeconds` (30 s) for the same reason,
+matching the slow-loris-vs-real-client trade the MCP daemon already
+makes elsewhere.
+
+**Verification.** Live test with a persistent Python `http.client`
+connection against `easyai-mcp-server`:
+
+| Pause between requests | Pre-fix | Post-fix |
+| --- | --- | --- |
+| 7 s   | server closed (ConnectionReset) | reused (same `socket_fd`) |
+| 25 s  | server closed                   | reused (same `socket_fd`) |
+| 35 s  | server closed                   | server closed (correct — exceeds 30 s timeout) |
+
+The keep-alive max-count default (`CPPHTTPLIB_KEEPALIVE_MAX_COUNT =
+100` requests per connection) is left at the cpp-httplib default —
+adequate for current sessions, and capping the per-connection
+request count provides a backstop against very long-lived sockets
+accumulating server state.
+
 ### 21.6 Audit-cleared this pass
 
 The sixth pass also examined and found no actionable concerns in:

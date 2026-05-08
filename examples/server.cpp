@@ -6054,10 +6054,23 @@ int main(int argc, char ** argv) {
     // see ServerArgs::http_timeout.  Logged below in the startup
     // banner so an operator reading journalctl knows the value in
     // effect without grepping --verbose output.
+    //
+    // Also pin the idle-keep-alive timeout to the same value so the
+    // server doesn't kill the TCP socket between agentic-session
+    // hops.  cpp-httplib's default is 5 s which is way too tight for
+    // a chat server: a tool dispatch round-trip (web_fetch, bash that
+    // compiles, fs_grep on a big tree) routinely exceeds 5 s, so the
+    // server would close the keep-alive connection between the
+    // previous turn's SSE end and the next POST — adding one
+    // TIME_WAIT per hop on the server side and undoing half the
+    // client-side persistent-Client win from commit 841dd47.  Lifting
+    // this to http_timeout means the connection lives as long as the
+    // session does.
     {
         const int t = args.http_timeout > 0 ? args.http_timeout : 600;
         svr.set_read_timeout (t);
         svr.set_write_timeout(t);
+        svr.set_keep_alive_timeout(t);
     }
 
     // CORS — permissive to be friendly with browser-based clients. Tighten if

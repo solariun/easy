@@ -964,6 +964,13 @@ int main(int argc, char ** argv) {
     svr.set_payload_max_length(args.max_body);
     svr.set_read_timeout (kReadTimeoutSeconds);
     svr.set_write_timeout(kWriteTimeoutSeconds);
+    // Pin the idle-keep-alive timeout to the read timeout so a client
+    // doing back-to-back tools/call requests on one TCP connection
+    // doesn't get its socket killed by cpp-httplib's 5 s default
+    // between calls.  MCP request bodies are tiny but inter-arrival
+    // can easily exceed 5 s when the calling AI client is waiting on
+    // its own tool dispatch chain.
+    svr.set_keep_alive_timeout(kReadTimeoutSeconds);
 
     // Custom thread pool — cpp-httplib's default is ThreadPool(8); we
     // resize via the new_task_queue factory hook so high-concurrency
