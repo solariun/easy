@@ -1581,31 +1581,40 @@ opens a new TCP, server-side TIME_WAIT count rises one per hop —
 exactly the class of bug the original commit set out to avoid, just
 on the other end of the wire.
 
-**Fix.** `examples/server.cpp` now calls
-`svr.set_keep_alive_timeout(t)` with the same `t` it uses for
-`set_read_timeout` / `set_write_timeout` (default 600 s, configurable
-via `[SERVER] http_timeout` / `--http-timeout`). On a typical
-deploy with `http_timeout = 86400` (24 h, the installer default
-since the 5th-pass docs), the connection lives as long as the
-agentic session.  `examples/mcp_server.cpp` pins the keep-alive
-timeout to its `kReadTimeoutSeconds` (30 s) for the same reason,
-matching the slow-loris-vs-real-client trade the MCP daemon already
-makes elsewhere.
+**Fix.**
+
+`examples/server.cpp` now calls `svr.set_keep_alive_timeout(ka)`
+where `ka = max(http_timeout, 3600)`. The 1-hour floor applies even
+when `http_timeout` is configured shorter (e.g. operators who
+choose aggressive slow-loris hardening on the request payload still
+get generous idle re-use between requests). When `http_timeout` is
+longer than 1 h — including the installer's default of 86400 s
+(24 h) — the keep-alive timeout follows it, so the connection
+lives as long as the agentic session.
+
+`examples/mcp_server.cpp` pins keep-alive timeout to **3600 s
+(1 hour)** as a constant, decoupled from the per-request slow-loris
+read/write timeouts (30 / 60 s). MCP clients typically dispatch a
+batch of `tools/call` requests, then sit idle waiting on their own
+LLM turn before the next batch — holding the TCP socket across that
+idle window avoids server-side TIME_WAIT pile-up under load.
 
 **Verification.** Live test with a persistent Python `http.client`
 connection against `easyai-mcp-server`:
 
-| Pause between requests | Pre-fix | Post-fix |
-| --- | --- | --- |
-| 7 s   | server closed (ConnectionReset) | reused (same `socket_fd`) |
-| 25 s  | server closed                   | reused (same `socket_fd`) |
-| 35 s  | server closed                   | server closed (correct — exceeds 30 s timeout) |
+| Pause between requests | Pre-fix (5 s default) | After 1st fix (30 s) | Final (1 h floor) |
+| --- | --- | --- | --- |
+| 7 s   | server closed (`ConnectionReset`) | reused (same `socket_fd`) | reused |
+| 25 s  | server closed                     | reused                    | reused |
+| 35 s  | server closed                     | server closed             | reused (`socket_fd=4`) |
+| 95 s  | server closed                     | server closed             | reused (`socket_fd=4`) |
 
 The keep-alive max-count default (`CPPHTTPLIB_KEEPALIVE_MAX_COUNT =
 100` requests per connection) is left at the cpp-httplib default —
-adequate for current sessions, and capping the per-connection
-request count provides a backstop against very long-lived sockets
-accumulating server state.
+caps per-connection request count as a backstop against very
+long-lived sockets accumulating server state. 100 requests is
+plenty for any single agentic session; sessions that exceed that
+will silently rotate to a fresh socket, no operator action needed.
 
 ### 21.6 Audit-cleared this pass
 

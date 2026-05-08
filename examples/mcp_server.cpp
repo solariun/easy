@@ -964,13 +964,17 @@ int main(int argc, char ** argv) {
     svr.set_payload_max_length(args.max_body);
     svr.set_read_timeout (kReadTimeoutSeconds);
     svr.set_write_timeout(kWriteTimeoutSeconds);
-    // Pin the idle-keep-alive timeout to the read timeout so a client
-    // doing back-to-back tools/call requests on one TCP connection
-    // doesn't get its socket killed by cpp-httplib's 5 s default
-    // between calls.  MCP request bodies are tiny but inter-arrival
-    // can easily exceed 5 s when the calling AI client is waiting on
-    // its own tool dispatch chain.
-    svr.set_keep_alive_timeout(kReadTimeoutSeconds);
+    // Idle-keep-alive: 1 hour, decoupled from the per-request
+    // slow-loris read/write timeout (30 / 60 s).  MCP clients
+    // typically dispatch a few tools/call requests, then sit idle
+    // waiting on their own LLM turn before issuing the next batch.
+    // Holding the TCP socket open across that idle window avoids
+    // server-side TIME_WAIT pile-up under load.  cpp-httplib's
+    // CPPHTTPLIB_KEEPALIVE_MAX_COUNT (default 100) still bounds
+    // total requests per socket, so a 1-hour idle ceiling does not
+    // mean unbounded server state per client.
+    constexpr int kKeepAliveTimeoutSeconds = 3600;
+    svr.set_keep_alive_timeout(kKeepAliveTimeoutSeconds);
 
     // Custom thread pool — cpp-httplib's default is ThreadPool(8); we
     // resize via the new_task_queue factory hook so high-concurrency
