@@ -39,7 +39,30 @@
 #include "chat.h"
 #include "common.h"
 
+// VerboseServer (defined later in this file) overrides the
+// httplib::Server::process_and_close_socket(socket_t) method to log
+// per-TCP-connection accept/close events.  Upstream cpp-httplib
+// declares that virtual `private:`, which would refuse the override's
+// call to the base implementation — and we MUST call the base, that's
+// what runs the actual HTTP keep-alive / parse pipeline.
+//
+// The macro trick below widens `private` to `protected` for THIS
+// translation unit's view of httplib.h.  It changes only compile-time
+// access checks; vtable layout is unaffected, so linking against
+// cpp-httplib.a (compiled against the unmodified header) is safe.
+//
+// Strict scoping rules:
+//   - Wraps ONLY the httplib.h include, not any neighbouring headers.
+//   - httplib.h's include guard (CPPHTTPLIB_HTTPLIB_H) means any later
+//     #include "httplib.h" elsewhere is a no-op, so this redefinition
+//     can't leak into other TUs.
+//   - Verified that common.h / chat.h above do NOT transitively
+//     include httplib.h, so the order is correct.
+//   - Leaves no derivative copy of cpp-httplib in our build tree and
+//     does not modify llama.cpp's source on disk.
+#define private protected
 #include "httplib.h"          // vendored by llama.cpp
+#undef private
 #include "nlohmann/json.hpp"  // vendored by llama.cpp
 
 #if defined(EASYAI_BUILD_WEBUI)

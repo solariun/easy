@@ -272,27 +272,15 @@ if (EASYAI_BUILD_EXAMPLES)
     add_executable(easyai-server examples/server.cpp ${EASYAI_WEBUI_HEADERS})
     target_link_libraries(easyai-server PRIVATE easyai cpp-httplib llama-common ${EASYAI_ATOMIC_LIBS})
 
-    # easyai-server's VerboseServer subclass needs to call the base
-    # httplib::Server::process_and_close_socket() to log per-TCP-connection
-    # accept/close events. Upstream declares that method `private:`, so we
-    # produce a build-dir-only patched copy of httplib.h and prepend its
-    # directory on the include path — only this target sees the patched
-    # header; the upstream vendored file stays untouched. See
-    # cmake/patch_httplib.cmake.
-    set(_easyai_httplib_patched_dir "${CMAKE_CURRENT_BINARY_DIR}/easyai-cpp-httplib")
-    set(_easyai_httplib_patched     "${_easyai_httplib_patched_dir}/httplib.h")
-    execute_process(
-        COMMAND ${CMAKE_COMMAND}
-            -DSOURCE=${CMAKE_CURRENT_SOURCE_DIR}/../llama.cpp/vendor/cpp-httplib/httplib.h
-            -DDEST=${_easyai_httplib_patched}
-            -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/patch_httplib.cmake
-        RESULT_VARIABLE _httplib_patch_rc)
-    if (NOT _httplib_patch_rc EQUAL 0)
-        message(FATAL_ERROR "[easyai] httplib.h patch failed (rc=${_httplib_patch_rc})")
-    endif()
-
+    # easyai-server's VerboseServer subclass overrides the
+    # httplib::Server::process_and_close_socket virtual to log per-TCP
+    # connect/close events. Upstream declares that virtual `private:`;
+    # we widen it to `protected` for our TU only via a tiny macro trick
+    # local to examples/server.cpp (`#define private protected` around
+    # the httplib.h include, scoped by httplib.h's own include guard).
+    # That keeps llama.cpp's source untouched and produces no derivative
+    # copy of cpp-httplib in our build tree.
     target_include_directories(easyai-server PRIVATE
-        ${_easyai_httplib_patched_dir}    # MUST come first — patched httplib.h
         ${CMAKE_CURRENT_SOURCE_DIR}/../llama.cpp/vendor/cpp-httplib
         ${CMAKE_CURRENT_SOURCE_DIR}/../llama.cpp/vendor
         ${CMAKE_CURRENT_BINARY_DIR})
