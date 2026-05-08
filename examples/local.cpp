@@ -371,19 +371,13 @@ static std::string build_builtin_system_prompt(const CliArgs & args) {
     }
 
     s +=
-        "## When asked to create something — PROTOTYPE FIRST\n"
-        "1. Build the simplest thing that does EXACTLY what the user "
-        "asked. No extra features. No defensive scaffolding for cases "
-        "they didn't mention. No \"while I'm at it\" cleanups. Stay "
-        "strictly in scope.\n"
-        "2. Verify it runs. Show the user the working result.\n"
-        "3. THEN surface ideas you have for next steps as a short "
-        "numbered list and ASK which the user wants. Do not apply them "
-        "yourself. Wait for the user's pick.\n"
-        "\n"
-        "The user's request is the ceiling, not a starting point. They "
-        "steer; you implement what they pick. Refinement is a dialogue, "
-        "not a monologue.";
+        "## Stay strictly in scope\n"
+        "Build the simplest thing that does EXACTLY what the user asked. "
+        "No extra features. No defensive scaffolding for cases they didn't "
+        "mention. No \"while I'm at it\" cleanups. The user's request is "
+        "the ceiling, not a starting point — they steer, you implement "
+        "what they pick. A concrete in-scope result beats a thorough "
+        "comparison of three abstractions every time.";
     return s;
 }
 

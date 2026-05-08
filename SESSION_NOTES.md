@@ -370,18 +370,24 @@ Webui title default also flips to `"Deep"`.
         [environment]  — absolute path of the sandbox root
                          (saves the wasted "where am I" tool
                          hop on turn 1)
-        [guidance]     — "PROTOTYPE FIRST. EXACTLY what the
-                         user asked, no more. Verify it runs.
-                         Surface ideas as a numbered list and
-                         ASK which the user wants. Do not apply
-                         them yourself. The user's request is
-                         the ceiling, not a starting point."
+        [guidance]     — "Stay strictly in scope. Build the
+                         simplest thing that does EXACTLY what
+                         the user asked. No extras, no defensive
+                         scaffolding, no 'while I'm at it'
+                         cleanups. The user's request is the
+                         ceiling, not a starting point."
     * Same guidance lives in server.cpp's Deep persona and
-      local.cpp's kBuiltinSystem so all three default-prompt
+      local.cpp's built-in prompt so all three default-prompt
       sites match.
-    * The PROTOTYPE-FIRST framing came from a second iteration —
-      previous "pick one and ship" didn't bound scope, models
-      kept adding features the user didn't ask for.
+    * Iteration history: started as "pick one and ship", grew
+      into a 3-step "PROTOTYPE FIRST → verify → ask for next
+      steps" ritual to bound scope. The ritual itself caused
+      problems — models would build, stop, and ask even when
+      the user just wanted the simplest thing done. Collapsed
+      back to a single stay-in-scope paragraph; the no-extras
+      / no-scaffolding / no-while-I'm-at-it specifics carry
+      the scope-bounding work without forcing the build-then-
+      ask dance.
 
   Default preset: balanced → precise everywhere:
     * Library fallbacks (backend.cpp, cli_client.cpp,

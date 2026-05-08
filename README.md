@@ -73,10 +73,10 @@ default prompts, and the CLI flag wiring at once.
   any create/mutate affordance is registered (fs_* / bash / plan),
   the cli prepends two short blocks to the user's `--system` content:
   the absolute sandbox path (saves a "where am I" tool hop on turn 1)
-  and a PROTOTYPE-FIRST behavioral rule (build EXACTLY what the user
-  asked, verify it runs, surface improvements as a numbered list and
-  let the user pick). The same guidance lives in the server's Deep
-  persona and easyai-local's built-in prompt.
+  and a stay-in-scope behavioral rule (build EXACTLY what the user
+  asked — no extras, no defensive scaffolding, no "while I'm at it"
+  cleanups). The same guidance lives in the server's Deep persona
+  and easyai-local's built-in prompt.
 * **Default sampling preset → `precise`** (was `balanced`).
   Temp 0.2, top_p 0.95, top_k 40, min_p 0.10. Tuned for code,
   math, and factual Q&A — the dominant use case for a tool-calling
