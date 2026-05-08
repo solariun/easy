@@ -1001,7 +1001,12 @@ using easyai::cli::client_has_tool;
 //   the conversation isn't truncated mid-stream. After the chat returns
 //   the program exits cleanly (rc=0).
 //   Second signal in the same turn → user's clearly impatient — fall
-//   back to a hard cancel like quiet mode.
+//   back to a cooperative cancel like quiet mode (flips the Client's
+//   cancel flag; takes effect on the next SSE chunk).
+//   Third signal in the same turn → cooperative cancel didn't unblock
+//   us (stalled socket, blocked tool handler, deadlocked syscall). Bail
+//   out of the process via _exit(130): no destructors, no atexit, just
+//   gone. This is the operator's "I've waited long enough" lever.
 //   First signal at the REPL prompt (no chat in flight) → existing
 //   behavior: getline returns EINTR, the prompt loop exits cleanly.
 //
@@ -1009,17 +1014,36 @@ using easyai::cli::client_has_tool;
 // practice on every platform we care about (x86, ARM64, RISC-V) — that
 // plus a single ::write() to STDERR_FILENO is all we do from inside the
 // handler. printf / fprintf would NOT be safe.
-static std::atomic<bool>   g_signal_caught{false};
+static std::atomic<int>    g_signal_count{0};     // 0=none, 1=graceful, 2=cancel, 3+=force
 static std::atomic<bool>   g_quiet_mode{false};   // mirror of o.quiet
 static std::atomic<bool>   g_in_chat{false};      // true between cli.chat() entry/exit
 static std::atomic<bool>   g_graceful_exit{false};// "exit cleanly when the turn ends"
 static easyai::Client *    g_active_client = nullptr;
 
 static void on_terminating_signal(int /*sig*/) {
-    bool was_caught = g_signal_caught.exchange(true, std::memory_order_relaxed);
+    const int count = g_signal_count.fetch_add(1, std::memory_order_relaxed) + 1;
 
-    // Second signal OR --quiet → hard cancel (the existing behavior).
-    if (was_caught || g_quiet_mode.load(std::memory_order_relaxed)) {
+    // ::write is async-signal-safe; stdio is not. GCC's warn_unused_result
+    // on write() bypasses the (void) cast, so assign-then-discard.
+
+    // Third (or later) signal — operator hammered Ctrl-C; cooperative
+    // cancel clearly isn't taking effect. Bypass C++ destructors and
+    // atexit, exit the process directly.
+    if (count >= 3) {
+        static const char kMsg[] = "\n<force-exiting now.>\n";
+        ssize_t _ = ::write(STDERR_FILENO, kMsg, sizeof(kMsg) - 1);
+        (void) _;
+        ::_exit(130);
+    }
+
+    // Second signal OR --quiet → cooperative cancel (flip the flag).
+    if (count >= 2 || g_quiet_mode.load(std::memory_order_relaxed)) {
+        if (count == 2) {
+            static const char kMsg[] =
+                "\n<cancelling… Ctrl-C once more to force-exit.>\n";
+            ssize_t _ = ::write(STDERR_FILENO, kMsg, sizeof(kMsg) - 1);
+            (void) _;
+        }
         if (g_active_client != nullptr) g_active_client->request_cancel();
         return;
     }
@@ -1030,10 +1054,7 @@ static void on_terminating_signal(int /*sig*/) {
         g_graceful_exit.store(true, std::memory_order_relaxed);
         static const char kMsg[] =
             "\n<exiting: waiting for the ai session to be finished. "
-            "Ctrl-C again to force.>\n";
-        // ::write is async-signal-safe; stdio is not. GCC's
-        // warn_unused_result on write() bypasses the (void) cast, so
-        // assign-then-discard.
+            "Ctrl-C again to cancel; once more to force-exit.>\n";
         ssize_t _ = ::write(STDERR_FILENO, kMsg, sizeof(kMsg) - 1);
         (void) _;
         return;
@@ -1122,7 +1143,7 @@ int run_one(easyai::Client & cli, easyai::Plan & plan,
                      st.dim(), st.reset());
         return 0;
     }
-    if (g_signal_caught.load(std::memory_order_relaxed)) {
+    if (g_signal_count.load(std::memory_order_relaxed) > 0) {
         std::fprintf(stderr, "%s── cancelled ──%s\n", st.yellow(), st.reset());
         return 130;   // conventional exit code for SIGINT
     }
@@ -1186,7 +1207,7 @@ int run_repl(easyai::Client & cli, easyai::Plan & plan,
         // immediately. The signal-caught atomic also resets here so we
         // can detect a Ctrl+C that arrives DURING getline below.
         cli.clear_cancel();
-        g_signal_caught.store(false, std::memory_order_relaxed);
+        g_signal_count.store(0, std::memory_order_relaxed);
 
         std::fprintf(stdout, "%s>%s ", st.cyan(), st.reset());
         std::fflush(stdout);
@@ -1196,7 +1217,7 @@ int run_repl(easyai::Client & cli, easyai::Plan & plan,
             // the two so Ctrl+C at an empty prompt exits cleanly without
             // also turning Ctrl+D into a confusing "cancelled" message.
             std::fputc('\n', stdout);
-            if (g_signal_caught.load(std::memory_order_relaxed)) {
+            if (g_signal_count.load(std::memory_order_relaxed) > 0) {
                 std::fprintf(stderr, "%s(interrupted)%s\n",
                              st.dim(), st.reset());
             }
