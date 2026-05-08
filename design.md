@@ -295,6 +295,176 @@ If `replace_history` is called we wipe the KV cache via
 
 ---
 
+## 4b. Sampling and the penalty stack
+
+Every step of generation is a draw from a probability distribution
+over the vocabulary.  Sampling is the set of knobs that *shape* that
+distribution before the draw.  We expose three orthogonal layers:
+
+| Layer | Purpose | Knobs |
+|---|---|---|
+| **Shapers** | Decide which tokens are *eligible* and how flat or peaked the distribution is. | `temperature`, `top_p`, `top_k`, `min_p` |
+| **Penalties** | Bias *against* tokens the model has already produced, to prevent loops and topic-stickiness. | `repeat_penalty`, `frequency_penalty`, `presence_penalty` |
+| **Presets** | Named bundles of shaper values that match a use-case (code, chat, brainstorming). | `precise / balanced / creative / …` |
+
+Shapers and presets are well-understood llama.cpp territory; this
+section focuses on the penalty layer because the three penalties
+look superficially similar and pick-the-right-one mistakes are the
+most common sampling-tuning bug we see in production.
+
+### The three penalties — what they actually do
+
+All three penalties live in the same struct
+(`common_params_sampling`) and apply at the same point in the
+sampler pipeline (after the shapers, before the draw).  The math is
+what differs:
+
+| Penalty | Form | Read as | llama.cpp field |
+|---|---|---|---|
+| `repeat_penalty` | **multiplicative** on the logit of any token in the recent window | "scale the log-probability of any previously-seen token by `1/p`" | `penalty_repeat` |
+| `frequency_penalty` | **additive**, scaled by *how many times* the token has appeared | "subtract `p × count` from the logit" | `penalty_freq` |
+| `presence_penalty` | **additive**, fixed per token that has appeared *at all* | "subtract `p` from the logit if the token has been seen — once or a hundred times, same cost" | `penalty_present` |
+
+The three failure modes they each address:
+
+* **`repeat_penalty`** — *literal token repetition* in a tight
+  window.  The classic small-thinking-model loop: "I'll write
+  types.h / Let me write types.h / OK, creating types.h" —
+  identical tokens in adjacent positions.  Multiplicative form
+  means the penalty *grows fast* once a token recurs: the second
+  occurrence is mildly discouraged, the third is hammered.
+
+* **`frequency_penalty`** — *over-use of common tokens* across the
+  whole turn.  The "the the the" / "and and and" failure on weak
+  models, or a model that keeps pronouning everything as "it".
+  Linear in count, so cheap tokens accumulate cost gradually.
+
+* **`presence_penalty`** — *topic stickiness*.  Once a concept
+  appears, the model becomes likelier to keep referring to it
+  (linguistically: anaphora; statistically: the KV cache primes
+  related tokens).  A flat per-token cost on already-seen tokens
+  pushes the model to introduce *new* vocabulary instead of
+  rehearsing the same one — useful for keeping long agentic flows
+  from collapsing into a single narrow topic.
+
+### Why we added `presence_penalty` now
+
+The original safety net was `repeat_penalty = 1.15` (mild
+multiplicative) — catches tight rephrasing loops, leaves everything
+else alone.  That worked well for short turns.
+
+On *long agentic flows* (10+ tool hops, 50k+ tokens of
+conversation history), `repeat_penalty=1.15` starts penalising the
+wrong thing.  Examples we hit in production:
+
+* The model has called `fs_read_file` four times.  On the fifth
+  call, the literal tokens `fs_read_file` are inside the
+  recent-token window.  `repeat_penalty` discounts them.  The
+  model substitutes a paraphrase — `read_file`, `fs_read`,
+  `read` — which doesn't match any registered tool and causes an
+  "unknown tool" failure.
+* During a long planning section, the model has used the word
+  "step" a dozen times.  `repeat_penalty` makes "step" expensive,
+  so the model starts pronouning ("the next *one*", "the
+  following *thing*"), which the user finds harder to read.
+
+These are correct *behaviours* of `repeat_penalty` — its job is to
+discourage repetition.  But for an agent that *should* keep saying
+`fs_read_file` exactly the same way, repetition is feature, not
+bug.  Multiplicative penalties also stack non-linearly: by hop 5+
+the third occurrence of a tool name is ~1.5× discouraged in raw
+logit space, which is a lot.
+
+`presence_penalty` is the lever for the *other* failure mode —
+topic stickiness — without the per-occurrence ramp-up.  A fixed
+1.5 cost per "this token has appeared at all" leaves the
+quantitative shape of repetition unchanged: calling
+`fs_read_file` for the tenth time is no more expensive than the
+second.  But it does push the model to *introduce new content*
+between tool calls instead of paraphrasing the prior turn.
+
+The production tuning on the AI box settled on:
+
+```
+repeat_penalty   = 1.0      ; off — let the model repeat tool names literally
+presence_penalty = 1.5      ; gentle pressure to introduce new content
+```
+
+This pairing tested better than `repeat_penalty=1.15` alone on
+long agentic flows.  Operators with shorter chat workloads can
+reverse it (`repeat_penalty=1.15`, `presence_penalty=0`) — the
+trade-off is workload-shape-dependent, not absolute.
+
+### How the penalty values reach the sampler
+
+```
+[ENGINE] presence_penalty = 1.5          (INI, generated by installer)
+        │
+        │  apply_ini_to_args()
+        ▼
+ServerArgs::presence_penalty = 1.5f
+        │
+        │  if (args.presence_penalty > -2.0f)        (sentinel guard)
+        ▼
+ctx->engine.presence_penalty(1.5f)
+        │
+        │  Engine::presence_penalty()
+        ▼
+params.sampling.penalty_present = 1.5f   (llama.cpp common_params_sampling)
+        │
+        │  load() → common_sampler_init()
+        ▼
+sampler chain applies the penalty before every token draw
+```
+
+The sentinel `-2.0f` ("not set") is shared with
+`Client::presence_penalty()` in `libeasyai-cli` — `-2.0` is the
+floor of the OpenAI-defined valid range, so picking it as
+"untouched" loses a single legal point but matches the convention
+used everywhere else.  Any value strictly greater than `-2.0`
+wins.
+
+### Per-request behaviour
+
+`Engine::set_sampling(temp, top_p, top_k, min_p)` is called at
+the **top of every request** to reset the *shapers* to ambient
+defaults (or to per-request overrides from the chat-completions
+JSON body).  Critically, `set_sampling()` does **not** touch
+`penalty_repeat`, `penalty_freq`, or `penalty_present`.
+
+That asymmetry is deliberate.  The shapers are *style* knobs —
+clients legitimately want a creative-temperature one-off in the
+middle of a precise-temp session, and OpenAI's request body has
+fields for them.  The penalties are *guardrails* — once the
+operator has tuned them for the model + workload, per-request
+overrides would mostly be a footgun (a third-party prompt could
+disable the anti-loop net by passing `repeat_penalty: 1.0`).
+They stick at startup-set values.
+
+If we ever need per-request penalty overrides (e.g. an OpenAI
+client passing `presence_penalty: 0.5` in the body), the wiring is
+a one-line addition to `set_sampling()` plus body-field parsing —
+intentionally not done yet because no concrete need has surfaced.
+
+### Where each knob lives in the layered API (cf. §1b)
+
+| Layer | Surface | Knobs |
+|---|---|---|
+| **Tier 1** (`Agent`) | implicit — uses preset only | preset name, no penalty access |
+| **Tier 2a** (`Engine`) | `Engine::repeat_penalty(float)`, `Engine::presence_penalty(float)` | typed setters |
+| **Tier 2b** (`Client`) | `Client::repeat_penalty / frequency_penalty / presence_penalty` | typed setters; written into the OpenAI request body |
+| **Tier 3** (CLI / INI) | `--repeat-penalty F`, `--presence-penalty F`, `[ENGINE] repeat_penalty / presence_penalty` | one flag and one INI key per knob |
+| **Tier 4** (raw HTTP) | request-body field `presence_penalty` etc. | currently honoured by the Client (outbound) but ignored by the server (inbound — see "Per-request behaviour" above) |
+
+`frequency_penalty` is intentionally *not* exposed at Tier 2a
+(Engine).  llama.cpp supports it (`penalty_freq`) but we haven't
+seen a workload where it outperformed the
+`repeat_penalty + presence_penalty` pair, so adding the surface
+would just be one more knob to mistune.  If the need arises the
+plumbing follows the `presence_penalty` template exactly.
+
+---
+
 ## 5. Tools & schema generation
 
 A `Tool` is just:

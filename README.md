@@ -392,7 +392,8 @@ has a matching INI key (see [`easyai-server.md`](easyai-server.md) §1).
 | `--top-p F` | per preset | Nucleus sampling p. |
 | `--top-k N` | per preset | Top-k cutoff. |
 | `--min-p F` | per preset | Min-p threshold. |
-| `--repeat-penalty F` | 1.15 | Repetition penalty — anti-loop safety net for thinking models that lock into rephrasing their own intent. `--repeat-penalty 1.0` disables. |
+| `--repeat-penalty F` | 1.15 | Repetition penalty (multiplicative on recent logits) — anti-loop safety net for thinking models that lock into rephrasing their own intent. `--repeat-penalty 1.0` disables. |
+| `--presence-penalty F` | 0.0 | Presence penalty (additive, fixed cost per token-already-seen, OpenAI semantics, `[-2.0, 2.0]`). Discourages topic stickiness without penalising literal tool-name repetition; pairs well with `--repeat-penalty 1.0` on long agentic flows. See [`design.md` §4b](design.md#4b-sampling-and-the-penalty-stack). |
 | `--max-tokens N` | unlimited | Cap tokens per request. |
 | `--seed U32` | random | RNG seed (0 = random). |
 | `--max-incomplete-retries N` | 10 | Retry budget for "announce-only" turns; 0 disables. |
@@ -585,7 +586,8 @@ Full local engine. Header:
 | `.seed(u32)` | `uint32_t` | random | RNG seed. |
 | `.system(prompt)` | `string` | — | System prompt. |
 | `.temperature(t) / .top_p(p) / .top_k(k) / .min_p(p)` | scalar | 0.7 / 0.95 / 40 / 0.05 | Sampling. |
-| `.repeat_penalty(r)` | `float` | 1.15 | Repetition penalty — anti-loop default. Set to 1.0 to disable. |
+| `.repeat_penalty(r)` | `float` | 1.15 | Repetition penalty (multiplicative on recent logits) — anti-loop default. Set to 1.0 to disable. |
+| `.presence_penalty(p)` | `float` | 0.0 | Presence penalty (additive, fixed cost per token-already-seen, OpenAI semantics, range `[-2.0, 2.0]`). Pairs well with `repeat_penalty=1.0` on long agentic flows. See [`design.md` §4b](design.md#4b-sampling-and-the-penalty-stack). |
 | `.max_tokens(n)` | `int` | -1 (until ctx) | Per-turn cap. |
 | `.tool_choice_auto / .tool_choice_required / .tool_choice_none` | call | auto | Tool-choice mode. |
 | `.parallel_tool_calls(on)` | `bool` | off | Allow parallel tool calls. |

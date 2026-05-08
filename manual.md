@@ -2763,9 +2763,51 @@ the full Behaviour / Pick when… table.
 
 Per-request: pin temp + top_p + top_k + min_p in the request body
 (via the `--temperature` / `--top-p` / etc. flags on cli-remote, or
-the matching `Client::*` setters in code).
+the matching `Client::*` setters in code).  These reset every turn.
 
-### 8.6 Tool budget
+### 8.6 Penalties — `repeat_penalty` and `presence_penalty`
+
+Penalties bias generation *against* tokens that have already been
+produced.  Three knobs, three failure modes:
+
+| Knob | Form | What it bites on |
+|---|---|---|
+| `repeat_penalty` | multiplicative on logits in recent window | tight literal repetition ("I'll write X / Let me write X / OK, creating X") |
+| `frequency_penalty` | additive, scales with token *count* | over-use of common tokens ("the the the") |
+| `presence_penalty` | additive, fixed cost per token-already-seen *at all* | topic stickiness without per-occurrence ramp-up |
+
+The default `repeat_penalty=1.15` is an anti-loop safety net for
+thinking models that otherwise rephrase the same intent before
+acting.  It works for short turns.  On *long agentic flows* (10+
+tool hops) it starts misfiring — by the fifth `fs_read_file` call
+the literal tokens of the tool name fall inside the window, the
+model paraphrases ("read_file", "fs_read"), the dispatcher fails
+with "unknown tool".
+
+`presence_penalty` (default `0.0`) is the lever for the *other*
+failure mode.  A fixed per-token-seen cost discourages re-introducing
+the same vocabulary without the per-occurrence ramp of
+`repeat_penalty`, so calling `fs_read_file` for the tenth time costs
+the same as the second.
+
+The production AI box ships `repeat_penalty=1.0` (off) +
+`presence_penalty=1.5` because that pairing tested better on long
+flows than `repeat_penalty=1.15` alone.  Operators with shorter
+chat workloads can keep the original pairing
+(`repeat_penalty=1.15`, `presence_penalty=0`).
+
+Persistence: penalties are set at startup via the INI / CLI flags
+(`[ENGINE] repeat_penalty / presence_penalty`,
+`--repeat-penalty / --presence-penalty`) and **persist across
+requests**.  Per-request `set_sampling()` only resets the shapers
+(temp / top_p / top_k / min_p) — the penalties stick.  This is
+deliberate: they're operator-tuned guardrails, not per-call
+stylistic knobs.
+
+The full design rationale (math, failure modes, layered API) lives
+in [`design.md` §4b](design.md#4b-sampling-and-the-penalty-stack).
+
+### 8.7 Tool budget
 
 `Engine::chat()` caps at 8 tool hops; `Client::chat()` does the
 same.  A model that runs away calling tools without converging will

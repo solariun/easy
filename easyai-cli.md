@@ -312,12 +312,46 @@ nothing else — neither block is injected.
 ## 7. Sampling and penalty knobs
 
 All knobs are server-side parameters; the CLI just forwards what you
-pass. Omitting any leaves the server's default in place. The one
-non-obvious default in the CLI itself is `--repeat-penalty 1.15` —
-that's an anti-loop safety net for thinking models that otherwise
-rephrase the same plan three times before acting ("I'll write types.h /
-Let me write types.h / OK, creating types.h"). Pass `--repeat-penalty
-1.0` to disable.
+pass. Omitting any leaves the server's default in place.
+
+The penalties (`--repeat-penalty`, `--frequency-penalty`,
+`--presence-penalty`) all bias generation *against* tokens that have
+already been produced — but they bite differently:
+
+| Flag | Form | Bites on |
+| --- | --- | --- |
+| `--repeat-penalty F` | multiplicative on recent logits | tight literal repetition ("I'll write X / Let me write X / OK, creating X") |
+| `--frequency-penalty F` | additive, scales with token count | over-use of common tokens ("the the the") |
+| `--presence-penalty F` | additive, fixed cost per token-already-seen | topic stickiness without per-occurrence ramp-up |
+
+`--repeat-penalty 1.15` (the CLI's only non-obvious default) is the
+anti-loop safety net.  Pass `1.0` to disable when you *want* the model
+to repeat itself — for example when calling the same tool many times
+in an agentic flow and you don't want the model paraphrasing tool
+names after the third call.
+
+`--presence-penalty F` (OpenAI standard, range `[-2.0, 2.0]`,
+default `0.0`) is the gentler companion.  Reach for it when:
+
+* You're running long agentic flows where `repeat_penalty=1.15`
+  starts making the model invent tool-name synonyms.
+* The model has correct content but keeps rehearsing the same
+  topic instead of moving on.
+* You want "introduce new vocabulary" pressure without the
+  per-occurrence cost ramp of `repeat_penalty`.
+
+Typical pairings:
+
+| Workload | `repeat_penalty` | `presence_penalty` |
+|---|---|---|
+| Short chat / single-tool turns | `1.15` (default) | `0.0` |
+| Long agentic flows (10+ hops) | `1.0` (off) | `1.0` to `1.5` |
+| Brainstorm / creative writing | `1.15` | `0.6` to `1.0` |
+| Code generation, structured output | `1.15` | `0.0` |
+
+See [`design.md` §4b](design.md#4b-sampling-and-the-penalty-stack)
+for the full rationale on why the two penalties exist and when to
+pick which.
 
 `--extra-json` is the escape hatch for fields the CLI doesn't know
 about. Whatever JSON object you pass is merged shallowly into the
