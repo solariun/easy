@@ -20,6 +20,7 @@ to other AI applications (Claude Desktop, Cursor, Continue), see
 
 ## Table of contents
 
+0. [Quick start — connect your editor](#0-quick-start--connect-your-editor)
 1. [What gets installed where](#1-what-gets-installed-where)
 2. [The systemd unit](#2-the-systemd-unit)
 3. [Configuration files](#3-configuration-files)
@@ -34,6 +35,147 @@ to other AI applications (Claude Desktop, Cursor, Continue), see
 12. [Upgrading](#12-upgrading)
 13. [Uninstalling](#13-uninstalling)
 14. [Troubleshooting](#14-troubleshooting)
+
+---
+
+## 0. Quick start — connect your editor
+
+The installer leaves you with an OpenAI-compatible HTTP API and an
+mDNS advertisement (`--no-avahi` to skip). With the default install
+the box advertises itself as `<hostname>.local`; the examples below
+assume the server's hostname is **`ai`** so the URL is
+**`http://ai.local:80/v1`**. Substitute your actual hostname (run
+`hostname` on the server) if it isn't `ai`.
+
+**Sanity check first** — fail fast on networking before fighting
+extension config:
+
+```bash
+curl http://ai.local:80/v1/models
+```
+
+You should see a JSON object listing one model whose `id` matches
+`[SERVER] alias` in `easyai.ini` (default `EasyAi`). If `curl` hangs
+or returns nothing, fix DNS / firewall / port before going further.
+
+If your INI has `api_key` set, also pass `Authorization: Bearer …`
+on every request.
+
+### VSCode + Continue.dev
+
+Install + configure in one shot — paste in any shell on the machine
+where VSCode runs:
+
+```bash
+# 1. install the extension via VSCode CLI
+code --install-extension Continue.continue
+
+# 2. write the Continue config pointing at ai.local
+mkdir -p ~/.continue
+cat > ~/.continue/config.yaml <<'YAML'
+name: ai.local
+version: 1.0.0
+schema: v1
+models:
+  - name: EasyAi
+    provider: openai
+    model: EasyAi              # matches [SERVER] alias = EasyAi
+    apiBase: http://ai.local:80/v1
+    apiKey: dummy              # any non-empty string when api_key is unset
+    roles: [chat, edit, apply]
+context:
+  - provider: code
+  - provider: docs
+  - provider: diff
+  - provider: terminal
+  - provider: problems
+  - provider: folder
+  - provider: codebase
+YAML
+```
+
+Open VSCode → Continue panel (sidebar icon, or `Cmd+L` / `Ctrl+L`)
+→ pick `EasyAi` from the model dropdown → start chatting.
+`Cmd+L` opens chat with the current selection;
+`Cmd+I` does inline edits.
+
+If `api_key` is set on the server, replace `dummy` with that token.
+
+### OpenCode (TUI agentic coder)
+
+OpenCode is roughly Claude-Code-shaped: agentic, in-terminal, edits
+files and runs shell commands in the project you launch it from.
+
+```bash
+# 1. install the binary (one-line installer from opencode.ai)
+curl -fsSL https://opencode.ai/install | bash
+
+# 2. configure it to use easyai-server as an OpenAI-compatible provider
+mkdir -p ~/.config/opencode
+cat > ~/.config/opencode/opencode.json <<'JSON'
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "easyai": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "easyai",
+      "options": {
+        "baseURL": "http://ai.local:80/v1",
+        "apiKey": "dummy"
+      },
+      "models": {
+        "EasyAi": { "name": "EasyAi" }
+      }
+    }
+  },
+  "model": "easyai/EasyAi"
+}
+JSON
+
+# 3. launch it inside any project
+cd ~/some/project && opencode
+```
+
+OpenCode runs its own fs/bash sandboxing on YOUR local machine —
+unrelated to the server's `[SERVER] sandbox` and `allow_fs` /
+`allow_bash` gates. The server-side gates only affect tools that
+the model itself calls server-side (web/RAG/etc.).
+
+### VSCode + Cline (heavier agent)
+
+```bash
+code --install-extension saoudrizwan.claude-dev
+```
+
+Click the Cline icon in the sidebar → API Provider →
+**OpenAI Compatible** → fill in:
+
+| Field | Value |
+| --- | --- |
+| Base URL | `http://ai.local:80/v1` |
+| API Key | any non-empty string (or your INI `api_key` if set) |
+| Model ID | `EasyAi` |
+
+Cline calls `/v1/models` on save to verify; you'll see `EasyAi`
+appear in the model picker.
+
+### Other OpenAI-compatible clients
+
+The pattern is identical for anything that takes a base URL and a
+model id:
+
+| Client | Base URL | Model |
+| --- | --- | --- |
+| `openai` Python SDK | `http://ai.local:80/v1` | `EasyAi` |
+| `openai` Node SDK | `http://ai.local:80/v1` | `EasyAi` |
+| Open WebUI (OpenAI mode) | `http://ai.local:80/v1` | `EasyAi` |
+| LobeChat | `http://ai.local:80/v1` | `EasyAi` |
+| LM Studio (remote) | `http://ai.local:80/v1` | `EasyAi` |
+| LiteLLM proxy upstream | `http://ai.local:80/v1` | `openai/EasyAi` |
+
+Ollama-mode clients work too — point them at
+`http://ai.local:80/api/tags` and pick the same model id. See §9 for
+the full endpoint table.
 
 ---
 
@@ -303,6 +445,14 @@ Active by default. The systemd unit always passes
 is why it's under `/var/lib` (mutable state) rather than `/etc`
 (operator config).
 
+**Visibility:** RAG is the model's PRIVATE long-term memory — there
+is no end-user UI, command, or API to browse or read entries. The
+operator can `cat` files on disk; the user talking to the model
+cannot. Current builds spell this out in the `rag` tool description
+itself so the model stops saying things like "check the rag for the
+code" — but if you ship a custom system prompt, repeat the rule
+there too.
+
 **Quick checks:**
 
 ```bash
@@ -436,9 +586,43 @@ Symptom: large model load → GPU hangs → `journalctl -k` shows
 `amdgpu: ttm pool full`.
 
 Fix: increase the GTT page limit in your boot config (kernel param
-`amdgpu.gttsize` or `ttm.pages_limit`). Gustavo's MINISFORUM UM690L
-(Radeon 680M, 32 GB system RAM) uses `ttm.pages_limit=7340032` (28 GiB
-GTT).
+`amdgpu.gttsize` or `ttm.pages_limit`). The installer manages this
+for you — re-run with `--gtt N` (default **29 GiB**, was 28 in
+earlier installs) and reboot. Gustavo's MINISFORUM UM690L (Radeon
+680M, 32 GB system RAM) currently runs at `ttm.pages_limit=7602176`
+(29 GiB GTT) — leaves enough headroom for a Q5_K_M / MXFP4_MOE 30B
+MoE plus a 32k KV cache fully on the iGPU.
+
+### Model uses a tool that's disabled in the INI
+
+Symptom: `allow_bash = off` in `easyai.ini`, but the model still
+emits a `bash` tool call (which the server rejects, model retries,
+loop).
+
+Cause: pre-2026-05 builds had two bugs that surfaced here. Both
+fixed in current builds:
+
+1. The server read `allow_fs` from the INI but never propagated it
+   to the toolbelt — a non-empty `sandbox` re-enabled `fs_*` even
+   with `allow_fs = off`. Now `allow_fs` / `allow_bash` are honoured
+   independently of `sandbox`.
+2. The built-in system prompt named every tool by hand
+   (`fs_read_file`, `bash`, `plan`, …) regardless of whether they
+   were registered. Models then hallucinated calls to disabled
+   tools. Now the built-in prompt only mentions tools that are
+   actually registered for the current invocation.
+
+If you supply your OWN system prompt via `[SERVER] system_file`
+(`/etc/easyai/system.txt`), the server cannot rewrite it for you —
+remove any references to tools you've gated off. Verify with:
+
+```bash
+sudo -u easyai easyai-server --config /etc/easyai/easyai.ini \
+                             --show-system-prompt | grep -E 'bash|fs_'
+```
+
+If you see `bash` / `fs_*` listed and the corresponding INI flag is
+`off`, edit `system.txt` to drop those lines.
 
 ### Webui blank / shows yesterday's UI
 
