@@ -54,15 +54,17 @@ std::vector<Tool> Toolbelt::tools() const {
         out.push_back(easyai::tools::web(google));
     }
     // fs / bash / python3 share a working root: the configured sandbox
-    // if set, otherwise ".". Whenever any executor category is enabled,
-    // `fs` should be available too — bash and python3 are strictly more
-    // permissive than `fs`, so allowing them without `fs` is incoherent
-    // (and traps models into using shell heredocs for ordinary file
-    // work). Conversely, anyone pointing at a sandbox wants file access
-    // in it.
-    const bool python_on = allow_python_;
+    // if set, otherwise ".". The unified `fs` and `python3` are
+    // auto-on whenever the operator has signalled "the model can
+    // touch this filesystem" — either by setting a sandbox, or by
+    // enabling bash (which strictly subsumes both). Without that
+    // signal we register neither, even with allow_python_=true;
+    // python3 defaults on so a server with --sandbox gets it for
+    // free, but pointing it at the operator's bare cwd would expose
+    // ambient files we never meant to expose.
     const bool bash_on   = allow_bash_;
-    const bool fs_on     = allow_fs_ && (!sandbox_.empty() || bash_on || python_on);
+    const bool python_on = allow_python_ && (!sandbox_.empty() || bash_on);
+    const bool fs_on     = allow_fs_     && (!sandbox_.empty() || bash_on || python_on);
     const std::string fs_root = sandbox_.empty() ? "." : sandbox_;
     if (fs_on) {
         // Single unified `fs` tool. Eight actions: read, write, list,

@@ -2269,14 +2269,62 @@ Tool bash(std::string root, bool show_output) {
 // The interpreter starts in *isolated mode* — no PYTHON* env vars, no
 // site-packages auto-load, no cwd on sys.path — so the snippet runs
 // against the bare standard library every time, regardless of the host
-// user's Python configuration. Imports beyond the stdlib will fail with
-// ModuleNotFoundError; that's by design.
+// user's Python configuration.
 //
-// NOT a hardened sandbox: the interpreter has the caller's full uid/gid
-// and can `import os`, `import socket`, `import urllib`, `import
-// subprocess` to do anything bash can do. The flags constrain *startup*,
-// not capabilities.
+// SANDBOX-ROOTED FILESYSTEM (defense-in-depth)
+// --------------------------------------------
+// Every snippet is auto-prefixed with a short Python preamble that
+// monkey-patches `builtins.open`, `io.open`, and `os.open` to reject
+// any path resolving outside the sandbox root (the cwd Python is
+// chdir'd into before exec). Attempts to read `/etc/passwd`, write
+// `~/.ssh/foo`, or open `../escape` raise PermissionError.
+//
+// This is NOT a hardened sandbox — the model can still escape via
+// `import ctypes; ctypes.CDLL("libc.so.6").open(...)`, `os.system`,
+// `subprocess.run`, raw socket reads of UNIX-domain server sockets,
+// etc. The protection is against ACCIDENT, not adversarial intent:
+// the description tells the model "never use python3 for disk; use
+// fs(action=...)", and the preamble enforces that contract for the
+// common open() / pathlib paths so a stray `open("/etc/hosts")` in
+// generated code fails loudly instead of silently leaking host data.
 // ============================================================================
+
+// Python preamble auto-prepended to every snippet. Locks open()/os.open()
+// to the sandbox root (cwd at exec time). Identifiers are `_e_*`-prefixed
+// to avoid colliding with any reasonable user code; the preamble keeps
+// references to the original open() functions inside its closure cell so
+// straightforward `import builtins; builtins.open = ...` resets restore
+// the patched (still-checking) version, not the raw one.
+static const char * const kPythonSandboxPreamble =
+    "import os as _e_os, builtins as _e_b, io as _e_io\n"
+    "_e_root = _e_os.path.realpath(_e_os.getcwd())\n"
+    "_e_open_orig = _e_b.open\n"
+    "_e_os_open_orig = _e_os.open\n"
+    "def _e_chk(p):\n"
+    "    if isinstance(p, int): return\n"
+    "    try: s = _e_os.fspath(p)\n"
+    "    except TypeError: return\n"
+    "    if _e_os.path.isabs(s):\n"
+    "        a = _e_os.path.realpath(s)\n"
+    "    else:\n"
+    "        a = _e_os.path.realpath(_e_os.path.join(_e_root, s))\n"
+    "    if a != _e_root and not a.startswith(_e_root + _e_os.sep):\n"
+    "        raise PermissionError(\n"
+    "            'easyai sandbox: disk access to ' + repr(s) +\n"
+    "            ' denied (resolves to ' + repr(a) + ', outside sandbox '\n"
+    "            'root ' + repr(_e_root) + '). The python3 tool is for '\n"
+    "            'compute / network / data only — use fs(action=...) for '\n"
+    "            'disk work.')\n"
+    "def _e_open(f, *a, **k):\n"
+    "    _e_chk(f); return _e_open_orig(f, *a, **k)\n"
+    "def _e_os_open(p, *a, **k):\n"
+    "    _e_chk(p); return _e_os_open_orig(p, *a, **k)\n"
+    "_e_b.open = _e_open\n"
+    "_e_io.open = _e_open\n"
+    "_e_os.open = _e_os_open\n"
+    "del _e_open, _e_os_open\n"
+    "# --- end preamble; user code follows ---\n";
+
 Tool python3(std::string root, bool show_output) {
     auto sb = std::make_shared<Sandbox>(std::move(root));
     return Tool::builder("python3")
@@ -2284,66 +2332,71 @@ Tool python3(std::string root, bool show_output) {
             "Run a Python 3 snippet via `python3 -I -S -E -c <code>`. "
             "Output is stdout and stderr merged.\n"
             "\n"
-            "AUTHORITATIVE SANDBOX RULE — before your first fs / bash / "
-            "python3 call in a task, run fs(action=\"sandbox\") (the "
-            "absolute on-disk root, pinned at registration) and then "
-            "fs(action=\"check_path\") against any file the snippet "
-            "will read from or write to. The interpreter runs with cwd "
-            "PINNED to the sandbox root, so the path you probe with "
-            "fs(action=\"check_path\") is the same path Python will see.\n"
+            "USE THIS FOR — testing, calculation, data processing, "
+            "networking, information gathering. Concretely:\n"
+            "  - quick experiments / what-if computations / verifying "
+            "    an assumption\n"
+            "  - arithmetic and numerical work (Decimal math, statistics, "
+            "    date arithmetic, counting, hashing)\n"
+            "  - data wrangling — parse JSON / CSV, transform lists, "
+            "    regex over text, normalise records\n"
+            "  - networking — `urllib.request` HTTP fetches, JSON APIs, "
+            "    socket probes, DNS lookups\n"
+            "  - querying anything reachable over the network or "
+            "    derivable from a small in-memory dataset\n"
+            "\n"
+            "NEVER USE THIS FOR DISK. The python3 tool is NOT for file "
+            "reads or writes. Use fs(action=...) for every disk "
+            "operation:\n"
+            "  - reading a file → fs(action=\"read\", path=...)\n"
+            "  - writing a file → fs(action=\"write\", path=..., content=...)\n"
+            "  - listing a dir  → fs(action=\"list\", path=...)\n"
+            "  - finding files  → fs(action=\"glob\", pattern=...)\n"
+            "  - searching      → fs(action=\"grep\", pattern=...)\n"
+            "  - probing a path → fs(action=\"check_path\", path=...)\n"
+            "\n"
+            "Disk access from python3 is mechanically restricted to the "
+            "sandbox root: `open()`, `io.open()`, and `os.open()` are "
+            "wrapped to reject any path that resolves outside the cwd. "
+            "Attempts to `open(\"/etc/passwd\")` or "
+            "`open(\"../foo\")` raise PermissionError. This is "
+            "defense-in-depth — the rule is about INTENT: the right "
+            "tool for disk is `fs`, not `python3`.\n"
             "\n"
             "ISOLATED INTERPRETER — `-I -S -E` means: no PYTHON* "
             "environment variables (-E), no `site.py` / no .pth files / "
-            "no site-packages auto-load (-S), no cwd on sys.path (-I, "
-            "which also implies -E -s). The standard library is "
-            "available; third-party packages are NOT, so an `import "
-            "numpy` or `import requests` will fail with "
-            "ModuleNotFoundError. Stick to the stdlib: `json`, `re`, "
-            "`statistics`, `datetime`, `decimal`, `pathlib`, "
-            "`urllib.request`, `subprocess`, `os`, `csv`, `math`, etc.\n"
+            "no site-packages auto-load (-S), no cwd on sys.path (-I). "
+            "The standard library is available; third-party packages "
+            "are NOT, so `import numpy` / `import requests` will fail "
+            "with ModuleNotFoundError. Stick to the stdlib: `json`, "
+            "`re`, `statistics`, `datetime`, `decimal`, `urllib.request`, "
+            "`socket`, `hashlib`, `csv`, `math`, etc.\n"
             "\n"
-            "WHEN TO USE — reach for `python3` for:\n"
-            "  - data manipulation (parse a JSON blob, transform a "
-            "    list, count occurrences)\n"
-            "  - arithmetic / numerical work (Decimal math, statistics, "
-            "    date arithmetic)\n"
-            "  - text processing (regex, multi-step string transforms "
-            "    that would be painful in shell)\n"
-            "  - non-trivial control flow over a small in-memory dataset\n"
-            "\n"
-            "Prefer fs(action=\"read\") / fs(action=\"write\") for plain "
-            "file read/write when no transformation is needed. Prefer "
-            "`bash` for shell pipelines, build runners, git, package "
-            "managers, and other process orchestration.\n"
-            "\n"
-            "WORKING DIRECTORY & PATHS — cwd is the sandbox root. Use "
-            "RELATIVE paths inside your code: `open(\"report.md\")`, "
-            "`pathlib.Path(\"src\").iterdir()`. Do NOT hardcode absolute "
-            "paths for sandbox files — they break portability across "
-            "sandboxes.\n"
-            "\n"
-            "OUTPUT — print() what you want returned to the model; the "
-            "captured stdout+stderr (capped at 32 KB) is what the tool "
-            "result contains. Snippets that don't print anything come "
-            "back with just the `exit=0` line, which is correct but "
-            "rarely useful — almost always you want a `print(result)` "
-            "at the end.\n"
+            "OUTPUT — print() what you want returned to the model. The "
+            "captured stdout+stderr (capped at 32 KB) is the tool "
+            "result. Snippets that don't print anything come back with "
+            "just the `exit=0` line — almost always you want a "
+            "`print(result)` at the end.\n"
             "\n"
             "EXAMPLES:\n"
-            "  {code: \"import json; d = json.loads(open('data.json').read()); "
-            "print(sum(d['items']))\"}\n"
-            "  {code: \"import re; print(len(re.findall(r'TODO', "
-            "open('notes.md').read())))\"}\n"
+            "  {code: \"from decimal import Decimal as D; "
+            "print(D('0.1')+D('0.2'))\"}\n"
+            "  {code: \"import json, urllib.request; "
+            "r=urllib.request.urlopen('https://api.github.com/repos/"
+            "torvalds/linux'); print(json.load(r)['stargazers_count'])\"}\n"
             "  {code: \"from datetime import date, timedelta; "
             "print(date.today() + timedelta(days=42))\"}\n"
+            "  {code: \"import re, sys; data='abc 123 def 456'; "
+            "print(sum(int(x) for x in re.findall(r'\\\\d+', data)))\"}\n"
             "\n"
             "WARNING: this is NOT a hardened sandbox — the interpreter "
-            "runs with the caller's full uid/gid and can `import os`, "
-            "`import socket`, `import subprocess`, `import urllib` to "
-            "do anything bash can. The `-I -S -E` flags constrain "
-            "*startup*, not capabilities. Output is capped at 32 KB and "
+            "has the caller's full uid/gid and can `import os`, "
+            "`import socket`, `import subprocess` to do anything bash "
+            "can. The `-I -S -E` flags constrain *startup* and the "
+            "preamble constrains the common file-open path; neither "
+            "constrains *capabilities*. Output is capped at 32 KB and "
             "a SIGTERM/SIGKILL deadline (default 30s, max 300s) bounds "
-            "the runtime."
+            "runtime."
         )
         .param("code", "string",
                "Python 3 source. Passed verbatim to `-c` (no shell layer; "
@@ -2362,8 +2415,21 @@ Tool python3(std::string root, bool show_output) {
             args::get_int(c.arguments_json, "timeout_sec", timeout_sec);
             if (timeout_sec < 1)   timeout_sec = 1;
             if (timeout_sec > 300) timeout_sec = 300;
+
+            // Prepend the sandbox preamble. The model's `code` is
+            // appended verbatim after the preamble's `# --- end
+            // preamble ---` marker; line-number errors in user code
+            // will be offset by the preamble's line count, but the
+            // model rarely reads tracebacks line-by-line and the
+            // PermissionError messages are descriptive enough to be
+            // actionable on their own.
+            std::string wrapped;
+            wrapped.reserve(std::strlen(kPythonSandboxPreamble) + code.size() + 1);
+            wrapped.append(kPythonSandboxPreamble);
+            wrapped.append(code);
+
             return run_capped_subprocess(
-                sb, CappedExecKind::Python3, code,
+                sb, CappedExecKind::Python3, wrapped,
                 timeout_sec, show_output, "python3");
         })
         .build();

@@ -305,6 +305,52 @@ Webui title default also flips to `"Deep"`.
 ## 5. Recent commits (most recent first)
 
 ```
+2026-05-09 — `python3` default-on + sandbox-rooted disk surface.
+             Promotion from explicit-opt-in to "auto-on whenever the
+             operator signals files-are-OK" (i.e. --sandbox or
+             --allow-bash). The webui inherits it for free since the
+             systemd unit always sets --sandbox.
+
+  Behaviour shift:
+    * Toolbelt::allow_python_ defaults TRUE (was FALSE).
+    * cfg.allow_python defaults TRUE.
+    * Toolbelt::tools() registers python3 when allow_python_ AND
+      (sandbox-or-bash). Same gate as `fs`.
+    * --allow-python flag REMOVED. --no-python opts out
+      (mirroring --no-web / --no-datetime). [SERVER] allow_python
+      defaults on; set to off in the INI for the same effect.
+
+  Disk surface restriction (defense-in-depth):
+    * Every snippet auto-prefixed with kPythonSandboxPreamble — a
+      ~25-line Python preamble that monkey-patches builtins.open,
+      io.open, os.open to reject paths whose realpath is outside
+      the cwd Python was chdir'd into.
+    * open("/etc/passwd"), open("../escape"), os.open("/etc/hosts"),
+      pathlib.Path("/etc/hostname").read_text() all raise
+      PermissionError with a descriptive message that points the
+      model to fs(action=...).
+    * NOT a hardened sandbox — import ctypes; CDLL("libc.so.6").open
+      escapes; subprocess.run / os.system escape. Same threat model
+      as bash, hence kept gated on operator opt-in.
+
+  Description rewrite:
+    * USE FOR: testing, calculation, data processing, networking,
+      information gathering. With concrete examples (Decimal math,
+      urllib HTTP fetch, date arithmetic, regex over text).
+    * NEVER USE FOR DISK — every disk operation has a
+      fs(action=...) equivalent listed inline.
+
+  Smoke tests passed (10/10):
+    sandbox_read_ok, etc_passwd_blocked, dotdot_blocked,
+    os_open_blocked, pathlib_blocked (caught through pathlib.py's
+    internal open()), compute_ok, network_ok (gethostbyname),
+    sandbox_write_ok, stdout_ok (fd-int passthrough), sandbox_subdir_ok.
+
+  Docs updated: README changelog + flag tables, easyai-server.md
+  + easyai-cli.md + easyai-mcp-server.md INI/flag tables.
+```
+
+```
 2026-05-09 — `python3` tool added.
              Second shell-class executor alongside `bash`. Runs snippets
              via `python3 -I -S -E -c <code>` (isolated mode: no

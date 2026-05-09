@@ -34,13 +34,16 @@ namespace easyai::cli {
 //                         engine="google" only enabled when use_google()
 //                         is called AND env vars are present
 //   - plan tool          (when with_plan(Plan&) is called)
-//   - fs                 (when sandbox(<dir>) is called — scoped to <dir>;
+//   - fs                 (when sandbox(<dir>) is called or allow_bash /
+//                         allow_python is on — scoped to <dir>;
 //                         unified read/write/list/glob/grep/check_path/
 //                         cwd/sandbox dispatcher)
+//   - python3            (default ON — runs snippets via
+//                         `python3 -I -S -E -c <code>`; isolated stdlib-
+//                         only interpreter; disk access auto-restricted
+//                         to the sandbox root via a Python preamble.
+//                         Opt out with allow_python(false).)
 //   - bash               (when allow_bash() is called)
-//   - python3            (when allow_python() is called) — runs snippets
-//                         via `python3 -I -S -E -c <code>`; same hardening
-//                         as bash, isolated stdlib-only interpreter
 //
 // `apply(Engine&)` and `apply(Client&)` register the tools AND, when
 // either bash or python3 is enabled, bump the agentic-loop
@@ -104,7 +107,11 @@ private:
     // enables fs_*" behaviour.  Server flips it OFF unless --allow-fs.
     bool        allow_fs_     = true;
     bool        allow_bash_   = false;
-    bool        allow_python_ = false;
+    // python3 defaults ON: a stdlib-only interpreter with the disk
+    // surface auto-restricted to the sandbox root (preamble in
+    // builtin_tools.cpp). Operators who don't want any subprocess
+    // executor at all can flip this off via .allow_python(false).
+    bool        allow_python_ = true;
     bool        show_bash_    = false;
     bool        show_python_  = false;
     bool        no_web_       = false;

@@ -43,6 +43,37 @@ A running log of user-facing changes. Latest first — keep this list
 current as features land so anyone returning to the repo (or
 landing on it for the first time) sees what shipped recently.
 
+### 2026-05-09 — `python3` is default-on with a sandboxed disk surface
+
+Promoting `python3` from explicit-opt-in (--allow-python) to
+auto-on whenever the operator has signalled "the model can touch
+files" — same gate as `fs`: --sandbox set OR --allow-bash on. The
+embedded webui inherits this for free since the systemd unit ships
+with --sandbox /var/lib/easyai/workspace.
+
+* **`--allow-python` removed; `--no-python` is the new opt-out.**
+  Mirrors `--no-web` / `--no-datetime`: the tool defaults on and
+  operators who don't want it pass the `--no-*` flag (or set
+  `[SERVER] allow_python = off` in the INI).
+* **Disk access auto-restricted to the sandbox root.** Every
+  snippet is auto-prefixed with a short Python preamble that
+  monkey-patches `builtins.open`, `io.open`, and `os.open` to
+  reject any path resolving outside the cwd Python was chdir'd
+  into. `open("/etc/passwd")` raises `PermissionError`;
+  `pathlib.Path("/etc/hostname").read_text()` raises through
+  `pathlib`'s internal `open()` call.
+* **Description rewritten to forbid disk use.** "USE FOR: testing,
+  calculation, data processing, networking, information gathering.
+  NEVER USE FOR DISK — every disk operation has a fs(action=...)
+  equivalent." The preamble is defense-in-depth; the description
+  is the primary contract.
+* **Defense-in-depth, not a real sandbox.** The model can still
+  escape via `import ctypes; ctypes.CDLL("libc.so.6").open(...)`,
+  `subprocess.run(["cat", "/etc/passwd"])`, or `os.system(...)` —
+  the protection is against accident, not adversarial intent. Same
+  threat model as `bash`: explicit operator opt-in, not a real
+  sandbox.
+
 ### 2026-05-09 — `python3` tool: isolated Python 3 snippet runner
 
 A second shell-class executor alongside `bash`, gated by its own
@@ -634,7 +665,7 @@ has a matching INI key (see [`easyai-server.md`](easyai-server.md) §1).
 | `--sandbox DIR` | server cwd | Root for `fs` / `bash` / `python3` / external `$SANDBOX`. |
 | `--allow-fs` | off | Register the unified `fs` tool (action=read / write / list / glob / grep / check_path / cwd / sandbox). |
 | `--allow-bash` | off | Register `bash` (NOT a hardened sandbox). |
-| `--allow-python` | off | Register `python3` (run snippets via `python3 -I -S -E -c <code>`; isolated stdlib-only interpreter; NOT a hardened sandbox). |
+| `--no-python` | python3 on | Drop the `python3` tool. By default it's auto-registered alongside `fs` whenever `--sandbox` is set or `--allow-bash` is on. Stdlib-only interpreter; disk access auto-restricted to the sandbox root. |
 | `--use-google` | off | Enable engine=`"google"` inside the unified `web` tool (needs `GOOGLE_API_KEY` + `GOOGLE_CSE_ID`). |
 | `--external-tools DIR` | — | Load every `EASYAI-*.tools` manifest in `DIR`. |
 | `--RAG DIR` | — | Enable RAG: registers one `rag(action=…)` tool with sub-actions save / append / search / load / list / delete / keywords. Persistent memory. |
@@ -732,7 +763,7 @@ upstream `llama-server`, OpenAI itself, etc.).
 | `--tools LIST` | datetime,plan,web,system_* | Comma list of locally-registered tools. |
 | `--sandbox DIR` | — | Enable the unified `fs` tool (action=read/write/list/glob/grep/check_path/cwd/sandbox) scoped to `DIR`. |
 | `--allow-bash` | off | Register `bash` (uses `--sandbox` as cwd, else current dir). |
-| `--allow-python` | off | Register `python3` (uses `--sandbox` as cwd, else current dir). |
+| `--no-python` | python3 on | Drop the auto-registered `python3` tool (default-on whenever `--sandbox` or `--allow-bash` is set). |
 | `--use-google` | off | Enable engine=`"google"` inside the unified `web` tool. |
 | `--external-tools DIR` | — | Load `EASYAI-*.tools` manifests. |
 | `--RAG DIR` | — | Enable RAG (one `rag(action=…)` tool). |
@@ -780,7 +811,7 @@ use `easyai-cli`.
 | `--no-tools` | off | Skip the built-in toolbelt. |
 | `--sandbox DIR` | — | Enable the unified `fs` tool scoped to `DIR`. |
 | `--allow-bash` | off | Register `bash`. |
-| `--allow-python` | off | Register `python3`. |
+| `--no-python` | python3 on | Drop the auto-registered `python3` tool. |
 | `--external-tools DIR` | — | Load `EASYAI-*.tools` manifests. |
 | `--RAG DIR` | — | Enable RAG. |
 | `-ctk, --cache-type-k TYPE` | `f16` | K-cache dtype. |

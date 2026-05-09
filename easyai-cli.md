@@ -180,7 +180,7 @@ prepended (see [§6](#6-system-prompt--injected-blocks)).
 | `--tools LIST` | Comma list, overrides the default catalog. See [§5](#5-tool-registration) for valid names. |
 | `--sandbox DIR` | Working root for `fs` / `bash` / `python3`. **Auto-registers the unified `fs` tool** (action=read / write / list / glob / grep / check_path / cwd / sandbox). `bash` and `python3` still require their respective `--allow-*` flags. |
 | `--allow-bash` | Register `bash`. **Implies `fs`** (bash subsumes it). cwd = `--sandbox` if given, else the binary's CWD. WARNING: not a hardened sandbox. |
-| `--allow-python` | Register `python3` (run snippets via `python3 -I -S -E -c <code>`). **Implies `fs`** too. Isolated stdlib-only interpreter (no PYTHON* env, no site-packages, no cwd on `sys.path`). cwd = `--sandbox` if given, else the binary's CWD. WARNING: not a hardened sandbox — `import os` / `import socket` / `import subprocess` all work. |
+| `--no-python` | Drop the auto-registered `python3` tool. By default `python3` is **ON** whenever `--sandbox` or `--allow-bash` is set. Stdlib-only interpreter (no PYTHON* env, no site-packages, no cwd on `sys.path`); disk access auto-restricted to the sandbox root via a Python preamble. WARNING: defense-in-depth, not a hardened sandbox — `import os` / `import socket` / `import subprocess` still work. |
 | `--use-google` | Enable `engine="google"` inside the unified `web` tool (Google Custom Search JSON API). Requires `GOOGLE_API_KEY` and `GOOGLE_CSE_ID` env vars. |
 | `--RAG DIR` | Enable RAG persistent memory rooted at DIR. Registers ONE `rag(action=...)` tool. |
 | `--external-tools DIR` | Load every `EASYAI-*.tools` manifest in DIR. See `EXTERNAL_TOOLS.md`. |
@@ -242,9 +242,9 @@ system_meminfo, system_loadavg, system_cpu_usage, system_swaps
 
 | Trigger | Adds |
 | --- | --- |
-| `--sandbox DIR` **OR** `--allow-bash` **OR** `--allow-python` | The unified `fs` tool (action=read / write / list / glob / grep / check_path / cwd / sandbox) |
+| `--sandbox DIR` **OR** `--allow-bash` | The unified `fs` tool AND `python3` (the latter unless `--no-python`) |
 | `--allow-bash` | `bash` (and bumps the agentic loop's `max_tool_hops` to 99999) |
-| `--allow-python` | `python3` (and bumps `max_tool_hops` to 99999, same as `bash`) |
+| `--no-python` | drops the auto-on `python3` tool (otherwise on whenever fs is on) |
 | `--use-google` (+ env vars set) | Enables `engine="google"` inside the unified `web` tool |
 | `--RAG DIR` | `rag` (single-tool dispatcher; sub-actions save / append / search / load / list / delete / keywords) |
 | `--external-tools DIR` | every tool from each loaded `EASYAI-*.tools` manifest |

@@ -91,7 +91,7 @@ The HTTP layer, paths, tool gating, concurrency, MCP auth.
 | `sandbox` | path | `--sandbox` | (none) | Root directory for `bash` / the unified `fs` tool / external-tools `$SANDBOX` placeholder. The binary `chdir`s into `<dir>` at startup so the model's relative paths land there. |
 | `allow_fs` | bool | `--allow-fs` | `off` | Register the unified `fs` tool (action=`read` / `write` / `list` / `glob` / `grep` / `check_path` / `cwd` / `sandbox`), scoped to the sandbox. |
 | `allow_bash` | bool | `--allow-bash` | `off` | Register the `bash` tool. **Not** a hardened sandbox — runs with this process's user privileges. Per-call timeouts + output cap remain. |
-| `allow_python` | bool | `--allow-python` | `off` | Register the `python3` tool — runs snippets via `python3 -I -S -E -c <code>`. Isolated stdlib-only interpreter (no PYTHON* env, no site-packages, no cwd on `sys.path`). **Not** a hardened sandbox — `import os` / `import socket` / `import subprocess` all work. Same per-call timeout + output cap as bash. |
+| `allow_python` | bool | (no `--allow-python`; `--no-python` flips off) | `on` | Register the `python3` tool — runs snippets via `python3 -I -S -E -c <code>`. **Defaults ON**, auto-registers when `--sandbox` is set or `--allow-bash` is on. Isolated stdlib-only interpreter (no PYTHON* env, no site-packages, no cwd on `sys.path`). **Disk access auto-restricted to the sandbox root** via a Python preamble. Defense-in-depth, **not** a hardened sandbox — `import os` / `import socket` / `import subprocess` / `import ctypes` all still work. Same per-call timeout + output cap as bash. Pass `--no-python` (or `[SERVER] allow_python = off`) to skip registration. |
 | `load_tools` | bool | `--no-tools` (negative) | `on` | Master switch for the built-in toolbelt. Set `off` to register zero default tools and rely on `external_tools` + `rag` only. |
 | `external_tools` | path | `--external-tools` | (none) | Directory of `EASYAI-*.tools` manifests. Per-file fault isolation. See [`EXTERNAL_TOOLS.md`](EXTERNAL_TOOLS.md). |
 | `rag` | path | `--RAG` | (none) | Directory of RAG entries — enables the unified `rag(action=...)` tool. See [`RAG.md`](RAG.md). |
@@ -194,7 +194,7 @@ No required arguments. Pass `--help` for the live list.
 | `--sandbox <dir>` | `sandbox` | (none) | Root for `fs` / `bash` / `$SANDBOX`. |
 | `--allow-fs` | `allow_fs` | `off` | Register the unified `fs` tool. |
 | `--allow-bash` | `allow_bash` | `off` | Register `bash`. |
-| `--allow-python` | `allow_python` | `off` | Register `python3` (isolated stdlib-only interpreter). |
+| `--no-python` | `allow_python = off` | python3 on | Drop the default-on `python3` tool. |
 | `--no-tools` | `load_tools = off` | n/a | Skip built-in toolbelt entirely. |
 | `--external-tools <dir>` | `external_tools` | (none) | Load `EASYAI-*.tools`. |
 | `--RAG <dir>` | `rag` | (none) | Enable the unified `rag(action=...)` tool. |
@@ -399,7 +399,7 @@ just one consumer of those factories.
 | `web` (action=`search` / `fetch`) | `easyai::tools::web(google_enabled)` | `load_tools` + libcurl at build |
 | `fs` (action=`read` / `write` / `list` / `glob` / `grep` / `check_path` / `cwd` / `sandbox`) | `easyai::tools::fs(sandbox)` | `--allow-fs` |
 | `bash` | `easyai::tools::bash(sandbox)` | `--allow-bash` |
-| `python3` | `easyai::tools::python3(sandbox)` | `--allow-python` |
+| `python3` | `easyai::tools::python3(sandbox)` | default ON when sandbox set or `--allow-bash`; `--no-python` to skip |
 | `rag` (action=`save` / `append` / `search` / `load` / `list` / `delete` / `keywords`) | `easyai::tools::make_rag_tool(dir)` | `--RAG <dir>` |
 | (any `EASYAI-*.tools` manifest) | `easyai::load_external_tools_from_dir(dir, reserved)` | `--external-tools <dir>` |
 

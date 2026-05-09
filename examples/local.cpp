@@ -118,7 +118,11 @@ struct CliArgs {
     bool load_tools = true;
     std::string sandbox;        // empty = `fs` tool NOT registered
     bool allow_bash = false;    // explicit opt-in for `bash`
-    bool allow_python = false;  // explicit opt-in for `python3`
+    // python3 defaults ON (auto-registers when --sandbox or
+    // --allow-bash is set). Stdlib-only interpreter with disk access
+    // restricted to the sandbox root via a Python preamble. Use
+    // --no-python to opt out.
+    bool allow_python = true;
     bool show_system_prompt = false;  // --show-system-prompt: dump and exit
     std::string external_tools_dir;     // optional external-tools dir (EASYAI-*.tools)
     std::string rag_dir;                 // optional RAG persistent-registry dir
@@ -182,16 +186,19 @@ struct CliArgs {
         "                                 given, otherwise CWD. NOT a\n"
         "                                 hardened sandbox — the command\n"
         "                                 runs with your user privileges.\n"
-        "      --allow-python            Register the `python3` tool (run\n"
-        "                                 Python 3 snippets via\n"
-        "                                 `python3 -I -S -E -c <code>`).\n"
-        "                                 Same hardening as bash; isolated\n"
-        "                                 stdlib-only interpreter (no\n"
-        "                                 PYTHON* env, no site-packages,\n"
-        "                                 no cwd on sys.path). NOT a\n"
-        "                                 hardened sandbox — `import os`,\n"
-        "                                 `import socket`, `import\n"
-        "                                 subprocess` all work.\n"
+        "      --no-python               Drop the `python3` tool. By default\n"
+        "                                 it auto-registers alongside `fs`\n"
+        "                                 (whenever --sandbox or --allow-bash\n"
+        "                                 is set). The interpreter is\n"
+        "                                 stdlib-only (no PYTHON* env, no\n"
+        "                                 site-packages, no cwd on sys.path)\n"
+        "                                 and a Python preamble auto-\n"
+        "                                 restricts disk access to the\n"
+        "                                 sandbox root. NOT a hardened\n"
+        "                                 sandbox — `import os`, `import\n"
+        "                                 socket`, `import subprocess` all\n"
+        "                                 work. Use --no-python to skip\n"
+        "                                 registration entirely.\n"
         "      --external-tools <dir>    Load every EASYAI-*.tools file in <dir>\n"
         "                                 as an external-tools manifest. Empty\n"
         "                                 dir is a normal state (no extra tools).\n"
@@ -251,7 +258,7 @@ static CliArgs parse(int argc, char ** argv) {
         else if (s == "--no-tools")                   a.load_tools    = false;
         else if (s == "--sandbox")                    a.sandbox       = need(i, "--sandbox");
         else if (s == "--allow-bash")                 a.allow_bash    = true;
-        else if (s == "--allow-python")               a.allow_python  = true;
+        else if (s == "--no-python")                  a.allow_python  = false;
         else if (s == "--external-tools")             a.external_tools_dir = need(i, "--external-tools");
         else if (s == "--RAG")                        a.rag_dir            = need(i, "--RAG");
         else if (s == "--show-system-prompt")         a.show_system_prompt = true;
@@ -281,9 +288,11 @@ static std::string build_builtin_system_prompt(const CliArgs & args) {
     // LocalBackend doesn't expose allow_fs separately; cli::Toolbelt's
     // predicate registers `fs` whenever sandbox is set OR a subprocess
     // executor (allow_bash / allow_python) is on.
-    const bool fs_on       = !args.sandbox.empty() || args.allow_bash || args.allow_python;
+    const bool fs_on       = !args.sandbox.empty() || args.allow_bash;
     const bool bash_on     = args.allow_bash;
-    const bool python_on   = args.allow_python;
+    // python3 defaults ON; auto-on under same gate as `fs` (sandbox or
+    // allow_bash); --no-python flips allow_python false to opt out.
+    const bool python_on   = args.allow_python && fs_on;
     const bool web_on      = true;            // datetime + web are default-on with --no-tools=false
     const bool datetime_on = true;
     const bool rag_on      = !args.rag_dir.empty();

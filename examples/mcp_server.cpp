@@ -215,7 +215,15 @@ struct ServerArgs {
     std::string sandbox;
     bool        allow_fs     = false;
     bool        allow_bash   = false;
-    bool        allow_python = false;
+    // python3 defaults ON: stdlib-only interpreter with disk access
+    // auto-restricted to the sandbox root via a Python preamble.
+    // Auto-registers when allow_bash is on OR sandbox is set; the
+    // server's existing explicit-opt-in policy for fs is preserved
+    // (fs only registers when allow_fs is also set), so the matrix
+    // becomes: --sandbox alone → python3; --allow-fs --sandbox →
+    // python3 + fs; --allow-bash --sandbox → python3 + bash. Use
+    // --no-python (or [SERVER] allow_python = off) to opt out.
+    bool        allow_python = true;
     bool        load_tools  = true;
 
     // Tool packs.
@@ -315,7 +323,11 @@ const std::vector<FlagDef> & kFlags() {
         { {"--sandbox"},               "SERVER", "sandbox",                "sandbox",             true,  SET_STR(&ServerArgs::sandbox) },
         { {"--allow-fs"},              "SERVER", "allow_fs",               "allow_fs",            false, SET_BOOL_TRUE(&ServerArgs::allow_fs) },
         { {"--allow-bash"},            "SERVER", "allow_bash",             "allow_bash",          false, SET_BOOL_TRUE(&ServerArgs::allow_bash) },
-        { {"--allow-python"},          "SERVER", "allow_python",           "allow_python",        false, SET_BOOL_TRUE(&ServerArgs::allow_python) },
+        { {"--no-python"},             "",       "",                       "no_python",           false, SET_BOOL_FALSE(&ServerArgs::allow_python) },
+        // [SERVER] allow_python = on/off — INI-only path. Operators
+        // can also pass --no-python on the CLI to flip it off, but
+        // there is no --allow-python (the flag defaults on).
+        { {},                          "SERVER", "allow_python",           "allow_python",        true,  SET_BOOL_TRUE(&ServerArgs::allow_python) },
         { {"--no-tools"},              "SERVER", "load_tools",             "load_tools",          false, SET_BOOL_FALSE(&ServerArgs::load_tools) },
         { {"--external-tools"},        "SERVER", "external_tools",         "external_tools",      true,  SET_STR(&ServerArgs::external_tools_dir) },
         { {"--RAG"},                   "SERVER", "rag",                    "rag",                 true,  SET_STR(&ServerArgs::rag_dir) },
@@ -383,12 +395,18 @@ const std::vector<FlagDef> & kFlags() {
         "      --allow-bash             Register `bash`. NOT a hardened\n"
         "                                sandbox — runs with this process's\n"
         "                                user privileges.\n"
-        "      --allow-python           Register `python3` (run snippets via\n"
-        "                                `python3 -I -S -E -c <code>`; isolated\n"
-        "                                stdlib-only interpreter). NOT a\n"
-        "                                hardened sandbox — `import os`,\n"
-        "                                `import socket`, `import subprocess`\n"
-        "                                all work.\n"
+        "      --no-python              Drop the `python3` tool. By default\n"
+        "                                it auto-registers when --sandbox\n"
+        "                                or --allow-bash is set. Stdlib-only\n"
+        "                                interpreter (no PYTHON* env, no\n"
+        "                                site-packages, no cwd on sys.path);\n"
+        "                                disk access auto-restricted to the\n"
+        "                                sandbox root via a Python preamble.\n"
+        "                                NOT a hardened sandbox — `import\n"
+        "                                os`, `import socket`, `import\n"
+        "                                subprocess` all work. Use\n"
+        "                                --no-python (or [SERVER]\n"
+        "                                allow_python = off) to opt out.\n"
         "      --no-tools               Skip the built-in toolbelt entirely\n"
         "                                (datetime / web).\n"
         "      --external-tools <dir>   Load every EASYAI-*.tools manifest\n"
@@ -829,8 +847,13 @@ int main(int argc, char ** argv) {
     // always; unified `fs` when --allow-fs; bash when --allow-bash.
     // Sandbox dir resolves against the cwd we chdir'd into above.
     if (args.load_tools) {
+        // python3 defaults ON, but registration is gated (inside
+        // Toolbelt::tools()) on sandbox-or-bash. So setting sb="."
+        // when allow_python alone is on would expose ambient cwd to
+        // python3 — explicitly only fall back to "." when fs / bash
+        // is on (matching the historical server policy).
         std::string sb = args.sandbox;
-        if (sb.empty() && (args.allow_fs || args.allow_bash || args.allow_python)) sb = ".";
+        if (sb.empty() && (args.allow_fs || args.allow_bash)) sb = ".";
         auto tb = easyai::cli::Toolbelt()
                       .sandbox     (sb)
                       .allow_fs    (args.allow_fs)

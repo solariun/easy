@@ -284,7 +284,11 @@ struct Options {
     std::string system_file;
     std::string sandbox;
     bool        allow_bash      = false;       // opt-in: register `bash` tool
-    bool        allow_python    = false;       // opt-in: register `python3` tool
+    // python3 defaults ON when --sandbox is set (or --allow-bash is on).
+    // It ships a stdlib-only interpreter with disk access mechanically
+    // restricted to the sandbox root — the cwd Python is chdir'd into.
+    // --no-python opts out entirely.
+    bool        allow_python    = true;
     // show_bash / show_python: mirror the subprocess's merged
     // stdout+stderr to the parent's stderr in real time so the operator
     // can watch a long-running build / test / computation scroll by.
@@ -418,10 +422,11 @@ void usage(const char * argv0) {
 "  Tools:\n"
 "    --tools LIST               comma list, valid names:\n"
 "                                 datetime, plan, web (unified search+fetch),\n"
-"                                 fs (unified file work; only with --sandbox\n"
-"                                     or --allow-bash / --allow-python),\n"
+"                                 fs (unified file work; auto-on with\n"
+"                                     --sandbox / --allow-bash),\n"
+"                                 python3 (auto-on with --sandbox /\n"
+"                                     --allow-bash; --no-python opts out),\n"
 "                                 bash (only with --allow-bash),\n"
-"                                 python3 (only with --allow-python),\n"
 "                                 system_meminfo, system_loadavg,\n"
 "                                 system_cpu_usage, system_swaps,\n"
 "                                 rag (only with --RAG DIR)\n"
@@ -429,33 +434,38 @@ void usage(const char * argv0) {
 "                                 system_meminfo,system_loadavg,\n"
 "                                 system_cpu_usage,system_swaps,\n"
 "                                 (rag is auto-registered when --RAG is set;\n"
-"                                  fs is auto-registered when --sandbox /\n"
-"                                  --allow-bash / --allow-python is set)\n"
+"                                  fs and python3 are auto-registered when\n"
+"                                  --sandbox or --allow-bash is set)\n"
 "    --sandbox DIR              enable file work scoped to DIR.\n"
-"                                 Auto-registers the `fs` tool (action=read /\n"
-"                                 write / list / glob / grep / check_path /\n"
-"                                 cwd / sandbox). Without --sandbox (and\n"
-"                                 without --allow-bash / --allow-python) the\n"
+"                                 Auto-registers the unified `fs` tool\n"
+"                                 (action=read / write / list / glob / grep\n"
+"                                 / check_path / cwd / sandbox) AND the\n"
+"                                 `python3` tool (a stdlib-only Python 3\n"
+"                                 interpreter for compute / network / data;\n"
+"                                 NEVER for disk — its open() / os.open()\n"
+"                                 calls are auto-restricted to DIR). Without\n"
+"                                 --sandbox (and without --allow-bash) the\n"
 "                                 model has no file access.\n"
 "    --allow-bash               register the `bash` tool (run shell\n"
-"                                 commands). Implies `fs` tool registration\n"
-"                                 (bash subsumes it; without `fs` the\n"
-"                                 model would use bash for file work).\n"
+"                                 commands). Implies `fs` and `python3`\n"
+"                                 registration (bash subsumes both; without\n"
+"                                 them the model would use bash for file\n"
+"                                 work and computation alike).\n"
 "                                 WARNING: NOT a hardened sandbox — the\n"
 "                                 command runs with your user privileges\n"
 "                                 (network, full FS, etc). cwd is set to\n"
 "                                 --sandbox DIR if given, otherwise the\n"
 "                                 current working dir.\n"
-"    --allow-python             register the `python3` tool (run Python 3\n"
-"                                 snippets via `python3 -I -S -E -c <code>`).\n"
-"                                 Same hardening as bash; isolated stdlib-\n"
-"                                 only interpreter (no PYTHON* env, no\n"
-"                                 site-packages, no cwd on sys.path).\n"
-"                                 WARNING: NOT a hardened sandbox — the\n"
-"                                 interpreter runs with your user\n"
-"                                 privileges and can `import os`, `import\n"
-"                                 socket`, `import subprocess`. The flags\n"
-"                                 constrain *startup*, not capabilities.\n"
+"    --no-python                drop the `python3` tool. By default it's\n"
+"                                 auto-registered alongside `fs` (whenever\n"
+"                                 --sandbox or --allow-bash is set). The\n"
+"                                 interpreter is isolated (no PYTHON* env,\n"
+"                                 no site-packages, no cwd on sys.path) and\n"
+"                                 disk access is auto-restricted to the\n"
+"                                 sandbox root via a Python preamble. Pass\n"
+"                                 --no-python to disable it entirely (e.g.\n"
+"                                 in environments where any subprocess\n"
+"                                 executor is too much capability).\n"
 "    --no-show-bash             suppress the live mirror of bash output to\n"
 "                                 stderr. By default, when the model calls\n"
 "                                 `bash`, the merged child stdout+stderr is\n"
@@ -628,7 +638,7 @@ bool parse_args(int argc, char ** argv, Options & o) {
         else if (a == "--system-file")    o.system_file   = need(i, "--system-file");
         else if (a == "--sandbox")        o.sandbox       = need(i, "--sandbox");
         else if (a == "--allow-bash")     o.allow_bash    = true;
-        else if (a == "--allow-python")   o.allow_python  = true;
+        else if (a == "--no-python")      o.allow_python  = false;
         else if (a == "--no-show-bash") {
             o.show_bash         = false;
             o.show_bash_cli_set = true;
@@ -784,17 +794,27 @@ void register_tools(easyai::Client & cli,
     auto wants = [&](const std::string & name) {
         if (o.tools_enabled.empty()) {
             for (const auto & d : kDefaultTools) if (d == name) return true;
-            // `fs` auto-enables when --sandbox is set OR any subprocess
-            // executor (--allow-bash / --allow-python) is on. The shell
-            // executors are strictly more permissive than `fs`, and a
-            // sandbox without `fs` is the same trap inverted.
-            if (name == "fs" && (!o.sandbox.empty() || o.allow_bash || o.allow_python))
+            // `fs` auto-enables when --sandbox is set OR --allow-bash
+            // is on. bash is strictly more permissive than `fs`, and
+            // a sandbox without `fs` is the same trap inverted.
+            if (name == "fs" && (!o.sandbox.empty() || o.allow_bash))
                 return true;
-            // bash / python3 are each opt-in by their --allow-* flag.
-            if (o.allow_bash   && name == "bash")    return true;
-            if (o.allow_python && name == "python3") return true;
+            // python3 defaults ON: same gate as `fs` (sandbox or bash),
+            // but additionally honours --no-python (allow_python=false).
+            // Disk access from python3 is auto-restricted to the
+            // sandbox root via a Python preamble; the description tells
+            // the model "never use python3 for disk — use fs(action=...)".
+            if (name == "python3" && o.allow_python
+                    && (!o.sandbox.empty() || o.allow_bash))
+                return true;
+            // bash is opt-in by --allow-bash.
+            if (o.allow_bash && name == "bash") return true;
             return false;
         }
+        // Explicit --tools list: --no-python still wins over an
+        // explicit `python3` in the list (the operator clearly
+        // doesn't want it registered).
+        if (name == "python3" && !o.allow_python) return false;
         return o.tools_enabled.count(name) != 0;
     };
 
