@@ -88,12 +88,12 @@ The HTTP layer, paths, tool gating, concurrency, MCP auth.
 | `port` | int | `--port` | `8089` | TCP port. (Different default from `easyai-server`'s 8080 so both can coexist on one host.) |
 | `name` | string | `-n`, `--name` | `easyai-mcp-server` | Server identity surfaced on `/health` and the MCP `initialize` response. Override on multi-server fleets so MCP clients can identify each instance. |
 | `max_body` | int | `--max-body` | `1048576` (1 MiB) | Max HTTP request body. MCP requests are tiny; 1 MiB is generous. |
-| `sandbox` | path | `--sandbox` | (none) | Root directory for `bash` / `fs_*` / external-tools `$SANDBOX` placeholder. The binary `chdir`s into `<dir>` at startup so the model's relative paths land there. |
-| `allow_fs` | bool | `--allow-fs` | `off` | Register `fs_read_file / fs_write_file / fs_list_dir / fs_glob / fs_grep` plus `get_current_dir`, scoped to the sandbox. |
+| `sandbox` | path | `--sandbox` | (none) | Root directory for `bash` / the unified `fs` tool / external-tools `$SANDBOX` placeholder. The binary `chdir`s into `<dir>` at startup so the model's relative paths land there. |
+| `allow_fs` | bool | `--allow-fs` | `off` | Register the unified `fs` tool (action=`read` / `write` / `list` / `glob` / `grep` / `check_path` / `cwd` / `sandbox`), scoped to the sandbox. |
 | `allow_bash` | bool | `--allow-bash` | `off` | Register the `bash` tool. **Not** a hardened sandbox — runs with this process's user privileges. Per-call timeouts + output cap remain. |
 | `load_tools` | bool | `--no-tools` (negative) | `on` | Master switch for the built-in toolbelt. Set `off` to register zero default tools and rely on `external_tools` + `rag` only. |
 | `external_tools` | path | `--external-tools` | (none) | Directory of `EASYAI-*.tools` manifests. Per-file fault isolation. See [`EXTERNAL_TOOLS.md`](EXTERNAL_TOOLS.md). |
-| `rag` | path | `--RAG` | (none) | Directory of RAG entries — enables the six `rag_*` tools. See [`RAG.md`](RAG.md). |
+| `rag` | path | `--RAG` | (none) | Directory of RAG entries — enables the unified `rag(action=...)` tool. See [`RAG.md`](RAG.md). |
 | `api_key` | string | `--api-key` | (none — open) | Bearer token for `/health`, `/metrics`, `/v1/tools`. `/health` is intentionally NOT gated even when set, so liveness probes don't need a credential. The `/mcp` endpoint uses `[MCP_USER]` instead. |
 | `mcp_auth` | enum | (no CLI; `--no-mcp-auth` overrides) | `auto` | `auto` (Bearer required iff `[MCP_USER]` non-empty), `on` (force require — invalid against an empty table), `off` (force open). |
 | `threads` | int | `-t`, `--threads` | `256` | cpp-httplib worker pool size. Each worker handles one request at a time; excess queues. |
@@ -190,12 +190,12 @@ No required arguments. Pass `--help` for the live list.
 | `--port <n>` | `port` | `8089` | TCP port. |
 | `-n`, `--name <id>` | `name` | `easyai-mcp-server` | Server identity. |
 | `--max-body <bytes>` | `max_body` | `1048576` | Max request body. |
-| `--sandbox <dir>` | `sandbox` | (none) | Root for fs_* / bash / `$SANDBOX`. |
-| `--allow-fs` | `allow_fs` | `off` | Register fs_* + get_current_dir. |
+| `--sandbox <dir>` | `sandbox` | (none) | Root for `fs` / `bash` / `$SANDBOX`. |
+| `--allow-fs` | `allow_fs` | `off` | Register the unified `fs` tool. |
 | `--allow-bash` | `allow_bash` | `off` | Register `bash`. |
 | `--no-tools` | `load_tools = off` | n/a | Skip built-in toolbelt entirely. |
 | `--external-tools <dir>` | `external_tools` | (none) | Load `EASYAI-*.tools`. |
-| `--RAG <dir>` | `rag` | (none) | Enable the six RAG tools. |
+| `--RAG <dir>` | `rag` | (none) | Enable the unified `rag(action=...)` tool. |
 | `--api-key <token>` | `api_key` | (none — open) | Bearer for `/metrics`, `/v1/tools`. |
 | `--no-mcp-auth` | (n/a) | `false` | Force `/mcp` open. Emergency override. |
 | `-t`, `--threads <n>` | `threads` | `256` | cpp-httplib worker pool size. |
@@ -321,15 +321,15 @@ Tools that share state synchronise themselves at the lib level:
   under a unique lock at startup so readers never need to upgrade.
   Atomic-rename writes (tempfile + `rename(2)`) make on-disk reads
   tear-free regardless of the lock.
-- **web_fetch cache** (`src/builtin_tools.cpp`): single `std::mutex`
-  guarding a 16-entry LRU. Critical sections are O(1) hash-table +
-  list-splice operations — a hot spot under extreme load but not a
-  bottleneck for normal operation.
+- **web fetch cache** (`src/builtin_tools.cpp`): single `std::mutex`
+  guarding a 16-entry LRU shared by every `web(action="fetch")` call.
+  Critical sections are O(1) hash-table + list-splice operations — a
+  hot spot under extreme load but not a bottleneck for normal operation.
 - **bash + external-tools**: each call is a fresh `fork`+`execve`.
   Process-isolated by definition — no shared in-process state. The
   `--max-concurrent-calls` cap is the right backstop for fork-rate
   pressure on the host.
-- **datetime, web_search, web_fetch, fs_* (read-only paths)**: no
+- **datetime, web (search/fetch), fs (read-only actions)**: no
   shared mutable state. Naturally parallel.
 
 ### What the layers compose to
@@ -394,12 +394,10 @@ just one consumer of those factories.
 | Tool | Source | Gated by |
 | --- | --- | --- |
 | `datetime` | `easyai::tools::datetime()` | `load_tools` (default on) |
-| `web_search` | `easyai::tools::web_search()` | `load_tools` + libcurl at build |
-| `web_fetch` | `easyai::tools::web_fetch()` | `load_tools` + libcurl at build |
-| `fs_read_file`, `fs_write_file`, `fs_list_dir`, `fs_glob`, `fs_grep`, `get_current_dir` | `easyai::tools::fs_*()`, `get_current_dir()` | `--allow-fs` |
+| `web` (action=`search` / `fetch`) | `easyai::tools::web(google_enabled)` | `load_tools` + libcurl at build |
+| `fs` (action=`read` / `write` / `list` / `glob` / `grep` / `check_path` / `cwd` / `sandbox`) | `easyai::tools::fs(sandbox)` | `--allow-fs` |
 | `bash` | `easyai::tools::bash(sandbox)` | `--allow-bash` |
-| `rag` (single dispatcher with sub-actions: save / append / search / load / list / delete / keywords) | `easyai::tools::make_unified_rag_tool(dir)` | `--RAG <dir>` (default RAG layout) |
-| `rag_save`, `rag_append`, `rag_search`, `rag_load`, `rag_list`, `rag_delete`, `rag_keywords` | `easyai::tools::make_rag_tools(dir)` | `--RAG <dir>` + `--split-rag` (`[SERVER] split_rag = on`) |
+| `rag` (action=`save` / `append` / `search` / `load` / `list` / `delete` / `keywords`) | `easyai::tools::make_rag_tool(dir)` | `--RAG <dir>` |
 | (any `EASYAI-*.tools` manifest) | `easyai::load_external_tools_from_dir(dir, reserved)` | `--external-tools <dir>` |
 
 The `plan` tool is **deliberately omitted** in `easyai-mcp-server` —
@@ -423,10 +421,7 @@ std::vector<easyai::Tool> tools;
 auto tb = easyai::cli::Toolbelt().sandbox("/srv/work").allow_fs();
 for (auto & t : tb.tools()) tools.push_back(std::move(t));
 
-auto rag = easyai::tools::make_rag_tools("/var/lib/myapp/rag");
-tools.push_back(std::move(rag.save));
-tools.push_back(std::move(rag.search));
-// ...
+tools.push_back(easyai::tools::make_rag_tool("/var/lib/myapp/rag"));
 
 // Your custom tools, side by side with the built-ins:
 tools.push_back(easyai::Tool::builder("my_internal_query")
@@ -722,7 +717,7 @@ What's planned next, roughly in priority order:
 - [`MCP.md`](MCP.md) — the MCP protocol surface, per-client
   connection cookbook, security model.
 - [`RAG.md`](RAG.md) — persistent registry, the unified `rag(action=...)`
-  tool (or seven `rag_*` tools under `--split-rag`), workflows.
+  tool, workflows.
 - [`EXTERNAL_TOOLS.md`](EXTERNAL_TOOLS.md) — operator-defined
   external tools (`EASYAI-*.tools` JSON manifests).
 - [`SECURITY_AUDIT.md`](SECURITY_AUDIT.md) — three audit passes,

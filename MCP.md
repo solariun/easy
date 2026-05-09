@@ -49,12 +49,11 @@ connect to easyai-server and use its tools as if they were native.
 ## 1. What we expose, and why
 
 `easyai-server` registers a tool catalogue at startup — built-in
-tools, RAG (one `rag(action=...)` tool by default; seven `rag_*`
-tools when `--split-rag` is on), and any operator-defined tools
-loaded from `--external-tools`. The MCP layer exposes that **same**
-catalogue via the Model Context Protocol so other AI applications
-can list and dispatch them as if they had registered the tools
-themselves.
+tools, RAG (one `rag(action=...)` tool), and any operator-defined
+tools loaded from `--external-tools`. The MCP layer exposes that
+**same** catalogue via the Model Context Protocol so other AI
+applications can list and dispatch them as if they had registered
+the tools themselves.
 
 ```
                     ┌─────────────────────────────────────┐
@@ -73,12 +72,10 @@ themselves.
    │                                                                │
    │   exposes the SAME tool catalogue the local model uses:        │
    │                                                                │
-   │     • datetime, web_search, web_fetch, plan                    │
-   │     • get_current_dir                                          │
-   │     • read_file, write_file, list_dir, glob, grep   (+--allow-fs)│
+   │     • datetime, web (search/fetch), plan                       │
+   │     • fs (read/write/list/glob/grep/check_path/cwd/sandbox)   (+--allow-fs)│
    │     • bash                                          (+--allow-bash)│
-   │     • rag_save, rag_search, rag_load, rag_list,                │
-   │       rag_delete, rag_keywords                                 │
+   │     • rag (save/append/search/load/list/delete/keywords)       │
    │     • every tool in /etc/easyai/external-tools/EASYAI-*.tools  │
    └───────────────────────────────────────────────────────────────┘
 ```
@@ -167,8 +164,8 @@ curl -fsS http://localhost/mcp \
   | jq '.result.tools[] | .name'
 ```
 
-You should see the full catalogue — datetime, web_search, RAG's six,
-any external tools you have configured.
+You should see the full catalogue — datetime, the unified `web` tool,
+the unified `rag` tool, any external tools you have configured.
 
 ### Call a tool
 
@@ -608,7 +605,7 @@ library can stack a remote MCP catalogue without writing a new
 client. `ClientOptions::retries` and `ClientOptions::timeout_seconds`
 are the programmatic equivalents of `--http-retries` / `--http-timeout`.
 The implementation is libcurl-based, gated on `EASYAI_HAVE_CURL`
-(the same flag that gates `web_fetch` / `web_search`).
+(the same flag that gates the unified `web` tool).
 
 ---
 
@@ -683,8 +680,7 @@ succeeded, only the wrapped tool reported a problem.
 ### Tools/list returns more entries than I expected
 
 Every registered tool is exposed: built-ins + RAG (one
-`rag(action=...)` tool by default; seven `rag_*` tools when
-`--split-rag` is on) + external-tools (operator's `EASYAI-*.tools`
+`rag(action=...)` tool) + external-tools (operator's `EASYAI-*.tools`
 manifests). Use `/health` to see the count and `/v1/tools` for a
 brief description list.
 
@@ -704,8 +700,7 @@ without a restart, but it's not in V1.
 ---
 
 *See also:* `LINUX_SERVER.md` (operator's guide), `RAG.md` (the
-single `rag(action=...)` dispatcher, or the seven `rag_*` tools
-under `--split-rag`, that the model writes to and clients read
-from), `EXTERNAL_TOOLS.md` (operator-defined tool packs that show
-up in the MCP catalogue alongside built-ins), `design.md`
+single `rag(action=...)` dispatcher that the model writes to and
+clients read from), `EXTERNAL_TOOLS.md` (operator-defined tool packs
+that show up in the MCP catalogue alongside built-ins), `design.md`
 (architecture).

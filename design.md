@@ -17,7 +17,7 @@ Everything easyai pulls in, why, and where it lives:
 | **ggml + backends**    | tensor ops (CPU / Metal / Vulkan / CUDA / HIP) | transitively via `llama`                                            | resolved at runtime through `libllama.so`                |
 | **cpp-httplib**        | server transport, **client transport**    | vendored by llama.cpp (`../llama.cpp/vendor/cpp-httplib/httplib.h`)     | static lib, linked into `easyai-server` and `libeasyai-cli` |
 | **nlohmann::json**     | request/response JSON, tool args/results  | vendored by llama.cpp (`../llama.cpp/vendor/nlohmann/json.hpp`)         | header-only; included only where needed                  |
-| **libcurl** (optional) | `web_fetch`, `web_search` (DuckDuckGo)    | system package (`libcurl-dev`)                                          | `libeasyai.so` `PRIVATE` when `EASYAI_WITH_CURL=ON`      |
+| **libcurl** (optional) | the unified `web` tool (action=`search` / `fetch`; `engine="ddg"` default + `engine="google"` opt-in) | system package (`libcurl-dev`) | `libeasyai.so` `PRIVATE` when `EASYAI_WITH_CURL=ON`      |
 | **OpenSSL** (optional) | future HTTPS for `easyai::Client`         | system package (`libssl-dev`)                                           | not yet linked — see [`include/easyai/client.hpp`](include/easyai/client.hpp) |
 | **glslc / Vulkan SDK** | shader compilation when `GGML_VULKAN=ON`  | system package                                                          | build-time only, baked into `libggml-vulkan.so`         |
 | **systemd-coredump**   | crash capture for the production server   | system package, declared by `scripts/install_easyai_server.sh`          | runtime, optional                                        |
@@ -129,9 +129,9 @@ Tier 4: raw llama.cpp handles, raw HTTP, custom Tool handlers
 2. Lower tiers are always reachable from higher ones.  Every façade
    exposes the layer below it — `Agent::backend()`, `Backend::tools()`,
    etc.
-3. Sensible defaults at every tier.  `Agent` registers
-   datetime/web_search/web_fetch by default; fs_* and bash stay off
-   until the user asks for them.  `Client::retry_on_incomplete` is on
+3. Sensible defaults at every tier.  `Agent` registers `datetime` +
+   the unified `web` tool by default; the unified `fs` tool and bash
+   stay off until the user asks for them.  `Client::retry_on_incomplete` is on
    by default.  `Client::http_retries` is 5 by default (pre-stream
    transport failures retried with exponential backoff, logged on
    stderr without `--verbose`).  `Client::timeout_seconds` is 1800 s
@@ -357,29 +357,29 @@ On *long agentic flows* (10+ tool hops, 50k+ tokens of
 conversation history), `repeat_penalty=1.15` starts penalising the
 wrong thing.  Examples we hit in production:
 
-* The model has called `fs_read_file` four times.  On the fifth
-  call, the literal tokens `fs_read_file` are inside the
-  recent-token window.  `repeat_penalty` discounts them.  The
-  model substitutes a paraphrase — `read_file`, `fs_read`,
-  `read` — which doesn't match any registered tool and causes an
-  "unknown tool" failure.
+* The model has called `fs(action="read")` four times. On the fifth
+  call, the literal tokens for the tool name are inside the
+  recent-token window.  `repeat_penalty` discounts them.  The model
+  substitutes a paraphrase — `read_file`, `fs_read`, `read` — which
+  doesn't match any registered tool and causes an "unknown tool"
+  failure.
 * During a long planning section, the model has used the word
   "step" a dozen times.  `repeat_penalty` makes "step" expensive,
   so the model starts pronouning ("the next *one*", "the
   following *thing*"), which the user finds harder to read.
 
 These are correct *behaviours* of `repeat_penalty` — its job is to
-discourage repetition.  But for an agent that *should* keep saying
-`fs_read_file` exactly the same way, repetition is feature, not
-bug.  Multiplicative penalties also stack non-linearly: by hop 5+
-the third occurrence of a tool name is ~1.5× discouraged in raw
-logit space, which is a lot.
+discourage repetition.  But for an agent that *should* keep emitting
+`fs(action="read")` exactly the same way, repetition is feature, not
+bug.  Multiplicative penalties also stack non-linearly: by hop 5+ the
+third occurrence of a tool name is ~1.5× discouraged in raw logit
+space, which is a lot.
 
 `presence_penalty` is the lever for the *other* failure mode —
 topic stickiness — without the per-occurrence ramp-up.  A fixed
 1.5 cost per "this token has appeared at all" leaves the
-quantitative shape of repetition unchanged: calling
-`fs_read_file` for the tenth time is no more expensive than the
+quantitative shape of repetition unchanged: emitting
+`fs(action="read")` for the tenth time is no more expensive than the
 second.  But it does push the model to *introduce new content*
 between tool calls instead of paraphrasing the prior turn.
 
@@ -541,8 +541,8 @@ actions consume them** — `"Used by add / update / delete. ..."`. Models
 following the schema can map a parameter to the right action without
 re-reading the body.
 
-**Single-action tools** (`web_fetch`, `read_file`, `bash`, …) describe
-one operation. The description should still cover:
+**Single-action tools** (`bash`, `datetime`, …) describe one
+operation. The description should still cover:
 
 * the operation (one sentence),
 * Required vs. Optional parameters,
@@ -565,16 +565,16 @@ worth ten that only describe the schema.
 
 Two flags control file/shell access:
 
-* `--sandbox <dir>` — sets the working root for `fs_*` and `bash`.
+* `--sandbox <dir>` — sets the working root for `fs` and `bash`.
 * `--allow-bash` — registers the `bash` tool.
 
-`fs_*` (and `get_sandbox_path`) auto-register whenever **either** flag
-is set. Bash subsumes the `fs_*` surface, so requiring an extra
-`--allow-fs` flag for the narrower set was inverted from the threat
-model — and produced sessions where the model had bash but no `fs_*`,
-trapping it into `cat > file` / `sed -i` for ordinary file work.
-`--allow-fs` still works (sets the working root to `.` if alone) but
-is redundant when `--sandbox` or `--allow-bash` is already given.
+The unified `fs` tool auto-registers whenever **either** flag is set.
+Bash subsumes `fs`, so requiring an extra `--allow-fs` flag for the
+narrower surface was inverted from the threat model — and produced
+sessions where the model had bash but no `fs`, trapping it into
+`cat > file` / `sed -i` for ordinary file work. `--allow-fs` still
+works (sets the working root to `.` if alone) but is redundant when
+`--sandbox` or `--allow-bash` is already given.
 
 The Toolbelt's `apply()` path also prepends three small in-binary
 blocks to the user's system prompt when the agent has any
@@ -592,15 +592,15 @@ create/mutate affordance:
   reaches the model regardless of which surface the operator
   drives.
 * `[environment]` — the absolute path of the sandbox root, so the
-  model doesn't waste turn 1 on `get_current_dir` / `pwd`.
+  model doesn't waste turn 1 on `fs(action="cwd")` / `pwd`.
 * `[guidance]` — "pick one viable implementation and carry it through"
   assertiveness rule, so smaller models don't enumerate options or
   stop at a draft.
 
-`get_sandbox_path` is registered alongside `get_current_dir` (the
-process cwd, can drift) — pinned at registration to the configured
-root so its answer is always the truth even if the process chdir's
-later.
+The unified `fs` tool's `cwd` and `sandbox` actions provide the same
+information `get_current_dir` and `get_sandbox_path` used to as
+standalone tools — `cwd` is the process's live working directory (can
+drift), `sandbox` is the configured root pinned at registration.
 
 ### Why the closed-set rule is in three places
 
@@ -769,7 +769,7 @@ The same retry shape is replicated (with the same backoff schedule
 but a libcurl-flavoured retryable-error set: `CURLE_COULDNT_CONNECT`,
 `CURLE_OPERATION_TIMEDOUT`, `CURLE_RECV_ERROR`, `CURLE_SEND_ERROR`,
 `CURLE_GOT_NOTHING`, `CURLE_PARTIAL_FILE`, plus 5xx) in the MCP
-client (§6d) and the `web_fetch` / `web_search` helpers — every
+client (§6d) and the unified `web` tool's libcurl helpers — every
 external HTTP boundary in the project goes through one of those
 three retry loops.
 
@@ -843,9 +843,9 @@ working through `Backend::set_*`.  `agent.backend()` returns the
 materialised Backend reference for everything Agent doesn't surface
 directly — that's the Tier-4 escape hatch.
 
-Default toolset matches the rest of the framework: datetime +
-web_search + web_fetch on by default; fs_* and bash off until the
-user opts in via `.sandbox(...) / .allow_bash()`.  Remote mode
+Default toolset matches the rest of the framework: datetime + the
+unified `web` tool on by default; the unified `fs` tool and bash off
+until the user opts in via `.sandbox(...)` / `.allow_bash()`.  Remote mode
 enables `with_tools = true` automatically so the model running on
 the server side can call tools dispatched in the client process.
 
@@ -873,7 +873,7 @@ Your training data ends around 2024-10.
 For ANY claim about events, people, products, prices, releases,
 leaders, scores, weather, or facts after that cutoff you MUST
 either:
-  1. Call a tool (web_search, web_fetch, datetime, …) to verify, OR
+  1. Call a tool (web action=search/fetch, datetime, …) to verify, OR
   2. Explicitly state that you are not certain.
 Never present a post-cutoff fact as known.
 ```
@@ -943,8 +943,8 @@ and aggregates results.
 
 ### The trust boundary
 
-Built-in tools (`datetime`, `web_search`, `fs_*`, `bash`, …) are C++
-code we wrote and reviewed. Adding a new built-in is a code change,
+Built-in tools (`datetime`, the unified `web` and `fs` tools, `bash`,
+the unified `rag` dispatcher, …) are C++ code we wrote and reviewed. Adding a new built-in is a code change,
 goes through review, ships in a binary release. That's the right
 process for tools that the agent's *author* controls.
 
@@ -1057,33 +1057,34 @@ The caps are deliberately tight — "cannot conceivably be needed by a
 legitimate manifest, can plausibly be tried by a hostile one."
 Loosen with a written reason or not at all.
 
-### Why `get_current_dir` and the startup chdir
+### Why `fs(action="cwd")` and the startup chdir
 
 The model has no implicit awareness of where it is on disk. With
-`fs_*` tools rooted at `/` (a virtualised view, not the real /),
+`fs` actions rooted at `/` (a virtualised view, not the real /),
 the model thinks it's in a clean filesystem starting from /; with
 `bash`, the model thinks it's in some shell. Both are abstractions
 over the *operator's chosen sandbox directory*.
 
-Without `get_current_dir`, the model has to either:
+Without `fs(action="cwd")`, the model has to either:
 
 - Assume relative paths work (fragile — depends on the operator's
   invocation), or
 - Call `bash pwd` (works but burns a tool call to learn one path).
 
-`easyai::tools::get_current_dir()` is the explicit answer. The
-CLIs `chdir(--sandbox)` at startup, the tool returns `getcwd()`,
-the model has a single source of truth for "where am I". The
-external-tools manifest's `cwd: "$SANDBOX"` resolves to the same
-directory at load time — every fs-flavoured surface (built-in or
-operator-declared) agrees on what "here" means.
+`fs(action="cwd")` is the explicit answer. The CLIs `chdir(--sandbox)`
+at startup, the action returns `getcwd()`, the model has a single
+source of truth for "where am I". The external-tools manifest's
+`cwd: "$SANDBOX"` resolves to the same directory at load time — every
+fs-flavoured surface (built-in or operator-declared) agrees on what
+"here" means.
 
-The Toolbelt registers `get_current_dir` AND `get_sandbox_path`
-automatically when any fs-flavoured surface is enabled (`--sandbox`,
-`--allow-fs`, or `--allow-bash` — see §5 "Sandbox + tool defaults").
-The pair lets the model distinguish the live process cwd
-(`get_current_dir`, can drift) from the boundary it's scoped to
-(`get_sandbox_path`, pinned at registration).
+The unified `fs` tool ships both `cwd` and `sandbox` actions, so
+whenever it's registered (i.e. whenever `--sandbox` / `--allow-fs` /
+`--allow-bash` are on — see §5 "Sandbox + tool defaults") both are
+available without separate registration. The pair lets the model
+distinguish the live process cwd (`fs(action="cwd")`, can drift) from
+the boundary it's scoped to (`fs(action="sandbox")`, pinned at
+registration).
 
 ### Where this fits in the four-tier API rule (§1b)
 
@@ -1222,36 +1223,40 @@ from `rename(2)`. We get indexing from a 200-line in-memory map
 that's rebuilt on first use (cost: parse N small files once per
 process — fast).
 
-### One tool by default, seven tools under `--split-rag`
+### One tool with seven sub-actions
 
-The default surface is **one** `rag(action=...)` tool with seven
-sub-actions (save / append / search / load / list / delete /
-keywords). This keeps the model's tool catalog short — one entry
-instead of seven — which most modern tool-callers handle cleanly
-and which saves a few hundred tokens per turn that would otherwise
-go to schema definitions in the prompt.
+The surface is **one** `rag(action=...)` tool with seven sub-actions
+(save / append / search / load / list / delete / keywords). This
+keeps the model's tool catalog short — one entry instead of seven —
+which most modern tool-callers handle cleanly and which saves a few
+hundred tokens per turn that would otherwise go to schema
+definitions in the prompt.
+
+The schema is flat (every parameter optional except `action`) because
+JSON Schema's discriminated-union shapes (`oneOf` with a
+discriminator) trip up smaller / quantised tool-callers far more
+often than a flat "everything optional" schema does. Validation
+stays runtime: each handler rejects calls missing its required
+fields with a crisp message naming the dispatch form.
 
 Behind the discriminator the seven handlers are still distinct
-closures with the same validation messages and the same audit
-shape — just multiplexed through one entry point. `rag(action="save",
+closures with the same validation messages and the same audit shape
+— just multiplexed through one entry point. `rag(action="save",
 ...)` and `rag(action="search", ...)` are still distinguishable in
 hooks / logs by their `action` argument, so curating by intent
 remains possible.
 
-Operators on weak / 1-bit-quant tool callers (Bonsai-class, BitNet)
-where discriminated schemas are noticeably less reliable than flat
-ones can pass `--split-rag` (or `[SERVER] split_rag = on` in the
-INI) to opt back into the legacy seven separate tools. Same store,
-same on-disk format, same handlers — only the catalog shape
-changes.
+(Until 2026-05-09 a `--split-rag` flag opted back into a legacy
+layout that exposed the seven actions as seven separate tools. That
+flag was removed alongside the unification of the web and fs tool
+surfaces; the dispatcher above is the only layout now.)
 
-The natural workflow underneath is unchanged either way: save
-(write a new memory), append (grow an existing one without losing
-its body), search + load (read in two steps because previewing
-keeps the prompt slim), list (browse), delete (curate), keywords
-(vocabulary review).
+The natural workflow is: save (write a new memory), append (grow an
+existing one without losing its body), search + load (read in two
+steps because previewing keeps the prompt slim), list (browse),
+delete (curate), keywords (vocabulary review).
 
-### Why max 4 entries per `rag_load`
+### Why max 4 entries per `rag(action="load")`
 
 Past 4, the model is almost always trying to drown the prompt in
 stale content. The cap forces "preview first, narrow second" —
@@ -1275,9 +1280,9 @@ operational experience we'll tune the descriptions further.
 | Tier | Audience | RAG surface |
 | --- | --- | --- |
 | 1 — façade | beginner | `easyai::Agent` could opt into RAG with a single setter (future). |
-| 2 — fluent | intermediate | Two factories: `make_unified_rag_tool(dir)` returns one `Tool` (the default `rag(action=...)` dispatcher); `make_rag_tools(dir)` returns a `RagTools` struct of seven `Tool` values you `add_tool` individually (the `--split-rag` layout). Both share the same `RagStore`. |
-| 3 — operator | deployment | `--RAG <dir>` flag on all three CLIs (defaults to the unified dispatcher); `--split-rag` (or `[SERVER] split_rag = on` in INI) opts back into the seven-tool layout; systemd unit passes `--RAG` for free. |
-| 4 — escape hatch | extension | The `RagStore` private class is replaceable: a future variant could swap files for SQLite or a vector store while keeping the same handler signatures behind both factories. |
+| 2 — fluent | intermediate | One factory: `make_rag_tool(dir)` returns the `rag(action=...)` dispatcher. |
+| 3 — operator | deployment | `--RAG <dir>` flag on all three CLIs; systemd unit passes `--RAG` for free. |
+| 4 — escape hatch | extension | The `RagStore` private class is replaceable: a future variant could swap files for SQLite or a vector store while keeping the same handler signatures. |
 
 ### What RAG is not
 

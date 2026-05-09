@@ -43,6 +43,42 @@ A running log of user-facing changes. Latest first — keep this list
 current as features land so anyone returning to the repo (or
 landing on it for the first time) sees what shipped recently.
 
+### 2026-05-09 — One tool per concept: unified `web`, unified `fs`, RAG `--split-rag` removed
+
+A consolidation pass on the built-in tool surface. Three loose
+collections (web, filesystem, rag) collapsed to one tool each, all
+shaped the same way — single `Tool` with an `action` parameter and a
+flat schema (every parameter optional except `action`). Pattern
+mirrors the rag dispatcher introduced 2026-05-04.
+
+* **`web` tool** — `web(action="search"|"fetch")`. Replaces the
+  separate `web_search`, `web_fetch`, and `web_google` tools. Search
+  takes an `engine` parameter (`"ddg"` default — DuckDuckGo, no key;
+  `"google"` opt-in via `--use-google` and the same env-var pair
+  Google CSE has always required). Both actions take `page` for
+  pagination; `fetch` takes `start` + `limit` for byte-window control.
+* **`fs` tool** — `fs(action="read"|"write"|"list"|"glob"|"grep"|"check_path"|"cwd"|"sandbox")`.
+  Replaces seven separate factories plus `get_current_dir` and
+  `get_sandbox_path`. `--allow-fs` now registers one tool, not seven.
+* **`--split-rag` removed.** The legacy seven `rag_*` tools and the
+  `--split-rag` flag are gone everywhere — CLI, INI, examples, all
+  four binaries. The single `rag(action=...)` dispatcher (default
+  since 2026-05-04) is the only RAG layout. On-disk format unchanged.
+* **Public-API breakage.** Anyone consuming `libeasyai` directly: the
+  individual `easyai::tools::web_search()` / `web_fetch()` /
+  `web_google()` / `fs_read_file()` / `fs_write_file()` / `fs_list_dir()`
+  / `fs_glob()` / `fs_grep()` / `fs_check_path()` / `get_current_dir()`
+  / `get_sandbox_path()` / `make_rag_tools()` / `RagTools` factories
+  are removed. Switch to `easyai::tools::web(google_enabled)`,
+  `easyai::tools::fs(root)`, and `easyai::tools::make_rag_tool(root)`.
+* **Why.** Three matching surfaces with the same shape make the
+  catalogue smaller (one entry per capability instead of nine), tool
+  prose can use one consolidated description style across all three,
+  and the model reasons about each capability as ONE thing with sub-
+  actions. The flat-schema-with-runtime-validation choice is the
+  same one the unified rag tool already validated against weak /
+  1-bit-quant tool callers.
+
 ### 2026-05-08 — Server observability + connection-pool fix + prompt cleanup
 
 Driven by a real production failure: an agentic session hung mid-stream,
@@ -566,13 +602,12 @@ has a matching INI key (see [`easyai-server.md`](easyai-server.md) §1).
 | `--no-mcp-auth` | off | Force `/mcp` open even with `[MCP_USER]` populated. |
 | `--http-retries N` | 5 | Extra attempts on transient HTTP failures (MCP client + web tools). 0 disables. Logged on stderr. |
 | `--http-timeout SECONDS` | 600 | Read/write timeout for the listen socket AND the MCP-client connection. Bumped from llama-server's 60 s default to accommodate long thinking turns. |
-| `--sandbox DIR` | server cwd | Root for `fs_*` / `bash` / external `$SANDBOX`. |
-| `--allow-fs` | off | Register `fs_read_file`, `fs_write_file`, `fs_list_dir`, `fs_glob`, `fs_grep`. |
+| `--sandbox DIR` | server cwd | Root for `fs` / `bash` / external `$SANDBOX`. |
+| `--allow-fs` | off | Register the unified `fs` tool (action=read / write / list / glob / grep / check_path / cwd / sandbox). |
 | `--allow-bash` | off | Register `bash` (NOT a hardened sandbox). |
-| `--use-google` | off | Register `web_google` (needs `GOOGLE_API_KEY` + `GOOGLE_CSE_ID`). |
-| `--split-rag` | off | Opt back into the legacy seven `rag_*` tools instead of the default single `rag(action=…)` dispatcher. |
+| `--use-google` | off | Enable engine=`"google"` inside the unified `web` tool (needs `GOOGLE_API_KEY` + `GOOGLE_CSE_ID`). |
 | `--external-tools DIR` | — | Load every `EASYAI-*.tools` manifest in `DIR`. |
-| `--RAG DIR` | — | Enable RAG (default: one `rag(action=…)` tool; with `--split-rag`: seven `rag_*` tools). Persistent memory. |
+| `--RAG DIR` | — | Enable RAG: registers one `rag(action=…)` tool with sub-actions save / append / search / load / list / delete / keywords. Persistent memory. |
 | `--preset NAME` | `precise` | Ambient sampling preset. See [Sampling presets](#sampling-presets) for what each implies. |
 | `--temperature F` | per preset | Override temperature (0.0–2.0). |
 | `--top-p F` | per preset | Nucleus sampling p. |
@@ -664,13 +699,12 @@ upstream `llama-server`, OpenAI itself, etc.).
 | `--max-tokens N` | server | Cap reply length. |
 | `--stop SEQ` | — | Add a stop string (repeatable). |
 | `--extra-json '{…}'` | — | Free-form JSON merged into the request body. |
-| `--tools LIST` | datetime,plan,web_search,web_fetch,system_* | Comma list of locally-registered tools. |
-| `--sandbox DIR` | — | Enable `fs_*` (read/list/glob/grep/write) scoped to `DIR`. |
+| `--tools LIST` | datetime,plan,web,system_* | Comma list of locally-registered tools. |
+| `--sandbox DIR` | — | Enable the unified `fs` tool (action=read/write/list/glob/grep/check_path/cwd/sandbox) scoped to `DIR`. |
 | `--allow-bash` | off | Register `bash` (uses `--sandbox` as cwd, else current dir). |
-| `--use-google` | off | Register `web_google`. |
-| `--split-rag` | off | Legacy seven `rag_*` tools instead of the default single `rag(action=…)`. |
+| `--use-google` | off | Enable engine=`"google"` inside the unified `web` tool. |
 | `--external-tools DIR` | — | Load `EASYAI-*.tools` manifests. |
-| `--RAG DIR` | — | Enable RAG (default: one `rag(action=…)` tool). |
+| `--RAG DIR` | — | Enable RAG (one `rag(action=…)` tool). |
 | `--no-plan` | off | Don't auto-register the planning tool. |
 | `-p, --prompt TEXT` | (REPL) | One-shot prompt; without it you get a REPL. |
 | `--no-reasoning` | shown | Hide `delta.reasoning_content`. |
@@ -841,13 +875,13 @@ pattern. Header: [`include/easyai/cli.hpp`](include/easyai/cli.hpp).
 
 | Method | Default | What it does |
 |---|---|---|
-| `.sandbox(dir)` | `""` | Root for `fs_*` (empty = no fs tools). |
-| `.allow_fs(on)` | on | Register `fs_*` (off in server unless `--allow-fs`). |
+| `.sandbox(dir)` | `""` | Root for the unified `fs` tool (empty = no fs tool). |
+| `.allow_fs(on)` | on | Register the unified `fs` tool (off in server unless `--allow-fs`). |
 | `.allow_bash(on)` | off | Register `bash` (also bumps `max_tool_hops` to 99999). |
 | `.with_plan(plan)` | — | Register the planning tool backed by a `Plan&`. |
-| `.no_web(on)` | off | Drop `web_search` / `web_fetch`. |
+| `.no_web(on)` | off | Drop the unified `web` tool. |
 | `.no_datetime(on)` | off | Drop `datetime`. |
-| `.use_google(on)` | off | Add `web_google` (env vars required at apply-time). |
+| `.use_google(on)` | off | Enable engine=`"google"` inside `web` (env vars required at apply-time). |
 | `.tools()` | — | Materialise `vector<Tool>`. |
 | `.apply(engine) / .apply(client)` | — | Register on the consumer + bump hops if bash. |
 
@@ -922,14 +956,12 @@ no API bill, no data leaving the box.**
   **Write one tool — every AI app on your machine can call it.**
 
 * **Long-term memory built in.** RAG: one `rag(action=...)` tool
-  by default (sub-actions save / append / search / load / list /
-  delete / keywords) the agent uses to save, append (grow what
-  you already know about the user without losing the previous
-  body), search, load, list, delete, and inventory its own
-  knowledge. Pass `--split-rag` to expose them as seven separate
-  `rag_*` tools instead — same store, useful for weak / 1-bit-
-  quant tool callers. One human-readable Markdown file per entry
-  — `cat`, `vim`, `grep` it. No vector DB to babysit.
+  (sub-actions save / append / search / load / list / delete /
+  keywords) the agent uses to save, append (grow what you already
+  know about the user without losing the previous body), search,
+  load, list, delete, and inventory its own knowledge. One
+  human-readable Markdown file per entry — `cat`, `vim`, `grep`
+  it. No vector DB to babysit.
 
 * **Operator-defined tool packs.** Drop a JSON manifest in
   `/etc/easyai/external-tools/`, the agent picks it up at startup.
@@ -992,9 +1024,9 @@ int main() {
 ```
 
 That's the whole thing.  Construct an `Agent`, ask, print.  Default
-toolset (datetime + web_search + web_fetch) is already wired in;
-fs_* and bash stay off until you opt in.  Remote endpoints work the
-same way:
+toolset (datetime + the unified `web` tool) is already wired in;
+the `fs` tool and `bash` stay off until you opt in.  Remote endpoints
+work the same way:
 
 ```cpp
 auto a = easyai::Agent::remote("http://127.0.0.1:8080/v1");
@@ -1018,7 +1050,7 @@ easyai::Engine engine;
 engine.model("models/qwen2.5-1.5b-instruct.gguf").gpu_layers(99).context(4096);
 
 easyai::cli::Toolbelt()
-    .sandbox   ("/srv/data")    // enables fs_read_file/list_dir/glob/grep/write
+    .sandbox   ("/srv/data")    // enables the unified `fs` tool (read/write/list/glob/grep)
     .allow_bash()                // enables bash + bumps max_tool_hops to 99999
     .apply     (engine);
 
@@ -1057,11 +1089,16 @@ engine.add_tool(
   callback on every mutation so you can render live.
 * `easyai::tools::*` — built-in tools:
   * `datetime` (no deps)
-  * `web_fetch` (libcurl, HTML→text)
-  * `web_search` (DuckDuckGo HTML, no API key, no external service)
-  * `fs_read_file`, `fs_write_file`, `fs_list_dir`, `fs_glob`, `fs_grep`
-    — sandboxed to a root directory you provide; the model sees a virtual
-    `/`-rooted filesystem (real sandbox path is hidden).
+  * `web` — unified search + fetch (`action="search"` / `"fetch"`).
+    Search engine selectable: `"ddg"` (DuckDuckGo, no key, default)
+    or `"google"` (Google Custom Search JSON API, opt-in via the
+    `google_enabled` ctor flag and the GOOGLE_API_KEY + GOOGLE_CSE_ID
+    env vars). Page-based pagination on search; byte-window pagination
+    on fetch. libcurl required at build time.
+  * `fs` — unified filesystem (`action="read"` / `"write"` / `"list"`
+    / `"glob"` / `"grep"` / `"check_path"` / `"cwd"` / `"sandbox"`),
+    sandboxed to a root directory you provide; the model sees a
+    virtual `/`-rooted filesystem (real sandbox path is hidden).
   * `bash` — shell command runner. `/bin/sh -c`, cwd pinned to the
     sandbox root, stdout/stderr merged + capped, configurable timeout.
     Honest about what it is: NOT a hardened sandbox — runs with your
@@ -1121,15 +1158,14 @@ no shell.
 
 | Flag                  | What it enables                                                         |
 |-----------------------|-------------------------------------------------------------------------|
-| (no flag)             | `datetime`, `web_search`, `web_fetch` only.                             |
-| `--sandbox <dir>`     | `fs_read_file / fs_write_file / fs_list_dir / fs_glob / fs_grep` plus `get_current_dir`, ALL scoped to `<dir>`. The CLIs `chdir` into `<dir>` so `get_current_dir` reports the sandbox path back to the model. |
+| (no flag)             | `datetime` and the unified `web` tool (action=`search` / `fetch`) only. |
+| `--sandbox <dir>`     | The unified `fs` tool (action=`read` / `write` / `list` / `glob` / `grep` / `check_path` / `cwd` / `sandbox`), all scoped to `<dir>`. The CLIs `chdir` into `<dir>` so `fs(action="cwd")` reports the sandbox path back to the model. |
 | `--allow-bash`        | `bash` (run `/bin/sh -c`). cwd = `--sandbox <dir>` if given, otherwise the binary's CWD. NOT a hardened sandbox — runs with your user privileges. Also bumps the agentic-loop `max_tool_hops` to 99999 (bash flows naturally span many turns). |
-| `--use-google`        | `web_google` (Google Custom Search JSON API). Requires `GOOGLE_API_KEY` and `GOOGLE_CSE_ID` env vars. Counts against your Google quota — free tier is 100 queries/day per key. Silently skipped if either env var is missing. |
+| `--use-google`        | Enables `engine="google"` inside the unified `web` tool (Google Custom Search JSON API). Requires `GOOGLE_API_KEY` and `GOOGLE_CSE_ID` env vars. Counts against your Google quota — free tier is 100 queries/day per key. Silently skipped if either env var is missing; the default `engine="ddg"` keeps working. |
 | `--external-tools <dir>` | Load every `EASYAI-<name>.tools` file in `<dir>` as an operator-defined tool pack. Per-file fault isolation (a bad file is logged + skipped, the agent still starts). Spawns via `fork`+`execve` — never a shell. **This is the supported way to give the model focused powers without flipping `--allow-bash`.** See [`EXTERNAL_TOOLS.md`](EXTERNAL_TOOLS.md). |
-| `--RAG <dir>`         | Enable RAG, the agent's persistent **memory** (search / store / append / recall / update / forget). DEFAULT: registers ONE `rag(action=...)` tool with sub-actions `save`, `append` (grow an existing memory without losing its body), `search`, `load`, `list`, `delete`, `keywords` — each memory one Markdown file in `<dir>`. Memories whose title starts with `fix-easyai-` are immutable: pass `fix=true` (sub-action `save`) to mint one. Pass `--split-rag` (below) to register the legacy seven separate tools instead. The systemd-installed server passes this by default (`/var/lib/easyai/rag`). See [`RAG.md`](RAG.md). |
-| `--split-rag`         | Opt back into the legacy seven `rag_*` tools (`rag_save`, `rag_append`, `rag_search`, `rag_load`, `rag_list`, `rag_delete`, `rag_keywords`) instead of the default single `rag(action=...)` dispatcher. Same on-disk format, same fix-memory semantics — only the catalog shape changes. Useful for weak / 1-bit-quant tool callers (Bonsai-class) that handle many flat schemas more reliably than one discriminated schema. Has no effect when `--RAG` is also off. |
+| `--RAG <dir>`         | Enable RAG, the agent's persistent **memory** (search / store / append / recall / update / forget). Registers ONE `rag(action=...)` tool with sub-actions `save`, `append` (grow an existing memory without losing its body), `search`, `load`, `list`, `delete`, `keywords` — each memory one Markdown file in `<dir>`. Memories whose title starts with `fix-easyai-` are immutable: pass `fix=true` (sub-action `save`) to mint one. The systemd-installed server passes this by default (`/var/lib/easyai/rag`). See [`RAG.md`](RAG.md). |
 | `--mcp <url>`         | Connect to a remote MCP server as a CLIENT (e.g. another `easyai-server` or `easyai-mcp-server`). The upstream's tool catalogue is fetched via `tools/list` and merged into the local one; each remote tool's handler proxies `tools/call` back to it. Local tool names win on collision (remote dup skipped with a warning). Pair with `--mcp-token <token>` when the upstream requires bearer auth. |
-| `--no-local-tools`    | Skip the LOCAL built-in toolbelt entirely (datetime, web_*, fs_*, bash, ...). Useful when you want ONLY external tools, ONLY RAG, or ONLY tools fetched via `--mcp`. Does NOT disable the MCP client — that's controlled by `--mcp`. **Renamed from `--no-tools`.** |
+| `--no-local-tools`    | Skip the LOCAL built-in toolbelt entirely (datetime, web, fs, bash, ...). Useful when you want ONLY external tools, ONLY RAG, or ONLY tools fetched via `--mcp`. Does NOT disable the MCP client — that's controlled by `--mcp`. **Renamed from `--no-tools`.** |
 
 #### Single config file: `/etc/easyai/easyai.ini`
 
@@ -1342,8 +1378,8 @@ Deep's operating loop is: **TIME → THINK → PLAN → EXECUTE → VERIFY**.
   another tool instead of guessing.
 
 Old behaviour rules carry over: `RULE 1` (execute or answer, never
-just announce), `web_search → web_fetch` mandatory, citations stick
-to the URL actually fetched.
+just announce), `web(action="search") → web(action="fetch")`
+mandatory, citations stick to the URL actually fetched.
 
 Operators who want a different persona pass `--system "<text>"` or
 `-s persona.txt` — Deep is the default, not a hardcoded identity.
@@ -1422,7 +1458,7 @@ cmake --build build -j
 cmake -S . -B build -DEASYAI_BUILD_WEBUI=OFF
 cmake --build build -j
 
-# Drop libcurl-using tools (web_fetch / web_search):
+# Drop libcurl-using tools (the `web` tool's search and fetch actions):
 cmake -S . -B build -DEASYAI_WITH_CURL=OFF
 cmake --build build -j
 
@@ -1472,10 +1508,12 @@ the other explicitly with `-DGGML_METAL=OFF` / `-DGGML_CUDA=OFF`.
 
 ### Web search
 
-`web_search` hits DuckDuckGo's HTML endpoint (`html.duckduckgo.com/html/`)
-directly and parses the result page. No API key, no external service to
-run, no environment variable to set. Works as long as the host has outbound
-HTTPS to duckduckgo.com.
+`web(action="search")` with the default `engine="ddg"` hits DuckDuckGo's
+HTML endpoint (`html.duckduckgo.com/html/`) directly and parses the result
+page. No API key, no external service to run, no environment variable to
+set. Works as long as the host has outbound HTTPS to duckduckgo.com. Pass
+`engine="google"` (operator opt-in via `--use-google` plus `GOOGLE_API_KEY`
++ `GOOGLE_CSE_ID`) for Google CSE instead.
 
 ---
 

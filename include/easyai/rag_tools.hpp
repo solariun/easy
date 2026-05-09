@@ -56,59 +56,27 @@
 
 namespace easyai::tools {
 
-// The seven tools that comprise the RAG surface. They share an
-// internal store object that holds the in-memory index and
-// serialises disk writes.
-struct RagTools {
-    Tool save;      // rag_save(title, keywords[], content)
-    Tool append;    // rag_append(title, content, keywords?[]) — RMW on existing
-    Tool search;    // rag_search(keywords[], max_results=10) — ≥2 matches when 2+ kw
-    Tool load;      // rag_load(titles[1..4])
-    Tool list;      // rag_list(prefix?, max=50)
-    Tool del;       // rag_delete(title)
-    Tool keywords;  // rag_keywords(min_count=1, max=200) — vocabulary overview
-};
-
-// Build the seven legacy RAG tools rooted at `root_dir` (the "split"
-// layout: rag_save / rag_append / rag_search / rag_load / rag_list /
-// rag_delete / rag_keywords as separate tools). The directory is
-// created on demand at first save; missing-directory at registration
-// time is NOT an error (operator may not have provisioned it yet).
+// Build the RAG tool rooted at `root_dir`. Single-tool dispatcher:
+// exposes one `rag` tool with an `action` parameter selecting one of
+// "save" / "append" / "search" / "load" / "list" / "delete" /
+// "keywords"; remaining params (title, keywords, content, fix,
+// titles, prefix, max, max_results, page, min_count) are routed to
+// the matching action's handler internally.
+//
+// The directory is created on demand at first save; missing-directory
+// at registration time is NOT an error (operator may not have
+// provisioned it yet).
 //
 // `root_dir` must not be empty; an empty path is a programmer error
-// and the tools will reject every call with a clear message.
+// and the tool will reject every call with a clear message.
 //
-// Fixed memories: rag_save accepts a `fix=true` argument that promotes
-// the saved entry to immutable. Immutable memories have a `fix-easyai-`
-// title prefix; rag_save refuses to overwrite them and rag_delete
-// refuses to remove them. Use this to seed system designs / domain
-// knowledge / hard rules the model must not rewrite mid-conversation.
-// rag_search / rag_load always see fixed entries.
-//
-// This is the OPT-IN layout, exposed behind --split-rag. The default
-// build registers the unified `rag(action=...)` tool below.
-RagTools make_rag_tools(std::string root_dir);
-
-// Default RAG layout — single-tool dispatcher. Exposes one `rag` tool
-// with an `action` parameter selecting one of "save" / "append" /
-// "search" / "load" / "list" / "delete" / "keywords"; remaining
-// params (title, keywords, content, fix, titles, prefix, max,
-// max_results, page, min_count) are routed to the matching action's
-// handler internally.
-//
-// Behaviour and on-disk format are byte-identical to the seven-tool
-// build (same RagStore, same handlers) — this is purely a different
-// shape for the model's tool catalog. When this is registered, the
-// seven rag_* tools should NOT be registered: the same operations
-// are reachable through `rag(action=...)` and exposing both would
-// just confuse the model with two paths to the same thing.
-//
-// Why this is the default: a single `rag(action=...)` keeps the tool
-// catalogue small (one entry instead of seven) and lets the model
-// reason about RAG as ONE capability with sub-actions, which most
-// modern tool-callers handle cleanly. Operators who run weak /
-// 1-bit-quant callers that struggle with discriminated schemas can
-// opt back into the legacy seven-tool layout via --split-rag.
-Tool make_unified_rag_tool(std::string root_dir);
+// Fixed memories: action="save" accepts a `fix=true` argument that
+// promotes the saved entry to immutable. Immutable memories have a
+// `fix-easyai-` title prefix; save refuses to overwrite them and
+// delete refuses to remove them. Use this to seed system designs /
+// domain knowledge / hard rules the model must not rewrite mid-
+// conversation. action="search" / action="load" always see fixed
+// entries.
+Tool make_rag_tool(std::string root_dir);
 
 }  // namespace easyai::tools

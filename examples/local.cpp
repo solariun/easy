@@ -116,14 +116,11 @@ struct CliArgs {
     int  n_ctx = 4096, ngl = -1, n_threads = 0;
     int  n_batch = 0;              // 0 = follow ctx
     bool load_tools = true;
-    std::string sandbox;        // empty = fs_* tools NOT registered
+    std::string sandbox;        // empty = `fs` tool NOT registered
     bool allow_bash = false;    // explicit opt-in for `bash`
     bool show_system_prompt = false;  // --show-system-prompt: dump and exit
     std::string external_tools_dir;     // optional external-tools dir (EASYAI-*.tools)
     std::string rag_dir;                 // optional RAG persistent-registry dir
-    bool        split_rag = false;       // opt back into the legacy seven rag_*
-                                          // tools instead of the default single
-                                          // `rag(action=...)` dispatcher.
 
     // KV cache controls
     std::string cache_type_k;      // empty = library default (f16)
@@ -194,20 +191,10 @@ struct CliArgs {
         "      --RAG <dir>               Enable RAG, the agent's persistent\n"
         "                                 registry / long-term memory. Each\n"
         "                                 entry is one Markdown file in <dir>.\n"
-        "                                 Default: registers ONE `rag(action=...)`\n"
+        "                                 Registers ONE `rag(action=...)`\n"
         "                                 tool with sub-actions save / append /\n"
         "                                 search / load / list / delete /\n"
-        "                                 keywords. Pass --split-rag to register\n"
-        "                                 the legacy seven separate rag_* tools\n"
-        "                                 instead. See RAG.md.\n"
-        "      --split-rag               Opt back into the legacy seven-tool RAG\n"
-        "                                 layout (rag_save / rag_append /\n"
-        "                                 rag_search / rag_load / rag_list /\n"
-        "                                 rag_delete / rag_keywords). Useful\n"
-        "                                 when the local model is a weak /\n"
-        "                                 1-bit-quant tool caller that handles\n"
-        "                                 many flat schemas better than one\n"
-        "                                 discriminated one.\n"
+        "                                 keywords. See RAG.md.\n"
         "\nKV cache (all optional):\n"
         " -ctk, --cache-type-k <type>    K-cache dtype (f32|f16|bf16|q8_0|q4_0|q4_1|q5_0|q5_1|iq4_nl)\n"
         " -ctv, --cache-type-v <type>    V-cache dtype (same options) — quantising V saves a lot of VRAM\n"
@@ -255,7 +242,6 @@ static CliArgs parse(int argc, char ** argv) {
         else if (s == "--allow-bash")                 a.allow_bash    = true;
         else if (s == "--external-tools")             a.external_tools_dir = need(i, "--external-tools");
         else if (s == "--RAG")                        a.rag_dir            = need(i, "--RAG");
-        else if (s == "--split-rag")                  a.split_rag          = true;
         else if (s == "--show-system-prompt")         a.show_system_prompt = true;
         // KV controls
         else if (s == "-ctk" || s == "--cache-type-k") a.cache_type_k = need(i, "-ctk");
@@ -311,8 +297,8 @@ static std::string build_builtin_system_prompt(const CliArgs & args) {
         "Your tools are EXACTLY those listed in your tools schema for "
         "this session. Do NOT invent tools. Anything you remember from "
         "other AI systems or training that isn't in the schema is NOT "
-        "available — including paraphrases (`read_file` is not "
-        "`fs_read_file`; `shell` is not `bash`).\n"
+        "available — including paraphrases (`read_file` is not `fs`; "
+        "you must use `fs(action=\"read\")`; `shell` is not `bash`).\n"
         "\n"
         "Uncertain whether a name is registered? Call `tool_lookup` "
         "first. With no argument it returns the full numbered "
@@ -335,37 +321,39 @@ static std::string build_builtin_system_prompt(const CliArgs & args) {
             s += "  - 'now' / 'today' / 'latest' → datetime first.\n";
         }
         if (web_on) {
-            s += "  - web_search returns snippets only; after one search, web_fetch "
-                 "the top 1-3 URLs and answer from the fetched body. Two searches "
-                 "in a row is wrong.\n";
+            s += "  - web(action=\"search\") returns snippets only; after one "
+                 "search, call web(action=\"fetch\") on the top 1-3 URLs and "
+                 "answer from the fetched body. Two searches in a row is wrong.\n";
         }
         if (fs_on && bash_on) {
-            s += "  - SANDBOX PRE-FLIGHT (authoritative): on the first turn that "
-                 "touches files, call `get_sandbox_path` to anchor the absolute "
-                 "root, then `fs_check_path` against the file/dir you're about "
-                 "to read or write. Skipping this causes avoidable error loops.\n"
-                 "  - Files: PREFER fs_read_file / fs_list_dir / fs_glob / fs_grep "
-                 "/ fs_write_file. Use RELATIVE paths (`report.md`, `src/main.cpp`, "
-                 "`.` for the root) — NEVER prefix with `/`. Do NOT use bash "
-                 "for `cat > file`, `cat <<EOF`, `echo > file`, `mkdir`, or for "
-                 "reading files — the dedicated fs tools do those without the "
-                 "shell-quoting minefield.\n"
+            s += "  - SANDBOX PRE-FLIGHT (authoritative): on the first turn "
+                 "that touches files, call `fs(action=\"sandbox\")` to anchor "
+                 "the absolute root, then `fs(action=\"check_path\")` against "
+                 "the file/dir you're about to read or write. Skipping this "
+                 "causes avoidable error loops.\n"
+                 "  - Files: PREFER the unified `fs` tool (action=read / "
+                 "write / list / glob / grep). Use RELATIVE paths "
+                 "(`report.md`, `src/main.cpp`, `.` for the root) — NEVER "
+                 "prefix with `/`. Do NOT use bash for `cat > file`, "
+                 "`cat <<EOF`, `echo > file`, `mkdir`, or for reading files "
+                 "— the `fs` actions do those without the shell-quoting "
+                 "minefield.\n"
                  "  - bash: cwd is the sandbox root; use RELATIVE paths. Reach "
-                 "for bash for shell features the dedicated tools don't have — "
+                 "for bash for shell features the `fs` actions don't have — "
                  "pipelines, find | xargs, build runners (make / cmake / cargo / "
                  "npm), git, package managers, sed/awk for in-place edits.\n";
         } else if (fs_on) {
-            s += "  - SANDBOX PRE-FLIGHT (authoritative): on the first turn that "
-                 "touches files, call `get_sandbox_path`, then `fs_check_path` "
-                 "against the target before any read/write.\n"
-                 "  - Files: use the dedicated fs tools — fs_read_file / "
-                 "fs_list_dir / fs_glob / fs_grep / fs_write_file. Use RELATIVE "
-                 "paths (`report.md`, `src/main.cpp`, `.` for the root) — NEVER "
-                 "prefix with `/`.\n";
+            s += "  - SANDBOX PRE-FLIGHT (authoritative): on the first turn "
+                 "that touches files, call `fs(action=\"sandbox\")`, then "
+                 "`fs(action=\"check_path\")` against the target before any "
+                 "read/write.\n"
+                 "  - Files: use the unified `fs` tool — action=read / list / "
+                 "glob / grep / write. Use RELATIVE paths (`report.md`, "
+                 "`src/main.cpp`, `.` for the root) — NEVER prefix with `/`.\n";
         } else if (bash_on) {
             s += "  - bash: run shell commands. cwd is the sandbox root; use "
-                 "RELATIVE paths. No dedicated file tools are registered, so "
-                 "bash is the only path for file work too.\n";
+                 "RELATIVE paths. The `fs` tool is not registered, so bash "
+                 "is the only path for file work too.\n";
         }
         if (rag_on) {
             s += "  - Long-term memory: rag(action=…) save / append / search / load.\n";
@@ -394,7 +382,7 @@ int main(int argc, char ** argv) {
     CliArgs args = parse(argc, argv);
     install_sigint();
 
-    // Anchor process cwd to --sandbox so get_current_dir surfaces the
+    // Anchor process cwd to --sandbox so fs(action="cwd") surfaces the
     // path the operator authorised, and so $SANDBOX placeholders in
     // any --external-tools manifests resolve to the right directory at
     // load time. Same idiom used by easyai-server / easyai-cli.
@@ -453,7 +441,6 @@ int main(int argc, char ** argv) {
     lc.external_tools_dir = args.external_tools_dir;
     lc.quiet              = args.quiet;
     lc.rag_dir            = args.rag_dir;
-    lc.split_rag          = args.split_rag;
     lc.n_ctx          = args.n_ctx;
     lc.n_batch        = args.n_batch;
     lc.ngl            = args.ngl;

@@ -10,7 +10,7 @@
 //         .temperature(0.8f)
 //         .top_p(0.95f)
 //         .add_tool(easyai::tools::datetime())
-//         .add_tool(easyai::tools::web_fetch())
+//         .add_tool(easyai::tools::web())
 //         .load();
 //
 //   engine.on_token([](const std::string & piece){ std::cout << piece; });

@@ -753,9 +753,9 @@ primitive; the rest is correctness.
   appenders queue cleanly without losing each other's appendix.
   The body is read off-disk per `load` / `append`, never cached,
   so memory doesn't grow with entry count beyond the metadata.
-  The default `rag(action=...)` dispatcher and the `--split-rag`
-  seven-tool layout share the same `RagStore` and the same
-  locking discipline; only the catalog shape changes.
+  The unified `rag(action=...)` dispatcher is the only layout
+  (the legacy `--split-rag` seven-tool surface was removed
+  2026-05-09).
 - **Filesystem permissions are the access boundary.** The installer
   creates `/var/lib/easyai/rag/` mode 750 owned by the `easyai`
   service user. The agent is the only thing that can read or

@@ -380,7 +380,7 @@ git clone https://github.com/ggml-org/llama.cpp
 
 | Optional        | Used by             |
 |-----------------|---------------------|
-| libcurl         | `web_fetch`, `web_search` |
+| libcurl         | the unified `web` tool (action=`search` / `fetch`) |
 
 On macOS:
 
@@ -439,8 +439,9 @@ build/easyai-chat       # bare REPL (no tools)
 build/libeasyai.dylib # the library
 ```
 
-If the configure step says `easyai: libcurl found — web_fetch / web_search enabled`,
-both web tools will work out of the box (no extra service to run).
+If the configure step says `easyai: libcurl found — web tool enabled`,
+the unified `web` tool's search and fetch actions work out of the box
+(no extra service to run).
 
 ### 1.4 Get a model
 
@@ -516,12 +517,13 @@ or "today".  Operators who want a different voice supply their own
 `--system "<text>"` or `-s persona.txt` — Deep is the default, not
 hardcoded.
 
-`--allow-fs` enables fs_* tools (read_file / write_file / list_dir /
-glob / grep + fs_check_path); pair with `--sandbox <dir>` to scope
-them under `<dir>` (otherwise they operate against the process's
-cwd).  `--allow-bash` adds the shell tool, also pinned to `<dir>`
-when `--sandbox` is set.  All three default OFF — fresh installs
-don't expose write access or shell to the model until the operator
+`--allow-fs` enables the unified `fs` tool (action=read / write /
+list / glob / grep / check_path / cwd / sandbox); pair with
+`--sandbox <dir>` to scope it under `<dir>` (otherwise it operates
+against the process's cwd).  `--allow-bash` adds the shell tool,
+also pinned to `<dir>` when `--sandbox` is set.  All three default
+OFF — fresh installs don't expose write access or shell to the
+model until the operator
 opts in. Note that `--sandbox <dir>` alone does NOT register fs_*;
 prior versions implied it but as of 2026-05-08 the flags are
 honoured independently so an operator can run with a sandbox
@@ -597,9 +599,10 @@ int main() {
 ```
 
 `Agent` is the friendly Tier-1 façade.  Construct, ask, print.
-Default toolset (datetime + web_search + web_fetch) is wired in;
-fs_* and bash stay off until you opt in via `.sandbox()` or
-`.allow_bash()`.  Streaming output is one chained call away:
+Default toolset (datetime + the unified `web` tool) is wired in;
+the unified `fs` tool and `bash` stay off until you opt in via
+`.sandbox()` or `.allow_bash()`.  Streaming output is one chained
+call away:
 
 ```cpp
 easyai::Agent a("model.gguf");
@@ -777,7 +780,7 @@ Two patterns ship in `src/`. Use whichever fits your tool's shape.
 #### Pattern A — single-action tools
 
 The default for a tool that does one thing. Examples in-tree:
-`web_fetch`, `read_file`, `bash`, `glob`, `grep`. Recipe:
+`bash` and `datetime` (the standalone single-action tools). Recipe:
 
 1. Open with one sentence: what does this tool do?
 2. State Required vs. Optional parameters explicitly.
@@ -961,18 +964,18 @@ applies to any `on_change`-style observable in a tool.
 - [ ] If multi-action: action inference + synonym mapping in place.
 - [ ] If batching: callbacks coalesced (RAII guard).
 
-### 3.3 Sandboxed filesystem tools
+### 3.3 Sandboxed filesystem tool
 
-Always pass a root directory:
+A single unified `fs` tool with eight sub-actions covers every file
+operation. Pass a root directory:
 
 ```cpp
-engine.add_tool(easyai::tools::fs_read_file    ("./workspace"));
-engine.add_tool(easyai::tools::fs_write_file   ("./workspace"));
-engine.add_tool(easyai::tools::fs_list_dir     ("./workspace"));
-engine.add_tool(easyai::tools::fs_glob         ("./workspace"));
-engine.add_tool(easyai::tools::fs_grep         ("./workspace"));
-engine.add_tool(easyai::tools::get_sandbox_path("./workspace")); // ← the absolute path
+engine.add_tool(easyai::tools::fs("./workspace"));
 ```
+
+Sub-actions selected by the `action` parameter: `read`, `write`,
+`list`, `glob`, `grep`, `check_path`, `cwd`, `sandbox`. The model
+calls them as `fs(action="read", path="report.md")` etc.
 
 Paths sent by the model are anchored to the root by **iterating path
 components and dropping any `..`, `.`, or absolute markers** before
@@ -983,11 +986,12 @@ The model sees a virtual `/`-rooted filesystem (`/report.md`,
 `/docs/spec.md`); the real sandbox path is hidden from descriptions
 and result messages.
 
-`get_sandbox_path` is the model's escape hatch when it does need the
-real on-disk path (typing it back in chat, invoking bash with absolute
-paths, etc.). It captures the configured root at registration so the
-answer is pinned — distinct from `get_current_dir`, which reports the
-process's live cwd and can drift.
+`fs(action="sandbox")` is the model's escape hatch when it does need
+the real on-disk path (typing it back in chat, invoking bash with
+absolute paths, etc.). It captures the configured root at
+registration so the answer is pinned — distinct from
+`fs(action="cwd")`, which reports the process's live cwd and can
+drift.
 
 ### 3.3.1 Toolbelt — register the canonical agent toolset in 3 lines
 
@@ -995,18 +999,18 @@ Instead of hand-rolling the standard tool registration:
 
 ```cpp
 easyai::cli::Toolbelt()
-    .sandbox   ("./workspace")    // adds fs_* + get_sandbox_path
-    .allow_bash()                  // adds bash; ALSO ensures fs_* are on
+    .sandbox   ("./workspace")    // adds the unified `fs` tool
+    .allow_bash()                  // adds bash; ALSO ensures `fs` is on
     .with_plan (plan)              // adds the plan tool
     .apply     (engine);           // or .apply(client) for the remote variant
 ```
 
-The Toolbelt always includes `datetime` + `web_search` + `web_fetch`.
-The filesystem set (`fs_*` + `get_sandbox_path`) is enabled by **either**
-`.sandbox()` or `.allow_bash()` — bash is strictly more permissive than
-`fs_*`, so allowing bash without `fs_*` is incoherent (the model would
-fall back to `cat > file` for ordinary writes). A fresh agent
-installation that calls neither still can't expose write or shell.
+The Toolbelt always includes `datetime` + the unified `web` tool.
+The unified `fs` tool is enabled by **either** `.sandbox()` or
+`.allow_bash()` — bash is strictly more permissive than `fs`, so
+allowing bash without `fs` is incoherent (the model would fall back
+to `cat > file` for ordinary writes). A fresh agent installation
+that calls neither still can't expose write or shell.
 
 ### 3.3.2 Bash tool — when you need a real shell
 
@@ -1024,23 +1028,19 @@ privileges. It's appropriate for local single-user agents; for
 anything multi-tenant or production, run easyai-server inside a
 container / firejail / unprivileged user.
 
-### 3.3.3 `get_current_dir` — anchor relative paths
+### 3.3.3 `fs(action="cwd")` — anchor relative paths
 
-```cpp
-engine.add_tool(easyai::tools::get_current_dir());
-```
+The unified `fs` tool's `cwd` action returns the absolute path of the
+process's current working directory at call time. Pair it with
+`--sandbox`: the CLIs and server `chdir` into the sandbox at startup,
+so what `fs(action="cwd")` reports is exactly the directory `bash`
+operates inside, and the same root every other `fs` action resolves
+its RELATIVE paths against. Models that don't already know the path
+should call it once at the start of a task; for any subsequent file
+op, relative paths just work.
 
-A zero-parameter tool that returns the absolute path of the process's
-current working directory at call time. Pair it with `--sandbox`: the
-CLIs and server `chdir` into the sandbox at startup, so what
-`get_current_dir` reports is exactly the directory `bash`, `read_file`,
-`write_file`, `list_dir`, `glob` and `grep` operate against. Models
-that don't already know the path should call it once at the start of
-a task; for any subsequent file op, relative paths just work.
-
-The `Toolbelt` adds it automatically when any filesystem-flavoured
-tool is enabled (`allow_fs` or `allow_bash`); register it manually if
-you build the toolbelt by hand.
+The `Toolbelt` adds the unified `fs` tool automatically when
+`allow_fs` or `allow_bash` is on; the `cwd` action ships with it.
 
 ### 3.3.4 External tools — operator-defined commands via JSON manifests
 
@@ -1428,7 +1428,7 @@ gets one chance to flush — typical build systems handle this fine.
 - Set `treat_nonzero_exit_as_error: false` for tools where non-zero is informational (`pgrep`, `grep`, `diff`).
 - Match `timeout_ms` and `max_output_bytes` to the worst plausible case for that tool — not a global default. Short-running status tools should have small caps so a hung command doesn't waste the 5-min ceiling.
 - Use `env_passthrough` to pass exactly the env vars the wrapped command needs (`HOME`, `PATH`, sometimes `LANG`, `TZ`, a credential token). Default `[]` and grow only when something fails.
-- Spend real time on `description` text — that string is how the model picks WHICH tool to call. Mention edge cases ("returns empty when nothing matches"), expected use ("call this AFTER web_search"), and units ("returns kilobytes").
+- Spend real time on `description` text — that string is how the model picks WHICH tool to call. Mention edge cases ("returns empty when nothing matches"), expected use ("call this AFTER `web(action=\"search\")`"), and units ("returns kilobytes").
 - Name parameters to match the wrapped CLI's vocabulary (`pattern` if the binary calls it pattern, not `regex`).
 - Group related tools in one manifest — the `--tools` allowlist applies after load, so a single big manifest is fine for the operator.
 - Validate the manifest dir before deploy: `easyai-local --no-tools --external-tools ./tools.d` (no model call, just load — exits cleanly if valid, errors emitted to stderr if not).
@@ -1486,12 +1486,10 @@ for (const auto & t : loaded.tools) {
 > is a quick reference.
 
 RAG gives the agent a tool surface for remembering things across
-sessions. Two layouts share the same on-disk store and the same
-seven handlers:
+sessions. One tool with seven sub-actions:
 
 ```cpp
-// DEFAULT: one tool with seven sub-actions.
-engine.add_tool(easyai::tools::make_unified_rag_tool("/var/lib/easyai/rag"));
+engine.add_tool(easyai::tools::make_rag_tool("/var/lib/easyai/rag"));
 // rag(action="save",     title, keywords[], content, fix?)
 // rag(action="append",   title, content, keywords?)        — grow an existing memory
 // rag(action="search",   keywords[], max_results=10)
@@ -1499,23 +1497,11 @@ engine.add_tool(easyai::tools::make_unified_rag_tool("/var/lib/easyai/rag"));
 // rag(action="list",     prefix?, max=50)
 // rag(action="delete",   title)
 // rag(action="keywords", min_count=1, max=200)
-
-// OPT-IN (--split-rag): seven separate tools.
-auto rag = easyai::tools::make_rag_tools("/var/lib/easyai/rag");
-engine.add_tool(rag.save);     // rag_save(title, keywords[], content, fix?)
-engine.add_tool(rag.append);   // rag_append(title, content, keywords?)
-engine.add_tool(rag.search);   // rag_search(keywords[], max_results=10)
-engine.add_tool(rag.load);     // rag_load(titles[1..4])
-engine.add_tool(rag.list);     // rag_list(prefix?, max=50)
-engine.add_tool(rag.del);      // rag_delete(title)
-engine.add_tool(rag.keywords); // rag_keywords(min_count=1, max=200)
 ```
 
 Or via the `--RAG <dir>` flag in `easyai-server`, `easyai-cli`, and
-`easyai-local` — that picks the unified dispatcher by default. Pass
-`--split-rag` (or `[SERVER] split_rag = on` in the INI) to opt back
-into the legacy seven-tool layout. The systemd-installed server
-passes `--RAG /var/lib/easyai/rag` by default.
+`easyai-local`. The systemd-installed server passes
+`--RAG /var/lib/easyai/rag` by default.
 
 Each entry is one Markdown file `<title>.md` in the configured
 directory:
@@ -1991,9 +1977,9 @@ Same engine, same callback shape, full schema control.
   patterns, the per-`param()` description style used in-tree, and the
   tolerance shims (synonym mapping, action inference, error messages
   that teach) that keep tools robust when the model goes off-spec.
-* **`src/builtin_tools.cpp`** — `web_search`, `web_fetch`, and the
-  filesystem tools.  All written with the exact API you've been using.
-  No internal magic; copy any of them as a starting point.
+* **`src/builtin_tools.cpp`** — the unified `web` and `fs` tools and
+  `bash`. All written with the exact API you've been using. No
+  internal magic; copy any of them as a starting point.
 * **`examples/agent.cpp`** — every built-in plus a one-liner
   `flip_coin` for the shortest possible custom tool.
 * [3.3 Sandboxed filesystem tools](#33-sandboxed-filesystem-tools) —

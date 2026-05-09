@@ -22,7 +22,7 @@ the whole system.
 1. [What RAG is, and why](#1-what-rag-is-and-why)
 2. [Quickstart](#2-quickstart)
 3. [The file format on disk](#3-the-file-format-on-disk)
-4. [The seven actions (default unified tool, or seven tools under `--split-rag`)](#4-the-seven-tools)
+4. [The seven actions of the unified `rag` tool](#4-the-seven-tools)
 5. [How the model is encouraged to use it](#5-how-the-model-is-encouraged-to-use-it)
 6. [Workflows](#6-workflows)
 7. [Best practices](#7-best-practices)
@@ -38,8 +38,8 @@ the whole system.
 RAG is a **keyword-indexed key/value store**, owned by the agent,
 persisted on disk, accessible to the agent as **its own memory** —
 something it can search, store, append to, recall, update, and
-forget. The default registration exposes ONE tool with seven sub-
-actions:
+forget. The tool surface is ONE `rag` tool with seven sub-actions
+selected by the `action` parameter:
 
 ```
 rag(action="save",     title, keywords[], content, fix?)   store / overwrite; fix=true → immutable memory
@@ -51,12 +51,10 @@ rag(action="delete",   title)                              forget a stale memory
 rag(action="keywords", min_count?, max?)                   vocabulary overview
 ```
 
-That is the whole API. Pass `--split-rag` (or `[SERVER] split_rag = on`
-in the INI) to flatten this into the legacy seven separate tools
-(`rag_save`, `rag_append`, `rag_search`, `rag_load`, `rag_list`,
-`rag_delete`, `rag_keywords`) — useful for weak / 1-bit-quant tool
-callers that handle many flat schemas more reliably than one
-discriminated schema.
+That is the whole API. (Until 2026-05-09 a `--split-rag` flag opted
+back into a legacy layout that exposed the same seven actions as
+seven separate tools; that flag is gone — the dispatcher above is
+the only layout now.)
 
 The model decides what to remember and how to classify it. Keywords
 are how it finds memories again later. The directory is the index.
@@ -68,41 +66,36 @@ memory; we just give it a place to put the bits it cared about.
 
 Any memory whose title starts with `fix-easyai-` is **immutable**:
 
-* `rag_save` refuses to overwrite it.
-* `rag_delete` refuses to remove it.
-* `rag_search` and `rag_load` work normally — and tag the entry
-  `[FIXED]` / `fixed: yes` so the model knows it's looking at
-  ground-truth knowledge, not a working note.
+* `rag(action="save")` refuses to overwrite it.
+* `rag(action="delete")` refuses to remove it.
+* `rag(action="search")` and `rag(action="load")` work normally — and
+  tag the entry `[FIXED]` / `fixed: yes` so the model knows it's
+  looking at ground-truth knowledge, not a working note.
 
-To mint one, the model passes `fix=true` to `rag_save`; the title
-is auto-prepended with `fix-easyai-` if not already present, and the
-file becomes read-only-via-tool from that point on. Use this when the
-user explicitly asks to "learn this as a rule", "remember this as the
-design", "this is the spec — memorise it". The only way to change a
-fixed memory is for the operator to remove the file from disk by hand.
+To mint one, the model passes `fix=true` to `rag(action="save")`; the
+title is auto-prepended with `fix-easyai-` if not already present, and
+the file becomes read-only-via-tool from that point on. Use this when
+the user explicitly asks to "learn this as a rule", "remember this as
+the design", "this is the spec — memorise it". The only way to change
+a fixed memory is for the operator to remove the file from disk by hand.
 
-### The single-tool dispatcher (default) and the legacy seven-tool layout
+### Why one tool with seven sub-actions
 
-By **default**, `--RAG <dir>` registers ONE tool that bundles every RAG
-action behind an `action` parameter:
+`--RAG <dir>` registers ONE tool that bundles every RAG action behind
+an `action` parameter:
 
 ```
 rag(action="save"|"append"|"search"|"load"|"list"|"delete"|"keywords", ...)
 ```
 
-Same on-disk format, same `RagStore`, same fix-memory rules. The
-catalogue carries 1 entry instead of 7, which keeps the toolbelt
-readable for the model and saves a few hundred tokens per turn.
-
-If you're driving a **weak / 1-bit-quant tool caller** (Bonsai-class)
-that handles many flat schemas more reliably than one discriminated
-schema, pass `--split-rag` (server / CLI / local flag — also
-`[SERVER] split_rag = on` in the INI) to opt back into the legacy
-seven-tool layout: `rag_save`, `rag_append`, `rag_search`,
-`rag_load`, `rag_list`, `rag_delete`, `rag_keywords`. When
-`--split-rag` is on the unified `rag(action=...)` is NOT registered,
-and vice-versa — the two paths to the same store would just confuse
-the model.
+The catalogue carries 1 entry instead of 7, keeping the toolbelt
+readable for the model and saving a few hundred tokens per turn. The
+schema is flat — every parameter optional except `action` — because
+JSON Schema's discriminated-union shapes (`oneOf` with a
+discriminator) trip up smaller / quantised tool-callers far more
+often than a flat "everything optional" schema does. Validation
+stays runtime: each handler rejects calls missing its required
+fields with a crisp message naming the dispatch form.
 
 ### How information flows
 
@@ -257,8 +250,8 @@ mkdir -p ~/easyai-reg
 easyai-cli --url http://127.0.0.1:8080 --RAG ~/easyai-reg
 ```
 
-Same single `rag(action=...)` tool (or seven `rag_*` tools with
-`--split-rag`), but the memory lives in your home directory.
+Same single `rag(action=...)` tool, but the memory lives in your
+home directory.
 
 ### From easyai-local (single-process REPL with RAG)
 
@@ -361,15 +354,13 @@ use `.` for hierarchy.
 
 ## 4. The seven actions
 
-By default the model sees ONE tool with seven sub-actions
-(`rag(action=...)`); under `--split-rag` it sees the same seven
-behaviours as separate `rag_*` tools. Either way the descriptions
-below are what the MODEL reads; they were written to actively
-encourage use — see §5. Action names below match the `action`
-parameter in the unified shape and the suffix of the legacy split
-shape (`save` ↔ `rag_save`, etc.).
+The model sees ONE `rag` tool with seven sub-actions selected by the
+`action` parameter (`rag(action="save")`, `rag(action="search")`,
+…). The descriptions below are what the MODEL reads; they were
+written to actively encourage use — see §5. Each section header
+names the action; the parameter signature and behaviour follow.
 
-### rag_save
+### action="save"
 
 ```
 rag_save(title: string, keywords: string[], content: string,
@@ -393,7 +384,7 @@ memory; the immutability is enforced by the title prefix, so
 `ls fix-easyai-*` is the canonical "show me every fixed memory"
 listing.
 
-### rag_append
+### action="append"
 
 ```
 rag_append(title: string, content: string,
@@ -435,7 +426,7 @@ queue up; both appendices land. Concurrent reads (`rag_search` /
 parallelise except while a writer holds the unique_lock — same
 discipline as the rest of the RagStore.
 
-### rag_search
+### action="search"
 
 ```
 rag_search(keywords: string[], max_results: integer = 10) -> list of {title, keywords, preview, matched/total}
@@ -475,7 +466,7 @@ the rest. The first page is already best-first, so you usually
 don't need more — the model decides. Asking for `page=99` past the
 end gets a clear "past the last page" message, not an error.
 
-### rag_load
+### action="load"
 
 ```
 rag_load(titles: string[1..4]) -> entries with full body
@@ -488,7 +479,7 @@ immutable. Cap is 4 deliberately: more than that drowns the prompt.
 Missing titles surface as per-entry errors in the response, the
 others still load.
 
-### rag_list
+### action="list"
 
 ```
 rag_list(prefix: string?, max: integer = 50) -> list of titles
@@ -500,7 +491,7 @@ starts with `prefix`). Memories whose title starts with `fix-easyai-`
 are tagged `[FIXED]`. Body NOT included — use rag_load for that.
 `prefix='fix-easyai-'` lists every fixed memory in one call.
 
-### rag_delete
+### action="delete"
 
 ```
 rag_delete(title: string) -> ok
@@ -512,7 +503,7 @@ not an error. **Fixed memories are refused** — any title starting
 with `fix-easyai-` is rejected with a clear message; the operator
 must remove the file by hand if it really needs to go.
 
-### rag_keywords
+### action="keywords"
 
 ```
 rag_keywords(min_count: integer = 1, max: integer = 200)

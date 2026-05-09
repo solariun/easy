@@ -4,7 +4,7 @@
 //  Goals
 //  -----
 //   * Expose the SAME tool catalogue easyai-server exposes — built-ins
-//     (datetime, web_*, fs_*, bash, get_current_dir), RAG (six tools),
+//     (datetime, web, fs, bash), RAG (single `rag(action=...)` tool),
 //     and operator-defined `EASYAI-*.tools` external packs — over a
 //     dedicated MCP endpoint at POST /mcp.
 //   * No GGUF model loaded. No /v1/chat/completions. No webui. The
@@ -51,7 +51,7 @@
 #include "easyai/external_tools.hpp"    // EASYAI-*.tools loader
 #include "easyai/log.hpp"               // optional log tee
 #include "easyai/mcp.hpp"               // JSON-RPC dispatcher
-#include "easyai/rag_tools.hpp"         // make_rag_tools
+#include "easyai/rag_tools.hpp"         // make_rag_tool
 #include "easyai/tool.hpp"
 
 #include "httplib.h"                    // vendored by llama.cpp
@@ -220,9 +220,6 @@ struct ServerArgs {
     // Tool packs.
     std::string external_tools_dir;
     std::string rag_dir;
-    bool        split_rag = false;        // opt back into the legacy seven
-                                          // rag_* tools instead of the default
-                                          // single `rag(action=...)` dispatcher.
 
     // HTTP knobs.
     std::size_t max_body    = kDefaultMaxBody;
@@ -320,7 +317,6 @@ const std::vector<FlagDef> & kFlags() {
         { {"--no-tools"},              "SERVER", "load_tools",             "load_tools",          false, SET_BOOL_FALSE(&ServerArgs::load_tools) },
         { {"--external-tools"},        "SERVER", "external_tools",         "external_tools",      true,  SET_STR(&ServerArgs::external_tools_dir) },
         { {"--RAG"},                   "SERVER", "rag",                    "rag",                 true,  SET_STR(&ServerArgs::rag_dir) },
-        { {"--split-rag"},             "SERVER", "split_rag",              "split_rag",           false, SET_BOOL_TRUE(&ServerArgs::split_rag) },
         // ----- SERVER: auth -----
         { {"--api-key"},               "SERVER", "api_key",                "api_key",             true,  SET_STR(&ServerArgs::api_key) },
         { {"--no-mcp-auth"},           "",       "",                       "no_mcp_auth",         false, SET_BOOL_TRUE(&ServerArgs::no_mcp_auth) },
@@ -377,30 +373,25 @@ const std::vector<FlagDef> & kFlags() {
         "                                dispatches; 503 on saturation\n"
         "                                (default 256).\n"
         "\nTools:\n"
-        "      --sandbox <dir>          Root for fs_* / bash / external\n"
+        "      --sandbox <dir>          Root for fs / bash / external\n"
         "                                tools $SANDBOX placeholder.\n"
-        "      --allow-fs               Register fs_read_file, fs_write_file,\n"
-        "                                fs_list_dir, fs_glob, fs_grep,\n"
-        "                                fs_check_path, get_sandbox_path,\n"
-        "                                get_current_dir.\n"
+        "      --allow-fs               Register the unified `fs` tool\n"
+        "                                (action=read / write / list / glob /\n"
+        "                                grep / check_path / cwd / sandbox).\n"
         "      --allow-bash             Register `bash`. NOT a hardened\n"
         "                                sandbox — runs with this process's\n"
         "                                user privileges.\n"
         "      --no-tools               Skip the built-in toolbelt entirely\n"
-        "                                (datetime / web_search / web_fetch).\n"
+        "                                (datetime / web).\n"
         "      --external-tools <dir>   Load every EASYAI-*.tools manifest\n"
         "                                in <dir>. Per-file fault isolation.\n"
         "                                See EXTERNAL_TOOLS.md.\n"
         "      --RAG <dir>              Enable RAG, the agent's persistent\n"
-        "                                registry, rooted at <dir>. Default:\n"
-        "                                registers ONE `rag(action=...)` tool\n"
-        "                                with sub-actions save / append /\n"
-        "                                search / load / list / delete /\n"
-        "                                keywords. Pass --split-rag to\n"
-        "                                register the legacy seven separate\n"
-        "                                rag_* tools instead. See RAG.md.\n"
-        "      --split-rag              Opt back into the legacy seven-tool\n"
-        "                                RAG layout. INI: SERVER.split_rag=on.\n"
+        "                                registry, rooted at <dir>. Registers\n"
+        "                                ONE `rag(action=...)` tool with\n"
+        "                                sub-actions save / append / search /\n"
+        "                                load / list / delete / keywords.\n"
+        "                                See RAG.md.\n"
         "\nAuth:\n"
         "      --api-key <token>        Bearer required for /health,\n"
         "                                /metrics, /v1/tools when set.\n"
@@ -416,7 +407,7 @@ const std::vector<FlagDef> & kFlags() {
         "key reference):\n"
         "  [SERVER]      every flag above (host, port, sandbox, threads,\n"
         "                 max_concurrent_calls, allow_fs, allow_bash,\n"
-        "                 external_tools, rag, split_rag, api_key, mcp_auth,\n"
+        "                 external_tools, rag, api_key, mcp_auth,\n"
         "                 metrics, verbose, max_body, name).\n"
         "  [MCP_USER]    one user per line: name = bearer-token.\n"
         "                 Populating any line enables Bearer auth on /mcp.\n",
@@ -825,10 +816,9 @@ int main(int argc, char ** argv) {
 
     // -------- register the standard toolbelt ------------------------------
     //
-    // Same factory as easyai-server: built-ins (datetime, web_search,
-    // web_fetch) always; fs_* + get_current_dir when --allow-fs;
-    // bash when --allow-bash. Sandbox dir resolves against the cwd we
-    // chdir'd into above.
+    // Same factory as easyai-server: built-ins (datetime, unified web)
+    // always; unified `fs` when --allow-fs; bash when --allow-bash.
+    // Sandbox dir resolves against the cwd we chdir'd into above.
     if (args.load_tools) {
         std::string sb = args.sandbox;
         if (sb.empty() && (args.allow_fs || args.allow_bash)) sb = ".";
@@ -840,32 +830,14 @@ int main(int argc, char ** argv) {
     }
 
     // -------- RAG ---------------------------------------------------------
-    // Default: one `rag(action=...)` tool. --split-rag opts back into
-    // the legacy seven separate rag_* tools (useful for weak /
-    // 1-bit-quant callers that handle many flat schemas more reliably
-    // than one discriminated schema).
+    // One `rag(action=...)` tool dispatching all seven sub-actions.
     if (!args.rag_dir.empty()) {
-        if (args.split_rag) {
-            auto rag = easyai::tools::make_rag_tools(args.rag_dir);
-            ctx->default_tools.push_back(std::move(rag.save));
-            ctx->default_tools.push_back(std::move(rag.append));
-            ctx->default_tools.push_back(std::move(rag.search));
-            ctx->default_tools.push_back(std::move(rag.load));
-            ctx->default_tools.push_back(std::move(rag.list));
-            ctx->default_tools.push_back(std::move(rag.del));
-            ctx->default_tools.push_back(std::move(rag.keywords));
-            std::fprintf(stderr,
-                "easyai-mcp-server: RAG enabled (split: seven rag_* "
-                "tools), root = %s\n",
-                args.rag_dir.c_str());
-        } else {
-            ctx->default_tools.push_back(
-                easyai::tools::make_unified_rag_tool(args.rag_dir));
-            std::fprintf(stderr,
-                "easyai-mcp-server: RAG enabled (single rag tool), "
-                "root = %s\n",
-                args.rag_dir.c_str());
-        }
+        ctx->default_tools.push_back(
+            easyai::tools::make_rag_tool(args.rag_dir));
+        std::fprintf(stderr,
+            "easyai-mcp-server: RAG enabled (single rag tool), "
+            "root = %s\n",
+            args.rag_dir.c_str());
     }
 
     // -------- external-tools dir -----------------------------------------

@@ -29,11 +29,14 @@ namespace easyai::cli {
 // ---------- Toolbelt: standard agent toolset, fluently configured ----------
 //
 // Composes the canonical "agent flavour" of the built-in tools:
-//   - datetime           (always)
-//   - web_search/fetch   (unless no_web())
-//   - web_google         (when use_google() is called AND env vars set)
+//   - datetime           (always, unless no_datetime())
+//   - web                (unless no_web()) — unified search + fetch tool;
+//                         engine="google" only enabled when use_google()
+//                         is called AND env vars are present
 //   - plan tool          (when with_plan(Plan&) is called)
-//   - fs_*               (when sandbox(<dir>) is called — scoped to <dir>)
+//   - fs                 (when sandbox(<dir>) is called — scoped to <dir>;
+//                         unified read/write/list/glob/grep/check_path/
+//                         cwd/sandbox dispatcher)
 //   - bash               (when allow_bash() is called)
 //
 // `apply(Engine&)` and `apply(Client&)` register the tools AND, when
@@ -48,8 +51,8 @@ namespace easyai::cli {
 //         .apply(client);
 class Toolbelt {
 public:
-    Toolbelt & sandbox      (std::string dir);   // "" stays the default (no fs_*)
-    Toolbelt & allow_fs     (bool on = true);    // gate fs_* registration
+    Toolbelt & sandbox      (std::string dir);   // "" stays the default (no fs)
+    Toolbelt & allow_fs     (bool on = true);    // gate fs registration
     Toolbelt & allow_bash   (bool on = true);
     // Mirror the bash subprocess's merged stdout+stderr to the parent's
     // stderr in real time. The model still receives the full captured
@@ -58,14 +61,17 @@ public:
     // that haven't opted in.
     Toolbelt & show_bash    (bool on = true);
     Toolbelt & with_plan    (Plan & plan);
-    Toolbelt & no_web       (bool on = true);    // drop web_search/web_fetch
+    Toolbelt & no_web       (bool on = true);    // drop the web tool
     Toolbelt & no_datetime  (bool on = true);    // drop datetime
 
-    // Opt-in: register web_google (Google Custom Search JSON API).
-    // Off by default — the API needs GOOGLE_API_KEY + GOOGLE_CSE_ID env
-    // vars and counts against a quota, so we don't expose it unless the
-    // caller asks. Even when on, the tool is only added to the catalog
-    // if both env vars are present at apply()-time.
+    // Opt-in: enable engine="google" inside the unified `web` tool.
+    // Off by default — Google Custom Search needs GOOGLE_API_KEY +
+    // GOOGLE_CSE_ID env vars and counts against a quota, so we don't
+    // expose it unless the caller asks. Even when on, engine="google"
+    // is only accepted at registration if both env vars are present at
+    // apply()-time. The tool itself re-reads the env at call time so a
+    // key rotation mid-session surfaces a clear error rather than
+    // silent disappearance.
     Toolbelt & use_google   (bool on = true);
 
     // Materialise the configured tool list.  Order is the canonical

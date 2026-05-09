@@ -824,7 +824,7 @@ A serious tool-calling library does, at minimum:
 * Run the SSE loop, accumulator, and dispatch, exposing only **callbacks** for content / reasoning / tool events.
 * Catch handler exceptions at the FFI boundary and convert them into structured tool errors.
 * Manage the conversation history, truncating it safely when the context window fills.
-* Provide built-in tools for the obvious cases — `datetime`, `web_fetch`, `web_search`, `fs_read_file`, `bash` — sandboxed and resource-capped by default.
+* Provide built-in tools for the obvious cases — `datetime`, a unified `web` (search + fetch), a unified `fs` (read / write / list / glob / grep / …), `bash` — sandboxed and resource-capped by default.
 * Expose escape hatches: raw prompt rendering, raw SSE parsing, custom samplers — for the operator who needs to override.
 
 That is roughly the shape of every well-designed library in this space, regardless of language. The naming differs. The API surface differs. The defaults differ. The set of things that must be done does not.

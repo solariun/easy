@@ -11,7 +11,7 @@
 //
 // That's it.  Three lines: construct, ask, print.  No model load
 // boilerplate, no template wiring, no manual tool registration —
-// datetime/web_search/web_fetch are wired in by default.  Stream the
+// datetime + the unified `web` tool are wired in by default. Stream the
 // reply with `.on_token([](auto p){ std::cout << p << std::flush; })`.
 //
 // All the power of the underlying Engine/Client/Backend is still one

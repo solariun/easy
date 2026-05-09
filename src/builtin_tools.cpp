@@ -45,7 +45,10 @@
 
 namespace easyai::tools {
 
-namespace fs = std::filesystem;
+// `stdfs` rather than the conventional `fs` alias because this file
+// also exposes a public `Tool fs(...)` factory in the same namespace,
+// and `namespace fs = std::filesystem` would collide with it.
+namespace stdfs = std::filesystem;
 
 // ---------------------------------------------------------------- helpers
 static std::string trim(std::string s) {
@@ -296,7 +299,7 @@ static size_t curl_write_cb(void * buf, size_t sz, size_t n, void * ud) {
 // degrade content for "easyai/0.1" and similar non-browser UAs; this
 // pretends to be a vanilla Edge install so the bot heuristics treat us
 // like an interactive user.  Bumped manually as Edge releases — kept
-// in one place so web_search and web_fetch share the same persona.
+// in one place so the web tool's search and fetch actions share the same persona.
 static const char * const kEdgeUserAgent =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0";
@@ -600,11 +603,11 @@ Tool datetime() {
 }
 
 // ============================================================================
-// web_fetch
+// web fetch cache (process-wide, used by web action="fetch")
 // ----------------------------------------------------------------------------
-// Process-wide LRU cache for fetched bodies.  The model often re-asks for
-// the same URL within a single conversation (it digests results, then
-// circles back).  Caching avoids:
+// LRU cache for fetched bodies. The model often re-asks for the same URL
+// within a single conversation (it digests results, then circles back).
+// Caching avoids:
 //  - re-hitting the source (politeness + DDG rate-limit avoidance)
 //  - waste of latency / tokens on the model side
 //
@@ -671,341 +674,396 @@ WebFetchCache & web_fetch_cache() {
 }  // namespace
 #endif
 
-Tool web_fetch() {
-    return Tool::builder("web_fetch")
-        .describe("Fetch a URL and return its text content (HTML stripped + "
-                  "trimmed).  This is the ONLY way to read a web page's "
-                  "actual content — web_search returns titles and short "
-                  "snippets, not the page body.  Always call this after "
-                  "web_search when the user wants the contents of an "
-                  "article, documentation page, or news story.\n"
-                  "\n"
-                  "Pagination: fetched bodies are clipped to the first "
-                  "8 KB by default.  When a body is truncated the response "
-                  "ends with `[truncated: N more bytes; pass start=N to "
-                  "continue]` — call web_fetch again with the same URL plus "
-                  "`start=N` to read the next slice.\n"
-                  "\n"
-                  "Repeated fetches of the same URL within 5 minutes are "
-                  "served from an in-process cache; you do NOT need to "
-                  "re-fetch the same URL within one conversation.")
-        .param("url",     "string", "Fully-qualified http(s) URL to fetch", true)
-        .param("as_html", "boolean","If true, return raw HTML instead of stripped text", false)
-        .param("start",   "integer","Byte offset into the (already stripped) body, "
-                                    "for pagination.  Default 0 = beginning.", false)
-        .handle([](const ToolCall & c) {
+// ============================================================================
+// web — unified search + fetch dispatcher
+// ----------------------------------------------------------------------------
+// Two actions:
+//
+//   action="search"  query → numbered title/url/snippet list
+//                    engine: "ddg" (default, no key) | "google" (CSE; opt-in
+//                    + env vars). page-based pagination over the engine's
+//                    own ordering.
+//
+//   action="fetch"   url   → text content (HTML stripped, or raw with
+//                    as_html=true). Pagination via start (byte offset) +
+//                    limit (window size).
+//
+// Handlers below are private; the unified Tool factory at the bottom owns
+// the schema + dispatches by action. Same flat-everything-optional schema
+// shape as the unified rag tool so weak / 1-bit-quant callers don't trip
+// on discriminated unions.
+// ============================================================================
+
+namespace {
+
+// ---------- search: DuckDuckGo HTML scraper ----------
+// POST html.duckduckgo.com/html/ (DDG is much more aggressive about CAPTCHA
+// on GETs from scripted clients). DDG wraps result URLs in a tracking
+// redirect (`//duckduckgo.com/l/?uddg=ENCODED_URL&rut=...`); we unwrap
+// via decode_ddg_redirect() before handing them back so the model gets
+// real fetchable URLs.
+ToolResult web_search_ddg(const std::string & query, long long page,
+                          long long max_results) {
 #if !defined(EASYAI_HAVE_CURL)
-            (void) c;
-            return ToolResult::error("web_fetch unavailable: easyai built without libcurl");
+    (void) query; (void) page; (void) max_results;
+    return ToolResult::error(
+        "web search unavailable: easyai built without libcurl");
 #else
-            std::string url; bool as_html = false;
-            if (!args::get_string(c.arguments_json, "url", url) || url.empty()) {
-                return ToolResult::error("missing required arg: url");
-            }
-            args::get_bool(c.arguments_json, "as_html", as_html);
-            long long start = std::max<long long>(0,
-                args::get_int_or(c.arguments_json, "start", 0));
+    if (max_results < 1)  max_results = 1;
+    if (max_results > 20) max_results = 20;
+    if (page < 1)         page = 1;
 
-            // Cache key: url + as_html flag.  start is applied AFTER cache
-            // hit so we don't multiply storage by every offset.
-            const std::string key = url + (as_html ? "|html" : "|text");
-            std::string processed;
-            if (!web_fetch_cache().get(key, processed)) {
-                std::string body, err;
-                if (!http_get(url, {}, body, err)) {
-                    return ToolResult::error("fetch failed: " + err);
-                }
-                processed = as_html ? body : strip_html(body);
-                web_fetch_cache().put(key, processed, as_html);
-            }
+    const std::string url       = "https://html.duckduckgo.com/html/";
+    const std::string post_body = "q=" + url_encode(query) + "&kl=us-en";
+    std::string body, err;
+    if (!http_post_form(url, post_body, body, err)) {
+        return ToolResult::error("search failed: " + err);
+    }
+    if (body.empty()) {
+        return ToolResult::error("search failed: empty response");
+    }
 
-            // Apply pagination + 8 KiB window.
-            constexpr size_t kWindow = 8 * 1024;
-            if ((size_t) start >= processed.size()) {
-                std::ostringstream oss;
-                oss << "[start=" << start << " is past end of body (size="
-                    << processed.size() << "); nothing to return]";
-                return ToolResult::ok(oss.str());
-            }
-            std::string slice = processed.substr(start, kWindow);
-            const size_t remaining =
-                processed.size() - start - slice.size();
-            if (remaining > 0) {
-                std::ostringstream oss;
-                oss << slice
-                    << "\n\n[truncated: " << remaining
-                    << " more bytes; pass start="
-                    << (start + slice.size())
-                    << " to continue]";
-                return ToolResult::ok(oss.str());
-            }
-            return ToolResult::ok(slice);
+    static const std::regex re_title(
+        R"DDG(<a[^>]*class\s*=\s*"[^"]*result__a[^"]*"[^>]*href\s*=\s*"([^"]+)"[^>]*>([\s\S]*?)</a>)DDG",
+        std::regex::icase);
+    static const std::regex re_snippet(
+        R"DDG(<(?:a|div)[^>]*class\s*=\s*"[^"]*result__snippet[^"]*"[^>]*>([\s\S]*?)</(?:a|div)>)DDG",
+        std::regex::icase);
+
+    // Two-pass: collect ALL parseable results, then page-slice. DDG returns
+    // ~30 per scrape; with default max_results=5 that gives the model up to
+    // page=6 before exhausting a single fetch.
+    struct Hit { std::string title, url, snippet; };
+    std::vector<Hit> hits;
+    hits.reserve(40);
+
+    auto t_end = std::sregex_iterator();
+    for (auto it = std::sregex_iterator(body.begin(), body.end(), re_title);
+         it != t_end; ++it) {
+        std::string href  = (*it)[1].str();
+        std::string title = strip_html((*it)[2].str());
+        std::string real  = decode_ddg_redirect(href);
+        if (real.empty() || title.empty()) continue;
+        size_t after = it->position(0) + it->length(0);
+        std::string tail = body.substr(after,
+            std::min<size_t>(2048, body.size() - after));
+        std::string snippet;
+        std::smatch sm;
+        if (std::regex_search(tail, sm, re_snippet)) {
+            snippet = strip_html(sm[1].str());
+        }
+        hits.push_back({std::move(title), std::move(real), std::move(snippet)});
+    }
+
+    if (hits.empty()) {
+        return ToolResult::error(
+            "no results parsed (DuckDuckGo may have rate-limited the "
+            "request; try again in a minute)");
+    }
+
+    const long long total = (long long) hits.size();
+    const long long total_pages =
+        (total + max_results - 1) / max_results;
+    if (page > total_pages) {
+        std::ostringstream o;
+        o << "[page " << page << " is past last page (" << total_pages
+          << "); total_entries: " << total << "]";
+        return ToolResult::ok(o.str());
+    }
+
+    const long long start_idx = (page - 1) * max_results;
+    const long long end_idx   = std::min(total, start_idx + max_results);
+
+    std::ostringstream out;
+    out << "total_entries: " << total << "\n";
+    out << "page: "          << page << " of " << total_pages << "\n";
+    out << "has_more: "      << (page < total_pages ? "yes" : "no") << "\n";
+    out << "engine: ddg\n";
+    out << "Top web results for: " << query << "\n";
+    for (long long i = start_idx; i < end_idx; ++i) {
+        out << "\n" << (i + 1) << ". " << hits[i].title
+            << "\n   " << hits[i].url
+            << "\n   " << clip(hits[i].snippet, 300) << "\n";
+    }
+    return ToolResult::ok(clip(out.str(), 8 * 1024));
 #endif
-        })
-        .build();
 }
 
-// ============================================================================
-// web_search — DuckDuckGo HTML scraper
-// ----------------------------------------------------------------------------
-// No external service required: we POST the query to html.duckduckgo.com and
-// parse the resulting HTML for the result list.  DDG's HTML page has a stable
-// class-based markup (`result__a`, `result__snippet`) that's been the same for
-// years; if/when that changes, only this function needs updating.
-//
-// We POST instead of GET because DDG is much more aggressive about throwing
-// CAPTCHAs at GET requests from scripted clients.
-//
-// The URLs returned by DDG are wrapped in a tracking redirect of the form
-// `//duckduckgo.com/l/?uddg=ENCODED_URL&rut=...`; decode_ddg_redirect() unwraps
-// them so the caller (the LLM) gets real, fetchable URLs.
-//
-// No global state, no env vars — works out of the box.
-// ============================================================================
-Tool web_search() {
-    return Tool::builder("web_search")
-        .describe("Search the web (DuckDuckGo). Returns a numbered list of "
-                  "title / url / snippet results. The snippets are 1-2 short "
-                  "sentences only — NEVER summarize a topic from them alone. "
-                  "After this call, you MUST call web_fetch on the top 1-3 "
-                  "most relevant URLs from the result list to read the actual "
-                  "page content, then base your answer on the fetched text.")
-        .param("query",       "string",  "Search query", true)
-        .param("max_results", "integer", "Maximum results to return "
-                                         "(default 5, max 20)", false)
-        .handle([](const ToolCall & c) {
+// ---------- search: Google Custom Search JSON API ----------
+// Env vars read at CALL time (not registration) so a long-running server
+// picks up rotated keys without restart, and missing-env errors at the
+// time the model actually invokes the tool tell the user which variable
+// to set.
+ToolResult web_search_google(const std::string & query, long long page,
+                             long long max_results) {
 #if !defined(EASYAI_HAVE_CURL)
-            (void) c;
-            return ToolResult::error(
-                "web_search unavailable: easyai built without libcurl");
+    (void) query; (void) page; (void) max_results;
+    return ToolResult::error(
+        "web search unavailable: easyai built without libcurl");
 #else
-            std::string query;
-            if (!args::get_string(c.arguments_json, "query", query) || query.empty()) {
-                return ToolResult::error("missing required arg: query");
-            }
-            long long max_results = 5;
-            args::get_int(c.arguments_json, "max_results", max_results);
-            if (max_results < 1)  max_results = 1;
-            if (max_results > 20) max_results = 20;
+    if (max_results < 1)  max_results = 1;
+    if (max_results > 10) max_results = 10;   // CSE per-call ceiling
+    if (page < 1)         page = 1;
 
-            // POST html.duckduckgo.com/html/  with a form-encoded query.
-            // kl=us-en pins the locale so results are reproducible.
-            const std::string url       = "https://html.duckduckgo.com/html/";
-            const std::string post_body = "q=" + url_encode(query) + "&kl=us-en";
-            std::string body, err;
-            if (!http_post_form(url, post_body, body, err)) {
-                return ToolResult::error("search failed: " + err);
-            }
-            if (body.empty()) {
-                return ToolResult::error("search failed: empty response");
-            }
+    const char * api_key = std::getenv("GOOGLE_API_KEY");
+    const char * cse_id  = std::getenv("GOOGLE_CSE_ID");
+    if (!api_key || !*api_key) {
+        return ToolResult::error(
+            "GOOGLE_API_KEY env var not set — get one at "
+            "https://console.cloud.google.com/apis/credentials "
+            "(enable 'Custom Search API' first). Or set engine=\"ddg\" "
+            "(no key required).");
+    }
+    if (!cse_id || !*cse_id) {
+        return ToolResult::error(
+            "GOOGLE_CSE_ID env var not set — create a Programmable "
+            "Search Engine at https://programmablesearchengine.google.com "
+            "and copy the 'cx' value. Or set engine=\"ddg\" (no key "
+            "required).");
+    }
 
-            // ----- parse HTML --------------------------------------------------
-            // Each result block contains:
-            //   <a class="result__a" href="REDIRECT">TITLE_HTML</a>
-            //   ...
-            //   <a class="result__snippet" ...>SNIPPET_HTML</a>     (most cases)
-            //     OR
-            //   <div class="result__snippet">SNIPPET_HTML</div>     (some)
-            //
-            // We iterate over title matches and look for the *next* snippet
-            // element after each title's match end.
-            //
-            // The regexes use [\s\S] for "any char incl. newline" because
-            // std::regex's "." doesn't match newlines by default.
-            static const std::regex re_title(
-                R"DDG(<a[^>]*class\s*=\s*"[^"]*result__a[^"]*"[^>]*href\s*=\s*"([^"]+)"[^>]*>([\s\S]*?)</a>)DDG",
-                std::regex::icase);
-            static const std::regex re_snippet(
-                R"DDG(<(?:a|div)[^>]*class\s*=\s*"[^"]*result__snippet[^"]*"[^>]*>([\s\S]*?)</(?:a|div)>)DDG",
-                std::regex::icase);
+    // Google CSE pagination uses `start=` (1-based offset). page=1 → start=1,
+    // page=2 with max_results=10 → start=11, etc. The API caps total
+    // pageable results at 100 (start ≤ 91 with max_results=10).
+    const long long start = (page - 1) * max_results + 1;
+    if (start > 91) {
+        return ToolResult::error(
+            "page is past Google CSE's pagination ceiling (start>91; "
+            "the API caps total pageable results at 100)");
+    }
 
-            std::ostringstream out;
-            out << "Top web results for: " << query << "\n";
-            int count = 0;
+    std::string url = "https://www.googleapis.com/customsearch/v1?";
+    url += "key="   + url_encode(api_key);
+    url += "&cx="   + url_encode(cse_id);
+    url += "&q="    + url_encode(query);
+    url += "&num="  + std::to_string(max_results);
+    url += "&start=" + std::to_string(start);
+    url += "&safe=active";
 
-            auto t_end = std::sregex_iterator();
-            for (auto it = std::sregex_iterator(body.begin(), body.end(), re_title);
-                 it != t_end && count < max_results; ++it) {
+    std::string body, err;
+    if (!http_get(url, {}, body, err, 20, 1024 * 1024)) {
+        return ToolResult::error("google search failed: " + err
+            + " (verify GOOGLE_API_KEY, GOOGLE_CSE_ID, and that "
+              "Custom Search API is enabled in your Cloud project)");
+    }
 
-                std::string href  = (*it)[1].str();
-                std::string title = strip_html((*it)[2].str());
-                std::string real  = decode_ddg_redirect(href);
-                if (real.empty() || title.empty()) continue;
+    nlohmann::json j;
+    try {
+        j = nlohmann::json::parse(body);
+    } catch (const std::exception & e) {
+        return ToolResult::error(
+            std::string("google search: malformed JSON response: ") + e.what());
+    }
+    if (j.contains("error") && j["error"].is_object()) {
+        std::string msg = j["error"].value("message", "unknown error");
+        return ToolResult::error("google search rejected request: " + msg);
+    }
 
-                // Look for a snippet inside the next ~2 KiB of HTML after this
-                // title (snippets sit immediately below their titles in the DOM).
-                size_t after = it->position(0) + it->length(0);
-                std::string tail = body.substr(after,
-                    std::min<size_t>(2048, body.size() - after));
-                std::string snippet;
-                std::smatch sm;
-                if (std::regex_search(tail, sm, re_snippet)) {
-                    snippet = strip_html(sm[1].str());
-                }
+    // CSE response includes `queries.nextPage` when more results exist.
+    bool has_more = false;
+    if (j.contains("queries") && j["queries"].is_object()
+            && j["queries"].contains("nextPage")
+            && j["queries"]["nextPage"].is_array()
+            && !j["queries"]["nextPage"].empty()) {
+        has_more = true;
+    }
 
-                out << "\n" << (count + 1) << ". " << title
-                    << "\n   " << real
-                    << "\n   " << clip(snippet, 300) << "\n";
-                ++count;
-            }
-
-            if (count == 0) {
-                // DDG occasionally serves a CAPTCHA / "anomaly" interstitial
-                // when it thinks we're a bot — surface that explicitly.
-                return ToolResult::error(
-                    "no results parsed (DuckDuckGo may have rate-limited the "
-                    "request; try again in a minute)");
-            }
-            return ToolResult::ok(clip(out.str(), 8 * 1024));
+    std::ostringstream out;
+    out << "page: "     << page << "\n";
+    out << "has_more: " << (has_more ? "yes" : "no") << "\n";
+    out << "engine: google\n";
+    out << "Top web results for: " << query << "\n";
+    int count = 0;
+    if (j.contains("items") && j["items"].is_array()) {
+        for (const auto & item : j["items"]) {
+            if (count >= max_results) break;
+            std::string title = item.value("title",   std::string{});
+            std::string link  = item.value("link",    std::string{});
+            std::string snip  = item.value("snippet", std::string{});
+            std::replace(snip.begin(), snip.end(), '\n', ' ');
+            if (link.empty() || title.empty()) continue;
+            out << "\n" << (start + count) << ". " << title
+                << "\n   " << link
+                << "\n   " << clip(snip, 300) << "\n";
+            ++count;
+        }
+    }
+    if (count == 0) {
+        return ToolResult::error(
+            "no results — try a broader query, or verify the CSE "
+            "is configured to search the entire web (not just a "
+            "single site) at https://programmablesearchengine.google.com");
+    }
+    return ToolResult::ok(clip(out.str(), 8 * 1024));
 #endif
-        })
-        .build();
 }
 
-// ============================================================================
-// web_google — Google Custom Search JSON API client
-// ----------------------------------------------------------------------------
-// Why an API rather than a scraper: google.com/search aggressively gates
-// scripted clients (CAPTCHA, "unusual traffic", JS-only result panels) so
-// a scraper version is unreliable in seconds. The Custom Search JSON API
-// is the supported, stable interface — small JSON, predictable schema,
-// no UA games — at the cost of needing two env vars (GOOGLE_API_KEY +
-// GOOGLE_CSE_ID). Free tier is 100 queries/day; over that you pay per 1k.
-//
-// We read the env vars at CALL time (not registration) so:
-//   1. A long-running server picks up newly-rotated keys without restart.
-//   2. The tool can produce a clear actionable error when a key is
-//      missing instead of silently disappearing from the catalog.
-// The cli.cpp / Toolbelt registration still gates exposure on the env
-// being set, so the model only sees the tool when it would actually work
-// — but if it does see it and the keys vanish later, the error message
-// tells the user exactly which variable to set.
-// ============================================================================
-Tool web_google() {
-    return Tool::builder("web_google")
-        .describe("Search the web via Google's Custom Search JSON API. "
-                  "Returns a numbered list of title / url / snippet results "
-                  "— same shape as web_search but using Google's index. "
-                  "Snippets are 1-2 short sentences; NEVER summarize from "
-                  "them alone. After this call, you MUST call web_fetch on "
-                  "the top 1-3 most relevant URLs to read the actual page "
-                  "content, then base your answer on the fetched text.\n"
-                  "\n"
-                  "Requires GOOGLE_API_KEY and GOOGLE_CSE_ID environment "
-                  "variables. Free tier is capped at 100 queries/day "
-                  "across the whole API key.")
-        .param("query",       "string",  "Search query", true)
-        .param("max_results", "integer", "Maximum results to return "
-                                         "(default 5, max 10 — the per-call "
-                                         "ceiling of Google CSE)", false)
-        .handle([](const ToolCall & c) {
-#if !defined(EASYAI_HAVE_CURL)
-            (void) c;
+// ---------- search: dispatch ----------
+ToolResult web_handle_search(const ToolCall & c, bool google_enabled) {
+    std::string query;
+    if (!args::get_string(c.arguments_json, "query", query) || query.empty()) {
+        return ToolResult::error(
+            "missing required arg: query (web action=\"search\")");
+    }
+    long long max_results = 5;
+    args::get_int(c.arguments_json, "max_results", max_results);
+    long long page = 1;
+    args::get_int(c.arguments_json, "page", page);
+    std::string engine = "ddg";
+    args::get_string(c.arguments_json, "engine", engine);
+
+    if (engine == "ddg") {
+        return web_search_ddg(query, page, max_results);
+    }
+    if (engine == "google") {
+        if (!google_enabled) {
             return ToolResult::error(
-                "web_google unavailable: easyai built without libcurl");
+                "engine=\"google\" not enabled on this server — operator "
+                "must pass --use-google (or Toolbelt::use_google()) to "
+                "allow Google CSE. Default engine \"ddg\" works without "
+                "any opt-in.");
+        }
+        return web_search_google(query, page, max_results);
+    }
+    return ToolResult::error(
+        "unknown engine \"" + engine + "\" — valid: \"ddg\" "
+        "(DuckDuckGo, no key) or \"google\" (Google Custom Search, "
+        "needs GOOGLE_API_KEY + GOOGLE_CSE_ID env vars)");
+}
+
+// ---------- fetch: GET a URL, return text (or raw HTML), with paging ----------
+ToolResult web_handle_fetch(const ToolCall & c) {
+#if !defined(EASYAI_HAVE_CURL)
+    (void) c;
+    return ToolResult::error(
+        "web fetch unavailable: easyai built without libcurl");
 #else
-            std::string query;
-            if (!args::get_string(c.arguments_json, "query", query) || query.empty()) {
-                return ToolResult::error("missing required arg: query");
-            }
-            long long max_results = 5;
-            args::get_int(c.arguments_json, "max_results", max_results);
-            if (max_results < 1)  max_results = 1;
-            if (max_results > 10) max_results = 10;   // CSE per-call ceiling
+    std::string url; bool as_html = false;
+    if (!args::get_string(c.arguments_json, "url", url) || url.empty()) {
+        return ToolResult::error("missing required arg: url (web action=\"fetch\")");
+    }
+    args::get_bool(c.arguments_json, "as_html", as_html);
+    long long start = std::max<long long>(0,
+        args::get_int_or(c.arguments_json, "start", 0));
+    long long limit = args::get_int_or(c.arguments_json, "limit", 8 * 1024);
+    if (limit < 256)            limit = 256;
+    if (limit > 64 * 1024)      limit = 64 * 1024;
 
-            const char * api_key = std::getenv("GOOGLE_API_KEY");
-            const char * cse_id  = std::getenv("GOOGLE_CSE_ID");
-            if (!api_key || !*api_key) {
-                return ToolResult::error(
-                    "GOOGLE_API_KEY env var not set — get one at "
-                    "https://console.cloud.google.com/apis/credentials "
-                    "(enable 'Custom Search API' first)");
-            }
-            if (!cse_id || !*cse_id) {
-                return ToolResult::error(
-                    "GOOGLE_CSE_ID env var not set — create a Programmable "
-                    "Search Engine at https://programmablesearchengine.google.com "
-                    "and copy the 'cx' value");
-            }
+    // Cache key: url + as_html flag. Pagination is applied AFTER cache
+    // hit so we don't multiply storage by every (start, limit) combo.
+    const std::string key = url + (as_html ? "|html" : "|text");
+    std::string processed;
+    if (!web_fetch_cache().get(key, processed)) {
+        std::string body, err;
+        if (!http_get(url, {}, body, err)) {
+            return ToolResult::error("fetch failed: " + err);
+        }
+        processed = as_html ? body : strip_html(body);
+        web_fetch_cache().put(key, processed, as_html);
+    }
 
-            // Build the GET URL. The API ignores trailing whitespace but we
-            // url_encode every component so a query containing &, =, # or
-            // unicode is preserved verbatim.
-            std::string url = "https://www.googleapis.com/customsearch/v1?";
-            url += "key=" + url_encode(api_key);
-            url += "&cx=" + url_encode(cse_id);
-            url += "&q="  + url_encode(query);
-            url += "&num=" + std::to_string(max_results);
-            // Safe-search default — Google's "off" leaves NSFW in the
-            // mix, "active" filters explicit content. We pick "active"
-            // for the same reason web_search uses kl=us-en: predictable
-            // results in a tool the model is steering autonomously.
-            url += "&safe=active";
-
-            std::string body, err;
-            // 1 MiB cap is plenty — CSE responses are typically <50 KiB
-            // even at num=10. Default 20s timeout is fine for an API call.
-            if (!http_get(url, {}, body, err, 20, 1024 * 1024)) {
-                // Google returns 4xx with a JSON error body explaining
-                // what's wrong (bad key, quota, disabled API). http_get
-                // dropped the body on HTTP>=400, so we can only surface
-                // the status code — but the message is still actionable
-                // because the most common 4xx is "key invalid / quota".
-                return ToolResult::error("google search failed: " + err
-                    + " (verify GOOGLE_API_KEY, GOOGLE_CSE_ID, and that "
-                      "Custom Search API is enabled in your Cloud project)");
-            }
-
-            // ----- parse JSON -----------------------------------------------
-            // Schema:
-            //   { "items": [ { "title", "link", "snippet" }, ... ],
-            //     "searchInformation": { "totalResults": "..." } }
-            // Missing items = no results; we don't treat that as an error.
-            nlohmann::json j;
-            try {
-                j = nlohmann::json::parse(body);
-            } catch (const std::exception & e) {
-                return ToolResult::error(
-                    std::string("google search: malformed JSON response: ") + e.what());
-            }
-
-            // Some error conditions (e.g. malformed cx) return 200 with
-            // {"error": {"message": "..."}}. Surface that explicitly.
-            if (j.contains("error") && j["error"].is_object()) {
-                std::string msg = j["error"].value("message", "unknown error");
-                return ToolResult::error("google search rejected request: " + msg);
-            }
-
-            std::ostringstream out;
-            out << "Top web results for: " << query << "\n";
-            int count = 0;
-            if (j.contains("items") && j["items"].is_array()) {
-                for (const auto & item : j["items"]) {
-                    if (count >= max_results) break;
-                    std::string title = item.value("title",   std::string{});
-                    std::string link  = item.value("link",    std::string{});
-                    std::string snip  = item.value("snippet", std::string{});
-                    // Google's snippet field has literal "\n" sequences for
-                    // line wraps in the rendered card; flatten them so the
-                    // result list reads as a single line per snippet.
-                    std::replace(snip.begin(), snip.end(), '\n', ' ');
-                    if (link.empty() || title.empty()) continue;
-                    out << "\n" << (count + 1) << ". " << title
-                        << "\n   " << link
-                        << "\n   " << clip(snip, 300) << "\n";
-                    ++count;
-                }
-            }
-
-            if (count == 0) {
-                return ToolResult::error(
-                    "no results — try a broader query, or verify the CSE "
-                    "is configured to search the entire web (not just a "
-                    "single site) at https://programmablesearchengine.google.com");
-            }
-            return ToolResult::ok(clip(out.str(), 8 * 1024));
+    if ((size_t) start >= processed.size()) {
+        std::ostringstream oss;
+        oss << "[start=" << start << " is past end of body (size="
+            << processed.size() << "); nothing to return]";
+        return ToolResult::ok(oss.str());
+    }
+    std::string slice = processed.substr(start, (size_t) limit);
+    const size_t remaining = processed.size() - start - slice.size();
+    if (remaining > 0) {
+        std::ostringstream oss;
+        oss << slice
+            << "\n\n[truncated: " << remaining
+            << " more bytes; pass start="
+            << (start + slice.size())
+            << " to continue]";
+        return ToolResult::ok(oss.str());
+    }
+    return ToolResult::ok(slice);
 #endif
+}
+
+}  // namespace
+
+Tool web(bool google_enabled) {
+    return Tool::builder("web")
+        .describe(
+            "The web, accessed through one tool. Pick an action; the "
+            "parameters needed depend on which action you choose. "
+            "Two actions are supported:\n"
+            "\n"
+            "  action=\"search\"\n"
+            "    Search the web. Required: query. Optional: max_results "
+            "(default 5; ddg max 20, google max 10), page (1-based, "
+            "default 1; pages slice the engine's own ordering), engine "
+            "(\"ddg\" default — DuckDuckGo, no key, works out of the "
+            "box; \"google\" — Google Custom Search JSON API, needs "
+            "GOOGLE_API_KEY + GOOGLE_CSE_ID env vars and an operator "
+            "opt-in; google may be disabled on this deployment, in "
+            "which case use \"ddg\"). Returns a numbered title / url / "
+            "snippet list with `total_entries`, `page`, `has_more` "
+            "header lines so you can page forward without guessing.\n"
+            "\n"
+            "  action=\"fetch\"\n"
+            "    Read a URL's actual content. Required: url. Optional: "
+            "as_html (default false — strip HTML to plain text; pass "
+            "true to keep raw markup), start (byte offset into the "
+            "stripped body, default 0), limit (window size, default "
+            "8192, max 65536). When the response is truncated it ends "
+            "with `[truncated: N more bytes; pass start=N to continue]` "
+            "— call again with the suggested start to read the next "
+            "slice. Repeated fetches of the same URL within 5 minutes "
+            "are served from an in-process cache.\n"
+            "\n"
+            "WORKFLOW. Snippets in search results are 1-2 short "
+            "sentences; NEVER summarize a topic from them alone. After "
+            "every search, call action=\"fetch\" on the top 1-3 most "
+            "relevant URLs to read the actual page content, then base "
+            "your answer on the fetched text — not on the snippet list. "
+            "If the first page of results doesn't have what you need, "
+            "page forward (page=2, page=3, ...) BEFORE giving up; the "
+            "highest-quality result is often not in the first five.")
+        .param("action",      "string",
+               "Required. One of: \"search\", \"fetch\". Each action "
+               "consumes a subset of the other parameters; see the tool "
+               "description for the per-action requirements.", true)
+        .param("query",       "string",
+               "Used by search. The search query string.", false)
+        .param("url",         "string",
+               "Used by fetch. Fully-qualified http(s) URL to read.", false)
+        .param("max_results", "integer",
+               "Used by search. Page size (default 5; ddg max 20, "
+               "google max 10).", false)
+        .param("page",        "integer",
+               "Used by search. 1-based page index (default 1). Use "
+               "when a previous search returned `has_more: yes`. "
+               "Google CSE caps total pageable results at 100.", false)
+        .param("engine",      "string",
+               "Used by search. \"ddg\" (default, no key) or "
+               "\"google\" (needs env vars + operator opt-in).", false)
+        .param("start",       "integer",
+               "Used by fetch. Byte offset into the stripped (or raw, "
+               "if as_html=true) body for pagination. Default 0.", false)
+        .param("limit",       "integer",
+               "Used by fetch. Window size in bytes (default 8192, "
+               "max 65536). Larger windows mean fewer round-trips but "
+               "more tokens per call.", false)
+        .param("as_html",     "boolean",
+               "Used by fetch. If true, return raw HTML instead of "
+               "stripped text. Default false.", false)
+        .handle([google_enabled](const ToolCall & c) -> ToolResult {
+            std::string action;
+            if (!args::get_string(c.arguments_json, "action", action)
+                    || action.empty()) {
+                return ToolResult::error(
+                    "missing required argument: action. Use \"search\" "
+                    "or \"fetch\".");
+            }
+            if (action == "search") return web_handle_search(c, google_enabled);
+            if (action == "fetch")  return web_handle_fetch(c);
+            return ToolResult::error(
+                "unknown action \"" + action + "\". Valid: \"search\", "
+                "\"fetch\".");
         })
         .build();
 }
@@ -1016,10 +1074,10 @@ Tool web_google() {
 namespace {
 
 struct Sandbox {
-    fs::path root;
+    stdfs::path root;
     explicit Sandbox(std::string r) {
         if (r.empty()) r = ".";
-        root = fs::weakly_canonical(fs::absolute(r));
+        root = stdfs::weakly_canonical(stdfs::absolute(r));
     }
     // Resolve a user-supplied path inside the sandbox; returns false if it
     // escapes the root.
@@ -1053,14 +1111,14 @@ struct Sandbox {
     // The `err` out-param is kept for API stability (callers still
     // check the return value) but is never written; this method
     // always returns true.
-    bool resolve(const std::string & in, fs::path & out, std::string & /*err*/) const {
+    bool resolve(const std::string & in, stdfs::path & out, std::string & /*err*/) const {
         auto is_only_dots = [](const std::string & s) {
             if (s.empty()) return false;
             for (char c : s) if (c != '.') return false;
             return true;
         };
-        fs::path raw = in;
-        fs::path rel;
+        stdfs::path raw = in;
+        stdfs::path rel;
         for (const auto & part : raw) {
             const std::string s = part.string();
             if (s.empty())                  continue;
@@ -1077,9 +1135,9 @@ struct Sandbox {
     // what every fs_* / bash description tells the model to USE as
     // input — so grep/glob output can be fed straight back into
     // read_file without a leading-slash dance.
-    std::string virtual_path(const fs::path & real) const {
+    std::string virtual_path(const stdfs::path & real) const {
         std::error_code ec;
-        fs::path rel = fs::relative(real, root, ec);
+        stdfs::path rel = stdfs::relative(real, root, ec);
         if (ec || rel.empty() || rel == ".") return ".";
         return rel.generic_string();
     }
@@ -1102,11 +1160,11 @@ struct Sandbox {
     //      here used to break fs_check_path on exactly the paths the
     //      operator most wanted to probe (e.g. files inside an
     //      0000-perm parent that the model wants to know about).
-    bool inside_sandbox(const fs::path & p) const {
+    bool inside_sandbox(const stdfs::path & p) const {
         // Path-component prefix match — avoids the string-prefix bug
         // where "/srv/user" prefix-matches "/srv/userMALICIOUS/secret".
-        auto component_prefix = [](const fs::path & prefix,
-                                   const fs::path & full) {
+        auto component_prefix = [](const stdfs::path & prefix,
+                                   const stdfs::path & full) {
             auto it_pre = prefix.begin();
             auto it_ful = full.begin();
             for (; it_pre != prefix.end(); ++it_pre, ++it_ful) {
@@ -1125,9 +1183,9 @@ struct Sandbox {
         // surface the real errno far more usefully than a blanket
         // "escapes sandbox" rejection.
         std::error_code ec;
-        fs::path canon_p = fs::weakly_canonical(p, ec);
+        stdfs::path canon_p = stdfs::weakly_canonical(p, ec);
         if (ec) return true;
-        fs::path canon_r = fs::weakly_canonical(root, ec);
+        stdfs::path canon_r = stdfs::weakly_canonical(root, ec);
         if (ec) return true;
         return component_prefix(canon_r, canon_p);
     }
@@ -1173,903 +1231,679 @@ inline std::string glob_to_regex(const std::string & pattern) {
 
 }  // namespace
 
-Tool fs_read_file(std::string root) {
-    auto sb = std::make_shared<Sandbox>(std::move(root));
-    return Tool::builder("read_file")
-        .describe(
-            "Read a UTF-8 text file from disk and return its contents.\n"
-            "\n"
-            "AUTHORITATIVE SANDBOX RULE — before your first fs_*/bash "
-            "call in a task, run `get_sandbox_path` (the absolute on-disk "
-            "root, pinned at registration; this is the truth) and then "
-            "`fs_check_path` against the file you intend to read so you "
-            "have confirmed it exists and is readable. Skipping this is "
-            "the most common cause of avoidable error loops.\n"
-            "\n"
-            "PATHS ARE RELATIVE to the sandbox root. Use `report.md`, "
-            "`docs/spec.md`, `src/main.cpp` — NEVER prefix with `/`. "
-            "Required: path. Optional: offset, limit (default returns the "
-            "first 64 KB; pass offset to page through larger files).\n"
-            "\n"
-            "Examples:\n"
-            "  {path:\"report.md\"}\n"
-            "  {path:\"docs/spec.md\", offset:65536, limit:65536}\n"
-            "\n"
-            "Errors return a single-line message starting with `error:`. "
-            "Reading a binary file returns the raw bytes — prefer the "
-            "dedicated tools or `bash` (e.g. `file <path>`) for those.")
-        .param("path",   "string",
-               "Required. RELATIVE file path under the sandbox root, e.g. "
-               "`report.md` or `docs/spec.md`. No leading `/`. Confirm with "
-               "`fs_check_path` first.", true)
-        .param("offset", "integer",
-               "Optional. Skip this many bytes from the start of the file "
-               "before reading. Default 0. Use the previous read's "
-               "(offset + bytes_returned) to page forward.", false)
-        .param("limit",  "integer",
-               "Optional. Maximum bytes to return. Default 65536 (64 KB). "
-               "Larger files are truncated; raise this only when you "
-               "really need a bigger chunk.", false)
-        .handle([sb](const ToolCall & c) {
-            std::string path; long long offset = 0, limit = 64 * 1024;
-            if (!args::get_string(c.arguments_json, "path", path))
-                return ToolResult::error("missing arg: path");
-            args::get_int(c.arguments_json, "offset", offset);
-            args::get_int(c.arguments_json, "limit",  limit);
-            if (offset < 0) offset = 0;
-            if (limit  < 1) limit  = 1;
-            if (limit > 1024 * 1024) limit = 1024 * 1024;
+// ============================================================================
+// fs — unified filesystem dispatcher
+// ----------------------------------------------------------------------------
+// Eight actions: read, write, list, glob, grep, check_path, cwd, sandbox.
+// Each handler factory below takes a shared Sandbox (capturing the pinned
+// root) and returns a ToolHandler the unified Tool dispatches to.
+//
+// The rest of this file kept the legacy seven-tool surface
+// (fs_read_file/fs_write_file/...) until 2026-05-09, when this dispatcher
+// replaced them. Same on-disk semantics, same Sandbox containment, same
+// O_NOFOLLOW + post-mkdir TOCTOU defenses — only the catalog shape
+// changes.
+// ============================================================================
 
-            fs::path p; std::string err;
-            if (!sb->resolve(path, p, err)) return ToolResult::error(err);
-            if (!sb->inside_sandbox(p)) {
-                return ToolResult::error("path escapes sandbox via symlink: "
-                                         + sb->virtual_path(p));
-            }
-            // Open with O_NOFOLLOW + O_CLOEXEC so a symlink at the leaf
-            // (e.g. one planted by the bash tool) cannot redirect us
-            // out of the sandbox between the containment check and the
-            // open(). The check above already canonicalises but a TOCTOU
-            // race on fast-changing filesystems would still escape it
-            // without O_NOFOLLOW.
-            int fd = ::open(p.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
-            if (fd < 0) {
-                return ToolResult::error(std::string("cannot open: ")
-                                         + sb->virtual_path(p)
-                                         + " (" + std::strerror(errno) + ")");
-            }
-            if (offset > 0 && ::lseek(fd, offset, SEEK_SET) < 0) {
-                ::close(fd);
-                return ToolResult::error(std::string("seek failed: ")
-                                         + std::strerror(errno));
-            }
-            std::string buf((size_t) limit, '\0');
-            ssize_t n = ::read(fd, buf.data(), (size_t) limit);
+namespace {
+
+ToolHandler make_fs_read_handler(std::shared_ptr<Sandbox> sb) {
+    return [sb](const ToolCall & c) -> ToolResult {
+        std::string path; long long offset = 0, limit = 64 * 1024;
+        if (!args::get_string(c.arguments_json, "path", path))
+            return ToolResult::error("missing arg: path (fs action=\"read\")");
+        args::get_int(c.arguments_json, "offset", offset);
+        args::get_int(c.arguments_json, "limit",  limit);
+        if (offset < 0) offset = 0;
+        if (limit  < 1) limit  = 1;
+        if (limit > 1024 * 1024) limit = 1024 * 1024;
+
+        stdfs::path p; std::string err;
+        if (!sb->resolve(path, p, err)) return ToolResult::error(err);
+        if (!sb->inside_sandbox(p)) {
+            return ToolResult::error("path escapes sandbox via symlink: "
+                                     + sb->virtual_path(p));
+        }
+        // O_NOFOLLOW + O_CLOEXEC so a symlink at the leaf (e.g. planted
+        // by the bash tool) cannot redirect us out of the sandbox
+        // between the containment check and the open(). The check
+        // above canonicalises but a TOCTOU race on fast-changing
+        // filesystems would still escape it without O_NOFOLLOW.
+        int fd = ::open(p.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+        if (fd < 0) {
+            return ToolResult::error(std::string("cannot open: ")
+                                     + sb->virtual_path(p)
+                                     + " (" + std::strerror(errno) + ")");
+        }
+        if (offset > 0 && ::lseek(fd, offset, SEEK_SET) < 0) {
             ::close(fd);
-            if (n < 0) {
-                return ToolResult::error(std::string("read failed: ")
-                                         + std::strerror(errno));
-            }
-            buf.resize((size_t) n);
-            return ToolResult::ok(std::move(buf));
-        })
-        .build();
+            return ToolResult::error(std::string("seek failed: ")
+                                     + std::strerror(errno));
+        }
+        std::string buf((size_t) limit, '\0');
+        ssize_t n = ::read(fd, buf.data(), (size_t) limit);
+        ::close(fd);
+        if (n < 0) {
+            return ToolResult::error(std::string("read failed: ")
+                                     + std::strerror(errno));
+        }
+        buf.resize((size_t) n);
+        return ToolResult::ok(std::move(buf));
+    };
 }
 
-Tool fs_write_file(std::string root) {
-    auto sb = std::make_shared<Sandbox>(std::move(root));
-    return Tool::builder("write_file")
-        .describe(
-            "Write UTF-8 text to a file. Default mode OVERWRITES any "
-            "existing content; pass append=true to extend instead. Missing "
-            "parent directories are created automatically.\n"
-            "\n"
-            "AUTHORITATIVE SANDBOX RULE — before your first fs_*/bash "
-            "call in a task, run `get_sandbox_path` (the absolute on-disk "
-            "root, pinned at registration; this is the truth) and then "
-            "`fs_check_path` with `touch:true` for the destination so "
-            "you have confirmed write access in the sandbox. Skipping "
-            "this turns permission errors into surprises.\n"
-            "\n"
-            "PATHS ARE RELATIVE to the sandbox root. Use `report.md`, "
-            "`docs/notes.md`, `src/main.cpp` — NEVER prefix with `/`. "
-            "Required: path, content. Optional: append.\n"
-            "\n"
-            "Examples:\n"
-            "  {path:\"report.md\", content:\"# Title\\n\\nBody...\"}\n"
-            "  {path:\"log.txt\", content:\"line\\n\", append:true}\n"
-            "\n"
-            "On success returns `wrote N bytes to <path>`. Errors return a "
-            "single-line message starting with `error:`.")
-        .param("path",    "string",
-               "Required. RELATIVE destination file path under the sandbox "
-               "root. No leading `/`. Parent directories are created if "
-               "missing. Examples: `report.md`, `docs/notes.md`. Validate "
-               "writability with `fs_check_path` first.", true)
-        .param("content", "string",
-               "Required. UTF-8 text to write. Use `\\n` for newlines. "
-               "Binary content is not supported — use bash for that.", true)
-        .param("append",  "boolean",
-               "Optional. If true, append to the file instead of "
-               "overwriting it (creates the file if missing). Default "
-               "false (overwrite).", false)
-        .handle([sb](const ToolCall & c) {
-            std::string path, content; bool append = false;
-            if (!args::get_string(c.arguments_json, "path",    path))
-                return ToolResult::error("missing arg: path");
-            if (!args::get_string(c.arguments_json, "content", content))
-                return ToolResult::error("missing arg: content");
-            args::get_bool(c.arguments_json, "append", append);
+ToolHandler make_fs_write_handler(std::shared_ptr<Sandbox> sb) {
+    return [sb](const ToolCall & c) -> ToolResult {
+        std::string path, content; bool append = false;
+        if (!args::get_string(c.arguments_json, "path",    path))
+            return ToolResult::error("missing arg: path (fs action=\"write\")");
+        if (!args::get_string(c.arguments_json, "content", content))
+            return ToolResult::error("missing arg: content (fs action=\"write\")");
+        args::get_bool(c.arguments_json, "append", append);
 
-            fs::path p; std::string err;
-            if (!sb->resolve(path, p, err)) return ToolResult::error(err);
-            if (!sb->inside_sandbox(p)) {
-                return ToolResult::error("path escapes sandbox via symlink: "
-                                         + sb->virtual_path(p));
+        stdfs::path p; std::string err;
+        if (!sb->resolve(path, p, err)) return ToolResult::error(err);
+        if (!sb->inside_sandbox(p)) {
+            return ToolResult::error("path escapes sandbox via symlink: "
+                                     + sb->virtual_path(p));
+        }
+
+        std::error_code ec;
+        stdfs::create_directories(p.parent_path(), ec);
+
+        // Re-check containment AFTER create_directories. The pre-check
+        // runs against the canonical path of `p`; create_directories
+        // follows symlinks in existing parents and could have
+        // materialised intermediate dirs along a path that — racing
+        // with concurrent symlink creation, or via a parent whose
+        // canonicalisation just failed-open in inside_sandbox() —
+        // actually points outside root. O_NOFOLLOW already protects
+        // the leaf write; this second check rejects the rare case
+        // where a parent dir was just created outside the sandbox.
+        if (!sb->inside_sandbox(p)) {
+            return ToolResult::error(
+                "path escapes sandbox via symlink (post-mkdir): "
+                + sb->virtual_path(p));
+        }
+
+        int flags = O_WRONLY | O_CREAT | O_NOFOLLOW | O_CLOEXEC
+                  | (append ? O_APPEND : O_TRUNC);
+        int fd = ::open(p.c_str(), flags, 0600);
+        if (fd < 0) {
+            return ToolResult::error(std::string("cannot open for write: ")
+                                     + sb->virtual_path(p)
+                                     + " (" + std::strerror(errno) + ")");
+        }
+        const char * data = content.data();
+        size_t       left = content.size();
+        while (left > 0) {
+            ssize_t n = ::write(fd, data, left);
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                ::close(fd);
+                return ToolResult::error(std::string("write failed: ")
+                                         + std::strerror(errno));
             }
+            data += n;
+            left -= (size_t) n;
+        }
+        ::close(fd);
+        return ToolResult::ok("wrote " + std::to_string(content.size())
+                              + " bytes to " + sb->virtual_path(p));
+    };
+}
 
-            std::error_code ec;
-            fs::create_directories(p.parent_path(), ec);
+ToolHandler make_fs_list_handler(std::shared_ptr<Sandbox> sb) {
+    return [sb](const ToolCall & c) -> ToolResult {
+        std::string path;
+        if (!args::get_string(c.arguments_json, "path", path))
+            return ToolResult::error("missing arg: path (fs action=\"list\")");
 
-            // Re-check sandbox containment AFTER create_directories. The
-            // pre-check above runs against the canonical path of `p`;
-            // create_directories follows symlinks in existing parents and
-            // could have materialised intermediate dirs along a path that
-            // — racing with concurrent symlink creation, or via a parent
-            // whose canonicalisation just failed-open in inside_sandbox()
-            // — actually points outside root.  The lstat below + O_NOFOLLOW
-            // already protect the leaf write; this second containment
-            // check rejects the rare case where a parent dir was just
-            // created outside the sandbox before we open the leaf.
+        stdfs::path p; std::string err;
+        if (!sb->resolve(path, p, err)) return ToolResult::error(err);
+        if (!sb->inside_sandbox(p)) {
+            return ToolResult::error("path escapes sandbox via symlink: "
+                                     + sb->virtual_path(p));
+        }
+        if (!stdfs::is_directory(p))
+            return ToolResult::error("not a directory: " + sb->virtual_path(p));
+
+        std::ostringstream o;
+        for (auto & e : stdfs::directory_iterator(p)) {
+            o << (e.is_directory() ? "d " : "f ") << e.path().filename().string();
+            if (e.is_regular_file()) {
+                std::error_code ec;
+                auto sz = stdfs::file_size(e.path(), ec);
+                if (!ec) o << "  (" << sz << " B)";
+            }
+            o << "\n";
+        }
+        return ToolResult::ok(clip(o.str(), 16 * 1024));
+    };
+}
+
+ToolHandler make_fs_glob_handler(std::shared_ptr<Sandbox> sb) {
+    return [sb](const ToolCall & c) -> ToolResult {
+        std::string pattern, sub;
+        if (!args::get_string(c.arguments_json, "pattern", pattern))
+            return ToolResult::error("missing arg: pattern (fs action=\"glob\")");
+        args::get_string(c.arguments_json, "path", sub);
+
+        stdfs::path start = sb->root; std::string err;
+        if (!sub.empty() && !sb->resolve(sub, start, err))
+            return ToolResult::error(err);
+        if (!sb->inside_sandbox(start)) {
+            return ToolResult::error("start dir escapes sandbox via symlink: "
+                                     + sb->virtual_path(start));
+        }
+        // Precheck: a clear `error:` line beats a stray
+        // `filesystem_error` exception when the model passes a path
+        // that doesn't exist or names a regular file.
+        std::error_code ec_pre;
+        if (!stdfs::is_directory(start, ec_pre)) {
+            return ToolResult::error(
+                std::string("not a directory: ") + sb->virtual_path(start)
+                + (ec_pre ? std::string(" (") + ec_pre.message() + ")"
+                          : std::string()));
+        }
+
+        std::regex rx;
+        try { rx = std::regex(glob_to_regex(pattern)); }
+        catch (const std::regex_error & e) {
+            return ToolResult::error(std::string("bad glob pattern: ") + e.what());
+        }
+
+        // skip_permission_denied lets the iterator silently step past
+        // 0700/0000 subdirs the running user can't enumerate instead
+        // of throwing mid-loop. Combined with the ec constructor and
+        // the ec-overloads on per-entry queries below, glob degrades
+        // gracefully across mixed-perms sandboxes (e.g. `--sandbox
+        // $HOME` with a ~/.gnupg in it).
+        constexpr auto kIterOpts =
+            stdfs::directory_options::skip_permission_denied;
+        std::error_code ec_it;
+        stdfs::recursive_directory_iterator it(start, kIterOpts, ec_it);
+        if (ec_it) {
+            return ToolResult::error(
+                std::string("cannot iterate: ") + sb->virtual_path(start)
+                + " (" + ec_it.message() + ")");
+        }
+        const stdfs::recursive_directory_iterator end;
+
+        std::ostringstream o;
+        int n = 0;
+        // Hand-rolled loop with ec-aware increment so a flake mid-
+        // traversal (vanished entry, race) skips the bad subtree
+        // instead of tearing down the whole call. Ranged-for would
+        // call the throwing operator++ overload.
+        for (; it != end; ) {
+            std::error_code ec_q;
+            if (it->is_regular_file(ec_q) && !ec_q) {
+                std::string rel =
+                    stdfs::relative(it->path(), sb->root, ec_q).generic_string();
+                if (!ec_q) {
+                    bool m = false;
+                    try { m = std::regex_match(rel, rx); }
+                    catch (const std::regex_error &) { /* skip entry */ }
+                    if (m) {
+                        o << sb->virtual_path(it->path()) << "\n";
+                        if (++n >= 500) {
+                            o << "...[stopped at 500 matches]\n";
+                            break;
+                        }
+                    }
+                }
+            }
+            std::error_code ec_step;
+            it.increment(ec_step);
+            if (ec_step) {
+                if (it == end) break;
+                it.pop();
+                if (it == end) break;
+            }
+        }
+        if (n == 0) return ToolResult::ok("No matches.");
+        return ToolResult::ok(o.str());
+    };
+}
+
+ToolHandler make_fs_grep_handler(std::shared_ptr<Sandbox> sb) {
+    return [sb](const ToolCall & c) -> ToolResult {
+        std::string pattern, sub, file_glob;
+        long long max_matches = 100;
+        bool ci = false;
+        if (!args::get_string(c.arguments_json, "pattern", pattern))
+            return ToolResult::error("missing arg: pattern (fs action=\"grep\")");
+        args::get_string(c.arguments_json, "path",      sub);
+        args::get_string(c.arguments_json, "file_glob", file_glob);
+        args::get_int   (c.arguments_json, "max_matches", max_matches);
+        args::get_bool  (c.arguments_json, "case_insensitive", ci);
+
+        stdfs::path start = sb->root; std::string err;
+        if (!sub.empty() && !sb->resolve(sub, start, err))
+            return ToolResult::error(err);
+        if (!sb->inside_sandbox(start)) {
+            return ToolResult::error("start dir escapes sandbox via symlink: "
+                                     + sb->virtual_path(start));
+        }
+        std::error_code ec_pre;
+        if (!stdfs::is_directory(start, ec_pre)) {
+            return ToolResult::error(
+                std::string("not a directory: ") + sb->virtual_path(start)
+                + (ec_pre ? std::string(" (") + ec_pre.message() + ")"
+                          : std::string()));
+        }
+
+        std::regex::flag_type rf = std::regex::ECMAScript;
+        if (ci) rf |= std::regex::icase;
+        std::regex rx;
+        try { rx = std::regex(pattern, rf); }
+        catch (const std::regex_error & e) {
+            return ToolResult::error(std::string("bad regex: ") + e.what());
+        }
+
+        std::regex glob_rx(".*");
+        if (!file_glob.empty()) {
+            std::string r = "^";
+            for (char ch : file_glob) {
+                if      (ch == '*') r += "[^/]*";
+                else if (ch == '?') r += "[^/]";
+                else if (std::strchr(".+()|^$\\{}[]", ch)) { r += '\\'; r += ch; }
+                else r += ch;
+            }
+            r += "$";
+            try { glob_rx = std::regex(r); }
+            catch (const std::regex_error & e) {
+                return ToolResult::error(std::string("bad file_glob: ") + e.what());
+            }
+        }
+
+        constexpr auto kIterOpts =
+            stdfs::directory_options::skip_permission_denied;
+        std::error_code ec_it;
+        stdfs::recursive_directory_iterator it(start, kIterOpts, ec_it);
+        if (ec_it) {
+            return ToolResult::error(
+                std::string("cannot iterate: ") + sb->virtual_path(start)
+                + " (" + ec_it.message() + ")");
+        }
+        const stdfs::recursive_directory_iterator end;
+
+        std::ostringstream o;
+        int n = 0;
+        for (; it != end; ) {
+            std::error_code ec_q;
+            const bool is_reg = it->is_regular_file(ec_q);
+            if (ec_q || !is_reg) goto step;
+            {
+                const auto sz = it->file_size(ec_q);
+                if (ec_q || sz > 4 * 1024 * 1024) goto step;
+                std::string fname = it->path().filename().string();
+                if (!file_glob.empty() && !std::regex_match(fname, glob_rx))
+                    goto step;
+                std::ifstream f(it->path());
+                if (!f) goto step;
+                std::string line; int lineno = 0;
+                std::string vpath = sb->virtual_path(it->path());
+                while (std::getline(f, line)) {
+                    ++lineno;
+                    // libstdc++'s regex engine is recursive; running a
+                    // user-supplied pattern against a multi-megabyte
+                    // single line (binary blob, minified JS, base64
+                    // dump) is a DoS vector via catastrophic
+                    // backtracking. 64 KiB is plenty for source code
+                    // and short of the failure regime.
+                    if (line.size() > 64 * 1024) continue;
+                    if (std::regex_search(line, rx)) {
+                        o << vpath << ":" << lineno << ": "
+                          << clip(line, 240) << "\n";
+                        if (++n >= max_matches) goto done;
+                    }
+                }
+            }
+        step:
+            std::error_code ec_step;
+            it.increment(ec_step);
+            if (ec_step) {
+                if (it == end) break;
+                it.pop();
+                if (it == end) break;
+            }
+        }
+    done:
+        if (n == 0) return ToolResult::ok("No matches.");
+        return ToolResult::ok(clip(o.str(), 32 * 1024));
+    };
+}
+
+ToolHandler make_fs_check_path_handler(std::shared_ptr<Sandbox> sb) {
+    return [sb](const ToolCall & c) -> ToolResult {
+        std::string path; bool touch = false;
+        if (!args::get_string(c.arguments_json, "path", path))
+            return ToolResult::error("missing arg: path (fs action=\"check_path\")");
+        args::get_bool(c.arguments_json, "touch", touch);
+
+        stdfs::path p; std::string err;
+        if (!sb->resolve(path, p, err)) return ToolResult::error(err);
+        if (!sb->inside_sandbox(p)) {
+            return ToolResult::error("path escapes sandbox via symlink: "
+                                     + sb->virtual_path(p));
+        }
+
+        // Touch path if requested AND it doesn't exist. Symmetric with
+        // the write handler: O_NOFOLLOW guards against a last-component
+        // symlink, parent dirs are created, mode 0600 same as model-
+        // written files.
+        bool created = false;
+        std::error_code ec_exist;
+        const bool exists_pre = stdfs::exists(p, ec_exist);
+        if (touch && !exists_pre) {
+            std::error_code ec_mk;
+            if (!p.parent_path().empty()) {
+                stdfs::create_directories(p.parent_path(), ec_mk);
+            }
             if (!sb->inside_sandbox(p)) {
                 return ToolResult::error(
                     "path escapes sandbox via symlink (post-mkdir): "
                     + sb->virtual_path(p));
             }
-
-            // Open with O_NOFOLLOW so a symlink at the leaf cannot
-            // redirect the write outside the sandbox. O_CLOEXEC keeps
-            // the fd off subsequently-spawned children. Mode 0600 —
-            // model-written files are private to the service user
-            // (containing potentially-sensitive content the model was
-            // told to save).
-            int flags = O_WRONLY | O_CREAT | O_NOFOLLOW | O_CLOEXEC
-                      | (append ? O_APPEND : O_TRUNC);
-            int fd = ::open(p.c_str(), flags, 0600);
+            int fd = ::open(p.c_str(),
+                            O_WRONLY | O_CREAT | O_EXCL
+                              | O_NOFOLLOW | O_CLOEXEC,
+                            0600);
             if (fd < 0) {
-                return ToolResult::error(std::string("cannot open for write: ")
-                                         + sb->virtual_path(p)
-                                         + " (" + std::strerror(errno) + ")");
-            }
-            const char * data = content.data();
-            size_t       left = content.size();
-            while (left > 0) {
-                ssize_t n = ::write(fd, data, left);
-                if (n < 0) {
-                    if (errno == EINTR) continue;
-                    ::close(fd);
-                    return ToolResult::error(std::string("write failed: ")
-                                             + std::strerror(errno));
-                }
-                data += n;
-                left -= (size_t) n;
+                return ToolResult::error(
+                    std::string("touch failed: ") + sb->virtual_path(p)
+                    + " (" + std::strerror(errno) + ")");
             }
             ::close(fd);
-            return ToolResult::ok("wrote " + std::to_string(content.size())
-                                  + " bytes to " + sb->virtual_path(p));
-        })
-        .build();
-}
+            created = true;
+        }
 
-Tool fs_list_dir(std::string root) {
-    auto sb = std::make_shared<Sandbox>(std::move(root));
-    return Tool::builder("list_dir")
-        .describe(
-            "List the entries (files and directories) inside one directory, "
-            "non-recursively. Use `glob` for recursive / pattern matching.\n"
-            "\n"
-            "AUTHORITATIVE SANDBOX RULE — before your first fs_*/bash "
-            "call in a task, run `get_sandbox_path` (the absolute on-disk "
-            "root, pinned at registration; this is the truth) and then "
-            "`fs_check_path` against the directory you intend to list so "
-            "you have confirmed it exists and is readable.\n"
-            "\n"
-            "Output is one entry per line, sorted, with a trailing `/` on "
-            "directories. Hidden entries (dotfiles) are included. PATHS "
-            "ARE RELATIVE to the sandbox root — use `.` for the root "
-            "itself, `subdir` / `src/headers` for nested. NEVER prefix "
-            "with `/`. Required: path.\n"
-            "\n"
-            "Examples:\n"
-            "  {path:\".\"}              # sandbox root entries\n"
-            "  {path:\"src\"}            # one nested level\n"
-            "\n"
-            "Errors (path missing, not a directory) return a single-line "
-            "message starting with `error:`.")
-        .param("path", "string",
-               "Required. RELATIVE directory path under the sandbox root. "
-               "Use `.` for the root, `subdir` for nested paths. No leading "
-               "`/`. Trailing slashes accepted. Validate with `fs_check_path` "
-               "first.", true)
-        .handle([sb](const ToolCall & c) {
-            std::string path;
-            if (!args::get_string(c.arguments_json, "path", path))
-                return ToolResult::error("missing arg: path");
+        struct stat st {};
+        const int    lstat_rc  = ::lstat(p.c_str(), &st);
+        const int    lstat_err = (lstat_rc == 0) ? 0 : errno;
+        const bool   exists_now = (lstat_rc == 0);
 
-            fs::path p; std::string err;
-            if (!sb->resolve(path, p, err)) return ToolResult::error(err);
-            if (!sb->inside_sandbox(p)) {
-                return ToolResult::error("path escapes sandbox via symlink: "
-                                         + sb->virtual_path(p));
+        std::ostringstream o;
+        o << "path: "     << path << "\n";
+        o << "absolute: " << p.string() << "\n";
+
+        if (!exists_now) {
+            if (lstat_err == ENOENT) {
+                o << "exists: no\n";
+                o << "type: missing\n";
+            } else {
+                o << "exists: unknown\n";
+                o << "type: unknown\n";
+                o << "error: lstat: " << std::strerror(lstat_err) << "\n";
             }
-            if (!fs::is_directory(p))
-                return ToolResult::error("not a directory: " + sb->virtual_path(p));
-
-            std::ostringstream o;
-            for (auto & e : fs::directory_iterator(p)) {
-                o << (e.is_directory() ? "d " : "f ") << e.path().filename().string();
-                if (e.is_regular_file()) {
-                    std::error_code ec;
-                    auto sz = fs::file_size(e.path(), ec);
-                    if (!ec) o << "  (" << sz << " B)";
-                }
-                o << "\n";
+            if (touch && !created && lstat_err == ENOENT) {
+                o << "note: vanished between exists check and lstat\n";
             }
-            return ToolResult::ok(clip(o.str(), 16 * 1024));
-        })
-        .build();
-}
-
-Tool fs_glob(std::string root) {
-    auto sb = std::make_shared<Sandbox>(std::move(root));
-    return Tool::builder("glob")
-        .describe(
-            "Find files by wildcard pattern. Recursive by default. The "
-            "`path` argument names a STARTING DIRECTORY (or is omitted, "
-            "defaulting to the sandbox root). Pointing it at a single "
-            "file is an error — globs scan trees, not files.\n"
-            "\n"
-            "AUTHORITATIVE SANDBOX RULE — before your first fs_*/bash "
-            "call in a task, run `get_sandbox_path` (the absolute on-disk "
-            "root, pinned at registration; this is the truth) and then "
-            "`fs_check_path` against the starting directory so you have "
-            "confirmed it exists, is readable, and is `type: directory` "
-            "before you scan it.\n"
-            "\n"
-            "Pattern grammar: `*` matches any run of characters except `/`; "
-            "`**` matches across directory boundaries; `?` matches one "
-            "character; `[abc]` matches one of a set. Required: pattern. "
-            "Optional: path (the starting directory; defaults to `.`, the "
-            "sandbox root).\n"
-            "\n"
-            "PATHS ARE RELATIVE to the sandbox root. Output is one matching "
-            "RELATIVE path per line, sorted. Examples:\n"
-            "  {pattern:\"*.cpp\"}                       # any .cpp anywhere\n"
-            "  {pattern:\"**/*.hpp\", path:\"src\"}       # .hpp under src/\n"
-            "  {pattern:\"src/**/*.{c,cc,cpp}\"}          # multiple suffixes\n"
-            "\n"
-            "Use `grep` to search file contents; use `list_dir` to browse "
-            "a single non-recursive level.")
-        .param("pattern", "string",
-               "Required. Wildcard pattern. `*` matches anything except "
-               "`/`, `**` crosses directory boundaries, `?` matches one "
-               "char, `[abc]` matches a character class.", true)
-        .param("path",    "string",
-               "Optional. RELATIVE starting directory under the sandbox "
-               "root. Default `.` (the root). No leading `/`. Example: "
-               "`src`.", false)
-        .handle([sb](const ToolCall & c) {
-            std::string pattern, sub;
-            if (!args::get_string(c.arguments_json, "pattern", pattern))
-                return ToolResult::error("missing arg: pattern");
-            args::get_string(c.arguments_json, "path", sub);
-
-            fs::path start = sb->root; std::string err;
-            if (!sub.empty() && !sb->resolve(sub, start, err))
-                return ToolResult::error(err);
-            if (!sb->inside_sandbox(start)) {
-                return ToolResult::error("start dir escapes sandbox via symlink: "
-                                         + sb->virtual_path(start));
-            }
-            // Precheck: a clear `error:` line beats a stray
-            // `filesystem_error` exception when the model passes a path
-            // that doesn't exist or names a regular file.
-            std::error_code ec_pre;
-            if (!fs::is_directory(start, ec_pre)) {
-                return ToolResult::error(
-                    std::string("not a directory: ") + sb->virtual_path(start)
-                    + (ec_pre ? std::string(" (") + ec_pre.message() + ")"
-                              : std::string()));
-            }
-
-            std::regex rx;
-            try { rx = std::regex(glob_to_regex(pattern)); }
-            catch (const std::regex_error & e) {
-                return ToolResult::error(std::string("bad glob pattern: ") + e.what());
-            }
-
-            // skip_permission_denied lets the iterator silently step
-            // past 0700/0000 subdirs the running user can't enumerate
-            // instead of throwing mid-loop. Combined with the ec
-            // constructor and the ec-overloads on per-entry queries
-            // below, glob now degrades gracefully across mixed-perms
-            // sandboxes (e.g. a `--sandbox $HOME` with a ~/.gnupg in
-            // it).
-            constexpr auto kIterOpts =
-                fs::directory_options::skip_permission_denied;
-            std::error_code ec_it;
-            fs::recursive_directory_iterator it(start, kIterOpts, ec_it);
-            if (ec_it) {
-                return ToolResult::error(
-                    std::string("cannot iterate: ") + sb->virtual_path(start)
-                    + " (" + ec_it.message() + ")");
-            }
-            const fs::recursive_directory_iterator end;
-
-            std::ostringstream o;
-            int n = 0;
-            // Hand-rolled loop with an ec-aware increment so a flake
-            // mid-traversal (vanished entry, race) skips the bad
-            // subtree instead of tearing down the whole call. Ranged-
-            // for would call the throwing operator++ overload.
-            for (; it != end; ) {
-                std::error_code ec_q;
-                if (it->is_regular_file(ec_q) && !ec_q) {
-                    std::string rel =
-                        fs::relative(it->path(), sb->root, ec_q).generic_string();
-                    if (!ec_q) {
-                        bool m = false;
-                        try { m = std::regex_match(rel, rx); }
-                        catch (const std::regex_error &) { /* skip entry */ }
-                        if (m) {
-                            o << sb->virtual_path(it->path()) << "\n";
-                            if (++n >= 500) {
-                                o << "...[stopped at 500 matches]\n";
-                                break;
-                            }
-                        }
-                    }
-                }
-                std::error_code ec_step;
-                it.increment(ec_step);
-                if (ec_step) {
-                    // Drop the offending subtree and keep going. We
-                    // already opted into skip_permission_denied so
-                    // this branch is reserved for genuinely flaky
-                    // errors (vanished entries on a busy FS, etc.).
-                    if (it == end) break;
-                    it.pop();
-                    if (it == end) break;
-                }
-            }
-            if (n == 0) return ToolResult::ok("No matches.");
             return ToolResult::ok(o.str());
-        })
-        .build();
+        }
+
+        o << "exists: yes\n";
+        const mode_t m = st.st_mode;
+        const char * type_str = "other";
+        if      (S_ISREG (m)) type_str = "file";
+        else if (S_ISDIR (m)) type_str = "directory";
+        else if (S_ISLNK (m)) type_str = "symlink";
+        else if (S_ISCHR (m)) type_str = "char-device";
+        else if (S_ISBLK (m)) type_str = "block-device";
+        else if (S_ISFIFO(m)) type_str = "fifo";
+        else if (S_ISSOCK(m)) type_str = "socket";
+        o << "type: " << type_str << "\n";
+
+        if (S_ISREG(m)) {
+            o << "size: " << (long long) st.st_size << "\n";
+        }
+        char modebuf[8];
+        std::snprintf(modebuf, sizeof(modebuf), "0%o",
+                      (unsigned) (m & 07777));
+        o << "mode: " << modebuf << "\n";
+
+        o << "readable: "   << (::access(p.c_str(), R_OK) == 0 ? "yes" : "no") << "\n";
+        o << "writable: "   << (::access(p.c_str(), W_OK) == 0 ? "yes" : "no") << "\n";
+        o << "executable: " << (::access(p.c_str(), X_OK) == 0 ? "yes" : "no") << "\n";
+
+        char tbuf[40] = {0};
+        struct tm tmv;
+        const time_t mt = (time_t) st.st_mtime;
+        if (::gmtime_r(&mt, &tmv) != nullptr) {
+            std::strftime(tbuf, sizeof(tbuf), "%Y-%m-%dT%H:%M:%SZ", &tmv);
+        }
+        if (tbuf[0]) o << "mtime: " << tbuf << "\n";
+
+        if (created) o << "created: yes\n";
+        return ToolResult::ok(o.str());
+    };
 }
 
-Tool fs_grep(std::string root) {
-    auto sb = std::make_shared<Sandbox>(std::move(root));
-    return Tool::builder("grep")
-        .describe(
-            "Search file contents for a regular expression, recursively "
-            "across a DIRECTORY TREE. The `path` argument MUST name a "
-            "directory (or be omitted, defaulting to the sandbox root). "
-            "Passing a single file's path is an error — to search within "
-            "one file, call `read_file` and look directly, or use `bash` "
-            "(`grep PATTERN file.txt`).\n"
-            "\n"
-            "AUTHORITATIVE SANDBOX RULE — before your first fs_*/bash "
-            "call in a task, run `get_sandbox_path` (the absolute on-disk "
-            "root, pinned at registration; this is the truth) and then "
-            "`fs_check_path` against the starting directory so you have "
-            "confirmed it exists, is readable, and is `type: directory` "
-            "before you scan it.\n"
-            "\n"
-            "Regex flavor is ECMAScript (same as JavaScript / std::regex): "
-            "`.`, `*`, `+`, `?`, `()`, `|`, `[]`, `\\d`, `\\w`, `\\s`, "
-            "anchors `^`/`$`. Each line is matched independently.\n"
-            "\n"
-            "Output: one match per line as `<path>:<lineno>:<line>`, paths "
-            "RELATIVE to the sandbox root, sorted by path. Stops after "
-            "`max_matches` (default 100).\n"
-            "\n"
-            "Required: pattern. Optional: path (start dir, default `.` — "
-            "the sandbox root), file_glob (limit by filename), "
-            "max_matches, case_insensitive. NEVER prefix paths with `/`.\n"
-            "\n"
-            "Examples:\n"
-            "  {pattern:\"TODO\"}\n"
-            "  {pattern:\"class\\\\s+\\\\w+\", path:\"src\", file_glob:\"*.hpp\"}\n"
-            "  {pattern:\"error\", case_insensitive:true, max_matches:50}\n"
-            "\n"
-            "Use `glob` to find files by name; use `read_file` to read one.")
-        .param("pattern",       "string",
-               "Required. ECMAScript regular expression. Each line is "
-               "tested with regex_search (substring match), so anchor with "
-               "`^` / `$` if you want full-line matches.", true)
-        .param("path",          "string",
-               "Optional. RELATIVE starting directory under the sandbox "
-               "root. Default `.` (the root). No leading `/`. Example: "
-               "`src`.", false)
-        .param("file_glob",     "string",
-               "Optional. Wildcard pattern restricting which filenames are "
-               "searched (matched against the basename). Examples: "
-               "`*.cpp`, `*.{c,h}`, `test_*.py`.", false)
-        .param("max_matches",   "integer",
-               "Optional. Stop after this many matching lines. Default 100. "
-               "Lines past the cap are silently dropped.", false)
-        .param("case_insensitive", "boolean",
-               "Optional. If true, the regex matches case-insensitively "
-               "(adds std::regex::icase). Default false.", false)
-        .handle([sb](const ToolCall & c) {
-            std::string pattern, sub, file_glob;
-            long long max_matches = 100;
-            bool ci = false;
-            if (!args::get_string(c.arguments_json, "pattern", pattern))
-                return ToolResult::error("missing arg: pattern");
-            args::get_string(c.arguments_json, "path",      sub);
-            args::get_string(c.arguments_json, "file_glob", file_glob);
-            args::get_int   (c.arguments_json, "max_matches", max_matches);
-            args::get_bool  (c.arguments_json, "case_insensitive", ci);
-
-            fs::path start = sb->root; std::string err;
-            if (!sub.empty() && !sb->resolve(sub, start, err))
-                return ToolResult::error(err);
-            if (!sb->inside_sandbox(start)) {
-                return ToolResult::error("start dir escapes sandbox via symlink: "
-                                         + sb->virtual_path(start));
-            }
-            // Precheck: a clear `error:` line beats a stray
-            // `filesystem_error` exception when the model passes a path
-            // that doesn't exist or names a regular file. Without this,
-            // `recursive_directory_iterator` throws on construction
-            // and the exception escapes the handler.
-            std::error_code ec_pre;
-            if (!fs::is_directory(start, ec_pre)) {
-                return ToolResult::error(
-                    std::string("not a directory: ") + sb->virtual_path(start)
-                    + (ec_pre ? std::string(" (") + ec_pre.message() + ")"
-                              : std::string()));
-            }
-
-            std::regex::flag_type rf = std::regex::ECMAScript;
-            if (ci) rf |= std::regex::icase;
-            std::regex rx;
-            try { rx = std::regex(pattern, rf); }
-            catch (const std::regex_error & e) {
-                return ToolResult::error(std::string("bad regex: ") + e.what());
-            }
-
-            std::regex glob_rx(".*");
-            if (!file_glob.empty()) {
-                std::string r = "^";
-                for (char ch : file_glob) {
-                    if      (ch == '*') r += "[^/]*";
-                    else if (ch == '?') r += "[^/]";
-                    else if (std::strchr(".+()|^$\\{}[]", ch)) { r += '\\'; r += ch; }
-                    else r += ch;
-                }
-                r += "$";
-                // Compile defensively — `file_glob` is model-supplied and
-                // a stray `[` (or any other regex metachar surviving the
-                // escape table) would otherwise throw an uncaught
-                // regex_error and tear down the request handler.
-                try { glob_rx = std::regex(r); }
-                catch (const std::regex_error & e) {
-                    return ToolResult::error(std::string("bad file_glob: ") + e.what());
-                }
-            }
-
-            // Mixed-perms sandboxes (e.g. `--sandbox $HOME` with a
-            // ~/.gnupg or ~/.cache somewhere underneath) used to
-            // crash grep mid-walk; skip_permission_denied silently
-            // steps past unreadable subtrees, and the ec-aware
-            // increment below catches any other flakes without
-            // tearing down the call.
-            constexpr auto kIterOpts =
-                fs::directory_options::skip_permission_denied;
-            std::error_code ec_it;
-            fs::recursive_directory_iterator it(start, kIterOpts, ec_it);
-            if (ec_it) {
-                return ToolResult::error(
-                    std::string("cannot iterate: ") + sb->virtual_path(start)
-                    + " (" + ec_it.message() + ")");
-            }
-            const fs::recursive_directory_iterator end;
-
-            std::ostringstream o;
-            int n = 0;
-            // Hand-rolled loop using ec-overloads everywhere so a
-            // single bad entry (vanished, racy, exotic permission
-            // flavor) skips that subtree instead of throwing.
-            for (; it != end; ) {
-                std::error_code ec_q;
-                const bool is_reg = it->is_regular_file(ec_q);
-                if (ec_q || !is_reg) goto step;
-                {
-                    const auto sz = it->file_size(ec_q);
-                    if (ec_q || sz > 4 * 1024 * 1024) goto step;
-                    std::string fname = it->path().filename().string();
-                    if (!file_glob.empty() && !std::regex_match(fname, glob_rx))
-                        goto step;
-                    std::ifstream f(it->path());
-                    if (!f) goto step;
-                    std::string line; int lineno = 0;
-                    std::string vpath = sb->virtual_path(it->path());
-                    while (std::getline(f, line)) {
-                        ++lineno;
-                        // libstdc++'s regex engine is recursive;
-                        // running a user-supplied pattern against a
-                        // multi-megabyte single line (binary blob,
-                        // minified JS, base64 dump) is a DoS vector
-                        // via catastrophic backtracking. 64 KiB is
-                        // plenty for source code and short of the
-                        // failure regime.
-                        if (line.size() > 64 * 1024) continue;
-                        if (std::regex_search(line, rx)) {
-                            o << vpath << ":" << lineno << ": "
-                              << clip(line, 240) << "\n";
-                            if (++n >= max_matches) goto done;
-                        }
-                    }
-                }
-            step:
-                std::error_code ec_step;
-                it.increment(ec_step);
-                if (ec_step) {
-                    // Drop the offending subtree (typically a flaky
-                    // entry the iterator can't even step over) and
-                    // keep going.
-                    if (it == end) break;
-                    it.pop();
-                    if (it == end) break;
-                }
-            }
-        done:
-            if (n == 0) return ToolResult::ok("No matches.");
-            return ToolResult::ok(clip(o.str(), 32 * 1024));
-        })
-        .build();
+ToolHandler make_fs_cwd_handler() {
+    return [](const ToolCall & /*c*/) -> ToolResult {
+        char buf[PATH_MAX];
+        if (::getcwd(buf, sizeof(buf)) == nullptr) {
+            return ToolResult::error(
+                std::string("getcwd failed: ") + std::strerror(errno));
+        }
+        const size_t n = ::strnlen(buf, sizeof(buf));
+        return ToolResult::ok(std::string(buf, n));
+    };
 }
 
-// ============================================================================
-// fs_check_path — sandbox-relative stat + access-rights probe.
-// ============================================================================
-//
-// The "look before you leap" tool. Other fs_* tools and bash all tell
-// the model (in their descriptions) to call fs_check_path before any
-// read/write so the sandbox boundary, file existence, and effective
-// r/w/x rights are confirmed up-front instead of discovered through
-// open() failures.
-//
-// Behaviour:
-//   - resolve(path) → real fs::path inside the sandbox (same anchoring
-//     as every other fs_* tool, so paths can never escape the root);
-//   - inside_sandbox() check protects against symlinks-to-outside;
-//   - if the path doesn't exist and `touch=true`, create an empty
-//     file there (parent dirs auto-created, mode 0600, O_NOFOLLOW so
-//     a planted symlink at the leaf can't redirect us out);
-//   - stat() the resolved path;
-//   - access() with R_OK / W_OK / X_OK for effective rights of the
-//     running process — these answer "can I really read/write/exec
-//     this *as me*", which is what the model actually wants.
-//
-// Output is multi-line key:value, with one mandatory `error:` line
-// surfaced on failure (consistent with the other fs_* tools).
-Tool fs_check_path(std::string root) {
-    auto sb = std::make_shared<Sandbox>(std::move(root));
-    return Tool::builder("fs_check_path")
-        .describe(
-            "AUTHORITATIVE PRE-FLIGHT — call this BEFORE any read_file, "
-            "write_file, list_dir, glob, grep, or bash command that "
-            "touches a path. It confirms the path is inside the "
-            "sandbox AND that the running process has the read / write "
-            "/ execute rights it needs. Skipping it causes the model to "
-            "trip on permission errors mid-task; running it once at the "
-            "start of every fs/bash subtask is the contract.\n"
-            "\n"
-            "Paths are RELATIVE to the sandbox root (e.g. `report.md`, "
-            "`src/main.cpp`, `docs`). Call `get_sandbox_path` first if "
-            "you need the absolute on-disk root — that path is the "
-            "authoritative anchor the fs_*/bash tools resolve against.\n"
-            "\n"
-            "Required: path. Optional: touch (default false). When "
-            "`touch=true` and the path doesn't exist, an empty file is "
-            "created there (parent directories auto-created) so you "
-            "can probe write access without committing real content.\n"
-            "\n"
-            "Output is multi-line key:value:\n"
-            "  path: <relative path you passed>\n"
-            "  absolute: <full on-disk path under the sandbox>\n"
-            "  exists: yes|no|unknown    (unknown = can't tell, e.g. parent\n"
-            "                             dir blocks lstat with EACCES)\n"
-            "  type: file|directory|symlink|other|missing|unknown\n"
-            "  size: <bytes>           (files only)\n"
-            "  mode: 0NNN              (octal permission bits)\n"
-            "  readable: yes|no        (effective R_OK for this process)\n"
-            "  writable: yes|no        (effective W_OK for this process)\n"
-            "  executable: yes|no      (effective X_OK for this process)\n"
-            "  mtime: <ISO-8601 UTC>   (last modification)\n"
-            "  created: yes            (only when touch=true created the file)\n"
-            "  error: <message>        (only when exists is unknown)\n"
-            "\n"
-            "Examples:\n"
-            "  {path:\"report.md\"}                        # exists? readable? writable?\n"
-            "  {path:\"src/main.cpp\"}                     # before read_file / grep\n"
-            "  {path:\"build/output.log\", touch:true}     # confirm write access\n"
-            "  {path:\".\"}                                # the sandbox root itself")
-        .param("path",  "string",
-               "Required. Sandbox-relative path. Use `.` for the sandbox root, "
-               "`subdir` for a directory, `subdir/file.ext` for a file. Absolute "
-               "or `..`-bearing inputs are re-anchored under the sandbox.", true)
-        .param("touch", "boolean",
-               "Optional. If true and the path does NOT yet exist, create an "
-               "empty file at that path (parent dirs auto-created, mode 0600). "
-               "Lets you probe write rights without writing real content. "
-               "Default false.", false)
-        .handle([sb](const ToolCall & c) {
-            std::string path; bool touch = false;
-            if (!args::get_string(c.arguments_json, "path", path))
-                return ToolResult::error("missing arg: path");
-            args::get_bool(c.arguments_json, "touch", touch);
-
-            fs::path p; std::string err;
-            if (!sb->resolve(path, p, err)) return ToolResult::error(err);
-            if (!sb->inside_sandbox(p)) {
-                return ToolResult::error("path escapes sandbox via symlink: "
-                                         + sb->virtual_path(p));
-            }
-
-            // Touch path if requested AND it doesn't exist.
-            // Symmetric with fs_write_file: O_NOFOLLOW guards against a
-            // last-component symlink, parent dirs are created, and the
-            // mode is the same 0600 we use for model-written files.
-            bool created = false;
-            std::error_code ec_exist;
-            const bool exists_pre = fs::exists(p, ec_exist);
-            if (touch && !exists_pre) {
-                std::error_code ec_mk;
-                if (!p.parent_path().empty()) {
-                    fs::create_directories(p.parent_path(), ec_mk);
-                }
-                // Re-check containment after create_directories — same
-                // rationale as fs_write_file: closes a narrow TOCTOU
-                // window where a concurrent symlink swap could have
-                // pulled the parent path outside the sandbox between
-                // the pre-check and the open.
-                if (!sb->inside_sandbox(p)) {
-                    return ToolResult::error(
-                        "path escapes sandbox via symlink (post-mkdir): "
-                        + sb->virtual_path(p));
-                }
-                int fd = ::open(p.c_str(),
-                                O_WRONLY | O_CREAT | O_EXCL
-                                  | O_NOFOLLOW | O_CLOEXEC,
-                                0600);
-                if (fd < 0) {
-                    return ToolResult::error(
-                        std::string("touch failed: ") + sb->virtual_path(p)
-                        + " (" + std::strerror(errno) + ")");
-                }
-                ::close(fd);
-                created = true;
-            }
-
-            // lstat — we want the truth about the leaf, not whatever a
-            // symlink at the leaf points to. inside_sandbox above
-            // canonicalised, so we won't mis-report a symlink-to-
-            // outside as if it were the target.
-            struct stat st {};
-            const int    lstat_rc  = ::lstat(p.c_str(), &st);
-            const int    lstat_err = (lstat_rc == 0) ? 0 : errno;
-            const bool   exists_now = (lstat_rc == 0);
-
-            std::ostringstream o;
-            // Echo the relative path the caller passed AND the absolute
-            // resolved path. Two anchors so the model can quote either
-            // back without recomputing.
-            o << "path: "     << path << "\n";
-            o << "absolute: " << p.string() << "\n";
-
-            if (!exists_now) {
-                // ENOENT really is "no such file"; anything else
-                // (typically EACCES on a 0000-perm parent dir) is
-                // "we can't tell — the FS won't let us look". Lying
-                // and saying `exists: no` for the latter would steer
-                // the model into creating a duplicate at a different
-                // path or giving up entirely; surface the truth.
-                if (lstat_err == ENOENT) {
-                    o << "exists: no\n";
-                    o << "type: missing\n";
-                } else {
-                    o << "exists: unknown\n";
-                    o << "type: unknown\n";
-                    o << "error: lstat: " << std::strerror(lstat_err) << "\n";
-                }
-                if (touch && !created && lstat_err == ENOENT) {
-                    // Touch was requested but the file already existed
-                    // pre-call; the missing branch can only be reached
-                    // if a concurrent rmdir raced us. Surface that
-                    // honestly so the model retries instead of looping.
-                    o << "note: vanished between exists check and lstat\n";
-                }
-                return ToolResult::ok(o.str());
-            }
-
-            o << "exists: yes\n";
-            const mode_t m = st.st_mode;
-            const char * type_str = "other";
-            if      (S_ISREG (m)) type_str = "file";
-            else if (S_ISDIR (m)) type_str = "directory";
-            else if (S_ISLNK (m)) type_str = "symlink";
-            else if (S_ISCHR (m)) type_str = "char-device";
-            else if (S_ISBLK (m)) type_str = "block-device";
-            else if (S_ISFIFO(m)) type_str = "fifo";
-            else if (S_ISSOCK(m)) type_str = "socket";
-            o << "type: " << type_str << "\n";
-
-            if (S_ISREG(m)) {
-                o << "size: " << (long long) st.st_size << "\n";
-            }
-            // Permission bits — the low 12 bits cover suid/sgid/sticky
-            // plus owner/group/other rwx. Mask off file-type bits so
-            // the model sees a pure mode.
-            char modebuf[8];
-            std::snprintf(modebuf, sizeof(modebuf), "0%o",
-                          (unsigned) (m & 07777));
-            o << "mode: " << modebuf << "\n";
-
-            // Effective access — answers "as me, right now". This is
-            // what actually matters for the next read/write call.
-            o << "readable: "   << (::access(p.c_str(), R_OK) == 0 ? "yes" : "no") << "\n";
-            o << "writable: "   << (::access(p.c_str(), W_OK) == 0 ? "yes" : "no") << "\n";
-            o << "executable: " << (::access(p.c_str(), X_OK) == 0 ? "yes" : "no") << "\n";
-
-            // mtime as ISO-8601 UTC. gmtime_r is reentrant; strftime's
-            // size cap is comfortably under 32 bytes for this format.
-            char tbuf[40] = {0};
-            struct tm tmv;
-            const time_t mt = (time_t) st.st_mtime;
-            if (::gmtime_r(&mt, &tmv) != nullptr) {
-                std::strftime(tbuf, sizeof(tbuf), "%Y-%m-%dT%H:%M:%SZ", &tmv);
-            }
-            if (tbuf[0]) o << "mtime: " << tbuf << "\n";
-
-            if (created) o << "created: yes\n";
-            return ToolResult::ok(o.str());
-        })
-        .build();
-}
-
-// ============================================================================
-// shell — run /bin/sh -c with merged stdout/stderr, cwd pinned to sandbox.
-// ============================================================================
-//
-// NOT a hardened sandbox.  The child has the caller's full privileges.
-// Capping is purely cooperative:
-//   - chdir(root) before exec
-//   - 32 KB output cap (the rest is silently dropped, with a marker)
-//   - SIGTERM at deadline, SIGKILL 2s later
-//
-// We deliberately use /bin/sh -c so the model can pipe, redirect, &&,
-// quote, etc — i.e. behave like a normal shell user.
-// get_current_dir — returns the process's CWD. Cheap, parameterless,
-// safe. The CLI / server chdir() into the --sandbox root at startup, so
-// the path this returns is exactly the directory the model's other
-// tools (bash, fs_*) will operate in. We resolve via getcwd() at call
-// time (not at registration) so a process that chdir'd later still
-// reports truthfully. Distinct from get_sandbox_path: this is the
-// process cwd (changes if the process chdir'd), get_sandbox_path is the
-// pinned sandbox boundary (always the truth).
-//
-// Two error paths surfaced as ToolResult::error:
-//   - getcwd returns nullptr (path too long, racing rmdir, EACCES on
-//     a parent component): we surface errno via strerror.
-//   - The path doesn't fit in PATH_MAX. POSIX guarantees PATH_MAX
-//     bytes are enough for any valid path that the kernel would let
-//     us land in via chdir, so this is a "should never happen" branch
-//     kept defensively.
-Tool get_current_dir() {
-    return Tool::builder("get_current_dir")
-        .describe(
-            "Returns the absolute path of the process's current working "
-            "directory. In the standard CLI / server setup the process "
-            "chdir's into the sandbox at startup, so this typically "
-            "matches the sandbox root — but if you specifically want "
-            "the sandbox boundary, use `get_sandbox_path` (its answer "
-            "is pinned at registration and won't drift). No parameters."
-        )
-        .handle([](const ToolCall & /*c*/) {
-            // PATH_MAX-sized stack buffer is the standard POSIX idiom;
-            // getcwd writes at most PATH_MAX bytes (incl. NUL) so this
-            // is bounded by the platform.
-            char buf[PATH_MAX];
-            if (::getcwd(buf, sizeof(buf)) == nullptr) {
-                return ToolResult::error(
-                    std::string("getcwd failed: ") + std::strerror(errno));
-            }
-            // strnlen is overkill (getcwd guarantees NUL-terminated on
-            // success) but treat it as a defence-in-depth bound anyway.
-            const size_t n = ::strnlen(buf, sizeof(buf));
-            return ToolResult::ok(std::string(buf, n));
-        })
-        .build();
-}
-
-// get_sandbox_path — returns the absolute path of the sandbox root.
-// Captures the configured root at registration time (so the answer is
-// stable even if the process chdir'd later). When `root` is empty or
-// ".", we resolve the process's cwd at call time as a fallback — that
-// matches what `bash` with no sandbox actually uses.
-//
-// One error path surfaced as ToolResult::error: getcwd fails when no
-// sandbox was configured (path too long, racing rmdir, EACCES on a
-// parent component). We surface errno via strerror.
-Tool get_sandbox_path(std::string root) {
-    // Resolve the configured root to an absolute path NOW, so registration
-    // pins the answer. We use fs::weakly_canonical() (matches the same
-    // canonicalisation the sandbox containment check uses in
-    // Sandbox::inside_sandbox(), so the answer the model sees is exactly
-    // the directory its fs_* tools operate against).
-    //
-    // Falls back to absolute(root) if weakly_canonical fails (transient
-    // ENOENT etc.); never falls back to the raw input because relative
-    // strings like "./" or "../foo" leak the operator's cwd shape into
-    // the model and break the model's "absolute path" expectation.
+ToolHandler make_fs_sandbox_handler(const std::string & root) {
+    // Pin the canonical root at registration. Falls back to absolute(root)
+    // if weakly_canonical fails (transient ENOENT etc.); never to the raw
+    // input because relative strings like "./" leak the operator's cwd
+    // shape and break the model's "absolute path" expectation.
     std::string resolved;
     if (!root.empty() && root != ".") {
         std::error_code ec;
-        fs::path canon = fs::weakly_canonical(fs::path(root), ec);
+        stdfs::path canon = stdfs::weakly_canonical(stdfs::path(root), ec);
         if (ec || canon.empty()) {
             ec.clear();
-            canon = fs::absolute(fs::path(root), ec);
+            canon = stdfs::absolute(stdfs::path(root), ec);
         }
         if (!ec && !canon.empty()) {
             resolved = canon.string();
         }
     }
-    // Capture by value into the closure; std::string move keeps it cheap.
-    return Tool::builder("get_sandbox_path")
+    return [resolved](const ToolCall & /*c*/) -> ToolResult {
+        if (!resolved.empty()) return ToolResult::ok(resolved);
+        // Fallback: no sandbox configured — answer with the process's
+        // current cwd, which is what `bash` actually uses with root=".".
+        char buf[PATH_MAX];
+        if (::getcwd(buf, sizeof(buf)) == nullptr) {
+            return ToolResult::error(
+                std::string("getcwd failed: ") + std::strerror(errno));
+        }
+        const size_t n = ::strnlen(buf, sizeof(buf));
+        return ToolResult::ok(std::string(buf, n));
+    };
+}
+
+}  // namespace
+
+Tool fs(std::string root) {
+    auto sb = std::make_shared<Sandbox>(root);
+    auto h_read       = make_fs_read_handler      (sb);
+    auto h_write      = make_fs_write_handler     (sb);
+    auto h_list       = make_fs_list_handler      (sb);
+    auto h_glob       = make_fs_glob_handler      (sb);
+    auto h_grep       = make_fs_grep_handler      (sb);
+    auto h_check_path = make_fs_check_path_handler(sb);
+    auto h_cwd        = make_fs_cwd_handler       ();
+    auto h_sandbox    = make_fs_sandbox_handler   (root);
+
+    return Tool::builder("fs")
         .describe(
-            "AUTHORITATIVE SANDBOX ROOT — read this BEFORE anything "
-            "else when a task involves the filesystem or shell. The "
-            "value is pinned at tool registration and is the single "
-            "source of truth for where every fs_* tool resolves its "
-            "RELATIVE paths and where `bash` has its cwd. Do NOT "
-            "guess, do NOT extrapolate from `get_current_dir`, do "
-            "NOT trust prior turns — call this tool fresh whenever "
-            "you start touching files, then pair with `fs_check_path` "
-            "to confirm read/write rights at your target before "
-            "issuing any read/write operation.\n"
+            "The filesystem, accessed through one tool. Pick an action; "
+            "the parameters needed depend on which action you choose. "
+            "Eight actions are supported:\n"
             "\n"
-            "Returns the absolute filesystem path of your sandbox "
-            "root. All filesystem tools (read_file, write_file, "
-            "list_dir, glob, grep, fs_check_path) operate inside "
-            "this directory; bash runs with this as its cwd. Their "
-            "RELATIVE paths anchor here.\n"
+            "AUTHORITATIVE SANDBOX RULE — at the start of every "
+            "filesystem or shell task, run action=\"sandbox\" once "
+            "(absolute on-disk root, pinned at registration; this is "
+            "the truth) and then action=\"check_path\" against the "
+            "specific file or directory you intend to touch. Skipping "
+            "this is the most common cause of avoidable error loops: "
+            "the model guesses a path, the open() fails, the model "
+            "guesses again. Don't guess — probe.\n"
             "\n"
-            "Use this when you need to mention the real on-disk path "
-            "in user-facing output (e.g. \"I created the file at "
-            "<sandbox>/main.cpp\") or in commands handed to external "
-            "tools that don't share our cwd. For day-to-day file "
-            "work, you DON'T paste this path into fs_*/bash arguments "
-            "— those expect relative paths.\n"
+            "PATHS ARE RELATIVE to the sandbox root. Use `report.md`, "
+            "`docs/spec.md`, `src/main.cpp`, `.` for the root itself "
+            "— NEVER prefix with `/`. Absolute / `..`-bearing inputs "
+            "are silently re-anchored under the root for safety, but "
+            "the relative form is what you should always pass.\n"
             "\n"
-            "No parameters. Example call: {}."
+            "  action=\"read\"\n"
+            "    Read a UTF-8 text file. Required: path. Optional: "
+            "offset (skip N bytes; default 0), limit (max bytes; "
+            "default 65536, max 1048576). Use offset to page through "
+            "files larger than the limit.\n"
+            "\n"
+            "  action=\"write\"\n"
+            "    Write UTF-8 text to a file. Default mode OVERWRITES "
+            "any existing content; pass append=true to extend. Missing "
+            "parent directories are created automatically. Required: "
+            "path, content. Optional: append (default false). Returns "
+            "`wrote N bytes to <path>` on success. Don't use bash for "
+            "`cat > file` / `echo \"...\" > file` / `cat <<EOF` — call "
+            "this instead, no shell-quoting minefield.\n"
+            "\n"
+            "  action=\"list\"\n"
+            "    List entries in one directory, non-recursively. "
+            "Required: path (use `.` for the sandbox root). Output is "
+            "one entry per line, sorted, with `d` / `f` prefix and file "
+            "sizes. Use action=\"glob\" for recursive / pattern "
+            "matching.\n"
+            "\n"
+            "  action=\"glob\"\n"
+            "    Find files by wildcard pattern, recursive by default. "
+            "Required: pattern. Optional: path (starting directory; "
+            "default `.`, the sandbox root). Pattern grammar: `*` "
+            "matches any run except `/`; `**` crosses directory "
+            "boundaries; `?` matches one char; `[abc]` matches a set. "
+            "The path argument names a starting DIRECTORY (not a "
+            "file); pointing it at a single file is an error.\n"
+            "\n"
+            "  action=\"grep\"\n"
+            "    Search file contents for a regex, recursively. "
+            "Required: pattern. Optional: path (start dir, default "
+            "`.`), file_glob (limit by basename, e.g. `*.cpp`), "
+            "max_matches (default 100), case_insensitive (default "
+            "false). Regex flavor is ECMAScript. Output: "
+            "`<path>:<lineno>:<line>`. Stops after max_matches.\n"
+            "\n"
+            "  action=\"check_path\"\n"
+            "    AUTHORITATIVE PRE-FLIGHT — confirm a path's existence "
+            "and the running process's effective r/w/x rights BEFORE "
+            "you touch it. Required: path. Optional: touch (default "
+            "false; when true and the path doesn't exist, an empty "
+            "file is created so you can probe write access without "
+            "committing real content). Output is multi-line key:value "
+            "(path, absolute, exists, type, size, mode, readable, "
+            "writable, executable, mtime, optional `created: yes`). "
+            "Run this once at the start of every fs / bash subtask.\n"
+            "\n"
+            "  action=\"cwd\"\n"
+            "    Return the absolute path of the process's CURRENT "
+            "working directory (resolved at call time via getcwd). "
+            "In the standard CLI / server setup the process chdir's "
+            "into the sandbox at startup, so this typically matches "
+            "the sandbox root — but if you specifically want the "
+            "sandbox boundary, use action=\"sandbox\" instead (its "
+            "answer is pinned at registration and won't drift). No "
+            "other parameters.\n"
+            "\n"
+            "  action=\"sandbox\"\n"
+            "    Return the absolute filesystem path of the sandbox "
+            "root, pinned at tool registration. This is the single "
+            "source of truth for where read/write/list/glob/grep "
+            "resolve their RELATIVE paths and where `bash` has its "
+            "cwd. Use this when you need to mention the real on-disk "
+            "path in user-facing output (e.g. \"I created the file "
+            "at <sandbox>/main.cpp\") or in commands handed to "
+            "external tools that don't share our cwd. For day-to-day "
+            "file work you DON'T paste this path into fs/bash "
+            "arguments — those expect relative paths. No other "
+            "parameters.\n"
+            "\n"
+            "Errors return a single-line message starting with `error:`. "
+            "Reading a binary file returns the raw bytes — prefer the "
+            "shell's `file <path>` for those."
         )
-        .handle([resolved](const ToolCall & /*c*/) {
-            if (!resolved.empty()) return ToolResult::ok(resolved);
-            // Fallback: no sandbox configured — answer with the
-            // process's current cwd, which is what `bash` actually
-            // uses when registered with root=".".
-            char buf[PATH_MAX];
-            if (::getcwd(buf, sizeof(buf)) == nullptr) {
+        .param("action",            "string",
+               "Required. One of: \"read\", \"write\", \"list\", "
+               "\"glob\", \"grep\", \"check_path\", \"cwd\", "
+               "\"sandbox\". Each action consumes a subset of the "
+               "other parameters; see the tool description for the "
+               "per-action requirements.", true)
+        .param("path",              "string",
+               "Used by read / write / list / glob / grep / check_path. "
+               "RELATIVE path under the sandbox root. No leading `/`. "
+               "Use `.` for the root itself.", false)
+        .param("content",           "string",
+               "Used by write. UTF-8 text to write. Use `\\n` for "
+               "newlines. Binary content is not supported — use bash.",
+               false)
+        .param("append",            "boolean",
+               "Used by write. If true, append to the file instead of "
+               "overwriting (creates the file if missing). Default "
+               "false.", false)
+        .param("offset",            "integer",
+               "Used by read. Skip this many bytes from the start of "
+               "the file before reading. Default 0. Use the previous "
+               "read's (offset + bytes_returned) to page forward.",
+               false)
+        .param("limit",             "integer",
+               "Used by read. Maximum bytes to return. Default 65536 "
+               "(64 KB), max 1048576 (1 MiB).", false)
+        .param("pattern",           "string",
+               "Used by glob / grep. For glob: wildcard pattern. For "
+               "grep: ECMAScript regex (each line matched independently "
+               "with regex_search; anchor with `^`/`$` for full-line "
+               "matches).", false)
+        .param("file_glob",         "string",
+               "Used by grep. Wildcard pattern restricting which "
+               "filenames are searched (matched against basename). "
+               "Examples: `*.cpp`, `*.{c,h}`, `test_*.py`.", false)
+        .param("max_matches",       "integer",
+               "Used by grep. Stop after this many matching lines. "
+               "Default 100.", false)
+        .param("case_insensitive",  "boolean",
+               "Used by grep. If true, the regex matches case-"
+               "insensitively. Default false.", false)
+        .param("touch",             "boolean",
+               "Used by check_path. If true and the path doesn't yet "
+               "exist, create an empty file there (parent dirs auto-"
+               "created, mode 0600). Lets you probe write rights "
+               "without writing real content. Default false.", false)
+        .handle([h_read, h_write, h_list, h_glob, h_grep,
+                 h_check_path, h_cwd, h_sandbox]
+                (const ToolCall & c) -> ToolResult {
+            std::string action;
+            if (!args::get_string(c.arguments_json, "action", action)
+                    || action.empty()) {
                 return ToolResult::error(
-                    std::string("getcwd failed: ") + std::strerror(errno));
+                    "missing required argument: action. Use one of "
+                    "\"read\", \"write\", \"list\", \"glob\", \"grep\", "
+                    "\"check_path\", \"cwd\", \"sandbox\".");
             }
-            const size_t n = ::strnlen(buf, sizeof(buf));
-            return ToolResult::ok(std::string(buf, n));
+            if (action == "read")        return h_read(c);
+            if (action == "write")       return h_write(c);
+            if (action == "list")        return h_list(c);
+            if (action == "glob")        return h_glob(c);
+            if (action == "grep")        return h_grep(c);
+            if (action == "check_path")  return h_check_path(c);
+            if (action == "cwd")         return h_cwd(c);
+            if (action == "sandbox")     return h_sandbox(c);
+            return ToolResult::error(
+                "unknown action \"" + action + "\". Valid: \"read\", "
+                "\"write\", \"list\", \"glob\", \"grep\", \"check_path\", "
+                "\"cwd\", \"sandbox\".");
         })
         .build();
 }
@@ -2081,14 +1915,15 @@ Tool bash(std::string root, bool show_output) {
             "Run a shell command via `/bin/sh -c`. Output is stdout and "
             "stderr merged.\n"
             "\n"
-            "AUTHORITATIVE SANDBOX RULE — before your first fs_*/bash "
-            "call in a task, run `get_sandbox_path` (the absolute on-disk "
-            "root, pinned at registration; this is the truth) and then "
-            "`fs_check_path` against any file the command will read from "
-            "or write to. The command runs with cwd PINNED to the "
-            "sandbox root, so the path you probe with `fs_check_path` "
-            "is the same path the shell will see. Skipping the precheck "
-            "is the most common cause of avoidable error loops.\n"
+            "AUTHORITATIVE SANDBOX RULE — before your first fs / bash "
+            "call in a task, run fs(action=\"sandbox\") (the absolute "
+            "on-disk root, pinned at registration; this is the truth) "
+            "and then fs(action=\"check_path\") against any file the "
+            "command will read from or write to. The command runs with "
+            "cwd PINNED to the sandbox root, so the path you probe with "
+            "fs(action=\"check_path\") is the same path the shell will "
+            "see. Skipping the precheck is the most common cause of "
+            "avoidable error loops.\n"
             "\n"
             "WORKING DIRECTORY & PATHS — cwd is the sandbox root. USE "
             "RELATIVE PATHS in your commands: `ls`, `cat report.md`, "
@@ -2096,15 +1931,15 @@ Tool bash(std::string root, bool show_output) {
             "for sandbox files — they break portability across "
             "sandboxes. If you need the absolute root for a log line "
             "or an external command, fetch it once via "
-            "`get_sandbox_path` and quote that.\n"
+            "fs(action=\"sandbox\") and quote that.\n"
             "\n"
-            "FILE WORK — PREFER THE DEDICATED TOOLS. For reading, "
-            "writing, listing, finding, or searching files use "
-            "`read_file`, `write_file`, `list_dir`, `glob`, and `grep`. "
-            "They're faster, can't be foot-gunned with quoting / "
-            "redirection mistakes, and produce structured output the "
-            "model parses reliably. Reach for `bash` only when you need "
-            "shell features the dedicated tools don't have:\n"
+            "FILE WORK — PREFER THE `fs` TOOL. For reading, writing, "
+            "listing, finding, or searching files use the unified `fs` "
+            "tool: action=read / write / list / glob / grep. It's "
+            "faster, can't be foot-gunned with quoting / redirection "
+            "mistakes, and produces structured output the model parses "
+            "reliably. Reach for `bash` only when you need shell "
+            "features `fs` doesn't have:\n"
             "\n"
             "  - pipelines (`grep | xargs`, `find ... -exec`, `... | "
             "    awk ...`)\n"
@@ -2114,11 +1949,11 @@ Tool bash(std::string root, bool show_output) {
             "    managers, `make`, `cmake`, `python` / `node` REPLs, "
             "    diff, file)\n"
             "  - non-trivial in-place edits (sed/awk for line-range "
-            "    replacements; the `write_file` tool overwrites or "
+            "    replacements; fs(action=\"write\") overwrites or "
             "    appends only)\n"
             "\n"
             "If your command is `cat > file` / `cat <<EOF` / "
-            "`echo \"...\" > file` / `mkdir`, call `write_file` "
+            "`echo \"...\" > file` / `mkdir`, call fs(action=\"write\") "
             "instead — it does the same thing without the shell-quoting "
             "minefield.\n"
             "\n"
@@ -2430,10 +2265,9 @@ Tool tool_lookup(ToolListGetter get_tools) {
             "  - {\"name\":\"<substring>\"} → returns only tools whose "
             "NAME contains that substring (case-insensitive, partial). "
             "Use this when you have a specific name in mind and just "
-            "need to confirm it. Examples: name=\"file\" finds "
-            "read_file / write_file / list_dir-style tools; name=\"web\" "
-            "finds web_search / web_fetch / web_google; name=\"rag\" "
-            "finds the rag store tool(s).\n"
+            "need to confirm it. Examples: name=\"fs\" finds the unified "
+            "filesystem tool; name=\"web\" finds the unified web tool; "
+            "name=\"rag\" finds the rag store tool.\n"
             "\n"
             "OUTPUT SHAPE (what you'll see)\n"
             "  1. <tool_name>: <one-line summary>\n"

@@ -245,23 +245,20 @@ WantedBy=multi-user.target
 
 Important pieces:
 
-- `User=easyai`. The agent runs unprivileged. `bash`, fs_*, every
-  external tool inherits this uid. THE single biggest "isolation"
-  you have. Don't run as root.
+- `User=easyai`. The agent runs unprivileged. `bash`, the unified
+  `fs` tool, every external tool inherits this uid. THE single biggest
+  "isolation" you have. Don't run as root.
 - `--sandbox /var/lib/easyai/workspace`. Where the agent's `bash` /
-  `fs_*` tools land. The agent `chdir`s here at startup so
-  `get_current_dir` reports this path.
+  `fs` tools land. The agent `chdir`s here at startup so
+  `fs(action="cwd")` reports this path.
 - `--external-tools /etc/easyai/external-tools`. Operator-defined
   tools live here. Empty dir is a normal state.
 - `--RAG /var/lib/easyai/rag`. The agent's persistent **memory**
-  (search / store / recall / update / forget). DEFAULT: registers
-  ONE `rag(action=...)` tool with sub-actions save / append /
-  search / load / list / delete / keywords. Memories whose title
-  starts with `fix-easyai-` are immutable — the model can't
-  overwrite or forget them, useful for seeding system designs and
-  hard rules. Pass `--split-rag` (or `[SERVER] split_rag = on` in
-  the INI) to opt back into the legacy seven separate `rag_*`
-  tools — useful for weak / 1-bit-quant tool callers.
+  (search / store / recall / update / forget). Registers ONE
+  `rag(action=...)` tool with sub-actions save / append / search /
+  load / list / delete / keywords. Memories whose title starts with
+  `fix-easyai-` are immutable — the model can't overwrite or forget
+  them, useful for seeding system designs and hard rules.
 
 Optional add-ons the systemd unit does NOT pass by default but the
 installer leaves room for in `/etc/easyai/easyai.ini`:
@@ -270,10 +267,10 @@ installer leaves room for in `/etc/easyai/easyai.ini`:
   to that MCP server as a client and merges its tool catalogue into
   this one. Pair with `mcp_token = …` if the upstream uses bearer
   auth. Local tool names win on collision.
-- `[SERVER] use_google = true`. Registers `web_google` (Google
-  Custom Search JSON API). Needs `GOOGLE_API_KEY` and
-  `GOOGLE_CSE_ID` in `Environment=` lines of a drop-in. Counts
-  against your Google quota (free tier: 100 queries/day).
+- `[SERVER] use_google = true`. Enables `engine="google"` inside the
+  unified `web` tool (Google Custom Search JSON API). Needs
+  `GOOGLE_API_KEY` and `GOOGLE_CSE_ID` in `Environment=` lines of a
+  drop-in. Counts against your Google quota (free tier: 100/day).
 - `[SERVER] local_tools = false` (or pass `--no-local-tools`).
   Skips the LOCAL built-in toolbelt — the model only sees RAG,
   external-tools, and any `--mcp` upstream. **Renamed from
@@ -482,8 +479,7 @@ sudo systemctl restart easyai-server
 ```
 
 **Full reference:** `RAG.md`. File format, the unified
-`rag(action=...)` tool (or the seven `rag_*` tools under
-`--split-rag`), workflows, roadmap, troubleshooting.
+`rag(action=...)` tool, workflows, roadmap, troubleshooting.
 
 ---
 
@@ -603,14 +599,14 @@ Cause: pre-2026-05 builds had two bugs that surfaced here. Both
 fixed in current builds:
 
 1. The server read `allow_fs` from the INI but never propagated it
-   to the toolbelt — a non-empty `sandbox` re-enabled `fs_*` even
-   with `allow_fs = off`. Now `allow_fs` / `allow_bash` are honoured
-   independently of `sandbox`.
+   to the toolbelt — a non-empty `sandbox` re-enabled the `fs` tool
+   even with `allow_fs = off`. Now `allow_fs` / `allow_bash` are
+   honoured independently of `sandbox`.
 2. The built-in system prompt named every tool by hand
-   (`fs_read_file`, `bash`, `plan`, …) regardless of whether they
-   were registered. Models then hallucinated calls to disabled
-   tools. Now the built-in prompt only mentions tools that are
-   actually registered for the current invocation.
+   (`fs`, `bash`, `plan`, …) regardless of whether they were
+   registered. Models then hallucinated calls to disabled tools.
+   Now the built-in prompt only mentions tools that are actually
+   registered for the current invocation.
 
 If you supply your OWN system prompt via `[SERVER] system_file`
 (`/etc/easyai/system.txt`), the server cannot rewrite it for you —
@@ -767,17 +763,14 @@ curl -fsS http://localhost/health | jq .tool_count
 
 Expected (rough):
 
-- 4 (datetime, web_search, web_fetch, plan)
-- + 1 (`--use-google`: web_google) — only when env vars set
-- + 1 (RAG default: single `rag(action=...)` dispatcher)
-- + 6 (`--allow-fs`: read_file / write_file / list_dir / glob / grep / get_current_dir)
+- 3 (datetime, the unified `web` tool, plan)
+- + 1 (`--RAG`: the unified `rag(action=...)` tool)
+- + 1 (`--allow-fs`: the unified `fs` tool)
 - + 1 (`--allow-bash`: bash)
 - + N (your `--external-tools` packs)
 - + M (tools fetched via `--mcp` from an upstream MCP server)
-- The `--split-rag` flag replaces the unified `rag` tool with the
-  legacy seven (`rag_save` / `rag_append` / `rag_search` / `rag_load`
-  / `rag_list` / `rag_delete` / `rag_keywords`) — add 6 if you flip
-  it on.
+- `--use-google` enables `engine="google"` *inside* the unified `web`
+  tool — does NOT add a new entry to the catalogue.
 
 ### RAG working?
 
@@ -962,9 +955,8 @@ which side is dropping the connection.
 
 The same retry-and-log pattern applies to the MCP client
 (`[easyai-mcp]` prefix) when `--mcp <url>` points at a flaky
-upstream, and to libcurl-based built-in tools (`[easyai-web]`
-prefix) for `web_search` / `web_fetch`. Configurable via
-`--http-retries N` (default 5, set 0 to disable).
+upstream, and to the unified `web` tool's libcurl calls (`[easyai-web]`
+prefix). Configurable via `--http-retries N` (default 5, set 0 to disable).
 
 ### External tool calls hang forever
 

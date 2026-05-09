@@ -8,7 +8,7 @@
 //   * "Competitor" semantics: when the *client* posts its own `system` message
 //     and `tools`, those win for that single request — the server-side defaults
 //     are only used when the request omits them.
-//   * Built-in toolbelt (datetime / web_fetch / web_search / fs_*) auto-
+//   * Built-in toolbelt (datetime / web / fs / bash / rag) auto-
 //     dispatched server-side when the client does NOT provide tools.
 //   * Friendly preset commands ("precise", "creative 0.9", "/temp 0.5") inside
 //     the user message — the server peels them off, applies them, then
@@ -1671,7 +1671,7 @@ static std::string build_authoritative_preamble(const ServerCtx & ctx) {
         << "For ANY claim about events, people, products, prices, releases,\n"
         << "leaders, scores, weather, or facts after that cutoff you MUST\n"
         << "either:\n"
-        << "  1. Call a tool (web_search, web_fetch, datetime, …) to verify, OR\n"
+        << "  1. Call a tool (web action=search/fetch, datetime, …) to verify, OR\n"
         << "  2. Explicitly state that you are not certain.\n"
         << "Never present a post-cutoff fact as known.  Hallucination is\n"
         << "considered a critical failure for this assistant.\n";
@@ -1873,10 +1873,10 @@ static void handle_chat_sync(ServerCtx & ctx, ChatRequest & req,
 // inline:
 //
 //   event: easyai.tool_call
-//   data: {"name":"web_search","arguments":"{...}","id":"call_1"}
+//   data: {"name":"web","arguments":"{...}","id":"call_1"}
 //
 //   event: easyai.tool_result
-//   data: {"name":"web_search","content":"...","is_error":false}
+//   data: {"name":"web","content":"...","is_error":false}
 //
 // Generic OpenAI clients ignore unknown event types, so this is additive.
 //
@@ -2168,8 +2168,9 @@ static void handle_chat_stream(ServerCtx & ctx,
                 //
                 // Best-effort target hint: the most useful field of the
                 // arguments JSON for "what is the model trying to reach".
-                // We pick `url` (web_fetch) first, then `query`
-                // (web_search), then `path` (fs_*), then `command` (bash).
+                // We pick `url` (web action=fetch) first, then `query`
+                // (web action=search), then `path` (fs_*), then `command`
+                // (bash).
                 // Falls back to a short prefix of the raw args blob so
                 // lesser-known tools still get *something* on the line.
                 // Truncated to 80 chars to keep the log a single line.
@@ -2473,7 +2474,7 @@ static void handle_chat_stream(ServerCtx & ctx,
             // Use `engine_tool_dispatches` to also exclude requests
             // where the engine DID call tools — even an empty final
             // visible reply is not "incomplete" if the model spent
-            // five web_fetches getting there. The user typically sees
+            // five web fetches getting there. The user typically sees
             // the tool dispatches in the Reasoning panel and the
             // server's last-resort fallback also paints the bubble
             // with the engine's promoted reasoning. Flagging that as
@@ -3028,8 +3029,8 @@ static bool require_auth(const ServerCtx & ctx, const httplib::Request & req,
         "      --http-retries N         Extra attempts on transient HTTP\n"
         "                                failures (connect refused, read\n"
         "                                timeout, 5xx). Applies to the MCP\n"
-        "                                client (--mcp), web_search/web_fetch\n"
-        "                                tools, and any other libcurl-based\n"
+        "                                client (--mcp), the unified `web`\n"
+        "                                tool, and any other libcurl-based\n"
         "                                tool. 0 disables. Default 5.\n"
         "                                Each retry logs to stderr.\n"
         "      --http-timeout SECONDS   HTTP read/write timeout for the\n"
@@ -3039,47 +3040,35 @@ static bool require_auth(const ServerCtx & ctx, const httplib::Request & req,
         "                                long thinking turns. INI key:\n"
         "                                [SERVER] http_timeout. Logged\n"
         "                                unconditionally at startup.\n"
-        "      --sandbox <dir>          Set the working root for fs_* and\n"
-        "                                bash AND the cwd / external-tools\n"
-        "                                root / get_sandbox_path target.\n"
-        "                                Setting --sandbox alone does NOT\n"
-        "                                register fs_* / bash — pass\n"
-        "                                --allow-fs / --allow-bash for that.\n"
+        "      --sandbox <dir>          Set the working root for the unified\n"
+        "                                `fs` tool and `bash` AND the cwd /\n"
+        "                                external-tools root / fs(action=\n"
+        "                                \"sandbox\") target. Setting --sandbox\n"
+        "                                alone does NOT register fs / bash —\n"
+        "                                pass --allow-fs / --allow-bash for that.\n"
         "                                Without --sandbox the tools default\n"
         "                                to the server's cwd.\n"
-        "      --allow-fs               Register the fs_* tools (fs_read_file,\n"
-        "                                fs_list_dir, fs_glob, fs_grep,\n"
-        "                                fs_write_file, fs_check_path) plus\n"
-        "                                get_sandbox_path. Scoped to\n"
-        "                                --sandbox dir if given, otherwise the\n"
-        "                                server's cwd. Required even when\n"
-        "                                --sandbox is set; INI [SERVER]\n"
-        "                                allow_fs=on is equivalent.\n"
+        "      --allow-fs               Register the unified `fs` tool\n"
+        "                                (action=read / write / list / glob /\n"
+        "                                grep / check_path / cwd / sandbox).\n"
+        "                                Scoped to --sandbox dir if given,\n"
+        "                                otherwise the server's cwd.\n"
+        "                                Required even when --sandbox is set;\n"
+        "                                INI [SERVER] allow_fs=on is equivalent.\n"
         "      --allow-bash             Register the `bash` tool (run shell\n"
         "                                commands). cwd = --sandbox dir if\n"
         "                                given, otherwise the server's cwd.\n"
         "                                NOT a hardened sandbox — the\n"
         "                                command runs with the server's\n"
         "                                user privileges.\n"
-        "      --use-google             Register the `web_google` tool\n"
-        "                                (Google Custom Search JSON API).\n"
-        "                                Requires GOOGLE_API_KEY and\n"
-        "                                GOOGLE_CSE_ID env vars; counts\n"
-        "                                against Google's quota (free tier:\n"
-        "                                100 queries/day per key).\n"
-        "      --split-rag              Opt back into the legacy seven-tool RAG\n"
-        "                                layout (rag_save / rag_append /\n"
-        "                                rag_search / rag_load / rag_list /\n"
-        "                                rag_delete / rag_keywords as\n"
-        "                                separate tools). The DEFAULT is now\n"
-        "                                the single `rag(action=...)`\n"
-        "                                dispatcher; pass --split-rag if\n"
-        "                                you're driving a weak / 1-bit-quant\n"
-        "                                tool caller (Bonsai-class) that\n"
-        "                                handles many flat schemas better\n"
-        "                                than one discriminated one. On-disk\n"
-        "                                format is byte-identical either way.\n"
-        "                                INI: SERVER.split_rag=on.\n"
+        "      --use-google             Enable engine=\"google\" inside the\n"
+        "                                unified `web` tool (Google Custom\n"
+        "                                Search JSON API). Requires both\n"
+        "                                GOOGLE_API_KEY and GOOGLE_CSE_ID env\n"
+        "                                vars; counts against Google's quota\n"
+        "                                (free tier: 100 queries/day per key).\n"
+        "                                The default engine \"ddg\" works\n"
+        "                                without env vars and any opt-in.\n"
         "      --external-tools <dir>   Load every EASYAI-*.tools file in <dir>\n"
         "                                as an external-tools manifest. Empty\n"
         "                                directory is a normal state (no extra\n"
@@ -3092,12 +3081,10 @@ static bool require_auth(const ServerCtx & ctx, const httplib::Request & req,
         "      --RAG <dir>              Enable RAG, the agent's persistent\n"
         "                                registry / long-term memory. Each\n"
         "                                entry is one Markdown file in <dir>.\n"
-        "                                Default: registers ONE `rag(action=...)`\n"
-        "                                tool with sub-actions save / append /\n"
+        "                                Registers ONE `rag(action=...)` tool\n"
+        "                                with sub-actions save / append /\n"
         "                                search / load / list / delete /\n"
-        "                                keywords. Pass --split-rag to register\n"
-        "                                the legacy seven separate rag_* tools\n"
-        "                                instead. The installed systemd unit\n"
+        "                                keywords. The installed systemd unit\n"
         "                                always passes this flag; manual\n"
         "                                invocations need it explicitly. See\n"
         "                                RAG.md.\n"
@@ -3237,17 +3224,12 @@ struct ServerArgs {
                                        // --metrics-interval N. INI:
                                        // [SERVER] metrics_interval.
                                      // before the network drops them.
-    std::string sandbox;            // optional: scope fs_* / bash to this dir
-    bool        allow_fs   = false; // explicit opt-in for the fs_* tools
+    std::string sandbox;            // optional: scope `fs` / `bash` to this dir
+    bool        allow_fs   = false; // explicit opt-in for the unified `fs` tool
     bool        allow_bash = false; // explicit opt-in for the `bash` tool
-    bool        use_google = false; // explicit opt-in for the `web_google` tool
-                                    // (also requires GOOGLE_API_KEY + GOOGLE_CSE_ID)
-    bool        split_rag = false;        // opt back into the legacy seven
-                                          // rag_* tools (rag_save / rag_append
-                                          // / rag_search / rag_load / rag_list
-                                          // / rag_delete / rag_keywords);
-                                          // default is the single
-                                          // `rag(action=...)` dispatcher.
+    bool        use_google = false; // enable engine="google" inside the unified
+                                    // `web` tool (also requires GOOGLE_API_KEY +
+                                    // GOOGLE_CSE_ID env vars)
     std::string external_tools_dir; // optional: dir of EASYAI-*.tools files
     std::string rag_dir;             // optional: RAG persistent-registry dir
     // Default preset: "precise" (temp=0.2, top_p=0.95, top_k=40, min_p=0.10).
@@ -3483,7 +3465,6 @@ static const std::vector<FlagDef> & kFlags() {
         { {"--allow-fs"},          "SERVER", "allow_fs",       "allow_fs",       false, SET_BOOL_TRUE(&ServerArgs::allow_fs) },
         { {"--allow-bash"},        "SERVER", "allow_bash",     "allow_bash",     false, SET_BOOL_TRUE(&ServerArgs::allow_bash) },
         { {"--use-google"},        "SERVER", "use_google",     "use_google",     false, SET_BOOL_TRUE(&ServerArgs::use_google) },
-        { {"--split-rag"},         "SERVER", "split_rag",      "split_rag",      false, SET_BOOL_TRUE(&ServerArgs::split_rag) },
         // --no-local-tools (formerly --no-tools): disables only the
         // LOCAL built-in toolbelt; remote tools fetched via --mcp are
         // unaffected. The INI key was renamed accordingly so the YAML
@@ -3779,8 +3760,8 @@ static TcpStates count_tcp_states() {
     return s;
 }
 
-// Linux ephemeral port range (used by outbound connect()s — web_fetch,
-// MCP client, etc.).  TIME_WAIT pressure is meaningful as a percentage
+// Linux ephemeral port range (used by outbound connect()s — the web
+// tool, MCP client, etc.). TIME_WAIT pressure is meaningful as a percentage
 // of THIS range, not of the full 65535 port space, because that's what
 // the kernel actually pulls from for ephemeral allocations.
 static uint64_t ephemeral_port_range() {
@@ -3814,14 +3795,14 @@ static std::mutex               g_metrics_mu;
 
 // Build the built-in system prompt with tool-notes bullets gated on which
 // tools will actually be registered. Naming an unregistered tool here makes
-// models try to call it ("bash"/"fs_write_file" hallucinations), so each
-// bullet is conditional on the same flag that controls registration.
+// models try to call it ("bash"/"fs" hallucinations), so each bullet is
+// conditional on the same flag that controls registration.
 static std::string build_builtin_system_prompt(const ServerArgs & args) {
     const bool tools_on    = args.local_tools;
     const bool fs_on       = tools_on && args.allow_fs;
     const bool bash_on     = tools_on && args.allow_bash;
     const bool sandbox_path_on = tools_on && (args.allow_fs || args.allow_bash);
-    const bool web_on      = tools_on;        // web_search/web_fetch are default-on
+    const bool web_on      = tools_on;        // unified web tool is default-on
     const bool datetime_on = tools_on;        // datetime is default-on
     const bool rag_on      = !args.rag_dir.empty();
 
@@ -3864,8 +3845,8 @@ static std::string build_builtin_system_prompt(const ServerArgs & args) {
         "Your tools are EXACTLY those listed in your tools schema for\n"
         "this session. Do NOT invent tools. Anything you remember from\n"
         "other AI systems or training that isn't in the schema is NOT\n"
-        "available — including paraphrases (`read_file` is not\n"
-        "`fs_read_file`; `shell` is not `bash`).\n"
+        "available — including paraphrases (`read_file` is not `fs`;\n"
+        "you must use `fs(action=\"read\")`; `shell` is not `bash`).\n"
         "\n"
         "Uncertain whether a name is registered? Call `tool_lookup`\n"
         "first. With no argument it returns the full numbered\n"
@@ -3890,55 +3871,55 @@ static std::string build_builtin_system_prompt(const ServerArgs & args) {
         }
         if (web_on) {
             s +=
-                "  - web_search returns snippets only; after ONE search, web_fetch\n"
-                "    the top 1-3 URLs and answer from the fetched body. Two searches\n"
-                "    in a row is wrong.\n";
+                "  - web(action=\"search\") returns snippets only; after ONE\n"
+                "    search, call web(action=\"fetch\") on the top 1-3 URLs\n"
+                "    and answer from the fetched body. Two searches in a row\n"
+                "    is wrong.\n";
         }
         if (fs_on && bash_on) {
             s +=
                 "  - SANDBOX PRE-FLIGHT (authoritative): on the first turn\n"
-                "    that touches files, call `get_sandbox_path` to anchor\n"
-                "    the absolute root, then `fs_check_path` against the\n"
-                "    file/dir you're about to read or write. Skipping this\n"
-                "    causes avoidable error loops.\n"
-                "  - Files: PREFER the dedicated tools — fs_read_file /\n"
-                "    fs_list_dir / fs_glob / fs_grep / fs_write_file. Use\n"
-                "    RELATIVE paths under the sandbox root (`report.md`,\n"
-                "    `src/main.cpp`, `.` for the root) — NEVER prefix with\n"
-                "    `/`. Do NOT use bash for `cat > file`, `cat <<EOF`,\n"
-                "    `echo > file`, `mkdir`, or for reading files —\n"
-                "    fs_write_file / fs_read_file / fs_list_dir do those\n"
-                "    without the shell-quoting minefield.\n"
+                "    that touches files, call fs(action=\"sandbox\") to\n"
+                "    anchor the absolute root, then fs(action=\"check_path\")\n"
+                "    against the file/dir you're about to read or write.\n"
+                "    Skipping this causes avoidable error loops.\n"
+                "  - Files: PREFER the unified `fs` tool (action=read /\n"
+                "    write / list / glob / grep). Use RELATIVE paths under\n"
+                "    the sandbox root (`report.md`, `src/main.cpp`, `.` for\n"
+                "    the root) — NEVER prefix with `/`. Do NOT use bash for\n"
+                "    `cat > file`, `cat <<EOF`, `echo > file`, `mkdir`, or\n"
+                "    for reading files — fs(action=\"write\") / fs(action=\n"
+                "    \"read\") / fs(action=\"list\") do those without the\n"
+                "    shell-quoting minefield.\n"
                 "  - bash: cwd is the sandbox root; use RELATIVE paths in\n"
                 "    your commands. Reach for bash for shell features the\n"
-                "    dedicated tools don't have — pipelines, `find | xargs`,\n"
+                "    `fs` actions don't have — pipelines, `find | xargs`,\n"
                 "    build runners (make / cmake / cargo / npm), git,\n"
                 "    package managers, sed/awk for in-place edits.\n";
         } else if (fs_on) {
             s +=
                 "  - SANDBOX PRE-FLIGHT (authoritative): on the first turn\n"
-                "    that touches files, call `get_sandbox_path` to anchor\n"
-                "    the absolute root, then `fs_check_path` against the\n"
-                "    target before any read/write.\n"
-                "  - Files: use the dedicated fs tools — fs_read_file /\n"
-                "    fs_list_dir / fs_glob / fs_grep / fs_write_file. Use\n"
-                "    RELATIVE paths under the sandbox root (`report.md`,\n"
-                "    `src/main.cpp`, `.` for the root) — NEVER prefix with\n"
-                "    `/`.\n";
+                "    that touches files, call fs(action=\"sandbox\") to\n"
+                "    anchor the absolute root, then fs(action=\"check_path\")\n"
+                "    against the target before any read/write.\n"
+                "  - Files: use the unified `fs` tool — action=read / list /\n"
+                "    glob / grep / write. Use RELATIVE paths under the\n"
+                "    sandbox root (`report.md`, `src/main.cpp`, `.` for the\n"
+                "    root) — NEVER prefix with `/`.\n";
         } else if (bash_on) {
             s +=
                 "  - bash: run shell commands. cwd is the sandbox root;\n"
-                "    use RELATIVE paths. No dedicated file tools are\n"
-                "    registered, so bash is the only path for file work\n"
-                "    too — use heredocs / cat / sed for edits.\n";
+                "    use RELATIVE paths. The `fs` tool is not registered,\n"
+                "    so bash is the only path for file work too — use\n"
+                "    heredocs / cat / sed for edits.\n";
         }
         if (sandbox_path_on) {
             s +=
-                "  - get_sandbox_path: AUTHORITATIVE absolute root of your\n"
-                "    sandbox. Read it BEFORE any fs_*/bash work. The fs_*\n"
-                "    tools take RELATIVE paths anchored here; you only\n"
-                "    paste the absolute root into user-facing output or\n"
-                "    external commands that don't share our cwd.\n";
+                "  - fs(action=\"sandbox\"): AUTHORITATIVE absolute root of\n"
+                "    your sandbox. Read it BEFORE any fs / bash work. The\n"
+                "    other fs actions take RELATIVE paths anchored here;\n"
+                "    you only paste the absolute root into user-facing\n"
+                "    output or external commands that don't share our cwd.\n";
         }
         if (rag_on) {
             s += "  - Long-term memory: rag(action=…) save / append / search / load.\n";
@@ -3992,7 +3973,7 @@ int main(int argc, char ** argv) {
     // Precedence: --system inline > -s file > built-in default. The default
     // exists because a *small* model with NO system prompt and a tool list
     // is very likely to over-eagerly call tools on simple greetings ("hi"
-    // → web_search).  Operators can fully replace it via -s.
+    // → web action=search). Operators can fully replace it via -s.
     //
     // The built-in prompt only mentions tools that are actually registered
     // for THIS server invocation. Listing names of unregistered tools (e.g.
@@ -4024,7 +4005,7 @@ int main(int argc, char ** argv) {
     // against getcwd at load time, so chdir-ing here makes those
     // placeholders mean "the dir the operator handed me", not
     // "wherever systemd happened to start me from". Also lets
-    // get_current_dir surface the sandbox path to the model.
+    // fs(action="cwd") surface the sandbox path to the model.
     if (!args.sandbox.empty()) {
         if (::chdir(args.sandbox.c_str()) != 0) {
             std::fprintf(stderr,
@@ -4067,11 +4048,12 @@ int main(int argc, char ** argv) {
 
     // Default toolbelt — opt-out via --no-local-tools.
     //
-    // fs_* and bash are SHIPPED OFF by default. The server requires
-    // explicit opt-in: --allow-fs registers fs_*, --allow-bash adds
-    // bash on top. --sandbox alone DOES NOT imply fs_* — the sandbox
-    // is also the cwd / external-tools root / get_sandbox_path target,
-    // so operators legitimately set it while keeping fs_*/bash off.
+    // The unified `fs` tool and `bash` are SHIPPED OFF by default. The
+    // server requires explicit opt-in: --allow-fs registers `fs`,
+    // --allow-bash adds `bash` on top. --sandbox alone DOES NOT imply
+    // `fs` — the sandbox is also the cwd / external-tools root /
+    // fs(action="sandbox") target, so operators legitimately set it
+    // while keeping fs / bash off.
     if (args.local_tools) {
         // Determine the working root: --sandbox if given, else cwd
         // when ANY filesystem-flavoured tool is on. We only pass a
@@ -4097,34 +4079,12 @@ int main(int argc, char ** argv) {
     // server passes --RAG by default (see
     // scripts/install_easyai_server.sh). See RAG.md.
     if (!args.rag_dir.empty()) {
-        if (args.split_rag) {
-            // Legacy seven-tool layout (opt-in via --split-rag): one tool
-            // per RAG action. Useful for weak / 1-bit-quant callers that
-            // handle many flat schemas more reliably than one discriminated
-            // schema.
-            auto rag = easyai::tools::make_rag_tools(args.rag_dir);
-            ctx->default_tools.push_back(std::move(rag.save));
-            ctx->default_tools.push_back(std::move(rag.append));
-            ctx->default_tools.push_back(std::move(rag.search));
-            ctx->default_tools.push_back(std::move(rag.load));
-            ctx->default_tools.push_back(std::move(rag.list));
-            ctx->default_tools.push_back(std::move(rag.del));
-            ctx->default_tools.push_back(std::move(rag.keywords));
-            std::fprintf(stderr,
-                "easyai-server: RAG enabled (split: seven rag_* "
-                "tools), root = %s\n",
-                args.rag_dir.c_str());
-        } else {
-            // Default: single `rag(action=...)` dispatcher. The seven
-            // rag_* tools are NOT registered — exposing both paths to
-            // the same store would just confuse the model.
-            ctx->default_tools.push_back(
-                easyai::tools::make_unified_rag_tool(args.rag_dir));
-            std::fprintf(stderr,
-                "easyai-server: RAG enabled (single rag tool), "
-                "root = %s\n",
-                args.rag_dir.c_str());
-        }
+        ctx->default_tools.push_back(
+            easyai::tools::make_rag_tool(args.rag_dir));
+        std::fprintf(stderr,
+            "easyai-server: RAG enabled (single rag tool), "
+            "root = %s\n",
+            args.rag_dir.c_str());
     }
 
     // MCP client — connect to a remote MCP server and merge its tool
@@ -5446,7 +5406,7 @@ int main(int argc, char ** argv) {
                   "applyBarPalette(chip);"
                 "};"
                 // Inline tool-log entries are emitted by the server as
-                // markdown italics ("\n*🔧 web_search*\n") so they end up
+                // markdown italics ("\n*🔧 web*\n") so they end up
                 // as <em> nodes inside the assistant's content body.  We
                 // render them at the same size as the per-message chip
                 // (.5rem mono, dim) — they're status traces, not prose.
@@ -6058,7 +6018,7 @@ int main(int argc, char ** argv) {
     // Idle-keep-alive timeout: pinned to AT LEAST 1 hour so the
     // TCP socket survives between agentic-session hops.  cpp-httplib's
     // 5 s default would kill the connection between any two POSTs
-    // separated by a tool dispatch (web_fetch, bash compile, fs_grep)
+    // separated by a tool dispatch (web fetch, bash compile, fs grep)
     // — server-side TIME_WAIT pile-up that undoes the client-side
     // persistent-Client win from commit 841dd47.  Floor of 3600 s
     // applies even if http_timeout is set lower (e.g. an operator who

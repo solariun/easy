@@ -11,7 +11,7 @@ libraries** (`find_package(easyai)` exports `easyai::engine` and
 
 | Artifact              | Type    | Role                                                                                                                                    |
 |-----------------------|---------|-----------------------------------------------------------------------------------------------------------------------------------------|
-| `libeasyai`           | library | local llama.cpp engine — `Engine`, `Tool`, `Plan`, built-in tools (datetime, web_search/fetch, fs_*), presets.  Linked via `easyai::engine`.    |
+| `libeasyai`           | library | local llama.cpp engine — `Engine`, `Tool`, `Plan`, built-in tools (datetime, unified `web` and `fs` tools, `bash`, unified `rag`), presets. Linked via `easyai::engine`. |
 | `libeasyai-cli`       | library | OpenAI-protocol client — `Client` mirrors `Engine`'s fluent API but the model runs remote and tools execute locally.  Linked via `easyai::cli`. |
 | `easyai-local`        | binary  | Local-only REPL: loads a GGUF in-process via `easyai::Engine`. Drop-in `llama-cli` replacement.                                       |
 | `easyai-cli`          | binary  | Agentic OpenAI-protocol client built on `libeasyai-cli` — no local model.  REPL or `-p`, full sampling control, plan tool, server-management subcommands. |
@@ -303,6 +303,85 @@ Webui title default also flips to `"Deep"`.
   fixed in commit `e03705e`).
 
 ## 5. Recent commits (most recent first)
+
+```
+2026-05-09 — Tool surface unification: one tool per concept.
+             Three loose collections (web, filesystem, rag) collapsed
+             to one Tool each, all shaped the same way: single Tool
+             with an `action` parameter and a flat schema (every
+             parameter optional except `action`). Pattern mirrors the
+             rag dispatcher introduced 2026-05-04.
+
+  Web:
+    * `web(action="search"|"fetch")` replaces web_search /
+      web_fetch / web_google.
+    * action=search: engine="ddg" (default, no key) or "google"
+      (Custom Search; opt-in via --use-google + GOOGLE_API_KEY +
+      GOOGLE_CSE_ID env vars). Page-based pagination over the
+      engine's own ordering — page= header in the response with
+      total_entries / has_more so the model can walk forward.
+    * action=fetch: start (byte offset) + limit (window size,
+      default 8 KB, max 64 KB) + as_html. Same in-process LRU
+      cache as the old web_fetch (16 entries, 5-minute TTL).
+
+  Filesystem:
+    * `fs(action="read"|"write"|"list"|"glob"|"grep"|"check_path"
+                |"cwd"|"sandbox")` replaces fs_read_file /
+      fs_write_file / fs_list_dir / fs_glob / fs_grep /
+      fs_check_path / get_current_dir / get_sandbox_path. Eight
+      sub-actions, one factory: easyai::tools::fs(root).
+    * Sandbox containment, O_NOFOLLOW + post-mkdir TOCTOU defenses,
+      lstat + access() probing in check_path — all unchanged from
+      the legacy split implementations.
+
+  RAG:
+    * `--split-rag` flag and the legacy seven rag_* tools removed
+      everywhere — CLI, INI, examples, all four binaries. The single
+      `rag(action=...)` dispatcher (default since 2026-05-04) is
+      the only layout. On-disk format unchanged.
+    * make_unified_rag_tool() renamed to make_rag_tool().
+    * make_rag_tools() factory and the RagTools struct deleted from
+      the public API.
+
+  Library API (BREAKING — direct libeasyai consumers must migrate):
+    * Removed: easyai::tools::web_search(), web_fetch(), web_google(),
+      fs_read_file(), fs_write_file(), fs_list_dir(), fs_glob(),
+      fs_grep(), fs_check_path(), get_current_dir(),
+      get_sandbox_path(), make_rag_tools(), RagTools struct.
+    * Added: easyai::tools::web(google_enabled), fs(root),
+      make_rag_tool(root).
+    * cfg.split_rag dropped from easyai::Config (LocalBackend).
+
+  Toolbelt:
+    * .allow_fs(), .no_web(), .use_google() flags retained but their
+      meaning shifted — register the unified tool instead of multiple,
+      and (for use_google) toggle whether engine="google" is accepted
+      at call time. Env vars still re-read every call so a key
+      rotation surfaces an actionable error rather than silent
+      disappearance.
+
+  Built-in description prose:
+    * Both new dispatchers' descriptions follow the same per-action
+      block / "USE THIS AGGRESSIVELY"-flavored guidance / anti-pattern
+      callouts / MANDATORY-first-call notes style as the existing
+      unified rag tool, including AUTHORITATIVE SANDBOX RULE on `fs`
+      directing the model to call action="sandbox" + action="check_path"
+      before the first read/write of any task.
+
+  Inside builtin_tools.cpp:
+    * `namespace fs = std::filesystem` renamed to `stdfs` because
+      the new public `Tool fs(...)` factory in the same namespace
+      collided with the alias.
+    * Each handler factory lifted into its own static
+      make_*_handler() function (mirroring the rag handler-factory
+      pattern); the unified tool's lambda routes by `action` and
+      forwards the original ToolCall.
+
+  Docs updated: README.md, RAG.md, easyai-server.md, easyai-cli.md,
+  easyai-mcp-server.md, LINUX_SERVER.md, MCP.md, manual.md, design.md,
+  AI_TOOLS.md, EXTERNAL_TOOLS.md, SECURITY_AUDIT.md (just the live
+  paragraph; historical findings keep their original tool names).
+```
 
 ```
 2026-05-08 — Server observability + connection-pool fix + prompt

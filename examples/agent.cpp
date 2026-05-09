@@ -34,14 +34,10 @@ int main(int argc, char ** argv) {
           .system(
             "You are a helpful agent with access to tools. "
             "Use them to answer the user's question, then reply concisely. "
-            "When unsure of facts, prefer web_search + web_fetch.")
+            "When unsure of facts, prefer web(action=\"search\") + web(action=\"fetch\").")
           .add_tool(easyai::tools::datetime())
-          .add_tool(easyai::tools::web_fetch())
-          .add_tool(easyai::tools::web_search())
-          .add_tool(easyai::tools::fs_list_dir("."))
-          .add_tool(easyai::tools::fs_read_file("."))
-          .add_tool(easyai::tools::fs_glob("."))
-          .add_tool(easyai::tools::fs_grep("."))
+          .add_tool(easyai::tools::web())
+          .add_tool(easyai::tools::fs("."))
           // Example of a custom tool defined inline — fewer than 10 lines.
           .add_tool(
               easyai::Tool::builder("flip_coin")

@@ -163,9 +163,9 @@ private:
 };
 
 // Heuristic: does the user's prompt look like it wants the model to
-// write a file?  Used by example CLIs to surface a "you forgot
-// --sandbox" hint when fs_write_file isn't registered.  Not exact;
-// false positives just produce a friendly extra message.
+// write a file? Used by example CLIs to surface a "you forgot
+// --sandbox" hint when the unified `fs` tool isn't registered. Not
+// exact; false positives just produce a friendly extra message.
 inline bool prompt_wants_file_write(const std::string & prompt) {
     std::string lo;
     lo.reserve(prompt.size());

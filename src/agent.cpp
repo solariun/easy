@@ -51,7 +51,7 @@ Agent::Agent(std::string model_path) : p_(std::make_unique<Impl>()) {
     p_->is_remote              = false;
     p_->local_cfg.model_path = std::move(model_path);
     // ngl=-1 is already the LocalBackend default (auto).
-    // Default toolset: datetime / web_search / web_fetch.  fs_* and
+    // Default toolset: datetime + the unified `web` tool. `fs` and
     // bash stay off until the user opts in via .sandbox()/.allow_bash().
 }
 

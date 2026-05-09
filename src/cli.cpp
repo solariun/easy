@@ -34,59 +34,41 @@ Toolbelt & Toolbelt::use_google (bool on)         { use_google_  = on;          
 
 std::vector<Tool> Toolbelt::tools() const {
     std::vector<Tool> out;
-    out.reserve(12);
+    out.reserve(8);
     if (!no_datetime_) out.push_back(easyai::tools::datetime());
     if (plan_)         out.push_back(plan_->tool());
+    // Unified `web` tool: action="search" (engine ddg/google) +
+    // action="fetch". google_enabled is the operator opt-in gate
+    // (--use-google) that keeps the billed Google CSE off by default;
+    // env vars are still re-read on every call so key rotation works
+    // without a restart and a missing key surfaces a clear error.
     if (!no_web_) {
-        out.push_back(easyai::tools::web_search());
-        out.push_back(easyai::tools::web_fetch());
-    }
-    // web_google requires explicit opt-in (--use-google in the CLI →
-    // Toolbelt::use_google()) AND the GOOGLE_API_KEY + GOOGLE_CSE_ID env
-    // vars present. Both gates are intentional: the API counts against a
-    // quota and may incur cost, so we never auto-expose it. The tool
-    // itself rechecks the env at call time, so a key rotation mid-
-    // session surfaces a clear error rather than silent disappearance.
-    if (use_google_) {
-        const char * gk = std::getenv("GOOGLE_API_KEY");
-        const char * gx = std::getenv("GOOGLE_CSE_ID");
-        if (gk && *gk && gx && *gx) {
-            out.push_back(easyai::tools::web_google());
+        bool google = false;
+        if (use_google_) {
+            const char * gk = std::getenv("GOOGLE_API_KEY");
+            const char * gx = std::getenv("GOOGLE_CSE_ID");
+            google = (gk && *gk && gx && *gx);
         }
+        out.push_back(easyai::tools::web(google));
     }
-    // fs_* and bash share a working root: the configured sandbox if set,
+    // fs and bash share a working root: the configured sandbox if set,
     // otherwise ".". Whenever either category is enabled, both should be
-    // available — bash is strictly more permissive than fs_*, so allowing
-    // bash without fs_* is incoherent (and traps models into using bash
+    // available — bash is strictly more permissive than fs, so allowing
+    // bash without fs is incoherent (and traps models into using bash
     // for file work because there's nothing else). Conversely, anyone
     // pointing at a sandbox wants file access in it.
     const bool fs_on   = allow_fs_ && (!sandbox_.empty() || allow_bash_);
     const bool bash_on = allow_bash_;
     const std::string fs_root = sandbox_.empty() ? "." : sandbox_;
     if (fs_on) {
-        out.push_back(easyai::tools::fs_list_dir  (fs_root));
-        out.push_back(easyai::tools::fs_read_file (fs_root));
-        out.push_back(easyai::tools::fs_glob      (fs_root));
-        out.push_back(easyai::tools::fs_grep      (fs_root));
-        out.push_back(easyai::tools::fs_write_file(fs_root));
-        // fs_check_path — the authoritative pre-flight that every other
-        // fs_* / bash description tells the model to call first. Always
-        // ships with the rest of the fs_* group; pinned to the same root.
-        out.push_back(easyai::tools::fs_check_path(fs_root));
+        // Single unified `fs` tool. Eight actions: read, write, list,
+        // glob, grep, check_path, cwd, sandbox. The cwd / sandbox
+        // actions replace the old standalone get_current_dir /
+        // get_sandbox_path tools.
+        out.push_back(easyai::tools::fs(fs_root));
     }
     if (bash_on) {
         out.push_back(easyai::tools::bash(fs_root, show_bash_));
-    }
-    // get_current_dir + get_sandbox_path register whenever ANY
-    // filesystem-flavoured tool is on. Both are parameter-free and
-    // cheap; the pair lets the model distinguish "where the process
-    // is right now" (cwd, can drift) from "the boundary I'm scoped
-    // to" (sandbox, pinned at registration). Without an fs/bash tool
-    // there's nothing for them to anchor, so we keep them off.
-    const bool any_fs_like = fs_on || bash_on;
-    if (any_fs_like) {
-        out.push_back(easyai::tools::get_current_dir());
-        out.push_back(easyai::tools::get_sandbox_path(fs_root));
     }
     return out;
 }

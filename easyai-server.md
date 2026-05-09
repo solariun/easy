@@ -106,15 +106,14 @@ The HTTP layer, paths, tool gating, MCP auth.
 | `metrics` | bool | `--metrics` | `off` | Expose Prometheus `/metrics`. |
 | `verbose` | bool | `-v`, `--verbose` | `off` | Noisy logs. Also enables: HTTP-level `→` / `←` lines per request (with status, duration, bytes, running totals) AND a periodic `METRICS` line every `metrics_interval` seconds. See §9. |
 | `metrics_interval` | int | `--metrics-interval` | `1` | Verbose-only periodic METRICS log line every N seconds (default `1` — high-frequency telemetry into journalctl is the whole point). Reports CPU%, iowait%, load avg, process RSS + peak, system mem, GPU GTT (Linux/AMD), HTTP in-flight + cumulative reqs / err / bytes, fd usage, AND TCP state breakdown with **explicit `TIME_WAIT N/M ephemeral ports (X.X% [elevated\|HIGH\|CRITICAL])`** so socket exhaustion shows up before connections fail. `0` disables. Lives outside Prometheus `/metrics` so you can tail it from journalctl. |
-| `allow_fs` | bool | `--allow-fs` | `off` | Register `fs_read_file / fs_write_file / fs_list_dir / fs_glob / fs_grep` plus `get_sandbox_path`. **`--sandbox` ALONE no longer implies `--allow-fs`** (the sandbox is also the cwd / external-tools root / `get_sandbox_path` target — operators legitimately set it while keeping fs_* off). Pass `--allow-fs` explicitly. `--allow-bash` still implies fs_* (bash strictly subsumes the file tools). |
-| `allow_bash` | bool | `--allow-bash` | `off` | Register the `bash` tool **and** the `fs_*` set (bash subsumes fs_*; without fs_* the model would use bash for ordinary file work). **Not** a hardened sandbox. |
-| `use_google` | bool | `--use-google` | `off` | Register the `web_google` tool (Google Custom Search JSON API). Requires `GOOGLE_API_KEY` and `GOOGLE_CSE_ID` env vars. Counts against your Google quota (free tier: 100 queries/day per key). When either env var is missing the tool is silently skipped. |
-| `split_rag` | bool | `--split-rag` | `off` | Opt back into the legacy seven-tool RAG layout (`rag_save`, `rag_append`, `rag_search`, `rag_load`, `rag_list`, `rag_delete`, `rag_keywords`). The DEFAULT is the single `rag(action=...)` dispatcher; flip this on if you're driving a weak / 1-bit-quant tool caller (Bonsai-class) that handles many flat schemas more reliably than one discriminated schema. On-disk format is byte-identical either way. |
+| `allow_fs` | bool | `--allow-fs` | `off` | Register the unified `fs` tool (action=`read` / `write` / `list` / `glob` / `grep` / `check_path` / `cwd` / `sandbox`). **`--sandbox` ALONE no longer implies `--allow-fs`** (the sandbox is also the cwd / external-tools root / `fs(action="sandbox")` target — operators legitimately set it while keeping the `fs` tool off). Pass `--allow-fs` explicitly. `--allow-bash` still implies `fs` (bash strictly subsumes it). |
+| `allow_bash` | bool | `--allow-bash` | `off` | Register the `bash` tool **and** the unified `fs` tool (bash subsumes `fs`; without `fs` the model would use bash for ordinary file work). **Not** a hardened sandbox. |
+| `use_google` | bool | `--use-google` | `off` | Enable `engine="google"` inside the unified `web` tool (Google Custom Search JSON API). Requires `GOOGLE_API_KEY` and `GOOGLE_CSE_ID` env vars. Counts against your Google quota (free tier: 100 queries/day per key). When either env var is missing the option is silently skipped (the default `engine="ddg"` keeps working). |
 | `mcp` | string | `--mcp` | (none — MCP client off) | URL of an upstream MCP server to connect to as a CLIENT. Format: `http(s)://host:port` (the `/mcp` endpoint is appended). Tools fetched from the upstream are merged into the local catalogue; local-tool names take precedence on collision. Failure at startup logs a warning and continues with whatever local / RAG tools were registered. |
 | `mcp_token` | string | `--mcp-token` | (empty) | Bearer token sent on every request to the upstream `mcp` URL. Empty = no `Authorization` header — appropriate when the upstream is in open mode. Don't put a real token in the INI directly if you can help it; load it from a separate file (analogous to how `api_key` is wired through `${EASYAI_API_KEY}` in the systemd installer). |
-| `http_retries` | int | `--http-retries` | `5` | Extra attempts on transient HTTP failures. Applies to the MCP client (`--mcp` upstream calls) and to libcurl-based built-in tools (`web_search`, `web_fetch`). 4xx never retries; 5xx + connect/read/write errors do. Each retry logs to stderr unconditionally (e.g. `[easyai-mcp] http://up:8089/mcp attempt 2/6 failed (Couldn't connect to server); retrying in 500ms`). 0 disables. |
+| `http_retries` | int | `--http-retries` | `5` | Extra attempts on transient HTTP failures. Applies to the MCP client (`--mcp` upstream calls) and to the unified `web` tool's libcurl calls. 4xx never retries; 5xx + connect/read/write errors do. Each retry logs to stderr unconditionally (e.g. `[easyai-mcp] http://up:8089/mcp attempt 2/6 failed (Couldn't connect to server); retrying in 500ms`). 0 disables. |
 | `http_timeout` | int | `--http-timeout` | `600` | Read/write timeout (seconds) for **both** the listen socket (cpp-httplib) AND the MCP-client connection. Bumped from llama-server's traditional 60 s default to give long-thinking models room to breathe before the network drops them. Echoed in the startup banner. HTTP 408/504 timeouts hit by the listen socket are logged unconditionally as `[easyai-server] WARN HTTP 408 timeout on POST /v1/chat/completions from CLIENT (check --http-timeout, …)`. |
-| `local_tools` | bool | `--no-local-tools` (negative) | `on` | Master switch for the LOCAL built-in toolbelt (datetime, web_*, fs_*, bash, ...). Set `off` (or pass `--no-local-tools`) to register zero local default tools. Has no effect on RAG, external tools, or remote tools fetched via `mcp` — those have their own switches. `allow_fs` / `allow_bash` / `use_google` further opt in. **Renamed from `load_tools` / `--no-tools`** to make clear the MCP client (`mcp`) is unaffected. |
+| `local_tools` | bool | `--no-local-tools` (negative) | `on` | Master switch for the LOCAL built-in toolbelt (datetime, web, fs, bash, ...). Set `off` (or pass `--no-local-tools`) to register zero local default tools. Has no effect on RAG, external tools, or remote tools fetched via `mcp` — those have their own switches. `allow_fs` / `allow_bash` / `use_google` further opt in. **Renamed from `load_tools` / `--no-tools`** to make clear the MCP client (`mcp`) is unaffected. |
 | `max_body` | int | `--max-body` | `8388608` (8 MiB) | Max HTTP request body size. |
 | `api_key` | string | `--api-key` | (none — `/v1/*` open) | Bearer token for `/v1/*`. Don't put real keys in INI directly — use `/etc/easyai/api_key` (file-based, the installer wires `${EASYAI_API_KEY}`). |
 | `mcp_auth` | enum | (no CLI; `--no-mcp-auth` overrides) | `auto` | `auto` (auth iff `[MCP_USER]` non-empty), `on` (force require), `off` (force open). |
@@ -150,7 +149,7 @@ Model loading and inference tunables.
 | `top_k` | int | `--top-k` | (preset) | Sampling override. |
 | `min_p` | float | `--min-p` | (preset) | Sampling override. |
 | `repeat_penalty` | float | `--repeat-penalty` | `1.15` | Repetition penalty — *multiplicative* on logits of recently-seen tokens. Anti-loop safety net for thinking models that lock into rephrasing their own intent ("I'll write X / Let me write X / OK, creating X" forever). Set `1.0` to disable. Pairs naturally with `presence_penalty=0`; the production AI box flips that pairing (see next row). |
-| `presence_penalty` | float | `--presence-penalty` | `0.0` (disabled) | Presence penalty (OpenAI semantics, range `[-2.0, 2.0]`) — *additive*, fixed cost per token that has appeared *at all* in the recent window, regardless of count. Discourages topic stickiness without penalising literal tool-name repetition. The installer ships `1.5` paired with `repeat_penalty=1.0` because long agentic flows (10+ tool hops) tested better with that pairing than with `repeat_penalty=1.15` alone — `repeat_penalty` was making the model paraphrase tool names like `fs_read_file` after the third call, breaking dispatch. See [`design.md` §4b](design.md#4b-sampling-and-the-penalty-stack) for the full rationale. Persists across requests (no per-request override path). |
+| `presence_penalty` | float | `--presence-penalty` | `0.0` (disabled) | Presence penalty (OpenAI semantics, range `[-2.0, 2.0]`) — *additive*, fixed cost per token that has appeared *at all* in the recent window, regardless of count. Discourages topic stickiness without penalising literal tool-name repetition. The installer ships `1.5` paired with `repeat_penalty=1.0` because long agentic flows (10+ tool hops) tested better with that pairing than with `repeat_penalty=1.15` alone — `repeat_penalty` was making the model paraphrase tool names like `fs` after the third call, breaking dispatch. See [`design.md` §4b](design.md#4b-sampling-and-the-penalty-stack) for the full rationale. Persists across requests (no per-request override path). |
 | `max_tokens` | int | `--max-tokens` | `-1` (until EOS / ctx full) | Per-turn cap. |
 | `seed` | uint32 | `--seed` | `0` (random) | RNG seed. |
 | `max_incomplete_retries` | int | `--max-incomplete-retries` | `10` | How many times the engine discards + nudges + retries when the model finishes a turn with no tool_call and only an "announce" snippet ("Let me…", "I'll…"). `0` disables retries (equivalent to `retry_on_incomplete = off`). Bump to 15-20 for weak / 1-bit-quant models that keep announcing-without-acting. Each retry surfaces in the webui Thinking panel as `↻ Retry N/max`. |
@@ -189,8 +188,8 @@ Documented up-front so operators can plan / pre-populate.
 
 ```ini
 [TOOLS]
-mcp_allowed = rag_*, datetime, web_search, web_fetch
-mcp_denied  = bash, fs_write_file
+mcp_allowed = rag, datetime, web
+mcp_denied  = bash, fs
 ```
 
 Future semantics (subject to refinement):
@@ -390,17 +389,16 @@ opt-in is logged at startup with sanity warnings.
 
 | Flag / INI key | What it enables |
 | --- | --- |
-| (no flag) | `datetime`, `web_search`, `web_fetch`. |
-| `--sandbox <dir>` (`[SERVER] sandbox`) | Sets the working root: cwd for the server process, root for `fs_*` / `bash` when those are enabled, base for `$SANDBOX` placeholders in external-tool manifests, and target of `get_sandbox_path`. **`--sandbox` alone NO LONGER auto-registers `fs_*`** (operators legitimately set it for cwd / external-tools / get_sandbox_path while keeping the file tools off). Pass `--allow-fs` explicitly to register the file tools. `--allow-bash` still implies fs_*. |
-| `--allow-fs` (`[SERVER] allow_fs`) | `fs_read_file / fs_write_file / fs_list_dir / fs_glob / fs_grep` plus `get_current_dir` and `get_sandbox_path`. The working root is `--sandbox <dir>` if given, else `.` (the server's cwd). Implied by `--allow-bash`. **Honored independently of `sandbox`** since the 2026-05-08 fix — `allow_fs = off` in the INI now genuinely disables fs_*, even with a sandbox set. |
-| `--allow-bash` (`[SERVER] allow_bash`) | `bash` (run `/bin/sh -c`) **plus the `fs_*` set** (bash subsumes them). cwd = sandbox if given, else the binary's CWD. NOT a hardened sandbox — runs with this process's user privileges. Also bumps the agentic-loop `max_tool_hops` to 99999 (bash flows naturally span many turns). |
-| `--use-google` (`[SERVER] use_google`) | `web_google` (Google Custom Search JSON API). Requires `GOOGLE_API_KEY` and `GOOGLE_CSE_ID` env vars; tool is silently skipped if either is missing so a key rotation that briefly drops the env doesn't take down the server. Counts against your Google quota (free tier: 100 queries/day per key). |
+| (no flag) | `datetime` and the unified `web` tool (action=`search` / `fetch`). |
+| `--sandbox <dir>` (`[SERVER] sandbox`) | Sets the working root: cwd for the server process, root for the unified `fs` tool / `bash` when those are enabled, base for `$SANDBOX` placeholders in external-tool manifests, and target of `fs(action="sandbox")`. **`--sandbox` alone NO LONGER auto-registers `fs`** (operators legitimately set it for cwd / external-tools / sandbox-path while keeping the file tool off). Pass `--allow-fs` explicitly to register `fs`. `--allow-bash` still implies `fs`. |
+| `--allow-fs` (`[SERVER] allow_fs`) | The unified `fs` tool (action=`read` / `write` / `list` / `glob` / `grep` / `check_path` / `cwd` / `sandbox`). The working root is `--sandbox <dir>` if given, else `.` (the server's cwd). Implied by `--allow-bash`. **Honored independently of `sandbox`** since the 2026-05-08 fix — `allow_fs = off` in the INI now genuinely disables `fs`, even with a sandbox set. |
+| `--allow-bash` (`[SERVER] allow_bash`) | `bash` (run `/bin/sh -c`) **plus the unified `fs` tool** (bash subsumes it). cwd = sandbox if given, else the binary's CWD. NOT a hardened sandbox — runs with this process's user privileges. Also bumps the agentic-loop `max_tool_hops` to 99999 (bash flows naturally span many turns). |
+| `--use-google` (`[SERVER] use_google`) | Enables `engine="google"` inside the unified `web` tool (Google Custom Search JSON API). Requires `GOOGLE_API_KEY` and `GOOGLE_CSE_ID` env vars; option is silently skipped if either is missing so a key rotation that briefly drops the env doesn't take down the server. Counts against your Google quota (free tier: 100 queries/day per key). The default `engine="ddg"` keeps working with no env vars. |
 | `--external-tools <dir>` (`[SERVER] external_tools`) | Load every `EASYAI-<name>.tools` file in `<dir>` as an operator-defined tool pack. Per-file fault isolation. Spawns via `fork`+`execve` — never a shell. **The supported way to give the model focused powers without flipping `--allow-bash`.** See [`EXTERNAL_TOOLS.md`](EXTERNAL_TOOLS.md). |
-| `--RAG <dir>` (`[SERVER] rag`) | Enable RAG, the agent's persistent **memory** (search / store / append / recall / update / forget). DEFAULT: registers ONE `rag(action=...)` tool with sub-actions `save`, `append` (grow an existing memory without losing its body), `search`, `load`, `list`, `delete`, `keywords` — each entry one Markdown file in `<dir>`, operator-readable and hand-editable. Memories whose title starts with `fix-easyai-` are immutable: save/append/delete refuse them. Pass `fix=true` (sub-action `save`) to mint one. Pass `--split-rag` (below) to register the legacy seven separate tools instead. The systemd-installed server passes this by default (`/var/lib/easyai/rag`). See [`RAG.md`](RAG.md). |
-| `--split-rag` (`[SERVER] split_rag`) | Opt back into the legacy seven-tool RAG layout: `rag_save`, `rag_append`, `rag_search`, `rag_load`, `rag_list`, `rag_delete`, `rag_keywords` as separate tools. Same `RagStore`, same on-disk format, same fix-memory semantics — only the catalog shape changes. Useful for weak / 1-bit-quant tool callers (Bonsai-class) that handle many flat schemas more reliably than one discriminated schema. Has no effect when `--RAG` is also off. |
+| `--RAG <dir>` (`[SERVER] rag`) | Enable RAG, the agent's persistent **memory** (search / store / append / recall / update / forget). Registers ONE `rag(action=...)` tool with sub-actions `save`, `append` (grow an existing memory without losing its body), `search`, `load`, `list`, `delete`, `keywords` — each entry one Markdown file in `<dir>`, operator-readable and hand-editable. Memories whose title starts with `fix-easyai-` are immutable: save/append/delete refuse them. Pass `fix=true` (sub-action `save`) to mint one. The systemd-installed server passes this by default (`/var/lib/easyai/rag`). See [`RAG.md`](RAG.md). |
 | `--mcp <url>` (`[SERVER] mcp`) | Connect to a remote MCP server as a CLIENT. The upstream's tool catalogue is merged into ours via `tools/list` at startup; each remote tool's handler proxies `tools/call` over HTTP. Local-tool names take precedence on collision (warning logged, remote dup skipped). Pair with `--mcp-token` for bearer-auth servers. Transient failures (connect refused, read timeout, 5xx) retry per `--http-retries`; each retry is logged. Connect failure after the retry budget logs a warning and continues with whatever local/RAG tools were registered. |
 | `--mcp-token <token>` (`[SERVER] mcp_token`) | Bearer token attached to every `--mcp` request. Empty = no auth header. |
-| `--http-retries N` (`[SERVER] http_retries`) | Default `5`. Extra attempts on transient HTTP failures, applied to the `--mcp` upstream calls AND to libcurl-based built-in tools (`web_search`, `web_fetch`). 4xx never retries; 5xx + connect/read/write errors retry with exponential backoff (250 ms → 500 ms → 1 s → 2 s → 4 s, capped). Set 0 to disable. Every retry logs to stderr (visible in journalctl without `--verbose`). |
+| `--http-retries N` (`[SERVER] http_retries`) | Default `5`. Extra attempts on transient HTTP failures, applied to the `--mcp` upstream calls AND to the unified `web` tool's libcurl calls. 4xx never retries; 5xx + connect/read/write errors retry with exponential backoff (250 ms → 500 ms → 1 s → 2 s → 4 s, capped). Set 0 to disable. Every retry logs to stderr (visible in journalctl without `--verbose`). |
 | `--http-timeout SECONDS` (`[SERVER] http_timeout`) | Default `600`. Read/write timeout for **both** the listen socket AND the MCP-client connection. Bumped from llama-server's traditional 60 s to give long-thinking models room before the network drops them. The chosen value is echoed in the startup banner; HTTP 408 / 504 listen-side timeouts log unconditionally on stderr with the request method/path/peer. |
 | `--no-local-tools` (`[SERVER] local_tools = off`) | Skip the LOCAL built-in toolbelt entirely (renamed from `--no-tools` / `load_tools`). Useful when you want ONLY external-tools, ONLY RAG, or ONLY tools fetched via `--mcp`. The MCP client remains active even with this flag set. |
 
@@ -412,7 +410,7 @@ virtual `/`-rooted filesystem (`/report.md`, `/docs/spec.md`); the
 real sandbox path is hidden from descriptions and result messages.
 
 Concurrency: built-in tools that share state (RAG's index,
-web_fetch's LRU cache) use lock-free or fine-grained synchronisation
+the web tool's fetch LRU cache) use lock-free or fine-grained synchronisation
 internally. RAG specifically uses `std::shared_mutex` so parallel
 reads from multiple workers don't serialise — the same tools used by
 [`easyai-mcp-server`](easyai-mcp-server.md) under thousands-of-clients
@@ -504,8 +502,8 @@ Deep's operating loop is: **TIME → THINK → PLAN → EXECUTE → VERIFY**.
   another tool instead of guessing.
 
 Old behaviour rules carry over: `RULE 1` (execute or answer, never
-just announce), `web_search → web_fetch` mandatory, citations stick
-to the URL actually fetched.
+just announce), `web(action="search") → web(action="fetch")`
+mandatory, citations stick to the URL actually fetched.
 
 Operators who want a different persona pass `--system "<text>"`
 (`[SERVER] system_inline`) or `-s persona.txt` (`[SERVER]
@@ -712,8 +710,9 @@ Highlights of the work documented in [`SECURITY_AUDIT.md`](SECURITY_AUDIT.md):
 
 - **`std::regex` is banned on hostile input.** A 2026-04-26 production
   SIGSEGV (94 766 stack frames in libstdc++'s recursive regex engine
-  on an HTML page from `web_fetch`) drove the rule. All scanners over
-  model output / HTTP bodies / file contents are forward-only.
+  on an HTML page from a `web(action="fetch")` call) drove the rule.
+  All scanners over model output / HTTP bodies / file contents are
+  forward-only.
 - **JSON depth cap (64 levels)** on every accepted-from-network body
   (`/v1/chat/completions`, `/mcp`). Iterative walk so the validator
   itself doesn't recurse.
@@ -728,8 +727,8 @@ Highlights of the work documented in [`SECURITY_AUDIT.md`](SECURITY_AUDIT.md):
   `env_passthrough`.
 - **Sandbox symlink-escape closed.** `Sandbox::resolve` runs
   `fs::weakly_canonical()` + path-component containment, plus
-  `O_NOFOLLOW | O_CLOEXEC` on `fs_read_file` / `fs_write_file` so a
-  TOCTOU race can't follow a last-second symlink.
+  `O_NOFOLLOW | O_CLOEXEC` on `fs(action="read")` / `fs(action="write")`
+  so a TOCTOU race can't follow a last-second symlink.
 - **RAG entries written mode 0600** so the OS-level ACL is
   owner-only even if the operator's umask leaves a wider default.
 - **Authoritative date/time preamble** appended to whichever system
@@ -774,8 +773,7 @@ ask for; the OS bounds what the *agent process* can do.
   per-client connection cookbook (Claude Desktop / Cursor / Continue /
   curl).
 - [`RAG.md`](RAG.md) — persistent registry, the unified
-  `rag(action=...)` tool (or seven `rag_*` tools under
-  `--split-rag`), workflows.
+  `rag(action=...)` tool, workflows.
 - [`EXTERNAL_TOOLS.md`](EXTERNAL_TOOLS.md) — operator-defined
   external tools (`EASYAI-*.tools` JSON manifests).
 - [`SECURITY_AUDIT.md`](SECURITY_AUDIT.md) — three audit passes,

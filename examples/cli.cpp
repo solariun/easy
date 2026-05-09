@@ -17,10 +17,11 @@
 // Built-in tools (off by default in the model's choice list — supplied so
 // it CAN call them):
 //   datetime, plan          (always)
-//   web_search, web_fetch   (when libeasyai was built with curl — runtime
-//                            check via the tool returning an error if not)
-//   fs_list_dir, fs_read_file, fs_glob, fs_grep, fs_write_file,
-//   fs_check_path           (only when --sandbox DIR is given; root scoped)
+//   web                     (unified search + fetch; needs libcurl at build
+//                            time — runtime check returns an error if not)
+//   fs                      (unified read / write / list / glob / grep /
+//                            check_path / cwd / sandbox dispatcher; only
+//                            when --sandbox DIR is given; root scoped)
 //
 // REPL specials:
 //   /exit, /quit       leave
@@ -289,16 +290,10 @@ struct Options {
     // is given; --no-show-bash opts out (or set show_bash=false in the
     // INI's [cli] section).
     bool        show_bash       = true;
-    bool        use_google      = false;       // opt-in: register `web_google`
-                                                // (also needs GOOGLE_API_KEY +
-                                                // GOOGLE_CSE_ID env vars)
-    bool        split_rag        = false;       // opt back into the legacy
-                                                // seven rag_* tools (rag_save /
-                                                // rag_append / rag_search /
-                                                // rag_load / rag_list /
-                                                // rag_delete / rag_keywords);
-                                                // default is the single
-                                                // `rag(action=...)` dispatcher.
+    bool        use_google      = false;       // opt-in: enable engine="google"
+                                                // inside the `web` tool (needs
+                                                // GOOGLE_API_KEY + GOOGLE_CSE_ID
+                                                // env vars too)
     std::set<std::string> tools_enabled;       // empty = all defaults
     std::string external_tools_dir;            // dir of EASYAI-*.tools files
     std::string rag_dir;                        // optional RAG persistent-registry dir
@@ -417,37 +412,27 @@ void usage(const char * argv0) {
 "\n"
 "  Tools:\n"
 "    --tools LIST               comma list, valid names:\n"
-"                                 datetime, plan, web_search, web_fetch,\n"
-"                                 web_google (also needs --use-google),\n"
-"                                 get_current_dir, get_sandbox_path,\n"
-"                                 fs_read_file, fs_list_dir, fs_glob,\n"
-"                                 fs_grep, fs_write_file, fs_check_path,\n"
-"                                 bash,\n"
+"                                 datetime, plan, web (unified search+fetch),\n"
+"                                 fs (unified file work; only with --sandbox\n"
+"                                     or --allow-bash),\n"
+"                                 bash (only with --allow-bash),\n"
 "                                 system_meminfo, system_loadavg,\n"
 "                                 system_cpu_usage, system_swaps,\n"
-"                                 rag (default RAG layout — single tool;\n"
-"                                   requires --RAG DIR),\n"
-"                                 rag_save, rag_append, rag_search,\n"
-"                                 rag_load, rag_list, rag_delete,\n"
-"                                 rag_keywords (legacy split layout —\n"
-"                                   only when --split-rag is also set)\n"
-"                               default: datetime,plan,web_search,web_fetch,\n"
-"                                 get_current_dir,\n"
+"                                 rag (only with --RAG DIR)\n"
+"                               default: datetime,plan,web,\n"
 "                                 system_meminfo,system_loadavg,\n"
 "                                 system_cpu_usage,system_swaps,\n"
 "                                 (rag is auto-registered when --RAG is set;\n"
-"                                  with --split-rag the seven rag_* tools are\n"
-"                                  registered instead)\n"
+"                                  fs is auto-registered when --sandbox is set)\n"
 "    --sandbox DIR              enable file work scoped to DIR.\n"
-"                                 Auto-registers fs_list_dir, fs_read_file,\n"
-"                                 fs_glob, fs_grep, fs_write_file,\n"
-"                                 fs_check_path AND get_sandbox_path.\n"
-"                                 Without --sandbox (and without\n"
-"                                 --allow-bash) the model has no file\n"
-"                                 access.\n"
+"                                 Auto-registers the `fs` tool (action=read /\n"
+"                                 write / list / glob / grep / check_path /\n"
+"                                 cwd / sandbox). Without --sandbox (and\n"
+"                                 without --allow-bash) the model has no\n"
+"                                 file access.\n"
 "    --allow-bash               register the `bash` tool (run shell\n"
-"                                 commands). Implies fs_* tool registration\n"
-"                                 (bash subsumes them; without fs_* the\n"
+"                                 commands). Implies `fs` tool registration\n"
+"                                 (bash subsumes it; without `fs` the\n"
 "                                 model would use bash for file work).\n"
 "                                 WARNING: NOT a hardened sandbox — the\n"
 "                                 command runs with your user privileges\n"
@@ -464,21 +449,13 @@ void usage(const char * argv0) {
 "                                 flag only silences the diagnostic mirror.\n"
 "                                 Override the default in the INI's [cli]\n"
 "                                 section: show_bash = false.\n"
-"    --use-google               register the `web_google` tool (Google\n"
-"                                 Custom Search JSON API). Requires both\n"
-"                                 GOOGLE_API_KEY and GOOGLE_CSE_ID env\n"
-"                                 vars; counts against your Google quota\n"
-"                                 (free tier: 100 queries/day).\n"
-"    --split-rag                opt back into the legacy seven-tool RAG layout\n"
-"                                 (rag_save / rag_append / rag_search /\n"
-"                                 rag_load / rag_list / rag_delete /\n"
-"                                 rag_keywords as separate tools). The\n"
-"                                 DEFAULT is now the single `rag(action=...)`\n"
-"                                 dispatcher; pass --split-rag if you're\n"
-"                                 driving a weak / 1-bit-quant tool caller\n"
-"                                 (Bonsai-class) that handles many flat\n"
-"                                 schemas better than one discriminated one.\n"
-"                                 On-disk format is byte-identical either way.\n"
+"    --use-google               enable engine=\"google\" inside the `web`\n"
+"                                 tool (Google Custom Search JSON API).\n"
+"                                 Requires both GOOGLE_API_KEY and\n"
+"                                 GOOGLE_CSE_ID env vars; counts against\n"
+"                                 your Google quota (free tier: 100/day).\n"
+"                                 The default engine \"ddg\" (DuckDuckGo)\n"
+"                                 needs no env vars and no opt-in.\n"
 "    --external-tools DIR       load every EASYAI-*.tools file in DIR as an\n"
 "                                 external-tools manifest. Empty dir is a\n"
 "                                 normal state (no extra tools). Per-file\n"
@@ -487,12 +464,10 @@ void usage(const char * argv0) {
 "                                 warnings (errors are always shown).\n"
 "                                 See EXTERNAL_TOOLS.md.\n"
 "    --RAG DIR                  enable RAG (the agent's persistent registry)\n"
-"                                 rooted at DIR. Default: registers ONE\n"
+"                                 rooted at DIR. Registers ONE\n"
 "                                 `rag(action=...)` tool with sub-actions\n"
 "                                 save / append / search / load / list /\n"
-"                                 delete / keywords. Pass --split-rag to\n"
-"                                 register the legacy seven separate rag_*\n"
-"                                 tools instead. Each memory is a small\n"
+"                                 delete / keywords. Each memory is a small\n"
 "                                 Markdown file in DIR. See RAG.md.\n"
 "    --no-plan                  don't auto-register the planning tool\n"
 "\n"
@@ -645,7 +620,6 @@ bool parse_args(int argc, char ** argv, Options & o) {
         else if (a == "--config")         o.config_path   = need(i, "--config");
         else if (a == "--unattended")     o.unattended    = true;
         else if (a == "--use-google")     o.use_google    = true;
-        else if (a == "--split-rag")        o.split_rag        = true;
         else if (a == "--external-tools") o.external_tools_dir = need(i, "--external-tools");
         else if (a == "--RAG")            o.rag_dir            = need(i, "--RAG");
         else if (a == "--temperature")    o.temperature       = std::stof(need(i, "--temperature"));
@@ -767,26 +741,9 @@ bool any_management(const Options & o) {
 // ---- tool registration ----------------------------------------------------
 // Default catalog when --tools isn't given.
 const std::vector<std::string> kDefaultTools = {
-    "datetime", "plan", "web_search", "web_fetch",
-    "get_current_dir",
+    "datetime", "plan", "web",
     "tool_lookup",
     "system_meminfo", "system_loadavg", "system_cpu_usage", "system_swaps",
-};
-
-// fs_* + companions auto-enabled by --sandbox DIR or --allow-bash.
-// Either flag is the operator's "the model can touch files" gesture:
-// --sandbox scopes the working root, --allow-bash is strictly more
-// permissive than fs_* (bash subsumes them all). Bundling fs_* with
-// bash means models reach for the structured tools instead of falling
-// back to `cat > file` / `sed -i` because the dedicated tools weren't
-// registered. fs_write_file is included: --sandbox / --allow-bash is
-// the operator's explicit write authorisation.
-// `get_sandbox_path` ships alongside so the model can resolve the real
-// on-disk path of its working root (fs_* otherwise speak a virtual `/`).
-const std::vector<std::string> kSandboxFsTools = {
-    "fs_list_dir", "fs_read_file", "fs_glob", "fs_grep", "fs_write_file",
-    "fs_check_path",
-    "get_sandbox_path",
 };
 
 void register_tools(easyai::Client & cli,
@@ -796,54 +753,41 @@ void register_tools(easyai::Client & cli,
     auto wants = [&](const std::string & name) {
         if (o.tools_enabled.empty()) {
             for (const auto & d : kDefaultTools) if (d == name) return true;
-            // fs_* auto-enable when EITHER --sandbox is set OR
-            // --allow-bash is on. Bash without fs_* is incoherent (bash
-            // is strictly more permissive), and a sandbox without fs_*
+            // `fs` auto-enables when EITHER --sandbox is set OR
+            // --allow-bash is on. Bash without `fs` is incoherent (bash
+            // is strictly more permissive), and a sandbox without `fs`
             // is the same trap inverted.
-            if (!o.sandbox.empty() || o.allow_bash) {
-                for (const auto & d : kSandboxFsTools) if (d == name) return true;
-            }
+            if (name == "fs" && (!o.sandbox.empty() || o.allow_bash)) return true;
             // bash is opt-in by --allow-bash.
             if (o.allow_bash && name == "bash") return true;
-            // web_google is opt-in by --use-google (NOT in kDefaultTools).
-            // Even when the user passes --tools web_google explicitly we
-            // still require --use-google as a "yes I really want to spend
-            // Google API quota" affirmation.
-            if (o.use_google && name == "web_google") return true;
             return false;
         }
-        // --tools web_google in the explicit list still requires --use-google.
-        if (name == "web_google" && !o.use_google) return false;
         return o.tools_enabled.count(name) != 0;
     };
 
     if (wants("datetime"))         cli.add_tool(easyai::tools::datetime());
     if (!o.no_plan && wants("plan")) cli.add_tool(plan.tool());
-    if (wants("web_search"))       cli.add_tool(easyai::tools::web_search());
-    if (wants("web_fetch"))        cli.add_tool(easyai::tools::web_fetch());
-    // web_google is opt-in via --tools web_google (NOT in kDefaultTools).
-    // The user has to explicitly enable it AND have GOOGLE_API_KEY +
-    // GOOGLE_CSE_ID set — the tool itself rechecks at call time and
-    // returns an actionable error if either is missing.
-    if (wants("web_google"))       cli.add_tool(easyai::tools::web_google());
-    if (wants("get_current_dir"))  cli.add_tool(easyai::tools::get_current_dir());
+    // Unified `web` tool. engine="google" is gated on --use-google AND
+    // both env vars present at registration time; the tool itself
+    // re-reads the env at call time so a key rotation surfaces a clear
+    // error rather than silent disappearance.
+    if (wants("web")) {
+        bool google = false;
+        if (o.use_google) {
+            const char * gk = std::getenv("GOOGLE_API_KEY");
+            const char * gx = std::getenv("GOOGLE_CSE_ID");
+            google = (gk && *gk && gx && *gx);
+        }
+        cli.add_tool(easyai::tools::web(google));
+    }
 
-    // fs_* — scoped to --sandbox if given, otherwise CWD.
+    // Unified `fs` tool — scoped to --sandbox if given, otherwise CWD.
+    // Eight actions: read / write / list / glob / grep / check_path /
+    // cwd / sandbox.
     const std::string root = o.sandbox.empty() ? "." : o.sandbox;
-    if (wants("fs_list_dir"))   cli.add_tool(easyai::tools::fs_list_dir(root));
-    if (wants("fs_read_file"))  cli.add_tool(easyai::tools::fs_read_file(root));
-    if (wants("fs_glob"))       cli.add_tool(easyai::tools::fs_glob(root));
-    if (wants("fs_grep"))       cli.add_tool(easyai::tools::fs_grep(root));
-    if (wants("fs_write_file")) cli.add_tool(easyai::tools::fs_write_file(root));
-    // fs_check_path — pre-flight stat + access probe; the other fs_*/bash
-    // descriptions tell the model to call this before any read/write.
-    if (wants("fs_check_path")) cli.add_tool(easyai::tools::fs_check_path(root));
-    // get_sandbox_path — pinned to the same root as fs_*/bash. Lets
-    // the model resolve the absolute on-disk path of where its work
-    // is landing, without depending on the process's cwd matching.
-    if (wants("get_sandbox_path")) cli.add_tool(easyai::tools::get_sandbox_path(root));
+    if (wants("fs")) cli.add_tool(easyai::tools::fs(root));
 
-    // bash — same root as fs_*; opt-in via --allow-bash or --tools bash.
+    // bash — same root as fs; opt-in via --allow-bash or --tools bash.
     if (wants("bash")) {
         // o.show_bash mirrors merged child stdout+stderr to our stderr
         // in real time so a long build / test scroll is visible to the
@@ -854,9 +798,10 @@ void register_tools(easyai::Client & cli,
     }
     // Tool-hop ceiling.  Apply unconditionally — the cli binary is the
     // agentic surface, and even a tools-only session (no bash) commonly
-    // does 10+ hops on a non-trivial task: tool_lookup, list_dir, a
-    // handful of read_file calls, web_search + web_fetch, write_file,
-    // etc.  The library default of 8 truncates real work in production.
+    // does 10+ hops on a non-trivial task: tool_lookup, fs(action="list"),
+    // a handful of fs(action="read") calls, web(action="search") +
+    // web(action="fetch"), fs(action="write"), etc.  The library default
+    // of 8 truncates real work in production.
     // Default here is 99999 (effectively unlimited); --max-tool-hops N
     // puts a finite cap back if the operator wants one.  Per-tool
     // timeouts and HTTP retry budgets still bound runaway behaviour.
@@ -871,33 +816,12 @@ void register_tools(easyai::Client & cli,
     if (wants("system_swaps"))     cli.add_tool(systools::make_system_swaps());
 
     // RAG — the agent's persistent registry / long-term memory.
-    // Seven tools (rag_save / rag_append / rag_search / rag_load /
-    // rag_list / rag_delete / rag_keywords) registered when
-    // --RAG <dir> is given. The dir does not need to exist yet;
-    // rag_save creates it on first call. See RAG.md for the full
-    // guide.
+    // One `rag(action=...)` tool registered when --RAG <dir> is given.
+    // The dir does not need to exist yet; the tool creates it on first
+    // save. See RAG.md.
     if (!o.rag_dir.empty()) {
-        if (o.split_rag) {
-            // Legacy seven-tool layout (opt-in via --split-rag): one tool
-            // per RAG action. Useful for weak / 1-bit-quant callers that
-            // handle many flat schemas more reliably than one discriminated
-            // schema.
-            auto rag = easyai::tools::make_rag_tools(o.rag_dir);
-            if (o.tools_enabled.empty() || o.tools_enabled.count("rag_save"))     cli.add_tool(rag.save);
-            if (o.tools_enabled.empty() || o.tools_enabled.count("rag_append"))   cli.add_tool(rag.append);
-            if (o.tools_enabled.empty() || o.tools_enabled.count("rag_search"))   cli.add_tool(rag.search);
-            if (o.tools_enabled.empty() || o.tools_enabled.count("rag_load"))     cli.add_tool(rag.load);
-            if (o.tools_enabled.empty() || o.tools_enabled.count("rag_list"))     cli.add_tool(rag.list);
-            if (o.tools_enabled.empty() || o.tools_enabled.count("rag_delete"))   cli.add_tool(rag.del);
-            if (o.tools_enabled.empty() || o.tools_enabled.count("rag_keywords")) cli.add_tool(rag.keywords);
-        } else {
-            // Default: single `rag(action=...)` dispatcher. The seven
-            // rag_* tools are NOT registered — exposing both paths to
-            // the same store would just confuse the model. Gated only
-            // on the `rag` name when the operator passed --tools.
-            if (o.tools_enabled.empty() || o.tools_enabled.count("rag")) {
-                cli.add_tool(easyai::tools::make_unified_rag_tool(o.rag_dir));
-            }
+        if (o.tools_enabled.empty() || o.tools_enabled.count("rag")) {
+            cli.add_tool(easyai::tools::make_rag_tool(o.rag_dir));
         }
     }
 
@@ -1123,18 +1047,17 @@ int run_one(easyai::Client & cli, easyai::Plan & plan,
     // Tip targets newcomers who've forgotten --sandbox.  If the user
     // already passed --sandbox we stay quiet — they know about it; the
     // missing tool would be from an explicit --tools filter, where the
-    // tip's "pass --sandbox" advice is wrong anyway.
-    // The factory is `easyai::tools::fs_write_file`, but the tool it
-    // builds is registered with the model under the bare name
-    // `write_file` (see builtin_tools.cpp).  Use the registered name.
+    // tip's "pass --sandbox" advice is wrong anyway. We probe by the
+    // registered tool name `fs` — when --sandbox is unset the unified
+    // fs tool isn't registered and `fs(action="write")` is unreachable.
     if (o.sandbox.empty()
         && prompt_wants_file_write(prompt)
-        && !client_has_tool(cli, "write_file")) {
+        && !client_has_tool(cli, "fs")) {
         std::fprintf(stderr,
             "%s[easyai-cli-remote] tip:%s your prompt looks like it wants "
-            "the model to write a file, but fs_write_file is NOT registered. "
+            "the model to write a file, but the `fs` tool is NOT registered. "
             "Pass %s--sandbox DIR%s to give the model file read+write access "
-            "scoped to DIR (or %s--tools fs_write_file%s explicitly). "
+            "scoped to DIR (or %s--tools fs%s explicitly). "
             "Without it the model will research, then stall when it tries "
             "to save and finds no write tool.\n",
             st.yellow(), st.reset(),
@@ -1330,7 +1253,7 @@ int main(int argc, char ** argv) {
     }
 
     // Anchor the process CWD to the sandbox if one was given. This
-    // means: get_current_dir reports the sandbox path, every external
+    // means: fs(action="cwd") reports the sandbox path, every external
     // tool with `cwd: "$SANDBOX"` resolves there at load time, and the
     // bash tool's relative paths land where the operator authorised
     // file access. Without --sandbox we leave CWD alone and the
@@ -1431,8 +1354,9 @@ int main(int argc, char ** argv) {
     //
     //   [environment] — the absolute path of the agent's sandbox root.
     //   Models without this typically waste turn 1 on
-    //   `get_current_dir` / `pwd` before they can do anything useful.
-    //   Injecting it up front saves the hop on every coding task.
+    //   `fs(action="sandbox")` / `pwd` before they can do anything
+    //   useful. Injecting it up front saves the hop on every coding
+    //   task.
     //
     //   [guidance] — "pick one implementation and ship it" assertiveness
     //   note. Smaller models otherwise enumerate options, ask
@@ -1440,7 +1364,7 @@ int main(int argc, char ** argv) {
     //   refine after they see something running.
     //
     // Both blocks are conditional on the agent actually having a
-    // create/mutate affordance (fs_* / bash / plan). With no such tool
+    // create/mutate affordance (fs / bash / plan). With no such tool
     // the guidance is irrelevant and we leave the prompt alone.
     {
         const bool any_fs_like = o.allow_bash || !o.sandbox.empty();
@@ -1459,8 +1383,8 @@ int main(int argc, char ** argv) {
                 "schema for this session. Do NOT invent tools. Anything "
                 "you remember from other AI systems or training that "
                 "isn't in the schema is NOT available — including "
-                "paraphrases (`read_file` is not `fs_read_file`; "
-                "`shell` is not `bash`).\n"
+                "paraphrases (`read_file` is not `fs`; you must use "
+                "`fs(action=\"read\")`; `shell` is not `bash`).\n"
                 "\n"
                 "If a request needs a capability with no matching tool, "
                 "do the work in your visible reply. Asked to write a "

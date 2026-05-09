@@ -178,11 +178,10 @@ prepended (see [§6](#6-system-prompt--injected-blocks)).
 | Flag | Notes |
 | --- | --- |
 | `--tools LIST` | Comma list, overrides the default catalog. See [§5](#5-tool-registration) for valid names. |
-| `--sandbox DIR` | Working root for fs and bash. **Auto-registers `fs_*` + `get_sandbox_path`.** Bash still requires `--allow-bash`. |
-| `--allow-bash` | Register `bash`. **Implies fs_*** (bash subsumes them). cwd = `--sandbox` if given, else the binary's CWD. WARNING: not a hardened sandbox. |
-| `--use-google` | Register `web_google` (Google Custom Search JSON API). Requires `GOOGLE_API_KEY` and `GOOGLE_CSE_ID` env vars. |
-| `--RAG DIR` | Enable RAG persistent memory rooted at DIR. Default registers ONE `rag(action=...)` tool. |
-| `--split-rag` | Opt back into the legacy seven `rag_*` tools. |
+| `--sandbox DIR` | Working root for fs and bash. **Auto-registers the unified `fs` tool** (action=read / write / list / glob / grep / check_path / cwd / sandbox). Bash still requires `--allow-bash`. |
+| `--allow-bash` | Register `bash`. **Implies `fs`** (bash subsumes it). cwd = `--sandbox` if given, else the binary's CWD. WARNING: not a hardened sandbox. |
+| `--use-google` | Enable `engine="google"` inside the unified `web` tool (Google Custom Search JSON API). Requires `GOOGLE_API_KEY` and `GOOGLE_CSE_ID` env vars. |
+| `--RAG DIR` | Enable RAG persistent memory rooted at DIR. Registers ONE `rag(action=...)` tool. |
 | `--external-tools DIR` | Load every `EASYAI-*.tools` manifest in DIR. See `EXTERNAL_TOOLS.md`. |
 | `--no-plan` | Don't auto-register the `plan` tool. |
 
@@ -234,7 +233,7 @@ client dispatches and posts the result back as a tool message.
 When `--tools` is **not** given, the CLI auto-registers:
 
 ```
-datetime, plan, web_search, web_fetch, get_current_dir,
+datetime, plan, web,
 system_meminfo, system_loadavg, system_cpu_usage, system_swaps
 ```
 
@@ -242,42 +241,41 @@ system_meminfo, system_loadavg, system_cpu_usage, system_swaps
 
 | Trigger | Adds |
 | --- | --- |
-| `--sandbox DIR` **OR** `--allow-bash` | `fs_list_dir`, `fs_read_file`, `fs_glob`, `fs_grep`, `fs_write_file`, `get_sandbox_path` |
+| `--sandbox DIR` **OR** `--allow-bash` | The unified `fs` tool (action=read / write / list / glob / grep / check_path / cwd / sandbox) |
 | `--allow-bash` | `bash` (and bumps the agentic loop's `max_tool_hops` to 99999) |
-| `--use-google` (+ env vars set) | `web_google` |
-| `--RAG DIR` | `rag` (single dispatcher) — or seven `rag_*` tools when `--split-rag` is also set |
+| `--use-google` (+ env vars set) | Enables `engine="google"` inside the unified `web` tool |
+| `--RAG DIR` | `rag` (single-tool dispatcher; sub-actions save / append / search / load / list / delete / keywords) |
 | `--external-tools DIR` | every tool from each loaded `EASYAI-*.tools` manifest |
 
-### Why `--sandbox` and `--allow-bash` both register fs_*
+### Why `--sandbox` and `--allow-bash` both register `fs`
 
-Bash is strictly more permissive than the `fs_*` tools — if the operator
-trusts the model with bash, they trust it with `fs_read_file` etc. by
-construction. Requiring an extra `--allow-fs` flag for the narrower
-surface produced sessions where the model had bash but no `fs_*` and
-fell back to `cat > file` / `cat <<EOF` / `sed -i` for ordinary file
-work. The new defaults eliminate that trap: any flag that says "the
-model can touch files" registers all the file tools at once.
+Bash is strictly more permissive than the unified `fs` tool — if the
+operator trusts the model with bash, they trust it with
+`fs(action="read")` etc. by construction. Requiring an extra
+`--allow-fs` flag for the narrower surface produced sessions where
+the model had bash but no `fs` and fell back to `cat > file` /
+`cat <<EOF` / `sed -i` for ordinary file work. The new defaults
+eliminate that trap: any flag that says "the model can touch files"
+registers `fs` automatically.
 
-`get_sandbox_path` ships alongside so the model can resolve the real
-on-disk path of where its work is landing — distinct from
-`get_current_dir`, which reports the live process cwd and can drift.
+`fs(action="sandbox")` is one of the unified tool's sub-actions, so
+the model can always resolve the real on-disk path of where its work
+is landing — distinct from `fs(action="cwd")`, which reports the live
+process cwd and can drift.
 
 ### Restricting the catalog with `--tools`
 
 Pass `--tools LIST` to override the auto-catalog. Valid names:
 
 ```
-datetime, plan, web_search, web_fetch, web_google,
-get_current_dir, get_sandbox_path,
-fs_read_file, fs_list_dir, fs_glob, fs_grep, fs_write_file, bash,
+datetime, plan, web, fs, bash,
 system_meminfo, system_loadavg, system_cpu_usage, system_swaps,
-rag (single-dispatcher),
-rag_save, rag_append, rag_search, rag_load,
-rag_list, rag_delete, rag_keywords (split layout)
+rag
 ```
 
-`web_google` / `bash` / `rag*` still require their respective opt-in
-flags even when explicitly listed.
+`bash` / `rag` still require their respective opt-in flags even when
+explicitly listed; `engine="google"` inside `web` likewise depends on
+`--use-google` plus the env vars.
 
 ### Inspecting what got registered
 
@@ -315,7 +313,7 @@ see it working.
 Why:
 
 * **`[environment]`** — without it, the first move of any coding agent
-  is "where am I?" (`get_current_dir` / `pwd`). Injecting the resolved
+  is "where am I?" (`fs(action="cwd")` / `pwd`). Injecting the resolved
   absolute path saves that hop on every task.
 * **`[guidance]`** — smaller models otherwise enumerate options, ask
   permission for every choice, or stop at a draft. The assertive
@@ -442,14 +440,10 @@ python3 -c "import json,re; t=open('/tmp/run.log').read();
 
 ## 10. RAG — persistent memory
 
-`--RAG <dir>` mounts a directory as the agent's long-term memory. The
-default layout exposes ONE `rag` tool with seven sub-actions (`save`,
-`append`, `search`, `load`, `list`, `delete`, `keywords`); each memory
-is a single Markdown file in `<dir>` that the operator can hand-edit.
-
-Pass `--split-rag` to register seven separate `rag_*` tools instead —
-useful for weak / 1-bit-quant tool callers that handle many flat schemas
-better than one discriminated schema.
+`--RAG <dir>` mounts a directory as the agent's long-term memory. It
+exposes ONE `rag` tool with seven sub-actions (`save`, `append`,
+`search`, `load`, `list`, `delete`, `keywords`); each memory is a
+single Markdown file in `<dir>` that the operator can hand-edit.
 
 Memories whose title starts with `fix-easyai-` are immutable: save /
 append / delete refuse them. Pass `fix=true` (sub-action `save`) to
@@ -516,8 +510,9 @@ easyai-cli --url http://ai.local:8080 \
 What this gives the model:
 
 * `bash` rooted at `~/projects/tetris`
-* `fs_*` (read / write / list / glob / grep) all rooted there too
-* `get_sandbox_path` returning `~/projects/tetris`
+* the unified `fs` tool (action=read / write / list / glob / grep /
+  check_path / cwd / sandbox), all rooted there too
+* `fs(action="sandbox")` returning `~/projects/tetris`
 * `plan` for a visible step checklist
 * `[environment]` block with the resolved absolute path
 * `[guidance]` block with the assertiveness rule
@@ -529,13 +524,13 @@ easyai-cli --url http://ai.local:8080 -p "summarise transformers in 5 lines"
 ```
 
 No sandbox, no `--allow-bash` → the model has only `datetime`, `plan`,
-`web_*`, and `system_*`. No `[environment]` / `[guidance]` injection
+`web`, and `system_*`. No `[environment]` / `[guidance]` injection
 because there's no file / shell affordance.
 
 ### Restrict to specific tools
 
 ```bash
-easyai-cli --url http://ai.local:8080 --tools datetime,web_search,web_fetch \
+easyai-cli --url http://ai.local:8080 --tools datetime,web \
            "find the latest CVE for libcurl"
 ```
 
