@@ -320,6 +320,17 @@ struct Options {
     std::string              extra_body;       // JSON object literal
     int                      timeout           = 86400;  // 24 hours — multi-hour agentic sessions
     int                      http_retries      = 5;     // extra attempts on transient HTTP fails
+    // Per-turn tool-hop ceiling.  Library default is 8 (safe for thin
+    // embedders); the cli binary unconditionally lifts it to
+    // effectively-unlimited because the cli is the agentic surface —
+    // a paper-review / refactor / build-and-test session routinely
+    // does dozens of tool calls per turn before it converges, and a
+    // hard cap of 8 silently truncates real work mid-task.  Per-tool
+    // timeouts, HTTP retry budgets, and retry_on_incomplete still
+    // bound runaway behaviour.  --max-tool-hops N to put a finite cap
+    // back; 0 / negative resolve to the same effectively-unlimited
+    // ceiling.
+    int                      max_tool_hops     = 99999;
     bool        show_reasoning   = true;   // default ON; --no-reasoning to opt out
     bool        verbose          = false;
     bool        quiet            = false;  // --quiet/-q: disable spinner + ctx-% gauge
@@ -376,6 +387,12 @@ void usage(const char * argv0) {
 "                                request. 0 disables. Default 5. Each retry\n"
 "                                logs to stderr. EASYAI_HTTP_RETRIES env\n"
 "                                also accepted.\n"
+"    --max-tool-hops N          per-turn ceiling on tool calls before the\n"
+"                                agentic loop bails with `max tool hops\n"
+"                                exceeded`. Default effectively unlimited\n"
+"                                (99999) — agentic tasks routinely need 10+\n"
+"                                hops. Set a finite N to put a hard cap\n"
+"                                back; 0 / negative resolve to unlimited.\n"
 "    --insecure-tls             skip peer cert check (https only — DEV ONLY)\n"
 "    --ca-cert PATH             trust this CA bundle (PEM) for https://\n"
 "\n"
@@ -608,6 +625,11 @@ bool parse_args(int argc, char ** argv, Options & o) {
         else if (a == "--model")          o.model   = need(i, "--model");
         else if (a == "--timeout")        o.timeout = std::stoi(need(i, "--timeout"));
         else if (a == "--http-retries")   o.http_retries = std::stoi(need(i, "--http-retries"));
+        else if (a == "--max-tool-hops") {
+            try { o.max_tool_hops = std::stoi(need(i, "--max-tool-hops")); } catch (...) {}
+            // 0 / negative → effectively unlimited (same as default).
+            if (o.max_tool_hops <= 0) o.max_tool_hops = 99999;
+        }
         else if (a == "--system")         o.system_prompt = need(i, "--system");
         else if (a == "--system-file")    o.system_file   = need(i, "--system-file");
         else if (a == "--sandbox")        o.sandbox       = need(i, "--sandbox");
@@ -829,12 +851,16 @@ void register_tools(easyai::Client & cli,
         // in the INI) silences the mirror without affecting what the
         // model sees.
         cli.add_tool(easyai::tools::bash(root, o.show_bash));
-        // Bash flows naturally span many hops (compile → run → fix →
-        // re-run → grep logs → …); the default 8-hop cap chokes them.
-        // Bump to effectively-unlimited.  Other safety nets (per-tool
-        // timeouts, output caps, retry_on_incomplete) still apply.
-        cli.max_tool_hops(99999);
     }
+    // Tool-hop ceiling.  Apply unconditionally — the cli binary is the
+    // agentic surface, and even a tools-only session (no bash) commonly
+    // does 10+ hops on a non-trivial task: tool_lookup, list_dir, a
+    // handful of read_file calls, web_search + web_fetch, write_file,
+    // etc.  The library default of 8 truncates real work in production.
+    // Default here is 99999 (effectively unlimited); --max-tool-hops N
+    // puts a finite cap back if the operator wants one.  Per-tool
+    // timeouts and HTTP retry budgets still bound runaway behaviour.
+    cli.max_tool_hops(o.max_tool_hops);
 
     // Inline system-info tools — defined above in `namespace systools`.
     // They demonstrate how to add your own custom Tool with a couple of
