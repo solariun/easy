@@ -305,6 +305,35 @@ Webui title default also flips to `"Deep"`.
 ## 5. Recent commits (most recent first)
 
 ```
+2026-05-09 — python3 tool result rendered with the executed snippet.
+             Tool result now opens with a fenced ```python ...```
+             block carrying the snippet that just ran, then a
+             `[python3 executed]` notification line, then the exit
+             code and captured output. Chat UIs that render markdown
+             (webui, typical clients) display the code with syntax
+             highlighting; operators skimming the transcript see
+             what ran without expanding the raw tool-call JSON.
+
+  Code:
+    * builtin_tools.cpp python3 handler: post-process the
+      ToolResult from run_capped_subprocess() — prepend
+      ```python\n<code>\n```\n[python3 executed]\n to the
+      content. Spawn-side errors (pipe / fork) still surface
+      unwrapped (no misleading "executed" notice).
+    * The kPythonSandboxPreamble is intentionally stripped from
+      the rendered block — only the model's actual `code`
+      argument shows up. Avoids 25 lines of preamble clutter
+      on every call.
+    * Description's OUTPUT section updated to document the
+      result format so the model knows it doesn't need to add
+      its own markdown wrapping.
+
+  Smoke-tested 4/4: oneliner, multiline (preserves indentation),
+  denied-disk (preamble still triggers, error appears below the
+  code block), missing-arg (returns unwrapped error, no exec).
+```
+
+```
 2026-05-09 — easyai-server METRICS line: always on, default 5 min.
              The periodic METRICS log line was previously gated on
              --verbose. Operators told us they need this telemetry

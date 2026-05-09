@@ -2378,6 +2378,13 @@ Tool python3(std::string root, bool show_output) {
             "just the `exit=0` line — almost always you want a "
             "`print(result)` at the end.\n"
             "\n"
+            "The tool result is rendered as: a fenced ```python block "
+            "with the snippet you ran, then a `[python3 executed]` "
+            "notification line, then the exit code and captured "
+            "output. Chat UIs that render markdown will show the "
+            "code with syntax highlighting. You don't have to format "
+            "anything — the wrapper is added for you.\n"
+            "\n"
             "EXAMPLES:\n"
             "  {code: \"from decimal import Decimal as D; "
             "print(D('0.1')+D('0.2'))\"}\n"
@@ -2428,9 +2435,40 @@ Tool python3(std::string root, bool show_output) {
             wrapped.append(kPythonSandboxPreamble);
             wrapped.append(code);
 
-            return run_capped_subprocess(
+            ToolResult r = run_capped_subprocess(
                 sb, CappedExecKind::Python3, wrapped,
                 timeout_sec, show_output, "python3");
+
+            // Spawn-side errors (pipe / fork failure) leave the
+            // interpreter never having run — return them unaltered
+            // so the operator's message stays the actual cause and
+            // doesn't get dressed up with a deceptive "executed"
+            // notice.
+            if (r.is_error) return r;
+
+            // Wrap the result so any chat UI rendering markdown
+            // shows the executed snippet as a syntax-highlighted
+            // Python block, with an explicit "[python3 executed]"
+            // notification before the captured exit / output. The
+            // model already sees its own `code` argument in the
+            // tool_call but the rendered transcript a human reads
+            // typically only shows tool RESULTS, so dropping the
+            // code into the result is what makes it visible to the
+            // operator without expanding raw tool-call JSON.
+            //
+            // The preamble (kPythonSandboxPreamble) is intentionally
+            // NOT included in the rendered block — it's an
+            // implementation detail and would just clutter the
+            // transcript with the same 25 lines on every call.
+            std::string view;
+            view.reserve(code.size() + r.content.size() + 64);
+            view.append("```python\n");
+            view.append(code);
+            if (code.empty() || code.back() != '\n') view.push_back('\n');
+            view.append("```\n");
+            view.append("[python3 executed]\n");
+            view.append(r.content);
+            return ToolResult::ok(std::move(view));
         })
         .build();
 }

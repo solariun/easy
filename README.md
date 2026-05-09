@@ -43,6 +43,37 @@ A running log of user-facing changes. Latest first — keep this list
 current as features land so anyone returning to the repo (or
 landing on it for the first time) sees what shipped recently.
 
+### 2026-05-09 — `python3` tool result rendered with the executed snippet
+
+The tool result returned by `python3` now opens with a fenced
+```python ...``` block carrying the snippet that just ran, followed
+by a `[python3 executed]` notification line, then the exit code and
+captured output. Chat UIs that render markdown (the embedded webui,
+typical clients) display the code with syntax highlighting, so an
+operator skimming the conversation transcript can see what executed
+without having to expand the raw tool-call JSON.
+
+The model's `code` argument is what gets rendered — the
+`kPythonSandboxPreamble` (the disk-restriction monkey-patch) is
+deliberately stripped from the displayed source so the transcript
+isn't cluttered with the same 25 lines on every call.
+
+Result shape:
+
+```
+```python
+<the snippet>
+```
+[python3 executed]
+exit=0
+<captured stdout+stderr>
+```
+
+Spawn-side errors (pipe / fork failure — the interpreter never
+ran) still surface unwrapped, so the error message stays the
+actual cause and isn't dressed up with a misleading "executed"
+notice.
+
 ### 2026-05-09 — METRICS line: always on, default every 5 minutes
 
 The periodic METRICS log line in `easyai-server` is now emitted
