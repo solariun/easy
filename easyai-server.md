@@ -104,8 +104,8 @@ The HTTP layer, paths, tool gating, MCP auth.
 | `webui_mode` | enum | `--webui` | `modern` | `modern` (embedded llama-server bundle) or `minimal` (inline). |
 | `webui_placeholder` | string | `--webui-placeholder` | `Type a message…` | Input box hint. |
 | `metrics` | bool | `--metrics` | `off` | Expose Prometheus `/metrics`. |
-| `verbose` | bool | `-v`, `--verbose` | `off` | Noisy logs. Also enables: HTTP-level `→` / `←` lines per request (with status, duration, bytes, running totals) AND a periodic `METRICS` line every `metrics_interval` seconds. See §9. |
-| `metrics_interval` | int | `--metrics-interval` | `1` | Verbose-only periodic METRICS log line every N seconds (default `1` — high-frequency telemetry into journalctl is the whole point). Reports CPU%, iowait%, load avg, process RSS + peak, system mem, GPU GTT (Linux/AMD), HTTP in-flight + cumulative reqs / err / bytes, fd usage, AND TCP state breakdown with **explicit `TIME_WAIT N/M ephemeral ports (X.X% [elevated\|HIGH\|CRITICAL])`** so socket exhaustion shows up before connections fail. `0` disables. Lives outside Prometheus `/metrics` so you can tail it from journalctl. |
+| `verbose` | bool | `-v`, `--verbose` | `off` | Noisy logs. Enables HTTP-level `→` / `←` lines per request (with status, duration, bytes, running totals). The periodic `METRICS` line is **independent of verbose** — see `metrics_interval` below. |
+| `metrics_interval` | int | `--metrics-interval` | `300` | Periodic METRICS log line every N seconds, **ALWAYS ON regardless of `verbose`** since 2026-05-09. Reports CPU%, iowait%, load avg, process RSS + peak, system mem, GPU GTT (Linux/AMD), HTTP in-flight + cumulative reqs / err / bytes, fd usage, AND TCP state breakdown with **explicit `TIME_WAIT N/M ephemeral ports (X.X% [elevated\|HIGH\|CRITICAL])`** so socket exhaustion shows up before connections fail. `0` disables. Default `300` (5 min) — low-overhead enough to leave on permanently; bump down (60, 30, 5) when actively troubleshooting. Lives outside Prometheus `/metrics` so you can tail it from journalctl. |
 | `allow_fs` | bool | `--allow-fs` | `off` | Register the unified `fs` tool (action=`read` / `write` / `list` / `glob` / `grep` / `check_path` / `cwd` / `sandbox`). **`--sandbox` ALONE no longer implies `--allow-fs`** (the sandbox is also the cwd / external-tools root / `fs(action="sandbox")` target — operators legitimately set it while keeping the `fs` tool off). Pass `--allow-fs` explicitly. `--allow-bash` still implies `fs` (bash strictly subsumes it). |
 | `allow_bash` | bool | `--allow-bash` | `off` | Register the `bash` tool. **Not** a hardened sandbox. Note: on the server, `--allow-bash` alone does NOT auto-register `fs` — pass `--allow-fs` alongside if you want both. (The cli / local helpers DO auto-register `fs` whenever `--allow-bash` or `--allow-python` is on, since they treat the operator's intent as "let the model touch files".) |
 | `allow_python` | bool | (no `--allow-python`; `--no-python` flips off) | `on` | Register the `python3` tool — runs snippets via `python3 -I -S -E -c <code>`. **Defaults ON**, auto-registered whenever `--sandbox` is set or `--allow-bash` is on (the embedded webui inherits this since the systemd unit ships with `--sandbox`). Isolated stdlib-only interpreter: no PYTHON* env, no site-packages, no cwd on `sys.path`; third-party imports fail with ModuleNotFoundError. **Disk access auto-restricted to the sandbox root** via a Python preamble that monkey-patches `builtins.open` / `io.open` / `os.open` — `open("/etc/passwd")` raises `PermissionError`. Defense-in-depth, not a hardened sandbox: `import os` / `import socket` / `import subprocess` / `import ctypes` all still work. Pass `--no-python` (or `[SERVER] allow_python = off`) to skip registration. |
@@ -660,8 +660,10 @@ public APIs and `/proc`.
 ### 9.2 Periodic METRICS line
 
 A background ticker every `[SERVER] metrics_interval` seconds (CLI
-`--metrics-interval N`, **default `1`**, `0` disables) emits one
-line covering CPU / memory / GPU / load / HTTP / fd / TCP states:
+`--metrics-interval N`, **default `300`** (5 min), `0` disables)
+emits one line covering CPU / memory / GPU / load / HTTP / fd / TCP
+states. **Always on**, regardless of `--verbose` — operators need
+the telemetry whether or not they're chasing a debug session.
 
 ```
 [easyai-server] METRICS uptime=600s  cpu: usage=18.3% iowait=0.4% load=1.42 1.85 2.01  mem: rss=12.45GiB peak=12.51GiB sys=78.2% (28.3GiB/36.2GiB)  gpu: gtt=18.4GiB/29.0GiB (63.4%)  http: in_flight=1 reqs=87 err=2 in=109218B out=148329B  fd: 14/4096 (0.3%)  tcp: estab=24 time_wait=8123 close_wait=2 fin_wait=0 listen=4  TIME_WAIT 8123/28232 ephemeral ports (28.8% elevated)
@@ -699,10 +701,10 @@ The root cause was the cli's per-call `httplib::Client` construction
 upstream of the symptoms. See README §What's new (2026-05-08) for
 the full incident write-up.
 
-The `metrics_interval` default of `1` second means high-frequency
-visibility into journalctl. Bump it (e.g. `metrics_interval = 5`)
-if the volume is too noisy in production; set `0` to disable
-entirely.
+The `metrics_interval` default of `300` seconds (5 minutes) is
+low-overhead enough to leave on permanently in production. Bump
+**down** (60, 30, 5) when actively troubleshooting a slow leak or
+TIME_WAIT pressure; set `0` to disable the ticker entirely.
 
 ---
 

@@ -43,6 +43,26 @@ A running log of user-facing changes. Latest first — keep this list
 current as features land so anyone returning to the repo (or
 landing on it for the first time) sees what shipped recently.
 
+### 2026-05-09 — METRICS line: always on, default every 5 minutes
+
+The periodic METRICS log line in `easyai-server` is now emitted
+**unconditionally** — no longer gated on `--verbose`. Operators
+need the CPU / mem / GPU / TCP-state / TIME_WAIT-pressure telemetry
+in journalctl whether or not they're chasing a debug session.
+
+* `metrics_interval` default raised from `1` second to `300`
+  seconds (5 minutes). Low-overhead enough to leave on permanently
+  in production; bump **down** (60, 30, 5) when actively
+  troubleshooting.
+* The systemd installer's `easyai.ini` template was bumped from
+  `metrics_interval = 60` to `metrics_interval = 300` to match.
+* `--verbose` no longer claims the METRICS line in its description
+  or banner — only the request-level `→` / `←` lines remain
+  verbose-only.
+
+Existing operators who pinned `[SERVER] metrics_interval` in their
+INI keep their value; only the unspecified default shifts.
+
 ### 2026-05-09 — `python3` is default-on with a sandboxed disk surface
 
 Promoting `python3` from explicit-opt-in (--allow-python) to
@@ -164,10 +184,11 @@ and the build.
   completion lines with method/path/peer/body size, status,
   duration, response bytes (or `streamed` for SSE), and running
   totals (req / err / tools / in_flight / bytes_in / bytes_out).
-* **Server: periodic `METRICS` line with TCP state breakdown
-  (verbose mode).** Background ticker every `metrics_interval`
-  seconds (**default 1**, `--metrics-interval N` or
-  `[SERVER] metrics_interval` to tune, `0` disables) emits one
+* **Server: periodic `METRICS` line with TCP state breakdown.**
+  Background ticker every `metrics_interval` seconds
+  (`--metrics-interval N` or `[SERVER] metrics_interval` to tune,
+  `0` disables — **default raised to 300 / always-on as of
+  2026-05-09**, see entry above) emits one
   line with: CPU% + iowait%, load 1/5/15, process RSS + peak,
   system memory total/used/%, AMD GTT used/total/% (Linux + AMD
   only), in-flight requests, cumulative requests / errors / bytes,

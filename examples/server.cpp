@@ -3156,14 +3156,17 @@ static bool require_auth(const ServerCtx & ctx, const httplib::Request & req,
         "       --no-mmap               Disable mmap (read GGUF straight in)\n"
         "       --numa <strategy>       distribute|isolate|numactl|mirror\n"
         "       --metrics               Expose Prometheus /metrics endpoint\n"
-        "       --metrics-interval SECS Verbose-mode periodic METRICS log\n"
-        "                                line every SECS seconds (CPU%%, mem,\n"
-        "                                GPU GTT, load avg, iowait, fd usage,\n"
-        "                                TCP states incl. explicit TIME_WAIT\n"
-        "                                count + %% of ephemeral port range\n"
-        "                                with elevated/HIGH/CRITICAL tag).\n"
-        "                                0 disables. Default 1. INI:\n"
-        "                                [SERVER] metrics_interval.\n"
+        "       --metrics-interval SECS Periodic METRICS log line every SECS\n"
+        "                                seconds (CPU%%, mem, GPU GTT, load\n"
+        "                                avg, iowait, fd usage, TCP states\n"
+        "                                incl. explicit TIME_WAIT count + %%\n"
+        "                                of ephemeral port range with\n"
+        "                                elevated/HIGH/CRITICAL tag).\n"
+        "                                ALWAYS ON regardless of --verbose so\n"
+        "                                journalctl always carries the\n"
+        "                                telemetry. 0 disables. Default 300\n"
+        "                                (5 min). INI: [SERVER]\n"
+        "                                metrics_interval.\n"
         "       --reasoning <on|off>    Enable model thinking (default on)\n"
         "       --no-think              Strip <think>...</think> from replies\n"
         "       --inject-datetime <on|off>\n"
@@ -3180,9 +3183,11 @@ static bool require_auth(const ServerCtx & ctx, const httplib::Request & req,
         "                                 'why did it stop?' moments. Also logs\n"
         "                                 HTTP-level → arrival / ← completion\n"
         "                                 lines per request with running totals\n"
-        "                                 (in-flight, bytes in/out, errors), and\n"
-        "                                 a periodic METRICS line — see\n"
-        "                                 --metrics-interval.\n"
+        "                                 (in-flight, bytes in/out, errors).\n"
+        "                                 The periodic METRICS line is ALWAYS\n"
+        "                                 on (default every 5 min, see\n"
+        "                                 --metrics-interval) — independent of\n"
+        "                                 verbose.\n"
         "       --show-system-prompt    Print the resolved persona (built-in\n"
         "                                Deep default OR --system OR --system-\n"
         "                                file content, in the same precedence\n"
@@ -3231,10 +3236,15 @@ struct ServerArgs {
                                      // timeout in seconds.  Bumped from
                                      // llama-server's 60 s default to give
                                      // long-thinking models room to breathe
-    int         metrics_interval = 1;  // verbose-mode periodic metrics tick
-                                       // (seconds). 0 disables. Default 1
-                                       // — high-frequency telemetry is the
-                                       // whole point. CLI:
+    int         metrics_interval = 300; // periodic metrics tick (seconds).
+                                       // ALWAYS ON (no longer gated on
+                                       // --verbose) so operators see
+                                       // CPU / mem / TCP-state / TIME_WAIT
+                                       // pressure in journalctl without
+                                       // having to flip the noise level.
+                                       // 0 disables. Default 300 (5 min)
+                                       // — low-overhead enough to leave
+                                       // on permanently. CLI:
                                        // --metrics-interval N. INI:
                                        // [SERVER] metrics_interval.
                                      // before the network drops them.
@@ -3614,7 +3624,7 @@ static void on_signal(int) {
 }
 
 // ---------------------------------------------------------------------------
-// Periodic metrics sampler — verbose-mode-only.
+// Periodic metrics sampler — always on.
 //
 // One background thread that wakes every `interval_s` seconds and prints
 // a single line summarising:
@@ -6053,7 +6063,8 @@ int main(int argc, char ** argv) {
             "[easyai-server] VERBOSE: per-request POST line + per-hop "
             "generate_one/chat_continue dumps + thought-only retry trace + "
             "HTTP \xe2\x86\x92 arrival / \xe2\x86\x90 completion lines per "
-            "request + periodic METRICS line will appear in this stream.\n");
+            "request will appear in this stream. (The periodic METRICS line "
+            "ships unconditionally — see --metrics-interval.)\n");
     }
 
     // -------- http server -------------------------------------------------
@@ -6171,13 +6182,18 @@ int main(int argc, char ** argv) {
             });
     }
 
-    // ---- periodic metrics ticker (verbose only) -------------------------
+    // ---- periodic metrics ticker (always on) ----------------------------
     // Wakes every args.metrics_interval seconds and emits one METRICS line
     // covering CPU/GPU/mem/load/iowait/net.  Joined cleanly via
     // g_metrics_stop + g_metrics_cv so SIGINT/SIGTERM doesn't leave a
     // dangling worker.
+    //
+    // Runs unconditionally (not just under --verbose) — operations folks
+    // need this telemetry in journalctl regardless of log noise level.
+    // metrics_interval=0 disables; default is 300s (5 minutes), low-
+    // overhead enough to leave on permanently in production.
     std::thread metrics_thread;
-    if (args.verbose && args.metrics_interval > 0) {
+    if (args.metrics_interval > 0) {
         const int interval_s = args.metrics_interval;
         metrics_thread = std::thread([&ctx_ref, interval_s]() {
             using namespace metrics;
@@ -6301,7 +6317,7 @@ int main(int argc, char ** argv) {
             }
         });
         std::fprintf(stderr,
-            "[easyai-server] verbose metrics ticker every %ds (set --metrics-interval N or [SERVER] metrics_interval, 0 disables)\n",
+            "[easyai-server] metrics ticker every %ds (set --metrics-interval N or [SERVER] metrics_interval, 0 disables)\n",
             interval_s);
     }
 

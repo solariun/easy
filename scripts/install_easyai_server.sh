@@ -989,17 +989,20 @@ http_timeout    = $http_timeout
 # Switch to off if the journalctl noise is a problem in production.
 verbose         = $([[ "$enable_verbose" -eq 1 ]] && echo on || echo off)
 
-# Verbose-only periodic METRICS line: every metrics_interval seconds, log
-# CPU%, iowait, load, process mem (rss + peak), system mem, GPU GTT (AMD),
+# Periodic METRICS line: every metrics_interval seconds, log CPU%,
+# iowait, load, process mem (rss + peak), system mem, GPU GTT (AMD),
 # in-flight requests, cumulative requests / errors / bytes, fd usage, TCP
 # state breakdown (ESTABLISHED / TIME_WAIT / CLOSE_WAIT / FIN_WAIT / LISTEN)
 # with explicit TIME_WAIT-vs-ephemeral-port-range percentage tagged
 # "elevated" / "HIGH" / "CRITICAL" so socket exhaustion shows up before
-# connections start failing. 0 disables. Default 60 — one METRICS line
-# per minute is enough to watch slow-moving signals (RSS creep, TIME_WAIT
-# drift, GTT pressure) without flooding journalctl. Bump down (5, 10) for
-# active troubleshooting; raise (300+) for quiet long-running deploys.
-metrics_interval = 60
+# connections start failing. 0 disables.
+#
+# ALWAYS ON regardless of `verbose` — operators need this telemetry in
+# journalctl whether or not they're chasing a debug session.
+#
+# Default 300 (5 minutes) — low-overhead enough to leave on permanently
+# in production; bump down (60, 30, 5) when actively troubleshooting.
+metrics_interval = 300
 
 # /mcp authentication
 # ----------------------------------------------------------------

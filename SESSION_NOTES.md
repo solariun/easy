@@ -305,6 +305,42 @@ Webui title default also flips to `"Deep"`.
 ## 5. Recent commits (most recent first)
 
 ```
+2026-05-09 — easyai-server METRICS line: always on, default 5 min.
+             The periodic METRICS log line was previously gated on
+             --verbose. Operators told us they need this telemetry
+             (CPU / mem / GPU / TCP-state / TIME_WAIT pressure) in
+             journalctl regardless of debug noise level. Lifted the
+             gate; bumped the default interval from 1s to 300s so
+             the line is low-overhead enough to leave on
+             permanently.
+
+  Code:
+    * server.cpp: metrics_thread now starts whenever
+      args.metrics_interval > 0 (was: && args.verbose).
+    * ServerArgs::metrics_interval default 1 → 300.
+    * Help text + banner: METRICS line described as "always on";
+      verbose-only logging now mentions only the per-request
+      → / ← arrival/completion lines.
+    * Periodic-metrics-sampler header comment retitled "always on"
+      (was "verbose-mode-only").
+
+  Installer:
+    * scripts/install_easyai_server.sh easyai.ini template:
+      metrics_interval bumped 60 → 300, comment updated to
+      "ALWAYS ON regardless of `verbose`".
+
+  Docs:
+    * README.md: new changelog entry; legacy entry retitled "TCP
+      state breakdown" (verbose-mode caveat dropped).
+    * easyai-server.md: INI table + §9.2 (Periodic METRICS line)
+      updated to "always on" and default 300.
+
+  Existing operators who pinned [SERVER] metrics_interval in
+  their INI keep their value — only the unspecified default
+  shifts.
+```
+
+```
 2026-05-09 — `python3` default-on + sandbox-rooted disk surface.
              Promotion from explicit-opt-in to "auto-on whenever the
              operator signals files-are-OK" (i.e. --sandbox or
