@@ -118,6 +118,7 @@ struct CliArgs {
     bool load_tools = true;
     std::string sandbox;        // empty = `fs` tool NOT registered
     bool allow_bash = false;    // explicit opt-in for `bash`
+    bool allow_python = false;  // explicit opt-in for `python3`
     bool show_system_prompt = false;  // --show-system-prompt: dump and exit
     std::string external_tools_dir;     // optional external-tools dir (EASYAI-*.tools)
     std::string rag_dir;                 // optional RAG persistent-registry dir
@@ -181,6 +182,16 @@ struct CliArgs {
         "                                 given, otherwise CWD. NOT a\n"
         "                                 hardened sandbox — the command\n"
         "                                 runs with your user privileges.\n"
+        "      --allow-python            Register the `python3` tool (run\n"
+        "                                 Python 3 snippets via\n"
+        "                                 `python3 -I -S -E -c <code>`).\n"
+        "                                 Same hardening as bash; isolated\n"
+        "                                 stdlib-only interpreter (no\n"
+        "                                 PYTHON* env, no site-packages,\n"
+        "                                 no cwd on sys.path). NOT a\n"
+        "                                 hardened sandbox — `import os`,\n"
+        "                                 `import socket`, `import\n"
+        "                                 subprocess` all work.\n"
         "      --external-tools <dir>    Load every EASYAI-*.tools file in <dir>\n"
         "                                 as an external-tools manifest. Empty\n"
         "                                 dir is a normal state (no extra tools).\n"
@@ -240,6 +251,7 @@ static CliArgs parse(int argc, char ** argv) {
         else if (s == "--no-tools")                   a.load_tools    = false;
         else if (s == "--sandbox")                    a.sandbox       = need(i, "--sandbox");
         else if (s == "--allow-bash")                 a.allow_bash    = true;
+        else if (s == "--allow-python")               a.allow_python  = true;
         else if (s == "--external-tools")             a.external_tools_dir = need(i, "--external-tools");
         else if (s == "--RAG")                        a.rag_dir            = need(i, "--RAG");
         else if (s == "--show-system-prompt")         a.show_system_prompt = true;
@@ -267,9 +279,11 @@ static CliArgs parse(int argc, char ** argv) {
 // the gating LocalBackend / cli::Toolbelt apply at registration time.
 static std::string build_builtin_system_prompt(const CliArgs & args) {
     // LocalBackend doesn't expose allow_fs separately; cli::Toolbelt's
-    // predicate registers fs_* whenever sandbox is set OR allow_bash is on.
-    const bool fs_on       = !args.sandbox.empty() || args.allow_bash;
+    // predicate registers `fs` whenever sandbox is set OR a subprocess
+    // executor (allow_bash / allow_python) is on.
+    const bool fs_on       = !args.sandbox.empty() || args.allow_bash || args.allow_python;
     const bool bash_on     = args.allow_bash;
+    const bool python_on   = args.allow_python;
     const bool web_on      = true;            // datetime + web are default-on with --no-tools=false
     const bool datetime_on = true;
     const bool rag_on      = !args.rag_dir.empty();
@@ -314,7 +328,8 @@ static std::string build_builtin_system_prompt(const CliArgs & args) {
         "returns `unknown tool` and wastes the turn.\n"
         "\n";
 
-    const bool any_tool_note = datetime_on || web_on || fs_on || bash_on || rag_on;
+    const bool any_tool_note = datetime_on || web_on || fs_on || bash_on
+                            || python_on || rag_on;
     if (any_tool_note) {
         s += "Tool notes:\n";
         if (datetime_on) {
@@ -325,35 +340,37 @@ static std::string build_builtin_system_prompt(const CliArgs & args) {
                  "search, call web(action=\"fetch\") on the top 1-3 URLs and "
                  "answer from the fetched body. Two searches in a row is wrong.\n";
         }
-        if (fs_on && bash_on) {
+        if (fs_on) {
             s += "  - SANDBOX PRE-FLIGHT (authoritative): on the first turn "
                  "that touches files, call `fs(action=\"sandbox\")` to anchor "
                  "the absolute root, then `fs(action=\"check_path\")` against "
                  "the file/dir you're about to read or write. Skipping this "
                  "causes avoidable error loops.\n"
-                 "  - Files: PREFER the unified `fs` tool (action=read / "
-                 "write / list / glob / grep). Use RELATIVE paths "
+                 "  - Files: PREFER the unified `fs` tool — action=read / "
+                 "write / list / glob / grep. Use RELATIVE paths "
                  "(`report.md`, `src/main.cpp`, `.` for the root) — NEVER "
-                 "prefix with `/`. Do NOT use bash for `cat > file`, "
-                 "`cat <<EOF`, `echo > file`, `mkdir`, or for reading files "
-                 "— the `fs` actions do those without the shell-quoting "
-                 "minefield.\n"
-                 "  - bash: cwd is the sandbox root; use RELATIVE paths. Reach "
-                 "for bash for shell features the `fs` actions don't have — "
-                 "pipelines, find | xargs, build runners (make / cmake / cargo / "
-                 "npm), git, package managers, sed/awk for in-place edits.\n";
-        } else if (fs_on) {
-            s += "  - SANDBOX PRE-FLIGHT (authoritative): on the first turn "
-                 "that touches files, call `fs(action=\"sandbox\")`, then "
-                 "`fs(action=\"check_path\")` against the target before any "
-                 "read/write.\n"
-                 "  - Files: use the unified `fs` tool — action=read / list / "
-                 "glob / grep / write. Use RELATIVE paths (`report.md`, "
-                 "`src/main.cpp`, `.` for the root) — NEVER prefix with `/`.\n";
-        } else if (bash_on) {
-            s += "  - bash: run shell commands. cwd is the sandbox root; use "
-                 "RELATIVE paths. The `fs` tool is not registered, so bash "
-                 "is the only path for file work too.\n";
+                 "prefix with `/`.\n";
+        }
+        if (bash_on) {
+            s += "  - bash: cwd is the sandbox root; use RELATIVE paths. Do "
+                 "NOT use bash for `cat > file`, `cat <<EOF`, `echo > file`, "
+                 "`mkdir`, or for reading files — fs(action=\"write\") / "
+                 "fs(action=\"read\") do those without the shell-quoting "
+                 "minefield. Reach for bash for shell features `fs` doesn't "
+                 "have: pipelines, find | xargs, build runners (make / cmake "
+                 "/ cargo / npm), git, package managers, sed/awk for in-place "
+                 "edits.\n";
+        }
+        if (python_on) {
+            s += "  - python3: run a Python 3 snippet via "
+                 "`python3 -I -S -E -c <code>` (isolated stdlib-only "
+                 "interpreter — no third-party packages). Reach for it for "
+                 "JSON wrangling, regex, arithmetic, statistics, date math, "
+                 "and other small computations that would be painful in shell. "
+                 "ALWAYS print() what you want returned.\n";
+        }
+        if (!fs_on && !bash_on && !python_on) {
+            // No file affordance at all — leave the empty branch silent.
         }
         if (rag_on) {
             s += "  - Long-term memory: rag(action=…) save / append / search / load.\n";
@@ -438,6 +455,7 @@ int main(int argc, char ** argv) {
     lc.system_prompt  = system_prompt;
     lc.sandbox        = args.sandbox;
     lc.allow_bash     = args.allow_bash;
+    lc.allow_python   = args.allow_python;
     lc.external_tools_dir = args.external_tools_dir;
     lc.quiet              = args.quiet;
     lc.rag_dir            = args.rag_dir;

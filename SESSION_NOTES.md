@@ -11,7 +11,7 @@ libraries** (`find_package(easyai)` exports `easyai::engine` and
 
 | Artifact              | Type    | Role                                                                                                                                    |
 |-----------------------|---------|-----------------------------------------------------------------------------------------------------------------------------------------|
-| `libeasyai`           | library | local llama.cpp engine — `Engine`, `Tool`, `Plan`, built-in tools (datetime, unified `web` and `fs` tools, `bash`, unified `rag`), presets. Linked via `easyai::engine`. |
+| `libeasyai`           | library | local llama.cpp engine — `Engine`, `Tool`, `Plan`, built-in tools (datetime, unified `web` and `fs` tools, `bash`, `python3`, unified `rag`), presets. Linked via `easyai::engine`. |
 | `libeasyai-cli`       | library | OpenAI-protocol client — `Client` mirrors `Engine`'s fluent API but the model runs remote and tools execute locally.  Linked via `easyai::cli`. |
 | `easyai-local`        | binary  | Local-only REPL: loads a GGUF in-process via `easyai::Engine`. Drop-in `llama-cli` replacement.                                       |
 | `easyai-cli`          | binary  | Agentic OpenAI-protocol client built on `libeasyai-cli` — no local model.  REPL or `-p`, full sampling control, plan tool, server-management subcommands. |
@@ -303,6 +303,49 @@ Webui title default also flips to `"Deep"`.
   fixed in commit `e03705e`).
 
 ## 5. Recent commits (most recent first)
+
+```
+2026-05-09 — `python3` tool added.
+             Second shell-class executor alongside `bash`. Runs snippets
+             via `python3 -I -S -E -c <code>` (isolated mode: no
+             PYTHON* env, no site-packages, no cwd on sys.path —
+             stdlib only). Same hardening as bash (cwd pinned,
+             fds 3+ closed, SIGTERM/SIGKILL deadline, 32 KB output
+             cap, optional operator-facing live mirror via
+             --no-show-python).
+
+  Plumbing:
+    * easyai::tools::python3(root, show_output) factory.
+    * Toolbelt::allow_python(bool) + show_python(bool) methods.
+    * cli::Toolbelt auto-registers `fs` whenever any subprocess
+      executor (allow_bash OR allow_python) is on; bumps
+      max_tool_hops to 99999.
+    * cfg.allow_python on easyai::LocalBackend::Config.
+    * --allow-python flag wired into all four binaries
+      (cli, local, mcp_server, server) plus [SERVER] allow_python
+      INI key.
+    * `python3` added to kBuiltInNames reserved list — manifests
+      cannot shadow it.
+
+  Internal cleanup:
+    * Extracted run_capped_subprocess() helper inside
+      builtin_tools.cpp's anonymous namespace; bash() and python3()
+      both delegate to it. The fork/fd-close/chdir/drain/wait
+      machinery now lives in one place. CappedExecKind enum
+      selects exec(/bin/sh -c) vs execvp(python3 -I -S -E -c) in
+      the child; the rest is shared.
+
+  Smoke tests passed:
+    print(2+2), import json, isolated check (sys.path[0] is the
+    stdlib zip not cwd), stderr capture, raise SystemExit(2),
+    missing arg, timeout, third-party import correctly fails with
+    ModuleNotFoundError.
+
+  Docs: README.md changelog + flag tables, easyai-server.md INI
+  + flag tables, easyai-cli.md flag tables, easyai-mcp-server.md
+  flag table + tool catalogue, EXTERNAL_TOOLS.md reserved-name
+  list.
+```
 
 ```
 2026-05-09 — Tool surface unification: one tool per concept.

@@ -60,9 +60,10 @@ bool LocalBackend::init(std::string & err) {
 
     if (cfg.load_tools) {
         cli::Toolbelt()
-            .sandbox   (cfg.sandbox)
-            .allow_bash(cfg.allow_bash)
-            .apply     (engine);
+            .sandbox     (cfg.sandbox)
+            .allow_bash  (cfg.allow_bash)
+            .allow_python(cfg.allow_python)
+            .apply       (engine);
     }
 
     // RAG — the agent's persistent registry (long-term memory).

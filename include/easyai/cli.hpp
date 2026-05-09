@@ -38,10 +38,14 @@ namespace easyai::cli {
 //                         unified read/write/list/glob/grep/check_path/
 //                         cwd/sandbox dispatcher)
 //   - bash               (when allow_bash() is called)
+//   - python3            (when allow_python() is called) — runs snippets
+//                         via `python3 -I -S -E -c <code>`; same hardening
+//                         as bash, isolated stdlib-only interpreter
 //
 // `apply(Engine&)` and `apply(Client&)` register the tools AND, when
-// bash is enabled, bump the agentic-loop max_tool_hops to 99999 (bash
-// flows naturally span far more turns than the default 8 cap allows).
+// either bash or python3 is enabled, bump the agentic-loop
+// max_tool_hops to 99999 (interactive subprocess flows naturally span
+// far more turns than the default 8 cap allows).
 //
 // Example:
 //     easyai::cli::Toolbelt()
@@ -54,12 +58,16 @@ public:
     Toolbelt & sandbox      (std::string dir);   // "" stays the default (no fs)
     Toolbelt & allow_fs     (bool on = true);    // gate fs registration
     Toolbelt & allow_bash   (bool on = true);
+    Toolbelt & allow_python (bool on = true);    // gate python3 registration
     // Mirror the bash subprocess's merged stdout+stderr to the parent's
     // stderr in real time. The model still receives the full captured
     // buffer as the tool result; this is a parallel diagnostic channel
     // for the operator. Off by default to keep stderr clean for callers
     // that haven't opted in.
     Toolbelt & show_bash    (bool on = true);
+    // Same diagnostic mirror for the `python3` tool. Independent of
+    // show_bash so operators can quiet one without losing the other.
+    Toolbelt & show_python  (bool on = true);
     Toolbelt & with_plan    (Plan & plan);
     Toolbelt & no_web       (bool on = true);    // drop the web tool
     Toolbelt & no_datetime  (bool on = true);    // drop datetime
@@ -87,19 +95,22 @@ public:
     // text or banner ("registered N tools, sandbox=<dir>, bash=on").
     const std::string & sandbox_dir() const { return sandbox_; }
     bool                bash_on   () const { return allow_bash_; }
+    bool                python_on () const { return allow_python_; }
 
 private:
     std::string sandbox_;
     // allow_fs_ defaults TRUE so callers that pre-date this flag (Agent,
     // backend.cpp, examples/cli.cpp) keep the legacy "sandbox dir auto-
     // enables fs_*" behaviour.  Server flips it OFF unless --allow-fs.
-    bool        allow_fs_    = true;
-    bool        allow_bash_  = false;
-    bool        show_bash_   = false;
-    bool        no_web_      = false;
-    bool        no_datetime_ = false;
-    bool        use_google_  = false;
-    Plan *      plan_        = nullptr;
+    bool        allow_fs_     = true;
+    bool        allow_bash_   = false;
+    bool        allow_python_ = false;
+    bool        show_bash_    = false;
+    bool        show_python_  = false;
+    bool        no_web_       = false;
+    bool        no_datetime_  = false;
+    bool        use_google_   = false;
+    Plan *      plan_         = nullptr;
 };
 
 // ---------- Log file helper ------------------------------------------------

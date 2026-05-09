@@ -284,12 +284,15 @@ struct Options {
     std::string system_file;
     std::string sandbox;
     bool        allow_bash      = false;       // opt-in: register `bash` tool
-    // show_bash: mirror the bash subprocess's merged stdout+stderr to
-    // the parent's stderr in real time so the operator can watch a
-    // long-running build / test scroll by. Default ON when --allow-bash
-    // is given; --no-show-bash opts out (or set show_bash=false in the
-    // INI's [cli] section).
+    bool        allow_python    = false;       // opt-in: register `python3` tool
+    // show_bash / show_python: mirror the subprocess's merged
+    // stdout+stderr to the parent's stderr in real time so the operator
+    // can watch a long-running build / test / computation scroll by.
+    // Default ON when the matching --allow-* is given; --no-show-bash /
+    // --no-show-python opts out (or set show_bash=false /
+    // show_python=false in the INI's [cli] section).
     bool        show_bash       = true;
+    bool        show_python     = true;
     bool        use_google      = false;       // opt-in: enable engine="google"
                                                 // inside the `web` tool (needs
                                                 // GOOGLE_API_KEY + GOOGLE_CSE_ID
@@ -356,10 +359,12 @@ struct Options {
     // INI overlay (CLI > INI > hardcoded). Default path mirrors the
     // server / mcp-server convention; missing file = use defaults.
     std::string config_path = "/etc/easyai/easyai-cli.ini";
-    // Whether show_bash was explicitly set by the user on the command
-    // line — distinguishes "user wants the default" from "user passed
-    // --no-show-bash" so the INI can fill the gap when CLI is silent.
-    bool        show_bash_cli_set = false;
+    // Whether show_bash / show_python were explicitly set by the user
+    // on the command line — distinguishes "user wants the default"
+    // from "user passed --no-show-*" so the INI can fill the gap when
+    // CLI is silent.
+    bool        show_bash_cli_set   = false;
+    bool        show_python_cli_set = false;
 };
 
 void usage(const char * argv0) {
@@ -414,8 +419,9 @@ void usage(const char * argv0) {
 "    --tools LIST               comma list, valid names:\n"
 "                                 datetime, plan, web (unified search+fetch),\n"
 "                                 fs (unified file work; only with --sandbox\n"
-"                                     or --allow-bash),\n"
+"                                     or --allow-bash / --allow-python),\n"
 "                                 bash (only with --allow-bash),\n"
+"                                 python3 (only with --allow-python),\n"
 "                                 system_meminfo, system_loadavg,\n"
 "                                 system_cpu_usage, system_swaps,\n"
 "                                 rag (only with --RAG DIR)\n"
@@ -423,13 +429,14 @@ void usage(const char * argv0) {
 "                                 system_meminfo,system_loadavg,\n"
 "                                 system_cpu_usage,system_swaps,\n"
 "                                 (rag is auto-registered when --RAG is set;\n"
-"                                  fs is auto-registered when --sandbox is set)\n"
+"                                  fs is auto-registered when --sandbox /\n"
+"                                  --allow-bash / --allow-python is set)\n"
 "    --sandbox DIR              enable file work scoped to DIR.\n"
 "                                 Auto-registers the `fs` tool (action=read /\n"
 "                                 write / list / glob / grep / check_path /\n"
 "                                 cwd / sandbox). Without --sandbox (and\n"
-"                                 without --allow-bash) the model has no\n"
-"                                 file access.\n"
+"                                 without --allow-bash / --allow-python) the\n"
+"                                 model has no file access.\n"
 "    --allow-bash               register the `bash` tool (run shell\n"
 "                                 commands). Implies `fs` tool registration\n"
 "                                 (bash subsumes it; without `fs` the\n"
@@ -439,6 +446,16 @@ void usage(const char * argv0) {
 "                                 (network, full FS, etc). cwd is set to\n"
 "                                 --sandbox DIR if given, otherwise the\n"
 "                                 current working dir.\n"
+"    --allow-python             register the `python3` tool (run Python 3\n"
+"                                 snippets via `python3 -I -S -E -c <code>`).\n"
+"                                 Same hardening as bash; isolated stdlib-\n"
+"                                 only interpreter (no PYTHON* env, no\n"
+"                                 site-packages, no cwd on sys.path).\n"
+"                                 WARNING: NOT a hardened sandbox — the\n"
+"                                 interpreter runs with your user\n"
+"                                 privileges and can `import os`, `import\n"
+"                                 socket`, `import subprocess`. The flags\n"
+"                                 constrain *startup*, not capabilities.\n"
 "    --no-show-bash             suppress the live mirror of bash output to\n"
 "                                 stderr. By default, when the model calls\n"
 "                                 `bash`, the merged child stdout+stderr is\n"
@@ -449,6 +466,8 @@ void usage(const char * argv0) {
 "                                 flag only silences the diagnostic mirror.\n"
 "                                 Override the default in the INI's [cli]\n"
 "                                 section: show_bash = false.\n"
+"    --no-show-python           same as --no-show-bash, but for `python3`.\n"
+"                                 INI: [cli] show_python = false.\n"
 "    --use-google               enable engine=\"google\" inside the `web`\n"
 "                                 tool (Google Custom Search JSON API).\n"
 "                                 Requires both GOOGLE_API_KEY and\n"
@@ -609,6 +628,7 @@ bool parse_args(int argc, char ** argv, Options & o) {
         else if (a == "--system-file")    o.system_file   = need(i, "--system-file");
         else if (a == "--sandbox")        o.sandbox       = need(i, "--sandbox");
         else if (a == "--allow-bash")     o.allow_bash    = true;
+        else if (a == "--allow-python")   o.allow_python  = true;
         else if (a == "--no-show-bash") {
             o.show_bash         = false;
             o.show_bash_cli_set = true;
@@ -616,6 +636,14 @@ bool parse_args(int argc, char ** argv, Options & o) {
         else if (a == "--show-bash") {
             o.show_bash         = true;
             o.show_bash_cli_set = true;
+        }
+        else if (a == "--no-show-python") {
+            o.show_python         = false;
+            o.show_python_cli_set = true;
+        }
+        else if (a == "--show-python") {
+            o.show_python         = true;
+            o.show_python_cli_set = true;
         }
         else if (a == "--config")         o.config_path   = need(i, "--config");
         else if (a == "--unattended")     o.unattended    = true;
@@ -710,24 +738,27 @@ bool parse_args(int argc, char ** argv, Options & o) {
                 "easyai-cli: %s warnings:\n%s\n",
                 o.config_path.c_str(), ini_err.c_str());
         }
-        if (!o.show_bash_cli_set) {
-            const std::string v = ini.get("cli", "show_bash");
-            if (!v.empty()) {
-                std::string lc; lc.reserve(v.size());
-                for (char ch : v) lc.push_back((char) std::tolower((unsigned char) ch));
-                if (lc == "false" || lc == "no" || lc == "off" || lc == "0") {
-                    o.show_bash = false;
-                } else if (lc == "true" || lc == "yes" || lc == "on" || lc == "1") {
-                    o.show_bash = true;
-                } else {
-                    std::fprintf(stderr,
-                        "easyai-cli: %s [cli] show_bash=%s — "
-                        "expected true/false; keeping default %s\n",
-                        o.config_path.c_str(), v.c_str(),
-                        o.show_bash ? "true" : "false");
-                }
+        auto load_show_flag = [&](const char * key, bool & target,
+                                  bool cli_set) {
+            if (cli_set) return;
+            const std::string v = ini.get("cli", key);
+            if (v.empty()) return;
+            std::string lc; lc.reserve(v.size());
+            for (char ch : v) lc.push_back((char) std::tolower((unsigned char) ch));
+            if (lc == "false" || lc == "no" || lc == "off" || lc == "0") {
+                target = false;
+            } else if (lc == "true" || lc == "yes" || lc == "on" || lc == "1") {
+                target = true;
+            } else {
+                std::fprintf(stderr,
+                    "easyai-cli: %s [cli] %s=%s — "
+                    "expected true/false; keeping default %s\n",
+                    o.config_path.c_str(), key, v.c_str(),
+                    target ? "true" : "false");
             }
-        }
+        };
+        load_show_flag("show_bash",   o.show_bash,   o.show_bash_cli_set);
+        load_show_flag("show_python", o.show_python, o.show_python_cli_set);
     }
     return true;
 }
@@ -753,13 +784,15 @@ void register_tools(easyai::Client & cli,
     auto wants = [&](const std::string & name) {
         if (o.tools_enabled.empty()) {
             for (const auto & d : kDefaultTools) if (d == name) return true;
-            // `fs` auto-enables when EITHER --sandbox is set OR
-            // --allow-bash is on. Bash without `fs` is incoherent (bash
-            // is strictly more permissive), and a sandbox without `fs`
-            // is the same trap inverted.
-            if (name == "fs" && (!o.sandbox.empty() || o.allow_bash)) return true;
-            // bash is opt-in by --allow-bash.
-            if (o.allow_bash && name == "bash") return true;
+            // `fs` auto-enables when --sandbox is set OR any subprocess
+            // executor (--allow-bash / --allow-python) is on. The shell
+            // executors are strictly more permissive than `fs`, and a
+            // sandbox without `fs` is the same trap inverted.
+            if (name == "fs" && (!o.sandbox.empty() || o.allow_bash || o.allow_python))
+                return true;
+            // bash / python3 are each opt-in by their --allow-* flag.
+            if (o.allow_bash   && name == "bash")    return true;
+            if (o.allow_python && name == "python3") return true;
             return false;
         }
         return o.tools_enabled.count(name) != 0;
@@ -795,6 +828,12 @@ void register_tools(easyai::Client & cli,
         // in the INI) silences the mirror without affecting what the
         // model sees.
         cli.add_tool(easyai::tools::bash(root, o.show_bash));
+    }
+    // python3 — same root as fs / bash; opt-in via --allow-python or
+    // --tools python3. Same diagnostic mirror as bash, controlled by
+    // its own --no-show-python / [cli] show_python.
+    if (wants("python3")) {
+        cli.add_tool(easyai::tools::python3(root, o.show_python));
     }
     // Tool-hop ceiling.  Apply unconditionally — the cli binary is the
     // agentic surface, and even a tools-only session (no bash) commonly

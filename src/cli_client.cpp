@@ -15,7 +15,9 @@ namespace easyai::cli {
 
 void Toolbelt::apply(Client & client) const {
     for (auto & t : tools()) client.add_tool(t);
-    if (allow_bash_) client.max_tool_hops(99999);
+    // Mirror src/cli.cpp's apply(Engine &): bump the hop ceiling
+    // whenever an interactive subprocess executor is registered.
+    if (allow_bash_ || allow_python_) client.max_tool_hops(99999);
 }
 
 bool client_has_tool(const Client & client, const std::string & name) {

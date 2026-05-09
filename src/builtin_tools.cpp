@@ -1908,6 +1908,277 @@ Tool fs(std::string root) {
         .build();
 }
 
+// ============================================================================
+// run_capped_subprocess — shared spawn-and-cap machinery for shell-class tools
+// ----------------------------------------------------------------------------
+// Used by `bash` (`/bin/sh -c <cmd>`) and `python3` (`python3 -I -S -E -c
+// <code>`). Same fork / fd-close / chdir / exec / drain / timeout / output-cap
+// discipline; only the exec call in the child differs.
+//
+//   - Output is stdout+stderr merged through a single pipe.
+//   - 32 KB cap on the model-facing capture buffer.
+//   - 128 KB cap on the operator-facing live mirror (when show_output).
+//   - SIGTERM at deadline, SIGKILL +2s grace (negative pid → whole pgrp,
+//     so grandchildren the spawned process forked also receive the signal).
+//   - O_NOFOLLOW everywhere we open files in the child, fds 3..maxfd
+//     forcibly closed before exec so the parent's HTTP listener / log /
+//     mmap'd model stays out of the subprocess.
+// ============================================================================
+namespace {
+
+enum class CappedExecKind { Bash, Python3 };
+
+// `tool_label` is the prefix that goes into the operator-facing banner
+// (`[bash] $ ...`, `[python3] $ ...`) and into the diagnostic strings
+// the child writes on chdir/exec failure. Must be NUL-terminated and
+// short — async-signal-safe writes copy the literal verbatim.
+ToolResult run_capped_subprocess(
+        const std::shared_ptr<Sandbox> & sb,
+        CappedExecKind            kind,
+        const std::string &       body_arg,    // shell command (Bash) or Python source (Python3)
+        long long                 timeout_sec,
+        bool                      show_output,
+        const char *              tool_label) {
+    if (show_output) {
+        std::fprintf(stderr, "\n[%s] $ %s\n", tool_label, body_arg.c_str());
+        std::fflush(stderr);
+    }
+
+    int pipefd[2];
+    if (::pipe(pipefd) < 0)
+        return ToolResult::error(std::string("pipe() failed: ") + std::strerror(errno));
+
+    // Cap on the inherited-fd close loop in the child. Mirrors
+    // external_tools.cpp's kMaxFdScan: RLIMIT_NOFILE = unlimited
+    // wraps to -1 and silently disables a naive loop, leaking
+    // every parent fd into the child. 65 536 is more than enough
+    // for any well-behaved process.
+    constexpr long kMaxFdScan = 65536;
+
+    const std::string cwd = sb->root.string();
+    pid_t pid = ::fork();
+    if (pid < 0) {
+        ::close(pipefd[0]); ::close(pipefd[1]);
+        return ToolResult::error(std::string("fork() failed: ") + std::strerror(errno));
+    }
+    if (pid == 0) {
+        // ---- CHILD ----
+        // Async-signal-safe operations only until exec.
+        ::setpgid(0, 0);   // own process group → kill(-pgid) reaches grandchildren
+#if defined(__linux__)
+        // Tie our lifetime to the parent: if the agent crashes (segfault,
+        // OOM-kill, kill -9) before we exec or while we run, the kernel
+        // sends us SIGKILL. Without this an orphaned subprocess would
+        // survive (reparented to PID 1) and keep running until its own
+        // timeout.
+        ::prctl(PR_SET_PDEATHSIG, SIGKILL);
+#endif
+        ::close(pipefd[0]);
+        ::dup2(pipefd[1], 1);
+        ::dup2(pipefd[1], 2);
+        ::close(pipefd[1]);
+
+        // stdin → /dev/null. The model has no way to feed bytes into the
+        // subprocess, but anything that reads stdin (`cat`, `input()`,
+        // etc.) would otherwise inherit our controlling-terminal stdin
+        // and block.
+        int devnull = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
+        if (devnull >= 0) {
+            ::dup2(devnull, 0);
+            ::close(devnull);
+        } else {
+            ::close(0);
+        }
+
+        // Close every other inherited fd. The parent has the HTTP
+        // listener, log file, llama.cpp's mmap'd model, etc. None of
+        // those should be visible to the subprocess.
+        struct rlimit rl{};
+        long maxfd = kMaxFdScan;
+        if (::getrlimit(RLIMIT_NOFILE, &rl) == 0
+                && rl.rlim_cur != RLIM_INFINITY
+                && rl.rlim_cur > 0
+                && rl.rlim_cur < (rlim_t) kMaxFdScan) {
+            maxfd = (long) rl.rlim_cur;
+        }
+        for (int fd = 3; fd < (int) maxfd; ++fd) {
+            ::close(fd);
+        }
+
+        if (!cwd.empty() && ::chdir(cwd.c_str()) != 0) {
+            // Hand-written async-signal-safe diagnostic; can't use
+            // fprintf because its mutex state is shared with the parent.
+            const char prefix[] = ": chdir failed\n";
+            ssize_t w1 = ::write(1, tool_label, std::strlen(tool_label));
+            ssize_t w2 = ::write(1, prefix, sizeof(prefix) - 1);
+            (void) w1; (void) w2;
+            ::_exit(126);
+        }
+
+        if (kind == CappedExecKind::Bash) {
+            ::execl("/bin/sh", "sh", "-c", body_arg.c_str(), (char *) nullptr);
+        } else {
+            // python3 -I -S -E -c <code>:
+            //   -I  isolated mode (implies -E -s, plus drops sys.path[0])
+            //   -S  don't run site.py at startup (no .pth files / site-packages auto-load)
+            //   -E  ignore PYTHON* env vars
+            //   -c  run the code passed as argv[5]
+            // execvp does PATH lookup so we don't have to hardcode an
+            // absolute path; the operator's environment picks the right
+            // python3 (Homebrew, system, conda — whichever is on PATH).
+            const char * argv[] = {
+                "python3", "-I", "-S", "-E", "-c",
+                body_arg.c_str(), nullptr
+            };
+            ::execvp("python3", const_cast<char **>(argv));
+        }
+
+        const char prefix[] = ": exec failed\n";
+        ssize_t w1 = ::write(1, tool_label, std::strlen(tool_label));
+        ssize_t w2 = ::write(1, prefix, sizeof(prefix) - 1);
+        (void) w1; (void) w2;
+        ::_exit(127);
+    }
+    // ---- PARENT ----
+    // Mirror the child's setpgid so kill(-pid) reaches the right group
+    // regardless of scheduling order.
+    ::setpgid(pid, pid);
+    ::close(pipefd[1]);
+    ::fcntl(pipefd[0], F_SETFL, O_NONBLOCK);
+
+    constexpr size_t kCap = 32 * 1024;
+    // Mirror cap is intentionally larger than the model-facing buffer
+    // (4×) so the operator still sees most of a long build's output,
+    // but bounded so a hostile/runaway command can't paint the
+    // operator's terminal indefinitely.
+    constexpr size_t kMirrorCap = 128 * 1024;
+    std::string out;
+    out.reserve(4096);
+    size_t mirror_written = 0;
+    bool   mirror_truncated_warned = false;
+
+    auto deadline = std::chrono::steady_clock::now()
+                  + std::chrono::seconds(timeout_sec);
+    bool sent_term = false;
+    bool killed_for_timeout = false;
+    int  status = 0;
+    bool reaped = false;
+
+    auto drain_pipe = [&]() {
+        char buf[4096];
+        ssize_t n;
+        while ((n = ::read(pipefd[0], buf, sizeof(buf))) > 0) {
+            if (out.size() < kCap) {
+                size_t take = std::min((size_t) n, kCap - out.size());
+                out.append(buf, take);
+            }
+            // Live mirror: every byte the child writes (stdout and
+            // stderr were dup2'd onto the same pipe in the child) goes
+            // to the parent's stderr so the operator can watch a
+            // long-running build / test suite / Python computation
+            // scroll by. The model still receives the full captured
+            // buffer; this is a parallel "human-facing" channel.
+            //
+            // Two safety layers before the bytes hit the operator's
+            // terminal:
+            //   1. byte-budget: cap at kMirrorCap so a runaway / hostile
+            //      command can't flood the terminal indefinitely.
+            //   2. control-byte strip: strip ESC and other C0 control
+            //      bytes so a malicious child cannot inject ANSI/OSC
+            //      escape sequences (window-title hijack, screen wipe,
+            //      iTerm2 payloads, key-rebinding, etc.) into the
+            //      operator's terminal. CR / LF / TAB are preserved.
+            if (show_output && mirror_written < kMirrorCap) {
+                std::string safe = sanitize_for_operator_tty(buf, (size_t) n);
+                size_t room = kMirrorCap - mirror_written;
+                size_t take = std::min(safe.size(), room);
+                if (take > 0) {
+                    ::fwrite(safe.data(), 1, take, stderr);
+                    mirror_written += take;
+                }
+                if (mirror_written >= kMirrorCap && !mirror_truncated_warned) {
+                    char trunc[128];
+                    int tn = std::snprintf(trunc, sizeof(trunc),
+                        "\n[%s mirror truncated at 128 KB; "
+                        "model still receives the captured output]\n",
+                        tool_label);
+                    if (tn > 0) ::fwrite(trunc, 1, (size_t) tn, stderr);
+                    mirror_truncated_warned = true;
+                }
+                std::fflush(stderr);
+            }
+        }
+    };
+
+    for (;;) {
+        auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+            if (!sent_term) {
+                // Negative pid in ::kill targets the whole process group
+                // (we set setpgid above) so any grandchildren the
+                // process spawned receive the signal too. A bare
+                // kill(pid, …) on the leader leaves grandchildren
+                // behind.
+                ::kill(-pid, SIGTERM);
+                sent_term          = true;
+                killed_for_timeout = true;
+                deadline           = now + std::chrono::seconds(2); // grace
+            } else {
+                ::kill(-pid, SIGKILL);
+                break;
+            }
+        }
+        int wait_ms = (int) std::chrono::duration_cast<std::chrono::milliseconds>(
+                          deadline - now).count();
+        if (wait_ms < 0)   wait_ms = 0;
+        if (wait_ms > 200) wait_ms = 200;
+
+        struct pollfd pfd { pipefd[0], POLLIN, 0 };
+        int rc = ::poll(&pfd, 1, wait_ms);
+        if (rc < 0 && errno == EINTR) continue;
+        if (rc > 0 && (pfd.revents & (POLLIN | POLLHUP))) {
+            drain_pipe();
+        }
+
+        pid_t r = ::waitpid(pid, &status, WNOHANG);
+        if (r == pid) {
+            drain_pipe();
+            reaped = true;
+            break;
+        }
+    }
+
+    if (!reaped) {
+        drain_pipe();
+        ::waitpid(pid, &status, 0);
+    }
+    ::close(pipefd[0]);
+
+    std::ostringstream oss;
+    if (killed_for_timeout) {
+        oss << "exit=-1  [killed: timeout after " << timeout_sec << "s]\n";
+    } else if (WIFEXITED(status)) {
+        oss << "exit=" << WEXITSTATUS(status) << "\n";
+    } else if (WIFSIGNALED(status)) {
+        oss << "exit=signal:" << WTERMSIG(status) << "\n";
+    } else {
+        oss << "exit=?\n";
+    }
+    std::string body = std::move(out);
+    if (body.size() >= kCap) body += "\n[truncated at 32 KB]\n";
+    // Closing banner mirrors the opening one: the operator sees the
+    // exit status and a trailing newline so the next agent line
+    // doesn't run into the subprocess output. Newline first in case
+    // the child's last byte wasn't a '\n'.
+    if (show_output) {
+        std::fprintf(stderr, "\n[%s] %s", tool_label, oss.str().c_str());
+        std::fflush(stderr);
+    }
+    return ToolResult::ok(oss.str() + body);
+}
+
+}  // namespace
+
 Tool bash(std::string root, bool show_output) {
     auto sb = std::make_shared<Sandbox>(std::move(root));
     return Tool::builder("bash")
@@ -1938,16 +2209,21 @@ Tool bash(std::string root, bool show_output) {
             "tool: action=read / write / list / glob / grep. It's "
             "faster, can't be foot-gunned with quoting / redirection "
             "mistakes, and produces structured output the model parses "
-            "reliably. Reach for `bash` only when you need shell "
-            "features `fs` doesn't have:\n"
+            "reliably.\n"
+            "\n"
+            "DATA / COMPUTE WORK — PREFER THE `python3` TOOL when "
+            "available. For JSON wrangling, regex on a chunk of text, "
+            "arithmetic, statistics, date math, anything that's "
+            "naturally a few lines of code, `python3` is faster and "
+            "less error-prone than chained shell pipelines. Reach for "
+            "`bash` only when you genuinely need shell features:\n"
             "\n"
             "  - pipelines (`grep | xargs`, `find ... -exec`, `... | "
             "    awk ...`)\n"
             "  - process orchestration (running a build, a test "
             "    suite, a script)\n"
-            "  - tooling that has no equivalent fs tool (git, package "
-            "    managers, `make`, `cmake`, `python` / `node` REPLs, "
-            "    diff, file)\n"
+            "  - tooling that has no equivalent fs / python tool "
+            "    (git, package managers, `make`, `cmake`, diff, file)\n"
             "  - non-trivial in-place edits (sed/awk for line-range "
             "    replacements; fs(action=\"write\") overwrites or "
             "    appends only)\n"
@@ -1978,225 +2254,117 @@ Tool bash(std::string root, bool show_output) {
             args::get_int(c.arguments_json, "timeout_sec", timeout_sec);
             if (timeout_sec < 1)   timeout_sec = 1;
             if (timeout_sec > 300) timeout_sec = 300;
+            return run_capped_subprocess(
+                sb, CappedExecKind::Bash, cmd,
+                timeout_sec, show_output, "bash");
+        })
+        .build();
+}
 
-            // Diagnostic banner: surface the command being run before
-            // the first line of output drains. Operator-facing only —
-            // the model sees the unchanged ToolResult string.
-            if (show_output) {
-                std::fprintf(stderr, "\n[bash] $ %s\n", cmd.c_str());
-                std::fflush(stderr);
-            }
-
-            int pipefd[2];
-            if (::pipe(pipefd) < 0)
-                return ToolResult::error(std::string("pipe() failed: ") + std::strerror(errno));
-
-            // Cap on the inherited-fd close loop in the child. Mirrors
-            // external_tools.cpp's kMaxFdScan: RLIMIT_NOFILE = unlimited
-            // wraps to -1 and silently disables a naive loop, leaking
-            // every parent fd into the child. 65 536 is more than enough
-            // for any well-behaved process.
-            constexpr long kMaxFdScan = 65536;
-
-            const std::string cwd = sb->root.string();
-            pid_t pid = ::fork();
-            if (pid < 0) {
-                ::close(pipefd[0]); ::close(pipefd[1]);
-                return ToolResult::error(std::string("fork() failed: ") + std::strerror(errno));
-            }
-            if (pid == 0) {
-                // ---- CHILD ----
-                // Async-signal-safe operations only until execve.
-                ::setpgid(0, 0);   // own process group → kill(-pgid) reaches grandchildren
-#if defined(__linux__)
-                // Tie our lifetime to the parent: if the agent crashes
-                // (segfault, OOM-kill, kill -9) before we exec or while
-                // we run, the kernel sends us SIGKILL. Without this an
-                // orphaned shell would survive (reparented to PID 1)
-                // and keep running until its own timeout.
-                ::prctl(PR_SET_PDEATHSIG, SIGKILL);
-#endif
-                ::close(pipefd[0]);
-                ::dup2(pipefd[1], 1);
-                ::dup2(pipefd[1], 2);
-                ::close(pipefd[1]);
-
-                // stdin → /dev/null. The model has no way to feed
-                // bytes into the subprocess, but a shell that reads
-                // stdin (e.g. `cat`) would otherwise inherit our
-                // controlling-terminal stdin and block.
-                int devnull = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
-                if (devnull >= 0) {
-                    ::dup2(devnull, 0);
-                    ::close(devnull);
-                } else {
-                    ::close(0);
-                }
-
-                // Close every other inherited fd. The parent has the
-                // HTTP listener, log file, llama.cpp's mmap'd model,
-                // etc. None of those should be visible to a /bin/sh
-                // command.
-                struct rlimit rl{};
-                long maxfd = kMaxFdScan;
-                if (::getrlimit(RLIMIT_NOFILE, &rl) == 0
-                        && rl.rlim_cur != RLIM_INFINITY
-                        && rl.rlim_cur > 0
-                        && rl.rlim_cur < (rlim_t) kMaxFdScan) {
-                    maxfd = (long) rl.rlim_cur;
-                }
-                for (int fd = 3; fd < (int) maxfd; ++fd) {
-                    ::close(fd);
-                }
-
-                if (!cwd.empty() && ::chdir(cwd.c_str()) != 0) {
-                    const char m[] = "bash: chdir failed\n";
-                    ssize_t w = ::write(1, m, sizeof(m) - 1); (void) w;
-                    ::_exit(126);
-                }
-                ::execl("/bin/sh", "sh", "-c", cmd.c_str(), (char *) nullptr);
-                const char m[] = "bash: execl failed\n";
-                ssize_t w = ::write(1, m, sizeof(m) - 1); (void) w;
-                ::_exit(127);
-            }
-            // ---- PARENT ----
-            // Mirror the child's setpgid so kill(-pid) reaches the right
-            // group regardless of scheduling order.
-            ::setpgid(pid, pid);
-            ::close(pipefd[1]);
-            ::fcntl(pipefd[0], F_SETFL, O_NONBLOCK);
-
-            constexpr size_t kCap = 32 * 1024;
-            // Mirror cap is intentionally larger than the model-facing
-            // buffer (4×) so the operator still sees most of a long
-            // build's output, but bounded so a hostile/runaway command
-            // can't paint the operator's terminal indefinitely.
-            constexpr size_t kMirrorCap = 128 * 1024;
-            std::string out;
-            out.reserve(4096);
-            size_t mirror_written = 0;
-            bool   mirror_truncated_warned = false;
-
-            auto deadline = std::chrono::steady_clock::now()
-                          + std::chrono::seconds(timeout_sec);
-            bool sent_term = false;
-            bool killed_for_timeout = false;
-            int  status = 0;
-            bool reaped = false;
-
-            auto drain_pipe = [&]() {
-                char buf[4096];
-                ssize_t n;
-                while ((n = ::read(pipefd[0], buf, sizeof(buf))) > 0) {
-                    if (out.size() < kCap) {
-                        size_t take = std::min((size_t) n, kCap - out.size());
-                        out.append(buf, take);
-                    }
-                    // Live mirror: every byte the child writes (stdout
-                    // and stderr were dup2'd onto the same pipe in the
-                    // child) goes to the parent's stderr so the operator
-                    // can watch a long-running build / test suite scroll
-                    // by. The model still receives the full captured
-                    // buffer; this is a parallel "human-facing" channel.
-                    //
-                    // Two safety layers before the bytes hit the operator's
-                    // terminal:
-                    //   1. byte-budget: cap at kMirrorCap so a runaway /
-                    //      hostile command can't flood the terminal
-                    //      indefinitely (the model itself is already capped
-                    //      at kCap; this limit is independent so the
-                    //      operator can still see most of a long build).
-                    //   2. control-byte strip: strip ESC and other C0
-                    //      control bytes so a malicious child cannot
-                    //      inject ANSI/OSC escape sequences (window-title
-                    //      hijack, screen wipe, iTerm2-specific payloads,
-                    //      key-rebinding, etc.) into the operator's
-                    //      terminal.  CR / LF / TAB are preserved.
-                    if (show_output && mirror_written < kMirrorCap) {
-                        std::string safe = sanitize_for_operator_tty(buf, (size_t) n);
-                        size_t room = kMirrorCap - mirror_written;
-                        size_t take = std::min(safe.size(), room);
-                        if (take > 0) {
-                            ::fwrite(safe.data(), 1, take, stderr);
-                            mirror_written += take;
-                        }
-                        if (mirror_written >= kMirrorCap && !mirror_truncated_warned) {
-                            const char trunc[] =
-                                "\n[bash mirror truncated at 128 KB; "
-                                "model still receives the captured output]\n";
-                            ::fwrite(trunc, 1, sizeof(trunc) - 1, stderr);
-                            mirror_truncated_warned = true;
-                        }
-                        std::fflush(stderr);
-                    }
-                }
-            };
-
-            for (;;) {
-                auto now = std::chrono::steady_clock::now();
-                if (now >= deadline) {
-                    if (!sent_term) {
-                        // Negative pid in ::kill targets the whole
-                        // process group (we set setpgid above) so any
-                        // grandchildren the shell spawned receive the
-                        // signal too. A bare `kill(pid, …)` on the
-                        // shell leader leaves grandchildren behind.
-                        ::kill(-pid, SIGTERM);
-                        sent_term          = true;
-                        killed_for_timeout = true;   // we initiated it
-                        deadline           = now + std::chrono::seconds(2); // grace
-                    } else {
-                        ::kill(-pid, SIGKILL);
-                        break;
-                    }
-                }
-                int wait_ms = (int) std::chrono::duration_cast<std::chrono::milliseconds>(
-                                  deadline - now).count();
-                if (wait_ms < 0)   wait_ms = 0;
-                if (wait_ms > 200) wait_ms = 200;
-
-                struct pollfd pfd { pipefd[0], POLLIN, 0 };
-                int rc = ::poll(&pfd, 1, wait_ms);
-                if (rc < 0 && errno == EINTR) continue;
-                if (rc > 0 && (pfd.revents & (POLLIN | POLLHUP))) {
-                    drain_pipe();
-                }
-
-                pid_t r = ::waitpid(pid, &status, WNOHANG);
-                if (r == pid) {
-                    drain_pipe();
-                    reaped = true;
-                    break;
-                }
-            }
-
-            if (!reaped) {
-                drain_pipe();
-                ::waitpid(pid, &status, 0);
-            }
-            ::close(pipefd[0]);
-
-            std::ostringstream oss;
-            if (killed_for_timeout) {
-                oss << "exit=-1  [killed: timeout after " << timeout_sec << "s]\n";
-            } else if (WIFEXITED(status)) {
-                oss << "exit=" << WEXITSTATUS(status) << "\n";
-            } else if (WIFSIGNALED(status)) {
-                oss << "exit=signal:" << WTERMSIG(status) << "\n";
-            } else {
-                oss << "exit=?\n";
-            }
-            std::string body = std::move(out);
-            if (body.size() >= kCap) body += "\n[truncated at 32 KB]\n";
-            // Closing banner mirrors the opening one: the operator sees
-            // the exit status and a trailing newline so the next agent
-            // line doesn't run into the bash output. Newline first in
-            // case the child's last byte wasn't a '\n'.
-            if (show_output) {
-                std::fprintf(stderr, "\n[bash] %s", oss.str().c_str());
-                std::fflush(stderr);
-            }
-            return ToolResult::ok(oss.str() + body);
+// ============================================================================
+// python3 — run a Python 3 snippet via `python3 -I -S -E -c <code>`
+// ----------------------------------------------------------------------------
+// Same hardening as `bash` (cwd pinned to sandbox, fds 3+ closed before
+// exec, SIGTERM/SIGKILL deadline, output cap, optional operator mirror).
+// The interpreter starts in *isolated mode* — no PYTHON* env vars, no
+// site-packages auto-load, no cwd on sys.path — so the snippet runs
+// against the bare standard library every time, regardless of the host
+// user's Python configuration. Imports beyond the stdlib will fail with
+// ModuleNotFoundError; that's by design.
+//
+// NOT a hardened sandbox: the interpreter has the caller's full uid/gid
+// and can `import os`, `import socket`, `import urllib`, `import
+// subprocess` to do anything bash can do. The flags constrain *startup*,
+// not capabilities.
+// ============================================================================
+Tool python3(std::string root, bool show_output) {
+    auto sb = std::make_shared<Sandbox>(std::move(root));
+    return Tool::builder("python3")
+        .describe(
+            "Run a Python 3 snippet via `python3 -I -S -E -c <code>`. "
+            "Output is stdout and stderr merged.\n"
+            "\n"
+            "AUTHORITATIVE SANDBOX RULE — before your first fs / bash / "
+            "python3 call in a task, run fs(action=\"sandbox\") (the "
+            "absolute on-disk root, pinned at registration) and then "
+            "fs(action=\"check_path\") against any file the snippet "
+            "will read from or write to. The interpreter runs with cwd "
+            "PINNED to the sandbox root, so the path you probe with "
+            "fs(action=\"check_path\") is the same path Python will see.\n"
+            "\n"
+            "ISOLATED INTERPRETER — `-I -S -E` means: no PYTHON* "
+            "environment variables (-E), no `site.py` / no .pth files / "
+            "no site-packages auto-load (-S), no cwd on sys.path (-I, "
+            "which also implies -E -s). The standard library is "
+            "available; third-party packages are NOT, so an `import "
+            "numpy` or `import requests` will fail with "
+            "ModuleNotFoundError. Stick to the stdlib: `json`, `re`, "
+            "`statistics`, `datetime`, `decimal`, `pathlib`, "
+            "`urllib.request`, `subprocess`, `os`, `csv`, `math`, etc.\n"
+            "\n"
+            "WHEN TO USE — reach for `python3` for:\n"
+            "  - data manipulation (parse a JSON blob, transform a "
+            "    list, count occurrences)\n"
+            "  - arithmetic / numerical work (Decimal math, statistics, "
+            "    date arithmetic)\n"
+            "  - text processing (regex, multi-step string transforms "
+            "    that would be painful in shell)\n"
+            "  - non-trivial control flow over a small in-memory dataset\n"
+            "\n"
+            "Prefer fs(action=\"read\") / fs(action=\"write\") for plain "
+            "file read/write when no transformation is needed. Prefer "
+            "`bash` for shell pipelines, build runners, git, package "
+            "managers, and other process orchestration.\n"
+            "\n"
+            "WORKING DIRECTORY & PATHS — cwd is the sandbox root. Use "
+            "RELATIVE paths inside your code: `open(\"report.md\")`, "
+            "`pathlib.Path(\"src\").iterdir()`. Do NOT hardcode absolute "
+            "paths for sandbox files — they break portability across "
+            "sandboxes.\n"
+            "\n"
+            "OUTPUT — print() what you want returned to the model; the "
+            "captured stdout+stderr (capped at 32 KB) is what the tool "
+            "result contains. Snippets that don't print anything come "
+            "back with just the `exit=0` line, which is correct but "
+            "rarely useful — almost always you want a `print(result)` "
+            "at the end.\n"
+            "\n"
+            "EXAMPLES:\n"
+            "  {code: \"import json; d = json.loads(open('data.json').read()); "
+            "print(sum(d['items']))\"}\n"
+            "  {code: \"import re; print(len(re.findall(r'TODO', "
+            "open('notes.md').read())))\"}\n"
+            "  {code: \"from datetime import date, timedelta; "
+            "print(date.today() + timedelta(days=42))\"}\n"
+            "\n"
+            "WARNING: this is NOT a hardened sandbox — the interpreter "
+            "runs with the caller's full uid/gid and can `import os`, "
+            "`import socket`, `import subprocess`, `import urllib` to "
+            "do anything bash can. The `-I -S -E` flags constrain "
+            "*startup*, not capabilities. Output is capped at 32 KB and "
+            "a SIGTERM/SIGKILL deadline (default 30s, max 300s) bounds "
+            "the runtime."
+        )
+        .param("code", "string",
+               "Python 3 source. Passed verbatim to `-c` (no shell layer; "
+               "no quoting concerns). Newlines and indentation are "
+               "preserved literally — write multi-line code with `\\n` in "
+               "the JSON string and the interpreter will see it as "
+               "ordinary Python source.", true)
+        .param("timeout_sec", "integer",
+               "Max seconds to run before SIGTERM/SIGKILL. Default 30, max 300.",
+               false)
+        .handle([sb, show_output](const ToolCall & c) {
+            std::string code;
+            long long timeout_sec = 30;
+            if (!args::get_string(c.arguments_json, "code", code) || code.empty())
+                return ToolResult::error("missing arg: code");
+            args::get_int(c.arguments_json, "timeout_sec", timeout_sec);
+            if (timeout_sec < 1)   timeout_sec = 1;
+            if (timeout_sec > 300) timeout_sec = 300;
+            return run_capped_subprocess(
+                sb, CappedExecKind::Python3, code,
+                timeout_sec, show_output, "python3");
         })
         .build();
 }

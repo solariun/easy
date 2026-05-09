@@ -3061,6 +3061,17 @@ static bool require_auth(const ServerCtx & ctx, const httplib::Request & req,
         "                                NOT a hardened sandbox — the\n"
         "                                command runs with the server's\n"
         "                                user privileges.\n"
+        "      --allow-python           Register the `python3` tool (run\n"
+        "                                Python 3 snippets via\n"
+        "                                `python3 -I -S -E -c <code>`).\n"
+        "                                Same hardening as bash; isolated\n"
+        "                                stdlib-only interpreter (no\n"
+        "                                PYTHON* env, no site-packages, no\n"
+        "                                cwd on sys.path). NOT a hardened\n"
+        "                                sandbox — the interpreter has\n"
+        "                                full uid/gid and `import os`,\n"
+        "                                `import socket`, `import\n"
+        "                                subprocess` all work.\n"
         "      --use-google             Enable engine=\"google\" inside the\n"
         "                                unified `web` tool (Google Custom\n"
         "                                Search JSON API). Requires both\n"
@@ -3225,8 +3236,9 @@ struct ServerArgs {
                                        // [SERVER] metrics_interval.
                                      // before the network drops them.
     std::string sandbox;            // optional: scope `fs` / `bash` to this dir
-    bool        allow_fs   = false; // explicit opt-in for the unified `fs` tool
-    bool        allow_bash = false; // explicit opt-in for the `bash` tool
+    bool        allow_fs     = false; // explicit opt-in for the unified `fs` tool
+    bool        allow_bash   = false; // explicit opt-in for the `bash` tool
+    bool        allow_python = false; // explicit opt-in for the `python3` tool
     bool        use_google = false; // enable engine="google" inside the unified
                                     // `web` tool (also requires GOOGLE_API_KEY +
                                     // GOOGLE_CSE_ID env vars)
@@ -3464,6 +3476,7 @@ static const std::vector<FlagDef> & kFlags() {
         { {"--show-system-prompt"},"",       "",               "show_system_prompt", false, SET_BOOL_TRUE(&ServerArgs::show_system_prompt) },
         { {"--allow-fs"},          "SERVER", "allow_fs",       "allow_fs",       false, SET_BOOL_TRUE(&ServerArgs::allow_fs) },
         { {"--allow-bash"},        "SERVER", "allow_bash",     "allow_bash",     false, SET_BOOL_TRUE(&ServerArgs::allow_bash) },
+        { {"--allow-python"},      "SERVER", "allow_python",   "allow_python",   false, SET_BOOL_TRUE(&ServerArgs::allow_python) },
         { {"--use-google"},        "SERVER", "use_google",     "use_google",     false, SET_BOOL_TRUE(&ServerArgs::use_google) },
         // --no-local-tools (formerly --no-tools): disables only the
         // LOCAL built-in toolbelt; remote tools fetched via --mcp are
@@ -3801,7 +3814,8 @@ static std::string build_builtin_system_prompt(const ServerArgs & args) {
     const bool tools_on    = args.local_tools;
     const bool fs_on       = tools_on && args.allow_fs;
     const bool bash_on     = tools_on && args.allow_bash;
-    const bool sandbox_path_on = tools_on && (args.allow_fs || args.allow_bash);
+    const bool python_on   = tools_on && args.allow_python;
+    const bool sandbox_path_on = tools_on && (args.allow_fs || args.allow_bash || args.allow_python);
     const bool web_on      = tools_on;        // unified web tool is default-on
     const bool datetime_on = tools_on;        // datetime is default-on
     const bool rag_on      = !args.rag_dir.empty();
@@ -3863,7 +3877,7 @@ static std::string build_builtin_system_prompt(const ServerArgs & args) {
         "\n";
 
     const bool any_tool_note = datetime_on || web_on || fs_on || bash_on
-                            || sandbox_path_on || rag_on;
+                            || python_on || sandbox_path_on || rag_on;
     if (any_tool_note) {
         s += "Tool notes:\n";
         if (datetime_on) {
@@ -3912,6 +3926,17 @@ static std::string build_builtin_system_prompt(const ServerArgs & args) {
                 "    use RELATIVE paths. The `fs` tool is not registered,\n"
                 "    so bash is the only path for file work too — use\n"
                 "    heredocs / cat / sed for edits.\n";
+        }
+        if (python_on) {
+            s +=
+                "  - python3: run a Python 3 snippet via\n"
+                "    `python3 -I -S -E -c <code>` (isolated stdlib-only\n"
+                "    interpreter — no third-party packages, no PYTHON*\n"
+                "    env, no site-packages, no cwd on sys.path). Reach\n"
+                "    for it for JSON wrangling, regex, arithmetic, date\n"
+                "    math, statistics — anything that's a few lines of\n"
+                "    code and would be painful in shell. Always print()\n"
+                "    what you want returned to the model.\n";
         }
         if (sandbox_path_on) {
             s +=
@@ -4061,13 +4086,14 @@ int main(int argc, char ** argv) {
         // so the engine doesn't spuriously hold onto a sandbox dir the
         // operator never intended to use.
         std::string sb = args.sandbox;
-        const bool any_fs_like = args.allow_fs || args.allow_bash;
+        const bool any_fs_like = args.allow_fs || args.allow_bash || args.allow_python;
         if (sb.empty() && any_fs_like) sb = ".";
         auto tb = easyai::cli::Toolbelt()
-                      .sandbox   (sb)
-                      .allow_fs  (args.allow_fs)
-                      .allow_bash(args.allow_bash)
-                      .use_google(args.use_google);
+                      .sandbox     (sb)
+                      .allow_fs    (args.allow_fs)
+                      .allow_bash  (args.allow_bash)
+                      .allow_python(args.allow_python)
+                      .use_google  (args.use_google);
         for (auto & t : tb.tools()) ctx->default_tools.push_back(std::move(t));
     }
 

@@ -71,6 +71,7 @@ public:
         std::string system_prompt;
         std::string sandbox;            // empty = fs_* tools NOT registered
         bool        allow_bash = false; // explicit opt-in for the bash tool
+        bool        allow_python = false; // explicit opt-in for the python3 tool
         std::string external_tools_dir; // optional external-tools dir (EASYAI-*.tools)
         bool        quiet           = false; // suppress sanity warnings (errors still emitted)
         std::string rag_dir;            // optional RAG (long-term registry) dir; empty = RAG off

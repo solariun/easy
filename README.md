@@ -43,6 +43,35 @@ A running log of user-facing changes. Latest first — keep this list
 current as features land so anyone returning to the repo (or
 landing on it for the first time) sees what shipped recently.
 
+### 2026-05-09 — `python3` tool: isolated Python 3 snippet runner
+
+A second shell-class executor alongside `bash`, gated by its own
+`--allow-python` flag (off by default — same threat model as bash).
+The model gets one extra tool when enabled:
+
+* `python3(code, timeout_sec?)` — runs the snippet via
+  `python3 -I -S -E -c <code>`. Isolated mode: no `PYTHON*` env vars,
+  no `site.py` / no .pth files / no site-packages, no cwd on
+  `sys.path`. The standard library is available; `import requests`
+  fails with `ModuleNotFoundError`, by design — predictable behaviour
+  regardless of host Python configuration.
+* Same hardening as `bash`: cwd pinned to `--sandbox`, fds 3+ closed
+  before exec, SIGTERM/SIGKILL deadline, 32 KB stdout+stderr cap,
+  optional operator-facing live mirror via `--no-show-python` to opt
+  out (default ON when `--allow-python` is on).
+* Internally, `bash` and `python3` now share one `run_capped_subprocess`
+  helper — the fork/fd-close/chdir/drain/wait machinery only lives in
+  one place.
+
+When to reach for `python3` vs `bash`: data manipulation (JSON, regex,
+Decimal math, statistics, date arithmetic) is one Python snippet; shell
+pipelines / build runners / git / package managers stay in `bash`.
+
+`--allow-python` flag is wired through every binary (`easyai-cli`,
+`easyai-local`, `easyai-server`, `easyai-mcp-server`) plus the INI
+`[SERVER] allow_python` key. `EASYAI-*.tools` manifests cannot shadow
+the new `python3` reserved name.
+
 ### 2026-05-09 — One tool per concept: unified `web`, unified `fs`, RAG `--split-rag` removed
 
 A consolidation pass on the built-in tool surface. Three loose
@@ -602,9 +631,10 @@ has a matching INI key (see [`easyai-server.md`](easyai-server.md) §1).
 | `--no-mcp-auth` | off | Force `/mcp` open even with `[MCP_USER]` populated. |
 | `--http-retries N` | 5 | Extra attempts on transient HTTP failures (MCP client + web tools). 0 disables. Logged on stderr. |
 | `--http-timeout SECONDS` | 600 | Read/write timeout for the listen socket AND the MCP-client connection. Bumped from llama-server's 60 s default to accommodate long thinking turns. |
-| `--sandbox DIR` | server cwd | Root for `fs` / `bash` / external `$SANDBOX`. |
+| `--sandbox DIR` | server cwd | Root for `fs` / `bash` / `python3` / external `$SANDBOX`. |
 | `--allow-fs` | off | Register the unified `fs` tool (action=read / write / list / glob / grep / check_path / cwd / sandbox). |
 | `--allow-bash` | off | Register `bash` (NOT a hardened sandbox). |
+| `--allow-python` | off | Register `python3` (run snippets via `python3 -I -S -E -c <code>`; isolated stdlib-only interpreter; NOT a hardened sandbox). |
 | `--use-google` | off | Enable engine=`"google"` inside the unified `web` tool (needs `GOOGLE_API_KEY` + `GOOGLE_CSE_ID`). |
 | `--external-tools DIR` | — | Load every `EASYAI-*.tools` manifest in `DIR`. |
 | `--RAG DIR` | — | Enable RAG: registers one `rag(action=…)` tool with sub-actions save / append / search / load / list / delete / keywords. Persistent memory. |
@@ -702,6 +732,7 @@ upstream `llama-server`, OpenAI itself, etc.).
 | `--tools LIST` | datetime,plan,web,system_* | Comma list of locally-registered tools. |
 | `--sandbox DIR` | — | Enable the unified `fs` tool (action=read/write/list/glob/grep/check_path/cwd/sandbox) scoped to `DIR`. |
 | `--allow-bash` | off | Register `bash` (uses `--sandbox` as cwd, else current dir). |
+| `--allow-python` | off | Register `python3` (uses `--sandbox` as cwd, else current dir). |
 | `--use-google` | off | Enable engine=`"google"` inside the unified `web` tool. |
 | `--external-tools DIR` | — | Load `EASYAI-*.tools` manifests. |
 | `--RAG DIR` | — | Enable RAG (one `rag(action=…)` tool). |
@@ -747,8 +778,9 @@ use `easyai-cli`.
 | `--ngl N` | -1 (auto) | GPU layers. |
 | `-t, --threads N` | hw cores | CPU threads. |
 | `--no-tools` | off | Skip the built-in toolbelt. |
-| `--sandbox DIR` | — | Enable `fs_*` scoped to `DIR`. |
+| `--sandbox DIR` | — | Enable the unified `fs` tool scoped to `DIR`. |
 | `--allow-bash` | off | Register `bash`. |
+| `--allow-python` | off | Register `python3`. |
 | `--external-tools DIR` | — | Load `EASYAI-*.tools` manifests. |
 | `--RAG DIR` | — | Enable RAG. |
 | `-ctk, --cache-type-k TYPE` | `f16` | K-cache dtype. |

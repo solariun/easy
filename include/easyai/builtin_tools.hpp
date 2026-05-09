@@ -63,7 +63,7 @@ Tool web(bool google_enabled = false);
 // the boundary obvious and matches what bash with the pinned cwd sees.
 Tool fs(std::string root = ".");
 
-// ---------- shell -------------------------------------------------------
+// ---------- shell-class executors ---------------------------------------
 // Run a shell command via /bin/sh -c. Working directory is set to `root`.
 //
 // IMPORTANT: this is NOT a hardened sandbox. The child runs with the
@@ -86,6 +86,27 @@ Tool fs(std::string root = ".");
 // like a stalled session. Off by default to keep tool output strictly
 // in-band; the CLI flips it on unless --no-show-bash is passed.
 Tool bash         (std::string root = ".", bool show_output = false);
+
+// python3: run a Python 3 snippet via `python3 -I -S -E -c <code>`.
+// Working directory is `root`. Same hardening as `bash` (cwd pinned,
+// fds 3+ closed before exec, SIGTERM/SIGKILL deadline, 32 KB output
+// cap, optional operator-facing stderr mirror via `show_output`).
+//
+// `-I -S -E` puts the interpreter in *isolated mode*: no PYTHON*
+// environment variables (`-E`), no `site.py` / `.pth` files / site-
+// packages auto-load (`-S`), no cwd on `sys.path` (`-I`, which also
+// implies `-E -s`). The standard library is available; third-party
+// packages are NOT. Imports beyond the stdlib will fail with
+// ModuleNotFoundError.
+//
+// IMPORTANT: this is NOT a hardened sandbox. The interpreter runs
+// with the caller's full uid/gid and can `import os`, `import socket`,
+// `import urllib`, `import subprocess` to do anything bash can do.
+// `-I -S -E` constrains *startup*, not capabilities. Caller is
+// responsible for deciding whether `python3` is appropriate for
+// their threat model — surfaced only when the operator opts in
+// (e.g. `--allow-python`).
+Tool python3      (std::string root = ".", bool show_output = false);
 
 // ---------- introspection -----------------------------------------------
 // tool_lookup: return the currently-registered tool catalogue, optionally

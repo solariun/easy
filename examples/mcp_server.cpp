@@ -213,8 +213,9 @@ struct ServerArgs {
 
     // Sandbox + tool gating (mirrors easyai-server).
     std::string sandbox;
-    bool        allow_fs    = false;
-    bool        allow_bash  = false;
+    bool        allow_fs     = false;
+    bool        allow_bash   = false;
+    bool        allow_python = false;
     bool        load_tools  = true;
 
     // Tool packs.
@@ -314,6 +315,7 @@ const std::vector<FlagDef> & kFlags() {
         { {"--sandbox"},               "SERVER", "sandbox",                "sandbox",             true,  SET_STR(&ServerArgs::sandbox) },
         { {"--allow-fs"},              "SERVER", "allow_fs",               "allow_fs",            false, SET_BOOL_TRUE(&ServerArgs::allow_fs) },
         { {"--allow-bash"},            "SERVER", "allow_bash",             "allow_bash",          false, SET_BOOL_TRUE(&ServerArgs::allow_bash) },
+        { {"--allow-python"},          "SERVER", "allow_python",           "allow_python",        false, SET_BOOL_TRUE(&ServerArgs::allow_python) },
         { {"--no-tools"},              "SERVER", "load_tools",             "load_tools",          false, SET_BOOL_FALSE(&ServerArgs::load_tools) },
         { {"--external-tools"},        "SERVER", "external_tools",         "external_tools",      true,  SET_STR(&ServerArgs::external_tools_dir) },
         { {"--RAG"},                   "SERVER", "rag",                    "rag",                 true,  SET_STR(&ServerArgs::rag_dir) },
@@ -381,6 +383,12 @@ const std::vector<FlagDef> & kFlags() {
         "      --allow-bash             Register `bash`. NOT a hardened\n"
         "                                sandbox — runs with this process's\n"
         "                                user privileges.\n"
+        "      --allow-python           Register `python3` (run snippets via\n"
+        "                                `python3 -I -S -E -c <code>`; isolated\n"
+        "                                stdlib-only interpreter). NOT a\n"
+        "                                hardened sandbox — `import os`,\n"
+        "                                `import socket`, `import subprocess`\n"
+        "                                all work.\n"
         "      --no-tools               Skip the built-in toolbelt entirely\n"
         "                                (datetime / web).\n"
         "      --external-tools <dir>   Load every EASYAI-*.tools manifest\n"
@@ -407,6 +415,7 @@ const std::vector<FlagDef> & kFlags() {
         "key reference):\n"
         "  [SERVER]      every flag above (host, port, sandbox, threads,\n"
         "                 max_concurrent_calls, allow_fs, allow_bash,\n"
+        "                 allow_python,\n"
         "                 external_tools, rag, api_key, mcp_auth,\n"
         "                 metrics, verbose, max_body, name).\n"
         "  [MCP_USER]    one user per line: name = bearer-token.\n"
@@ -821,11 +830,12 @@ int main(int argc, char ** argv) {
     // Sandbox dir resolves against the cwd we chdir'd into above.
     if (args.load_tools) {
         std::string sb = args.sandbox;
-        if (sb.empty() && (args.allow_fs || args.allow_bash)) sb = ".";
+        if (sb.empty() && (args.allow_fs || args.allow_bash || args.allow_python)) sb = ".";
         auto tb = easyai::cli::Toolbelt()
-                      .sandbox   (sb)
-                      .allow_fs  (args.allow_fs)
-                      .allow_bash(args.allow_bash);
+                      .sandbox     (sb)
+                      .allow_fs    (args.allow_fs)
+                      .allow_bash  (args.allow_bash)
+                      .allow_python(args.allow_python);
         for (auto & t : tb.tools()) ctx->default_tools.push_back(std::move(t));
     }
 

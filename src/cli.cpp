@@ -23,14 +23,16 @@ namespace easyai::cli {
 // ============================================================================
 // Toolbelt
 // ============================================================================
-Toolbelt & Toolbelt::sandbox    (std::string dir) { sandbox_     = std::move(dir); return *this; }
-Toolbelt & Toolbelt::allow_fs   (bool on)         { allow_fs_    = on;             return *this; }
-Toolbelt & Toolbelt::allow_bash (bool on)         { allow_bash_  = on;             return *this; }
-Toolbelt & Toolbelt::show_bash  (bool on)         { show_bash_   = on;             return *this; }
-Toolbelt & Toolbelt::with_plan  (Plan & plan)     { plan_        = &plan;          return *this; }
-Toolbelt & Toolbelt::no_web     (bool on)         { no_web_      = on;             return *this; }
-Toolbelt & Toolbelt::no_datetime(bool on)         { no_datetime_ = on;             return *this; }
-Toolbelt & Toolbelt::use_google (bool on)         { use_google_  = on;             return *this; }
+Toolbelt & Toolbelt::sandbox     (std::string dir) { sandbox_      = std::move(dir); return *this; }
+Toolbelt & Toolbelt::allow_fs    (bool on)         { allow_fs_     = on;             return *this; }
+Toolbelt & Toolbelt::allow_bash  (bool on)         { allow_bash_   = on;             return *this; }
+Toolbelt & Toolbelt::allow_python(bool on)         { allow_python_ = on;             return *this; }
+Toolbelt & Toolbelt::show_bash   (bool on)         { show_bash_    = on;             return *this; }
+Toolbelt & Toolbelt::show_python (bool on)         { show_python_  = on;             return *this; }
+Toolbelt & Toolbelt::with_plan   (Plan & plan)     { plan_         = &plan;          return *this; }
+Toolbelt & Toolbelt::no_web      (bool on)         { no_web_       = on;             return *this; }
+Toolbelt & Toolbelt::no_datetime (bool on)         { no_datetime_  = on;             return *this; }
+Toolbelt & Toolbelt::use_google  (bool on)         { use_google_   = on;             return *this; }
 
 std::vector<Tool> Toolbelt::tools() const {
     std::vector<Tool> out;
@@ -51,14 +53,16 @@ std::vector<Tool> Toolbelt::tools() const {
         }
         out.push_back(easyai::tools::web(google));
     }
-    // fs and bash share a working root: the configured sandbox if set,
-    // otherwise ".". Whenever either category is enabled, both should be
-    // available — bash is strictly more permissive than fs, so allowing
-    // bash without fs is incoherent (and traps models into using bash
-    // for file work because there's nothing else). Conversely, anyone
-    // pointing at a sandbox wants file access in it.
-    const bool fs_on   = allow_fs_ && (!sandbox_.empty() || allow_bash_);
-    const bool bash_on = allow_bash_;
+    // fs / bash / python3 share a working root: the configured sandbox
+    // if set, otherwise ".". Whenever any executor category is enabled,
+    // `fs` should be available too — bash and python3 are strictly more
+    // permissive than `fs`, so allowing them without `fs` is incoherent
+    // (and traps models into using shell heredocs for ordinary file
+    // work). Conversely, anyone pointing at a sandbox wants file access
+    // in it.
+    const bool python_on = allow_python_;
+    const bool bash_on   = allow_bash_;
+    const bool fs_on     = allow_fs_ && (!sandbox_.empty() || bash_on || python_on);
     const std::string fs_root = sandbox_.empty() ? "." : sandbox_;
     if (fs_on) {
         // Single unified `fs` tool. Eight actions: read, write, list,
@@ -70,12 +74,19 @@ std::vector<Tool> Toolbelt::tools() const {
     if (bash_on) {
         out.push_back(easyai::tools::bash(fs_root, show_bash_));
     }
+    if (python_on) {
+        out.push_back(easyai::tools::python3(fs_root, show_python_));
+    }
     return out;
 }
 
 void Toolbelt::apply(Engine & engine) const {
     for (auto & t : tools()) engine.add_tool(t);
-    if (allow_bash_) engine.max_tool_hops(99999);
+    // bash and python3 are both interactive subprocess executors whose
+    // flows naturally span many turns — bump the agentic-loop ceiling
+    // when either is enabled so the default 8-hop cap doesn't truncate
+    // real work.
+    if (allow_bash_ || allow_python_) engine.max_tool_hops(99999);
 }
 // Toolbelt::apply(Client &) lives in src/cli_client.cpp — libeasyai-cli.
 
