@@ -14,6 +14,7 @@
 #include <fstream>
 #include <iomanip>
 #include <list>
+#include <map>
 #include <mutex>
 #include <unordered_map>
 #include <regex>
@@ -1250,10 +1251,12 @@ namespace {
 ToolHandler make_fs_read_handler(std::shared_ptr<Sandbox> sb) {
     return [sb](const ToolCall & c) -> ToolResult {
         std::string path; long long offset = 0, limit = 64 * 1024;
+        bool line_numbers = false;
         if (!args::get_string(c.arguments_json, "path", path))
             return ToolResult::error("missing arg: path (fs action=\"read\")");
         args::get_int(c.arguments_json, "offset", offset);
         args::get_int(c.arguments_json, "limit",  limit);
+        args::get_bool(c.arguments_json, "line_numbers", line_numbers);
         if (offset < 0) offset = 0;
         if (limit  < 1) limit  = 1;
         if (limit > 1024 * 1024) limit = 1024 * 1024;
@@ -1288,6 +1291,49 @@ ToolHandler make_fs_read_handler(std::shared_ptr<Sandbox> sb) {
                                      + std::strerror(errno));
         }
         buf.resize((size_t) n);
+
+        // line_numbers=true prefixes each line with `<lineno>| ` so
+        // the model can plan an action="edit" call without having to
+        // count lines manually. Numbering continues from the line at
+        // `offset`: byte offsets that don't fall on a line boundary
+        // count their partial first line as line 1 (consistent with
+        // every line-numbering tool models have seen in training —
+        // grep, less, vim's `:set nu`).
+        if (line_numbers && !buf.empty()) {
+            std::string out;
+            out.reserve(buf.size() + buf.size() / 32);
+            // We don't know which file-line `offset` lands on without
+            // a second read; if offset > 0 we restart numbering at 1
+            // and add an explicit `[note: numbering restarts at this
+            // chunk]` line so the model doesn't confuse a paged read
+            // with an absolute file map.
+            if (offset > 0) {
+                out.append("[note: numbering restarts at this chunk; "
+                           "for absolute line numbers, read with "
+                           "offset=0 or use action=\"grep\"]\n");
+            }
+            long long lineno = 1;
+            char numbuf[16];
+            size_t line_start = 0;
+            for (size_t i = 0; i < buf.size(); ++i) {
+                if (buf[i] == '\n') {
+                    int nn = std::snprintf(numbuf, sizeof(numbuf),
+                                           "%6lld| ", lineno);
+                    if (nn > 0) out.append(numbuf, (size_t) nn);
+                    out.append(buf, line_start, i - line_start + 1);
+                    line_start = i + 1;
+                    ++lineno;
+                }
+            }
+            if (line_start < buf.size()) {
+                int nn = std::snprintf(numbuf, sizeof(numbuf),
+                                       "%6lld| ", lineno);
+                if (nn > 0) out.append(numbuf, (size_t) nn);
+                out.append(buf, line_start, buf.size() - line_start);
+            }
+            return ToolResult::ok(std::move(out));
+        }
+
         return ToolResult::ok(std::move(buf));
     };
 }
@@ -1350,6 +1396,252 @@ ToolHandler make_fs_write_handler(std::shared_ptr<Sandbox> sb) {
         ::close(fd);
         return ToolResult::ok("wrote " + std::to_string(content.size())
                               + " bytes to " + sb->virtual_path(p));
+    };
+}
+
+// append: write `content` to the end of `path`, creating the file
+// (and any missing parent dirs) if needed. Same hardening as write
+// (sandbox containment, post-mkdir re-check, O_NOFOLLOW, mode 0600).
+// Equivalent to action="write" with append=true, but exists as a
+// first-class verb so ops batches can stack sequential appends
+// without per-op `append:true` boilerplate.
+ToolHandler make_fs_append_handler(std::shared_ptr<Sandbox> sb) {
+    return [sb](const ToolCall & c) -> ToolResult {
+        std::string path, content;
+        if (!args::get_string(c.arguments_json, "path", path))
+            return ToolResult::error("missing arg: path (fs action=\"append\")");
+        if (!args::get_string(c.arguments_json, "content", content))
+            return ToolResult::error("missing arg: content (fs action=\"append\")");
+
+        stdfs::path p; std::string err;
+        if (!sb->resolve(path, p, err)) return ToolResult::error(err);
+        if (!sb->inside_sandbox(p)) {
+            return ToolResult::error("path escapes sandbox via symlink: "
+                                     + sb->virtual_path(p));
+        }
+
+        std::error_code ec;
+        stdfs::create_directories(p.parent_path(), ec);
+        // Re-check containment AFTER create_directories — same TOCTOU
+        // defense as write.
+        if (!sb->inside_sandbox(p)) {
+            return ToolResult::error(
+                "path escapes sandbox via symlink (post-mkdir): "
+                + sb->virtual_path(p));
+        }
+
+        const int flags = O_WRONLY | O_CREAT | O_APPEND
+                        | O_NOFOLLOW | O_CLOEXEC;
+        int fd = ::open(p.c_str(), flags, 0600);
+        if (fd < 0) {
+            return ToolResult::error(std::string("cannot open for append: ")
+                                     + sb->virtual_path(p)
+                                     + " (" + std::strerror(errno) + ")");
+        }
+        const char * data = content.data();
+        size_t       left = content.size();
+        while (left > 0) {
+            ssize_t n = ::write(fd, data, left);
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                ::close(fd);
+                return ToolResult::error(std::string("write failed: ")
+                                         + std::strerror(errno));
+            }
+            data += n;
+            left -= (size_t) n;
+        }
+        ::close(fd);
+        return ToolResult::ok("appended " + std::to_string(content.size())
+                              + " bytes to " + sb->virtual_path(p));
+    };
+}
+
+// edit: replace lines [start_line..end_line] (1-based, inclusive) with
+// `content`. Pure insert is end_line = start_line - 1 (zero-width
+// range). Pure delete is content="". File must already exist (use
+// action="write" to create). Atomic via tempfile + rename, same
+// O_NOFOLLOW + post-mkdir TOCTOU defenses as write.
+ToolHandler make_fs_edit_handler(std::shared_ptr<Sandbox> sb) {
+    return [sb](const ToolCall & c) -> ToolResult {
+        std::string path, content;
+        long long start_line = 0, end_line = 0;
+        if (!args::get_string(c.arguments_json, "path", path))
+            return ToolResult::error("missing arg: path (fs action=\"edit\")");
+        if (!args::get_int(c.arguments_json, "start_line", start_line))
+            return ToolResult::error("missing arg: start_line (fs action=\"edit\")");
+        if (!args::get_int(c.arguments_json, "end_line", end_line))
+            return ToolResult::error("missing arg: end_line (fs action=\"edit\")");
+        // content is required but allowed to be empty string (pure
+        // delete). args::get_string returns false when the key is
+        // absent; an explicit "" present in the JSON returns true.
+        if (!args::get_string(c.arguments_json, "content", content))
+            return ToolResult::error(
+                "missing arg: content (fs action=\"edit\"). "
+                "Pass content=\"\" for a pure delete.");
+
+        stdfs::path p; std::string err;
+        if (!sb->resolve(path, p, err)) return ToolResult::error(err);
+        if (!sb->inside_sandbox(p)) {
+            return ToolResult::error("path escapes sandbox via symlink: "
+                                     + sb->virtual_path(p));
+        }
+
+        // Read the file. action="edit" never creates — that's
+        // action="write"'s job. ENOENT is a clear error so the model
+        // doesn't accidentally turn a missing-file into an empty file
+        // by editing line 1.
+        int rfd = ::open(p.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+        if (rfd < 0) {
+            return ToolResult::error(std::string("cannot open for edit: ")
+                                     + sb->virtual_path(p)
+                                     + " (" + std::strerror(errno) + ")."
+                                     + " Use fs(action=\"write\") to create.");
+        }
+        std::string body;
+        {
+            constexpr size_t kEditMaxBytes = 8 * 1024 * 1024;  // 8 MiB
+            char chunk[64 * 1024];
+            for (;;) {
+                ssize_t n = ::read(rfd, chunk, sizeof(chunk));
+                if (n < 0) {
+                    if (errno == EINTR) continue;
+                    ::close(rfd);
+                    return ToolResult::error(std::string("read failed: ")
+                                             + std::strerror(errno));
+                }
+                if (n == 0) break;
+                if (body.size() + (size_t) n > kEditMaxBytes) {
+                    ::close(rfd);
+                    return ToolResult::error(
+                        "file too large for edit (>8 MiB); use action=\"write\" "
+                        "with the new full content instead.");
+                }
+                body.append(chunk, (size_t) n);
+            }
+        }
+        ::close(rfd);
+
+        // Slice into lines. We track a "newline-terminated" flag for
+        // each line so the rebuild preserves whether the file ended
+        // in '\n' or not. Lines = 0 only if the file is empty.
+        std::vector<std::string_view> lines;
+        lines.reserve(body.size() / 32 + 1);
+        size_t line_start = 0;
+        for (size_t i = 0; i < body.size(); ++i) {
+            if (body[i] == '\n') {
+                lines.emplace_back(body.data() + line_start, i - line_start + 1);
+                line_start = i + 1;
+            }
+        }
+        if (line_start < body.size()) {
+            lines.emplace_back(body.data() + line_start, body.size() - line_start);
+        }
+        const long long line_count = (long long) lines.size();
+
+        // Validate range. Conventions:
+        //   start_line ∈ [1, line_count + 1]   (line_count+1 = append at EOF)
+        //   end_line   ∈ [start_line - 1, line_count]   (start_line-1 = pure insert)
+        if (start_line < 1) {
+            return ToolResult::error(
+                "start_line must be >= 1 (got " + std::to_string(start_line) + ")");
+        }
+        if (start_line > line_count + 1) {
+            return ToolResult::error(
+                "start_line " + std::to_string(start_line)
+                + " is past end of file (line_count=" + std::to_string(line_count)
+                + "). Max is " + std::to_string(line_count + 1)
+                + " (= append at EOF).");
+        }
+        if (end_line < start_line - 1) {
+            return ToolResult::error(
+                "end_line " + std::to_string(end_line)
+                + " < start_line - 1 = " + std::to_string(start_line - 1)
+                + ". For a pure insert before line N, pass start_line=N, "
+                + "end_line=N-1.");
+        }
+        if (end_line > line_count) {
+            return ToolResult::error(
+                "end_line " + std::to_string(end_line)
+                + " is past end of file (line_count=" + std::to_string(line_count)
+                + ").");
+        }
+
+        const long long deleted = std::max<long long>(0, end_line - start_line + 1);
+
+        // Build new body: lines[0..start_line-2] + content + lines[end_line..]
+        // (1-based to 0-based conversion: line N is lines[N-1]).
+        std::string new_body;
+        new_body.reserve(body.size() + content.size() + 32);
+        for (long long i = 0; i < start_line - 1 && i < line_count; ++i) {
+            new_body.append(lines[(size_t) i].data(), lines[(size_t) i].size());
+        }
+        new_body.append(content);
+        for (long long i = end_line; i < line_count; ++i) {
+            new_body.append(lines[(size_t) i].data(), lines[(size_t) i].size());
+        }
+
+        // Count inserted lines for the report. Counts a trailing
+        // partial line as one line (consistent with how `lines`
+        // splits the file).
+        long long inserted = 0;
+        if (!content.empty()) {
+            inserted = 1;
+            for (char ch : content) if (ch == '\n') ++inserted;
+            if (content.back() == '\n') --inserted;
+        }
+
+        // Atomic write — same dance as fs write: tempfile + rename(2),
+        // mode 0600, O_NOFOLLOW, re-check sandbox containment after
+        // create_directories on the parent.
+        std::error_code ec;
+        stdfs::create_directories(p.parent_path(), ec);
+        if (!sb->inside_sandbox(p)) {
+            return ToolResult::error(
+                "path escapes sandbox via symlink (post-mkdir): "
+                + sb->virtual_path(p));
+        }
+        std::string tmp_path = p.string() + ".easyai-edit-tmp";
+        int wfd = ::open(tmp_path.c_str(),
+                         O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC,
+                         0600);
+        if (wfd < 0) {
+            return ToolResult::error(std::string("cannot open tempfile: ")
+                                     + tmp_path + " (" + std::strerror(errno) + ")");
+        }
+        const char * data = new_body.data();
+        size_t left = new_body.size();
+        while (left > 0) {
+            ssize_t n = ::write(wfd, data, left);
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                ::close(wfd);
+                ::unlink(tmp_path.c_str());
+                return ToolResult::error(std::string("write failed: ")
+                                         + std::strerror(errno));
+            }
+            data += n;
+            left -= (size_t) n;
+        }
+        ::close(wfd);
+        if (::rename(tmp_path.c_str(), p.c_str()) != 0) {
+            const int e = errno;
+            ::unlink(tmp_path.c_str());
+            return ToolResult::error(std::string("rename failed: ")
+                                     + std::strerror(e));
+        }
+
+        std::ostringstream o;
+        o << "edited " << sb->virtual_path(p) << ": ";
+        if (deleted == 0) {
+            o << "inserted " << inserted << " line"
+              << (inserted == 1 ? "" : "s")
+              << " before line " << start_line;
+        } else {
+            o << "replaced lines " << start_line << "-" << end_line
+              << " (" << deleted << " deleted, " << inserted << " inserted)";
+        }
+        return ToolResult::ok(o.str());
     };
 }
 
@@ -1730,6 +2022,8 @@ Tool fs(std::string root) {
     auto sb = std::make_shared<Sandbox>(root);
     auto h_read       = make_fs_read_handler      (sb);
     auto h_write      = make_fs_write_handler     (sb);
+    auto h_append     = make_fs_append_handler    (sb);
+    auto h_edit       = make_fs_edit_handler      (sb);
     auto h_list       = make_fs_list_handler      (sb);
     auto h_glob       = make_fs_glob_handler      (sb);
     auto h_grep       = make_fs_grep_handler      (sb);
@@ -1737,11 +2031,40 @@ Tool fs(std::string root) {
     auto h_cwd        = make_fs_cwd_handler       ();
     auto h_sandbox    = make_fs_sandbox_handler   (root);
 
+    // Per-action dispatcher used by both the single-call and the
+    // ops-batch paths. `args_json` is the per-op JSON object — for
+    // single-call it's c.arguments_json verbatim; for batch it's
+    // ops[i].dump().
+    auto dispatch_single =
+        [h_read, h_write, h_append, h_edit, h_list, h_glob, h_grep,
+         h_check_path, h_cwd, h_sandbox]
+        (const std::string & action,
+         const std::string & args_json) -> ToolResult {
+            ToolCall sub;
+            sub.name = "fs";
+            sub.arguments_json = args_json;
+            if (action == "read")        return h_read(sub);
+            if (action == "write")       return h_write(sub);
+            if (action == "append")      return h_append(sub);
+            if (action == "edit")        return h_edit(sub);
+            if (action == "list")        return h_list(sub);
+            if (action == "glob")        return h_glob(sub);
+            if (action == "grep")        return h_grep(sub);
+            if (action == "check_path")  return h_check_path(sub);
+            if (action == "cwd")         return h_cwd(sub);
+            if (action == "sandbox")     return h_sandbox(sub);
+            return ToolResult::error(
+                "unknown action \"" + action + "\". Valid: \"read\", "
+                "\"write\", \"append\", \"edit\", \"list\", \"glob\", "
+                "\"grep\", \"check_path\", \"cwd\", \"sandbox\".");
+        };
+
     return Tool::builder("fs")
         .describe(
             "The filesystem, accessed through one tool. Pick an action; "
             "the parameters needed depend on which action you choose. "
-            "Eight actions are supported:\n"
+            "Ten actions are supported, plus a batch mode that runs up "
+            "to 20 operations in a single call.\n"
             "\n"
             "AUTHORITATIVE SANDBOX RULE — at the start of every "
             "filesystem or shell task, run action=\"sandbox\" once "
@@ -1761,17 +2084,50 @@ Tool fs(std::string root) {
             "  action=\"read\"\n"
             "    Read a UTF-8 text file. Required: path. Optional: "
             "offset (skip N bytes; default 0), limit (max bytes; "
-            "default 65536, max 1048576). Use offset to page through "
-            "files larger than the limit.\n"
+            "default 65536, max 1048576), line_numbers (default false; "
+            "when true, prefixes each line with `<lineno>| ` so the "
+            "model can plan an action=\"edit\" call without counting "
+            "manually). Use offset to page through files larger than "
+            "the limit.\n"
             "\n"
             "  action=\"write\"\n"
             "    Write UTF-8 text to a file. Default mode OVERWRITES "
-            "any existing content; pass append=true to extend. Missing "
+            "any existing content; pass append=true to extend (or use "
+            "action=\"append\" — same thing, cleaner verb). Missing "
             "parent directories are created automatically. Required: "
             "path, content. Optional: append (default false). Returns "
             "`wrote N bytes to <path>` on success. Don't use bash for "
             "`cat > file` / `echo \"...\" > file` / `cat <<EOF` — call "
             "this instead, no shell-quoting minefield.\n"
+            "\n"
+            "  action=\"append\"\n"
+            "    Append UTF-8 text to the END of a file (creates the "
+            "file and any missing parent dirs if needed). Required: "
+            "path, content. Returns `appended N bytes to <path>`. "
+            "Equivalent to action=\"write\" with append=true, but as a "
+            "first-class verb so ops batches can stack sequential "
+            "appends — `ops=[{append a}, {append b}, {append c}]` "
+            "writes a then b then c in order. Use this for building up "
+            "a log / report / running notes incrementally; for a "
+            "wholesale overwrite, use action=\"write\".\n"
+            "\n"
+            "  action=\"edit\"\n"
+            "    Replace a line range in an existing file. Required: "
+            "path, start_line (1-based, inclusive), end_line (1-based, "
+            "inclusive), content. The lines [start_line..end_line] are "
+            "deleted and `content` is inserted in their place; atomic "
+            "via tempfile + rename. content=\"\" is a pure delete; "
+            "end_line=start_line-1 is a pure insert (zero-width range) "
+            "before start_line. start_line=line_count+1 appends at "
+            "EOF. The file MUST already exist — use action=\"write\" "
+            "to create. content is inserted verbatim, so include a "
+            "trailing `\\n` if you want a clean line break.\n"
+            "    Workflow: read with line_numbers=true, look at the "
+            "numbered output, plan the edit, fire it. For multiple "
+            "edits to the same file, use the ops batch (below) — the "
+            "tool reorders same-path edits bottom-up so the line "
+            "numbers stay consistent with the file's ORIGINAL state "
+            "for every op.\n"
             "\n"
             "  action=\"list\"\n"
             "    List entries in one directory, non-recursively. "
@@ -1821,7 +2177,7 @@ Tool fs(std::string root) {
             "  action=\"sandbox\"\n"
             "    Return the absolute filesystem path of the sandbox "
             "root, pinned at tool registration. This is the single "
-            "source of truth for where read/write/list/glob/grep "
+            "source of truth for where read/write/edit/list/glob/grep "
             "resolve their RELATIVE paths and where `bash` has its "
             "cwd. Use this when you need to mention the real on-disk "
             "path in user-facing output (e.g. \"I created the file "
@@ -1831,28 +2187,88 @@ Tool fs(std::string root) {
             "arguments — those expect relative paths. No other "
             "parameters.\n"
             "\n"
+            "BATCH MODE — `ops` instead of `action`\n"
+            "  Pass an array of operation objects to run up to 20 "
+            "ops in a single call. Each op is a self-contained "
+            "JSON object with the same shape as a single-call "
+            "fs() — `action` plus that action's required / optional "
+            "params. Either `action` (single op) or `ops` (batch) "
+            "must be set, not both.\n"
+            "\n"
+            "    fs(ops=[\n"
+            "      {action:\"edit\", path:\"src/foo.cpp\", "
+            "start_line:42, end_line:58, content:\"...\"},\n"
+            "      {action:\"edit\", path:\"src/foo.cpp\", "
+            "start_line:100, end_line:100, content:\"...\"},\n"
+            "      {action:\"read\", path:\"src/main.cpp\", "
+            "line_numbers:true}\n"
+            "    ])\n"
+            "\n"
+            "  Same-path edits are AUTOMATICALLY REORDERED to apply "
+            "bottom-up (highest start_line first), so each edit's "
+            "line numbers stay consistent with the file's ORIGINAL "
+            "state — you don't have to manually offset for the "
+            "preceding edits. Submit edits in any order.\n"
+            "\n"
+            "  Ops execute one at a time. By default a failing op "
+            "STOPS the batch and the remaining ops are skipped; "
+            "pass continue_on_error=true to run all ops and report "
+            "each result independently (useful for "
+            "ops=[read,read,read,...] where one missing file "
+            "shouldn't abort the others). Per-op atomicity only — "
+            "no cross-op rollback; ops 1..N-1 stay committed if op "
+            "N fails. Output is a `[i/N] action target: result` "
+            "line per op.\n"
+            "\n"
             "Errors return a single-line message starting with `error:`. "
             "Reading a binary file returns the raw bytes — prefer the "
             "shell's `file <path>` for those."
         )
         .param("action",            "string",
-               "Required. One of: \"read\", \"write\", \"list\", "
-               "\"glob\", \"grep\", \"check_path\", \"cwd\", "
-               "\"sandbox\". Each action consumes a subset of the "
-               "other parameters; see the tool description for the "
-               "per-action requirements.", true)
+               "Required for single-op calls (mutually exclusive with "
+               "`ops`). One of: \"read\", \"write\", \"append\", "
+               "\"edit\", \"list\", \"glob\", \"grep\", \"check_path\", "
+               "\"cwd\", \"sandbox\". Each action consumes a subset of "
+               "the other parameters; see the tool description for "
+               "the per-action requirements.", false)
+        .param("ops",               "array",
+               "Required for batch calls (mutually exclusive with "
+               "`action`). Array of 1..20 operation objects. Each "
+               "object has `action` plus that action's per-action "
+               "params. Same-path edits are automatically reordered "
+               "bottom-up so line numbers stay consistent with the "
+               "file's original state.", false)
+        .param("continue_on_error", "boolean",
+               "Used by ops batch. If true, a failing op does NOT "
+               "abort the batch — the failure is reported and the "
+               "remaining ops still run. Default false (stop at "
+               "first error).", false)
         .param("path",              "string",
-               "Used by read / write / list / glob / grep / check_path. "
-               "RELATIVE path under the sandbox root. No leading `/`. "
-               "Use `.` for the root itself.", false)
-        .param("content",           "string",
-               "Used by write. UTF-8 text to write. Use `\\n` for "
-               "newlines. Binary content is not supported — use bash.",
+               "Used by read / write / append / edit / list / glob / "
+               "grep / check_path. RELATIVE path under the sandbox "
+               "root. No leading `/`. Use `.` for the root itself.",
                false)
+        .param("content",           "string",
+               "Used by write / append / edit. UTF-8 text. For "
+               "write: full file content (or appendix when "
+               "append=true). For append: text added to the end of "
+               "the file. For edit: replacement for the line range; "
+               "pass \"\" for a pure delete. Use `\\n` for "
+               "newlines. Binary content is not supported — use "
+               "bash.", false)
         .param("append",            "boolean",
                "Used by write. If true, append to the file instead of "
                "overwriting (creates the file if missing). Default "
                "false.", false)
+        .param("start_line",        "integer",
+               "Used by edit. 1-based, inclusive — the first line of "
+               "the range to replace. line_count+1 appends at EOF.",
+               false)
+        .param("end_line",          "integer",
+               "Used by edit. 1-based, inclusive — the last line of "
+               "the range to replace. Pass start_line-1 for a pure "
+               "insert (zero-width range) before start_line.",
+               false)
         .param("offset",            "integer",
                "Used by read. Skip this many bytes from the start of "
                "the file before reading. Default 0. Use the previous "
@@ -1861,6 +2277,11 @@ Tool fs(std::string root) {
         .param("limit",             "integer",
                "Used by read. Maximum bytes to return. Default 65536 "
                "(64 KB), max 1048576 (1 MiB).", false)
+        .param("line_numbers",      "boolean",
+               "Used by read. If true, prefix each returned line "
+               "with `<lineno>| ` so action=\"edit\" can target "
+               "specific lines without manual counting. Default "
+               "false.", false)
         .param("pattern",           "string",
                "Used by glob / grep. For glob: wildcard pattern. For "
                "grep: ECMAScript regex (each line matched independently "
@@ -1881,29 +2302,227 @@ Tool fs(std::string root) {
                "exist, create an empty file there (parent dirs auto-"
                "created, mode 0600). Lets you probe write rights "
                "without writing real content. Default false.", false)
-        .handle([h_read, h_write, h_list, h_glob, h_grep,
-                 h_check_path, h_cwd, h_sandbox]
+        .handle([dispatch_single]
                 (const ToolCall & c) -> ToolResult {
-            std::string action;
-            if (!args::get_string(c.arguments_json, "action", action)
-                    || action.empty()) {
+            // Detect the batch shape via raw nlohmann::json: an `ops`
+            // key whose value is an array. The args helpers in
+            // easyai::args don't have an array getter, so we parse
+            // once here and route accordingly.
+            nlohmann::json parsed;
+            try {
+                parsed = nlohmann::json::parse(c.arguments_json);
+            } catch (const std::exception & e) {
                 return ToolResult::error(
-                    "missing required argument: action. Use one of "
-                    "\"read\", \"write\", \"list\", \"glob\", \"grep\", "
-                    "\"check_path\", \"cwd\", \"sandbox\".");
+                    std::string("invalid JSON arguments: ") + e.what());
             }
-            if (action == "read")        return h_read(c);
-            if (action == "write")       return h_write(c);
-            if (action == "list")        return h_list(c);
-            if (action == "glob")        return h_glob(c);
-            if (action == "grep")        return h_grep(c);
-            if (action == "check_path")  return h_check_path(c);
-            if (action == "cwd")         return h_cwd(c);
-            if (action == "sandbox")     return h_sandbox(c);
-            return ToolResult::error(
-                "unknown action \"" + action + "\". Valid: \"read\", "
-                "\"write\", \"list\", \"glob\", \"grep\", \"check_path\", "
-                "\"cwd\", \"sandbox\".");
+            const bool has_action = parsed.contains("action")
+                && parsed["action"].is_string()
+                && !parsed["action"].get<std::string>().empty();
+            const bool has_ops = parsed.contains("ops")
+                && parsed["ops"].is_array();
+
+            // Single-op path (default).
+            if (!has_ops) {
+                if (!has_action) {
+                    return ToolResult::error(
+                        "missing required argument: either \"action\" "
+                        "(for a single op) or \"ops\" (for a batch). "
+                        "Single-op valid action values: \"read\", "
+                        "\"write\", \"append\", \"edit\", \"list\", "
+                        "\"glob\", \"grep\", \"check_path\", \"cwd\", "
+                        "\"sandbox\".");
+                }
+                return dispatch_single(parsed["action"].get<std::string>(),
+                                       c.arguments_json);
+            }
+
+            // Batch path. Validate.
+            if (has_action) {
+                return ToolResult::error(
+                    "\"action\" and \"ops\" are mutually exclusive. "
+                    "Pass `action` for a single op OR `ops` for a "
+                    "batch, not both.");
+            }
+            const auto & ops_arr = parsed["ops"];
+            if (ops_arr.empty()) {
+                return ToolResult::error("ops array is empty");
+            }
+            if (ops_arr.size() > 20) {
+                return ToolResult::error(
+                    "ops array has " + std::to_string(ops_arr.size())
+                    + " items; cap is 20 per call. Split into multiple "
+                    "calls.");
+            }
+            const bool continue_on_error =
+                parsed.contains("continue_on_error")
+                && parsed["continue_on_error"].is_boolean()
+                && parsed["continue_on_error"].get<bool>();
+
+            // Pre-validate every op so we can surface schema errors
+            // up front (no half-batched state from a 5th malformed op).
+            // Each op must be an object with a string `action` field.
+            const size_t N = ops_arr.size();
+            for (size_t i = 0; i < N; ++i) {
+                if (!ops_arr[i].is_object()) {
+                    return ToolResult::error(
+                        "ops[" + std::to_string(i) + "] is not an object");
+                }
+                if (!ops_arr[i].contains("action")
+                        || !ops_arr[i]["action"].is_string()
+                        || ops_arr[i]["action"].get<std::string>().empty()) {
+                    return ToolResult::error(
+                        "ops[" + std::to_string(i)
+                        + "] is missing string field \"action\"");
+                }
+            }
+
+            // Compute execute order. Same-path edits are reordered
+            // bottom-up (highest start_line first) so each edit's
+            // line numbers refer to the file's ORIGINAL state. The
+            // position of every NON-edit op is preserved; edit slots
+            // get refilled with the appropriate same-path edit.
+            std::map<std::string, std::vector<size_t>> edits_by_path;
+            for (size_t i = 0; i < N; ++i) {
+                const auto & op = ops_arr[i];
+                if (op["action"].get<std::string>() == "edit"
+                        && op.contains("path")
+                        && op["path"].is_string()) {
+                    edits_by_path[op["path"].get<std::string>()].push_back(i);
+                }
+            }
+            for (auto & kv : edits_by_path) {
+                std::sort(kv.second.begin(), kv.second.end(),
+                    [&](size_t a, size_t b) {
+                        long long sa = ops_arr[a].value("start_line", 0LL);
+                        long long sb = ops_arr[b].value("start_line", 0LL);
+                        return sa > sb;  // descending
+                    });
+            }
+            std::vector<size_t> exec_order;
+            exec_order.reserve(N);
+            std::map<std::string, size_t> next_for_path;
+            for (size_t i = 0; i < N; ++i) {
+                const auto & op = ops_arr[i];
+                const std::string action = op["action"].get<std::string>();
+                if (action == "edit" && op.contains("path")
+                        && op["path"].is_string()) {
+                    const std::string p = op["path"].get<std::string>();
+                    auto & sorted = edits_by_path[p];
+                    exec_order.push_back(sorted[next_for_path[p]++]);
+                } else {
+                    exec_order.push_back(i);
+                }
+            }
+
+            // Run.
+            std::ostringstream out;
+            int ok_count = 0;
+            int err_count = 0;
+            size_t ran = 0;
+            for (size_t step = 0; step < N; ++step) {
+                const size_t i = exec_order[step];
+                const auto & op = ops_arr[i];
+                const std::string action = op["action"].get<std::string>();
+                const std::string args_json = op.dump();
+                ToolResult r = dispatch_single(action, args_json);
+
+                // Build a short target hint for the report line so
+                // operators reading the transcript can see at a
+                // glance which path/pattern each op touched. Order
+                // mirrors what's actually meaningful per action.
+                std::string target;
+                if (op.contains("path") && op["path"].is_string()) {
+                    target = op["path"].get<std::string>();
+                } else if (op.contains("pattern")
+                        && op["pattern"].is_string()) {
+                    target = op["pattern"].get<std::string>();
+                }
+                if (!target.empty()) target = " " + target;
+
+                out << "[" << (step + 1) << "/" << N << "] "
+                    << (r.is_error ? "err " : "ok ")
+                    << action << target;
+                if (i != step) {
+                    // Edit-reorder happened: tell the operator
+                    // which submission index this slot came from.
+                    out << " (submitted as ops[" << i << "])";
+                }
+                out << ": ";
+
+                // First line of the op's body — keep the per-op line
+                // tight; the model sees the full op content via the
+                // continuation block below for edits / read /
+                // check_path that produce multi-line output.
+                std::string body = r.content;
+                size_t nl = body.find('\n');
+                if (nl == std::string::npos) {
+                    out << body << "\n";
+                } else {
+                    out << body.substr(0, nl) << "\n";
+                    // Multi-line bodies are indented and shown in
+                    // full so the model can read e.g. a check_path
+                    // dump or a read result inline.
+                    std::string rest = body.substr(nl + 1);
+                    if (!rest.empty()) {
+                        // Indent every continuation line by 4 spaces.
+                        std::string indented;
+                        indented.reserve(rest.size() + rest.size() / 64);
+                        size_t pos = 0;
+                        while (pos < rest.size()) {
+                            size_t e = rest.find('\n', pos);
+                            indented.append("    ");
+                            if (e == std::string::npos) {
+                                indented.append(rest, pos, std::string::npos);
+                                pos = rest.size();
+                            } else {
+                                indented.append(rest, pos, e - pos + 1);
+                                pos = e + 1;
+                            }
+                        }
+                        out << indented;
+                        if (!indented.empty()
+                                && indented.back() != '\n') {
+                            out << "\n";
+                        }
+                    }
+                }
+
+                ++ran;
+                if (r.is_error) {
+                    ++err_count;
+                    if (!continue_on_error) {
+                        const size_t skipped = N - step - 1;
+                        if (skipped > 0) {
+                            out << "[stopped at op " << (step + 1)
+                                << "; " << skipped
+                                << " op" << (skipped == 1 ? "" : "s")
+                                << " skipped — pass "
+                                "continue_on_error=true to run them "
+                                "anyway]\n";
+                        }
+                        break;
+                    }
+                } else {
+                    ++ok_count;
+                }
+            }
+            // Footer: one-line summary so the model can see at a
+            // glance how many ops succeeded vs failed vs were
+            // skipped after a stop-on-first-error abort.
+            const size_t skipped_total = N - ran;
+            out << "summary: " << ok_count << " ok, "
+                << err_count << " err";
+            if (skipped_total > 0)
+                out << ", " << skipped_total << " skipped";
+            if (continue_on_error && err_count > 0)
+                out << " (continue_on_error)";
+            out << "\n";
+
+            // The whole batch is reported as ToolResult::ok — the
+            // model parses per-op success/failure from the report
+            // body. Returning ::error here would lose the partial
+            // success information when stop-on-first-error fires.
+            return ToolResult::ok(out.str());
         })
         .build();
 }
