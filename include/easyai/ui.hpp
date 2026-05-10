@@ -103,24 +103,43 @@ public:
     // forces an immediate refresh, the heartbeat handles that.
     void set_context_pct(int pct);
 
+    // Toggle the "thinking" state — replaces the regular `<glyph><pct>%`
+    // rendering with a coloured "thinking <pct>%" word, lit by a
+    // bright spotlight that sweeps left-to-right across the letters
+    // (mirrors Claude Code's prompt-processing animation). Use this
+    // between the moment a request is sent and the first SSE delta
+    // arrives, so the operator sees that the server is actively
+    // ingesting the prompt rather than hung.  set_thinking(false) is
+    // idempotent — safe to call after each chat() returns regardless of
+    // whether the spinner ever entered the thinking state.  The
+    // heartbeat speeds up to ~10 Hz while thinking_ is on so the sweep
+    // looks smooth, and reverts to the idle 250 ms cadence afterwards.
+    void set_thinking(bool on);
+
 private:
     void maybe_advance_locked_();
     void erase_active_locked_();
     void draw_locked_();
+    void draw_thinking_locked_();
     void heartbeat_loop_();
 
-    static constexpr int kFrameAdvanceMs = 100;     // 10 Hz throttle floor
+    static constexpr int kFrameAdvanceMs    = 100;   // 10 Hz throttle floor
+    static constexpr int kIdleIntervalMs    = 250;   // glyph rotation cadence
+    static constexpr int kThinkingIntervalMs = 100;  // shimmer cadence (10 Hz)
 
     bool enabled_      = false;
+    bool color_        = false;  // 256-colour ANSI suppressed when off (NO_COLOR / non-tty)
     bool active_       = false;
     int  frame_        = 0;
+    int  shimmer_phase_= 0;      // advances with every heartbeat while thinking_
     int  active_width_ = 0;   // chars currently on stdout — backspace count for erase
     int  context_pct_  = -1;  // -1 = no suffix; 0..100 = "<pct>%"
+    std::atomic<bool> thinking_{false};
     std::chrono::steady_clock::time_point last_advance_{};
 
     std::mutex              mu_;               // stdout + state
     std::atomic<bool>       hb_running_{false};
-    int                     interval_ms_ = 250;
+    int                     interval_ms_ = kIdleIntervalMs;
     std::thread             hb_thread_;
     std::mutex              hb_wait_mu_;
     std::condition_variable hb_cv_;

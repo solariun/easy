@@ -26,7 +26,13 @@ Style detect_style() {
 
 // ---------------------------------------------------------------- Spinner
 Spinner::Spinner(bool enabled)
-    : enabled_(enabled && ::isatty(fileno(stdout)) != 0) {}
+    : enabled_(enabled && ::isatty(fileno(stdout)) != 0),
+      // Mirror Style::detect_style: NO_COLOR=any disables coloured
+      // output entirely (the shimmer "thinking" sweep falls back to
+      // plain text in that case).  isatty is already covered by
+      // enabled_ above, but kept here for explicit pairing with the
+      // colour decision so reading the field tells the whole story.
+      color_(enabled_ && std::getenv("NO_COLOR") == nullptr) {}
 
 Spinner::~Spinner() { stop_heartbeat(); }
 
@@ -87,6 +93,32 @@ void Spinner::set_context_pct(int pct) {
     }
 }
 
+void Spinner::set_thinking(bool on) {
+    if (!enabled_) return;
+    // Idempotent: skip the lock + repaint when nothing changes so the
+    // repeated "set_thinking(false)" call cli.cpp fires after every
+    // chat() return doesn't cost a flush per turn.
+    if (thinking_.load(std::memory_order_relaxed) == on) return;
+    {
+        std::lock_guard<std::mutex> lg(mu_);
+        thinking_.store(on, std::memory_order_relaxed);
+        // Reset the sweep position when entering thinking mode so the
+        // spotlight always starts from the left edge of the word —
+        // otherwise a quick prompt would catch the wave mid-pass and
+        // it'd look like the animation is jumpy.
+        if (on) shimmer_phase_ = 0;
+        if (active_) {
+            erase_active_locked_();
+            draw_locked_();
+            std::fflush(stdout);
+        }
+    }
+    // Wake the heartbeat thread so it adopts the new cadence
+    // (kThinkingIntervalMs vs kIdleIntervalMs) on the very next sleep
+    // instead of finishing whatever wait it was already in.
+    hb_cv_.notify_all();
+}
+
 void Spinner::start_heartbeat(int interval_ms) {
     if (!enabled_) return;
     if (hb_running_.exchange(true)) return;
@@ -125,6 +157,10 @@ void Spinner::erase_active_locked_() {
 }
 
 void Spinner::draw_locked_() {
+    if (thinking_.load(std::memory_order_relaxed)) {
+        draw_thinking_locked_();
+        return;
+    }
     static const char frames[] = { '|', '/', '-', '\\' };
     char buf[16];
     int  n;
@@ -145,19 +181,86 @@ void Spinner::draw_locked_() {
     active_width_ = n;
 }
 
+// Render `thinking[ <pct>%]` with a bright spotlight that sweeps
+// left-to-right across the letters, one cell per heartbeat tick.  The
+// sweep period is text_len + kTrailing so the spotlight fully exits the
+// word before the next pass begins (otherwise consecutive passes glue
+// together and read as a flicker, not a sweep).  When color_ is off
+// (NO_COLOR / piped stdout) we emit plain ASCII — same width, no escape
+// codes — so the spinner still tracks correctly under `tee` etc.
+void Spinner::draw_thinking_locked_() {
+    // Brightness ramp from the bright peak outward.  256-colour
+    // grayscale: 232 (near-black) … 255 (near-white).  Five values give
+    // a soft falloff that reads as "spotlight" rather than "blinking".
+    static const int kBrightness[] = { 255, 252, 247, 242, 238 };
+    static constexpr int kRampLen  = sizeof(kBrightness) / sizeof(int);
+    static const int kBaseColor    = 235;   // out-of-spotlight chars
+
+    // Build the visible text first so we know its cell width for the
+    // sweep period and the active_width_ tracking.
+    char suffix[12] = {0};
+    int  suffix_len = 0;
+    if (context_pct_ >= 0) {
+        suffix_len = std::snprintf(suffix, sizeof(suffix),
+                                   " %d%%", context_pct_);
+        if (suffix_len < 0) suffix_len = 0;
+    }
+    static const char kWord[] = "thinking";
+    static constexpr int kWordLen = sizeof(kWord) - 1;
+    const int text_len = kWordLen + suffix_len;
+
+    // kTrailing leaves the spotlight off-screen for a few frames between
+    // sweeps so the cycle has visible "rest" — without it the sweep
+    // restarts immediately and looks like a strobe.
+    constexpr int kTrailing = 6;
+    const int period = text_len + kTrailing;
+    const int peak   = shimmer_phase_ % period;
+
+    auto emit_char = [&](char c, int idx) {
+        if (color_) {
+            int dist = std::abs(peak - idx);
+            int color = (dist < kRampLen)
+                            ? kBrightness[dist]
+                            : kBaseColor;
+            std::fprintf(stdout, "\x1b[38;5;%dm%c", color, c);
+        } else {
+            std::fputc(c, stdout);
+        }
+    };
+    for (int i = 0; i < kWordLen; ++i) emit_char(kWord[i], i);
+    for (int i = 0; i < suffix_len; ++i) emit_char(suffix[i], kWordLen + i);
+    if (color_) std::fputs("\x1b[0m", stdout);
+    std::fflush(stdout);
+
+    active_       = true;
+    active_width_ = text_len;   // visible cells only — escapes don't move the cursor
+}
+
 void Spinner::heartbeat_loop_() {
     while (hb_running_) {
+        // Pick the cadence based on the current state — shimmer needs
+        // ~10 Hz to read as smooth, the idle |/-\ glyph is fine at 4 Hz
+        // and avoids gratuitous redraws while the operator is reading.
+        // Re-evaluated every loop so set_thinking() flipping the flag
+        // mid-wait takes effect on the next tick (notify_all wakes us).
+        const int sleep_ms = thinking_.load(std::memory_order_relaxed)
+                                 ? kThinkingIntervalMs
+                                 : interval_ms_;
         {
             std::unique_lock<std::mutex> wait_lk(hb_wait_mu_);
             hb_cv_.wait_for(wait_lk,
-                            std::chrono::milliseconds(interval_ms_),
+                            std::chrono::milliseconds(sleep_ms),
                             [this]{ return !hb_running_; });
         }
         if (!hb_running_) break;
         std::lock_guard<std::mutex> lg(mu_);
         if (!active_) continue;            // nothing drawn yet
         erase_active_locked_();
-        ++frame_;
+        if (thinking_.load(std::memory_order_relaxed)) {
+            ++shimmer_phase_;              // sweep one cell to the right
+        } else {
+            ++frame_;
+        }
         last_advance_ = std::chrono::steady_clock::now();
         draw_locked_();
     }
@@ -267,6 +370,11 @@ bool tail_is_partial_think_marker(const std::string & tail) {
 }  // namespace
 
 void Streaming::on_token_(const std::string & piece_in) {
+    // First output of this turn — exit the spinner's "thinking" sweep.
+    // Idempotent on the spinner side so the per-piece check stays cheap
+    // (cli.cpp also calls set_thinking(false) defensively after chat()
+    // returns; either path wins).
+    spinner_.set_thinking(false);
     ++stats_.content_pieces;
     if (stats_.ms_to_first_tok < 0) stats_.ms_to_first_tok = stats_.elapsed_ms();
 
@@ -333,11 +441,22 @@ void Streaming::on_token_(const std::string & piece_in) {
 }
 
 void Streaming::on_reason_(const std::string & piece_in) {
+    // First output of this turn — see on_token_ above.  Reasoning often
+    // arrives BEFORE content (the easyai-server "📝 prompt eval" line
+    // ships as reasoning_content), so the spinner needs to drop out of
+    // the shimmer here too.
+    spinner_.set_thinking(false);
     ++stats_.reason_pieces;
     emit_reason_(strip_think_markers(piece_in));
 }
 
 void Streaming::on_tool_(const ToolCall & call, const ToolResult & result) {
+    // A tool dispatch is also a "model finished prompt eval" signal —
+    // some agentic turns emit a tool_call as their entire visible
+    // output, in which case neither on_token_ nor on_reason_ ever
+    // fires.  Without this hook the shimmer would stay on through the
+    // whole tool round-trip.
+    spinner_.set_thinking(false);
     ++stats_.tool_calls;
     if (result.is_error) ++stats_.tool_errors;
 

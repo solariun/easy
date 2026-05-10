@@ -1144,6 +1144,16 @@ int run_one(easyai::Client & cli, easyai::Plan & plan,
 
     spinner.initial_draw();
     spinner.start_heartbeat();
+    // Enter the "thinking" state right after the request goes out so
+    // the operator sees a left-to-right shimmer sweep across the word
+    // "thinking <pct>%" while the server is processing the prompt
+    // (i.e. before the first reasoning_content / content delta lands).
+    // Streaming::on_token_ / on_reason_ / on_tool_ each call
+    // spinner.set_thinking(false) on the first piece they receive, so
+    // the shimmer is replaced by the regular `/<pct>%` glyph the
+    // moment generation begins.  We also flip it off explicitly after
+    // chat() returns to cover the no-output / error / cancel paths.
+    spinner.set_thinking(true);
 
     // Mark in-flight: the signal handler reads this to decide between
     // graceful (mid-chat) and prompt-level (between turns) handling.
@@ -1151,6 +1161,7 @@ int run_one(easyai::Client & cli, easyai::Plan & plan,
     std::string answer = cli.chat(prompt);
     g_in_chat.store(false, std::memory_order_relaxed);
 
+    spinner.set_thinking(false);
     spinner.stop_heartbeat();
     spinner.finish();
     std::fputc('\n', stdout);
