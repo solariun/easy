@@ -56,6 +56,28 @@ using HopResetCallback = std::function<void()>;
 using IncompleteRetryCallback =
     std::function<void(int attempt, int max, const std::string & reason)>;
 
+// Fires once per generate() AFTER the prompt-eval llama_decode loop
+// completes and BEFORE the first token is sampled. Mirrors what
+// llama-server emits via stderr / `prompt eval time` — the moment
+// where the user/operator can see "the model finished ingesting the
+// prompt; generation starts now". The callback receives the number
+// of tokens that were actually decoded in this pass (n_tokens), how
+// many were already in the KV cache from a prior turn (n_cached),
+// and the wall time the decode loop took (ms).
+//
+// Streaming layers (server SSE → webui chip + libeasyai-cli on_token
+// pipeline) register this to print a one-line status above the
+// model's first content delta.
+//
+// Skipped when n_tokens == 0 (every prompt token already cached —
+// nothing to report).
+struct PromptEvalReport {
+    int    n_tokens   = 0;     // tokens decoded in this prompt-eval pass
+    int    n_cached   = 0;     // tokens already in KV cache (no decode)
+    double prompt_ms  = 0.0;   // wall time spent in the decode loop
+};
+using PromptEvalCallback = std::function<void(const PromptEvalReport &)>;
+
 class Engine {
    public:
     Engine();
@@ -179,6 +201,7 @@ class Engine {
     Engine & on_tool             (ToolCallback              cb);
     Engine & on_hop_reset        (HopResetCallback          cb);
     Engine & on_incomplete_retry (IncompleteRetryCallback   cb);
+    Engine & on_prompt_eval      (PromptEvalCallback        cb);
 
     // ---------------- lifecycle --------------------------------------------
     bool load();              // loads gguf + builds context. returns true on success.

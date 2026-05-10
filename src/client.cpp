@@ -526,7 +526,8 @@ struct Client::Impl {
                 if (ev.data.empty() || ev.data == "[DONE]") continue;
                 // Skip our server's UI-only custom events.
                 if (ev.event == "easyai.tool_call" ||
-                    ev.event == "easyai.tool_result") continue;
+                    ev.event == "easyai.tool_result" ||
+                    ev.event == "easyai.prompt_eval") continue;
                 ordered_json j;
                 try { j = ordered_json::parse(ev.data); }
                 catch (...) { continue; }

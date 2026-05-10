@@ -66,6 +66,7 @@
 #include <cstring>
 #include <ctime>
 #include <fstream>
+#include <iomanip>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -851,6 +852,33 @@ class AssistantTurn {
     chatEl.scrollTop = chatEl.scrollHeight;
   }
 
+  // server-side prompt-eval completion (mirrors llama-server's
+  // "prompt eval time" stderr line).  Renders a single dim line
+  // above the content area so the user sees the moment ingestion
+  // finished and generation starts.  Replaces a previous prompt-
+  // eval line in the same turn (multi-hop turns get one event per
+  // generate() call; only the most recent matters for the user).
+  addPromptEval(evt){
+    let el = $(':scope > .prompt-eval', this.el);
+    if (!el) {
+      el = document.createElement('div');
+      el.className = 'prompt-eval';
+      el.style.cssText = 'margin:.4rem 0;padding:.2rem .55rem;'
+        + 'border-left:2px solid #d29922;'
+        + 'background:rgba(210,153,34,.08);'
+        + 'border-radius:4px;font-size:.75rem;color:#d29922;'
+        + 'font-family:ui-monospace,SFMono-Regular,Menlo,monospace;';
+      this.el.insertBefore(el, this.contentEl);
+    }
+    const tps = evt.tokens_per_second || 0;
+    const ms  = evt.prompt_ms || 0;
+    const n   = evt.n_tokens   || 0;
+    const cached = evt.n_cached || 0;
+    el.textContent = '📝 prompt eval: ' + n + ' tok'
+      + (cached > 0 ? ' (' + cached + ' cached)' : '')
+      + ' · ' + Math.round(ms) + ' ms · ' + tps.toFixed(1) + ' t/s';
+  }
+
   // server-side tool dispatch — card with running placeholder
   addToolCall(evt){
     const card = document.createElement('div');
@@ -993,6 +1021,7 @@ async function streamChat(messages, settings, handlers, signal){
         const j = JSON.parse(data);
         if (evtType === 'easyai.tool_call')   { handlers.onToolCall && handlers.onToolCall(j); continue; }
         if (evtType === 'easyai.tool_result') { handlers.onToolResult && handlers.onToolResult(j); continue; }
+        if (evtType === 'easyai.prompt_eval') { handlers.onPromptEval && handlers.onPromptEval(j); continue; }
         const ch = j?.choices?.[0];
         if (!ch) continue;
         if (ch.delta?.content)    handlers.onContent && handlers.onContent(ch.delta.content);
@@ -1037,6 +1066,7 @@ async function send(text){
       onContent:         p => turn.addContent(p),
       onToolCall:        e => turn.addToolCall(e),
       onToolResult:      e => turn.addToolResult(e),
+      onPromptEval:      e => turn.addPromptEval(e),
       onClientToolCalls: t => turn.addClientToolCalls(t),
       onFinish:          r => turn.finish(r),
     }, state.abort.signal);
@@ -2229,6 +2259,63 @@ static void handle_chat_stream(ServerCtx & ctx,
                 prev_msg = common_chat_msg{};
                 prev_msg.role = "assistant";
             });
+
+            // Engine fires this once per generate() AFTER the prompt-
+            // eval llama_decode loop completes and BEFORE the first
+            // token is sampled. We surface it as:
+            //   1) A custom SSE event (easyai.prompt_eval) carrying
+            //      n_tokens / n_cached / prompt_ms / tokens_per_second
+            //      — read by our embedded webui's monitorSSE block to
+            //      flip the per-message chip into a 'processing' state
+            //      with the live counters, and by libeasyai-cli's
+            //      Client to fire its own on_prompt_eval callback so
+            //      easyai-cli (non-quiet mode) can print the same
+            //      "prompt eval" status line llama-server reports.
+            //   2) A reasoning_content delta with the same one-line
+            //      summary, so generic OpenAI clients (anything that
+            //      ignores custom event types) still see the timing
+            //      inside the Thinking panel rather than nothing.
+            //   3) A stderr log mirroring llama-server's `prompt eval
+            //      time = X ms / N tokens / T t/s` line.
+            // Fires once per agentic hop (= once per model turn) so
+            // a multi-tool conversation gets one "prompt eval" line
+            // per round-trip, matching what llama-server does.
+            ctx.engine.on_prompt_eval(
+                [&](const easyai::PromptEvalReport & r) {
+                    if (r.n_tokens <= 0) return;
+                    const double tps = r.prompt_ms > 0.0
+                        ? (r.n_tokens * 1000.0 / r.prompt_ms) : 0.0;
+                    ordered_json evt;
+                    evt["choices"] = json::array({{
+                        {"index", 0},
+                        {"delta", json::object()},
+                        {"finish_reason", nullptr},
+                    }});
+                    evt["n_tokens"]            = r.n_tokens;
+                    evt["n_cached"]            = r.n_cached;
+                    evt["prompt_ms"]           = r.prompt_ms;
+                    evt["tokens_per_second"]   = tps;
+                    emit_event("easyai.prompt_eval", safe_dump(evt));
+
+                    std::ostringstream line;
+                    line << "\n📝 prompt eval: " << r.n_tokens << " tok";
+                    if (r.n_cached > 0) line << " (" << r.n_cached << " cached)";
+                    line << " · " << (long long) r.prompt_ms << " ms · "
+                         << std::fixed << std::setprecision(1) << tps
+                         << " t/s\n";
+                    ordered_json delta;
+                    delta["choices"] = json::array({{
+                        {"index", 0},
+                        {"delta", {{"reasoning_content", line.str()}}},
+                        {"finish_reason", nullptr},
+                    }});
+                    emit_data(safe_dump(delta));
+
+                    std::fprintf(stderr,
+                        "[easyai-server] prompt eval: %d tok (%d cached) "
+                        "%.0f ms %.1f t/s\n",
+                        r.n_tokens, r.n_cached, r.prompt_ms, tps);
+                });
 
             // Engine fires this every time it discards an "announce-only"
             // turn and is about to nudge + retry (and once more with
@@ -4829,6 +4916,24 @@ int main(int argc, char ** argv) {
                         "setLive(inThink?'thinking':'answering',liveExtra());"
                         "continue;"
                       "}"
+                      // easyai.prompt_eval — server-side llama-server-style
+                      // 'prompt eval time' report fired right after the
+                      // prompt-eval llama_decode loop completes and BEFORE
+                      // the first token is sampled.  Drives the chip into
+                      // a distinct 'processing' state so the user sees the
+                      // moment ingestion finished, with live n_tokens /
+                      // prompt_ms / t/s metrics.  The matching dim line
+                      // also arrives via a reasoning_content delta so it
+                      // shows in the Thinking panel for posterity.
+                      "if(evtType==='easyai.prompt_eval'){"
+                        "try{"
+                          "const j=JSON.parse(data);"
+                          "const tps=(j.tokens_per_second||0).toFixed(1);"
+                          "const ms=Math.round(j.prompt_ms||0);"
+                          "setLive('processing',j.n_tokens+'tok·'+ms+'ms·'+tps+'t/s');"
+                        "}catch(e){setLive('processing');}"
+                        "continue;"
+                      "}"
                       "try{"
                         "const j=JSON.parse(data);"
                         "if(j.timings){lastTimings=j.timings;"
@@ -5330,6 +5435,10 @@ int main(int argc, char ** argv) {
                   "thinking:'#b97df3',answering:'#1f6feb',"
                   "fetching:'#4fb0ff',error:'#f85149',"
                   "complete:'#3fb950',idle:'#5b626a',"
+                  // 'processing' = prompt-eval phase (llama-server's
+                  // "prompt eval time").  Amber so it visually stands
+                  // apart from blue answering / purple thinking.
+                  "processing:'#d29922',"
                   // 'answered' = past assistant message, no live SSE; the
                   // chip renders an EMPTY circle (transparent fill +
                   // subtle border) so it visually distinguishes "this is
@@ -5536,7 +5645,7 @@ int main(int argc, char ** argv) {
                     // Pulse while we're actively working; stop on
                     // terminal states so the user sees the difference at
                     // a glance.
-                    "const active=(state==='thinking'||state==='answering'||state==='fetching');"
+                    "const active=(state==='thinking'||state==='answering'||state==='fetching'||state==='processing');"
                     "if(active)dot.classList.add('pulse');"
                     "else dot.classList.remove('pulse');"
                   "}"
@@ -5546,6 +5655,8 @@ int main(int argc, char ** argv) {
                       "txt=extra;"
                     "}else if(state==='fetching'&&typeof extra==='string'&&extra){"
                       "txt='fetching·'+extra;"
+                    "}else if(state==='processing'&&typeof extra==='string'&&extra){"
+                      "txt='prompt·'+extra;"
                     "}else if(extra&&typeof extra==='object'&&extra.live){"
                       // Live metrics: state + tok count + elapsed + t/s.
                       "const sec=(extra.elapsedMs/1000).toFixed(1);"

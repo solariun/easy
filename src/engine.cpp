@@ -622,6 +622,7 @@ struct Engine::Impl {
     ToolCallback     on_tool;
     HopResetCallback         on_hop_reset;
     IncompleteRetryCallback  on_incomplete_retry;
+    PromptEvalCallback       on_prompt_eval;
 
     // Cooperative cancel — flipped from another thread (typically the
     // server's SSE provider when the client drops) and polled by the
@@ -1088,6 +1089,9 @@ Engine & Engine::on_hop_reset(HopResetCallback cb)  { p_->on_hop_reset = std::mo
 Engine & Engine::on_incomplete_retry(IncompleteRetryCallback cb) {
     p_->on_incomplete_retry = std::move(cb); return *this;
 }
+Engine & Engine::on_prompt_eval(PromptEvalCallback cb) {
+    p_->on_prompt_eval = std::move(cb); return *this;
+}
 
 bool Engine::load() {
     if (p_->loaded) return true;
@@ -1215,6 +1219,8 @@ std::string Engine::generate() {
         n_past = 0;
     }
     std::vector<llama_token> tail(all.begin() + n_past, all.end());
+    const int n_cached_at_start = n_past;
+    const int n_to_eval         = (int) tail.size();
     if (!tail.empty()) {
         const int n_ctx = llama_n_ctx(p_->ctx());
         if (n_past + (int) tail.size() > n_ctx) {
@@ -1222,6 +1228,7 @@ std::string Engine::generate() {
             return {};
         }
         const int n_batch = p_->params.n_batch > 0 ? p_->params.n_batch : 512;
+        const auto t_eval0 = std::chrono::steady_clock::now();
         for (size_t i = 0; i < tail.size(); i += n_batch) {
             int n = std::min<int>(n_batch, tail.size() - i);
             llama_batch b = llama_batch_get_one(tail.data() + i, n);
@@ -1230,6 +1237,23 @@ std::string Engine::generate() {
                 return {};
             }
             n_past += n;
+        }
+        const auto t_eval1 = std::chrono::steady_clock::now();
+        // Mirror llama-server's "prompt eval time" line. Fired once
+        // per generate() call right after the prompt-eval loop and
+        // BEFORE the first token is sampled — streaming consumers
+        // (server SSE → webui chip + libeasyai-cli) use this to
+        // surface "prompt processed: N tok / X ms / T t/s" so the
+        // user sees the model finished ingesting before the first
+        // visible delta appears.
+        if (p_->on_prompt_eval) {
+            const double prompt_ms =
+                std::chrono::duration<double, std::milli>(t_eval1 - t_eval0).count();
+            p_->on_prompt_eval(PromptEvalReport{
+                /*n_tokens=*/ n_to_eval,
+                /*n_cached=*/ n_cached_at_start,
+                /*prompt_ms=*/ prompt_ms,
+            });
         }
     }
 
