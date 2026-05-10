@@ -13,7 +13,37 @@
 
 namespace easyai {
 
-static constexpr int kMaxBatch = 20;
+static constexpr int kMaxBatch     = 20;
+
+// Per-step 'text' byte cap. Rejects the single-text-stuffed-numbered-
+// list anti-pattern (e.g. "1. analyze X 2. research Y 3. modernize Z…")
+// that small models fall into when they don't realise items=[…] is the
+// way to track multi-step work. 80 bytes comfortably fits a short
+// imperative phrase in any Latin script while making "more than one
+// step in one field" impossible to encode silently.
+static constexpr int kMaxTextChars = 80;
+
+// Build the rejection message for an over-long 'text'. Echoes the head
+// of the offending string so the model can see exactly what tripped the
+// guard and self-correct on retry without another tool round-trip.
+static std::string text_too_long_error(const std::string & text,
+                                       const std::string & where) {
+    std::string preview = text.substr(0, 60);
+    if (text.size() > 60) preview += "…";
+    // Replace any newlines / tabs in the preview so the error reads as
+    // one line in the model's tool_result view (the raw text the model
+    // sent often has the embedded numbered list on a single physical
+    // line, but defensive in case it doesn't).
+    for (char & c : preview) {
+        if (c == '\n' || c == '\r' || c == '\t') c = ' ';
+    }
+    return "plan: " + where + " 'text' is "
+         + std::to_string(text.size()) + " chars (max "
+         + std::to_string(kMaxTextChars) + "). Each step is a SHORT "
+         "imperative phrase, NEVER a numbered list. Split this into "
+         "multiple items via items=[{text:\"step 1\"},{text:\"step 2\"},…] "
+         "instead. Got: \"" + preview + "\"";
+}
 
 // Strip C0 control bytes (incl. ESC, 0x1b) and DEL from model-supplied
 // plan-item text before we render it. Preserves UTF-8 multi-byte
@@ -169,7 +199,9 @@ Tool Plan::tool() {
             R"(level are ignored.",)"
             R"("items":{"type":"object","properties":{)"
                 R"("id":{"type":"string"},)"
-                R"("text":{"type":"string"},)"
+                R"("text":{"type":"string","maxLength":80,)"
+                    R"("description":"HARD LIMIT 80 chars. ONE short )"
+                    R"(imperative phrase per entry. NEVER a numbered list."},)"
                 R"("status":{"type":"string",)"
                     R"("enum":["pending","working","done","error","deleted"]})"
             R"(}}},)"
@@ -179,11 +211,16 @@ Tool Plan::tool() {
             R"((e.g. \"3\"). NEVER invent an id — only ids you have just )"
             R"(seen in a tool result are valid. With action='delete' the )"
             R"(literal string \"all\" wipes every step at once."},)"
-        R"("text":{"type":"string","description":)"
+        R"("text":{"type":"string","maxLength":80,"description":)"
             R"("Used by single add (the new step's content) or single update )"
-            R"((replacement text for the existing step). One short )"
-            R"(imperative phrase per step (e.g. \"fetch arxiv index\"); )"
-            R"(control characters are stripped."},)"
+            R"((replacement text for the existing step). HARD LIMIT: 80 )"
+            R"(characters per step. MUST be ONE SHORT IMPERATIVE PHRASE )"
+            R"((e.g. \"fetch arxiv index\", \"write Makefile\"). NEVER stuff )"
+            R"(a numbered list, comma-separated list, or multi-step plan into )"
+            R"(this field — split into separate items via )"
+            R"(items=[{text:\"step 1\"},{text:\"step 2\"},…]. The server will )"
+            R"(REJECT any text > 80 chars with an error. Control characters )"
+            R"(are stripped."},)"
         R"("status":{"type":"string",)"
             R"("enum":["pending","working","done","error","deleted"],)"
             R"("description":"Used by single update, or as an optional field )"
@@ -211,6 +248,12 @@ Tool Plan::tool() {
         "tool calls, or pure information lookups.\n"
         "\n"
         "CRITICAL — never violate:\n"
+        "  • Each step's 'text' is HARD-CAPPED at 80 characters AND must "
+        "be ONE short imperative phrase (e.g. \"write Makefile\", "
+        "\"fetch arxiv index\"). NEVER cram a numbered list, comma list, "
+        "or multi-step plan into a single 'text' field — the server will "
+        "REJECT it. To track several steps at once, pass them as separate "
+        "entries: items=[{text:\"step 1\"},{text:\"step 2\"},…].\n"
         "  • Each step has an INTEGER id assigned by 'add' (rendered as "
         "\"1\", \"2\", \"3\", …). IDs are stable and never change.\n"
         "  • To mark a step STARTED:  action=\"update\", id=\"N\", "
@@ -332,9 +375,14 @@ Tool Plan::tool() {
                     if ((int) elems.size() > kMaxBatch)
                         return ToolResult::error("plan: max 20 items per call");
                     std::string ids;
+                    int idx = 0;
                     for (const auto & e : elems) {
+                        ++idx;
                         std::string t = args::get_string_or(e, "text", "");
                         if (t.empty()) continue;
+                        if ((int) t.size() > kMaxTextChars)
+                            return ToolResult::error(text_too_long_error(
+                                t, "add items[" + std::to_string(idx - 1) + "]"));
                         std::string id = self->add(std::move(t));
                         // Honor an optional per-item status so models can
                         // create + mark "working" in one call.
@@ -357,6 +405,8 @@ Tool Plan::tool() {
                         "{action:\"add\",text:\"my step\"} or "
                         "{action:\"add\",items:[{text:\"a\"},{text:\"b\"}]}. "
                         "items must be a real JSON array, not a quoted string.");
+                if ((int) text.size() > kMaxTextChars)
+                    return ToolResult::error(text_too_long_error(text, "add"));
                 std::string id = self->add(std::move(text));
                 return ToolResult::ok("added id=" + id + "\n" +
                                       self->render_string());
@@ -371,11 +421,16 @@ Tool Plan::tool() {
                     if ((int) elems.size() > kMaxBatch)
                         return ToolResult::error("plan: max 20 items per call");
                     int ok_count = 0;
+                    int idx = 0;
                     for (const auto & e : elems) {
+                        ++idx;
                         std::string id = args::get_string_or(e, "id", "");
                         if (id.empty()) continue;
                         std::string t = args::get_string_or(e, "text", "");
                         std::string s = args::get_string_or(e, "status", "");
+                        if (!t.empty() && (int) t.size() > kMaxTextChars)
+                            return ToolResult::error(text_too_long_error(
+                                t, "update items[" + std::to_string(idx - 1) + "]"));
                         if (self->update(id, t, s)) ++ok_count;
                     }
                     return ToolResult::ok("updated " + std::to_string(ok_count) +
@@ -392,6 +447,8 @@ Tool Plan::tool() {
                     call.arguments_json, "text", "");
                 std::string status = args::get_string_or(
                     call.arguments_json, "status", "");
+                if (!text.empty() && (int) text.size() > kMaxTextChars)
+                    return ToolResult::error(text_too_long_error(text, "update"));
                 if (!self->update(id, text, status))
                     return ToolResult::error("plan: unknown id " + id);
                 return ToolResult::ok("updated " + id + "\n" +
