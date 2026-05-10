@@ -180,9 +180,25 @@ public:
     using TokenCallback = std::function<void(const std::string &)>;
     using ToolCallback  = std::function<void(const ToolCall &, const ToolResult &)>;
 
-    Client & on_token  (TokenCallback);   // delta.content (visible reply)
-    Client & on_reason (TokenCallback);   // delta.reasoning_content (thinking)
-    Client & on_tool   (ToolCallback);    // every dispatched tool round-trip
+    // Per-batch prompt-eval progress fired during the server's prompt
+    // ingestion (before the first generated token).  Mirrors the
+    // easyai.prompt_progress SSE event the server emits, which itself
+    // mirrors llama-server's `prompt_progress` shape so any backend
+    // speaking that contract works.  Args:
+    //   processed — tokens decoded so far in this prompt-eval pass
+    //   total     — total tokens that need decoding
+    //   cached    — tokens already in KV cache (prefix that did NOT
+    //                need decoding; reported for context only)
+    //   ms        — wall time elapsed since prompt processing started
+    // The cli's shimmer reads this to render a real "thinking N%"
+    // gauge instead of an animated placeholder.
+    using PromptProgressCallback = std::function<void(
+        int processed, int total, int cached, double ms)>;
+
+    Client & on_token           (TokenCallback);   // delta.content (visible reply)
+    Client & on_reason          (TokenCallback);   // delta.reasoning_content (thinking)
+    Client & on_tool            (ToolCallback);    // every dispatched tool round-trip
+    Client & on_prompt_progress (PromptProgressCallback);  // per-batch prompt-eval %
 
     // ----- chat ------------------------------------------------------------
     // chat() pushes the user message, runs the agentic multi-hop loop

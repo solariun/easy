@@ -106,7 +106,10 @@ void Spinner::set_thinking(bool on) {
         // spotlight always starts from the left edge of the word —
         // otherwise a quick prompt would catch the wave mid-pass and
         // it'd look like the animation is jumpy.
-        if (on) shimmer_phase_ = 0;
+        if (on) {
+            shimmer_phase_ = 0;
+            thinking_pct_  = -1;   // clear stale % from the previous turn
+        }
         if (active_) {
             erase_active_locked_();
             draw_locked_();
@@ -117,6 +120,24 @@ void Spinner::set_thinking(bool on) {
     // (kThinkingIntervalMs vs kIdleIntervalMs) on the very next sleep
     // instead of finishing whatever wait it was already in.
     hb_cv_.notify_all();
+}
+
+void Spinner::set_thinking_pct(int pct) {
+    if (!enabled_) return;
+    if (pct < 0)        pct = -1;
+    else if (pct > 100) pct = 100;
+    std::lock_guard<std::mutex> lg(mu_);
+    if (thinking_pct_ == pct) return;
+    thinking_pct_ = pct;
+    // Repaint immediately if the shimmer is currently visible so the
+    // operator sees the gauge tick up between heartbeats — server
+    // emits one progress event per n_batch which is faster than the
+    // 100 ms heartbeat for big prompts.
+    if (active_ && thinking_.load(std::memory_order_relaxed)) {
+        erase_active_locked_();
+        draw_locked_();
+        std::fflush(stdout);
+    }
 }
 
 void Spinner::start_heartbeat(int interval_ms) {
@@ -197,12 +218,19 @@ void Spinner::draw_thinking_locked_() {
     static const int kBaseColor    = 235;   // out-of-spotlight chars
 
     // Build the visible text first so we know its cell width for the
-    // sweep period and the active_width_ tracking.
+    // sweep period and the active_width_ tracking.  The suffix is the
+    // REAL prompt-eval progress fed by Client::on_prompt_progress
+    // (server's easyai.prompt_progress events, mirroring llama-server's
+    // `prompt_progress` field).  We deliberately do NOT fall back to
+    // ctx_pct_ here because that's stale data from the prior turn —
+    // showing it would mislead the operator into thinking the prompt
+    // is mostly processed when only ctx fill is high.  No suffix is
+    // honest until the first progress tick arrives.
     char suffix[12] = {0};
     int  suffix_len = 0;
-    if (context_pct_ >= 0) {
+    if (thinking_pct_ >= 0) {
         suffix_len = std::snprintf(suffix, sizeof(suffix),
-                                   " %d%%", context_pct_);
+                                   " %d%%", thinking_pct_);
         if (suffix_len < 0) suffix_len = 0;
     }
     static const char kWord[] = "thinking";

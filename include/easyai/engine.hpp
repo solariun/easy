@@ -78,6 +78,40 @@ struct PromptEvalReport {
 };
 using PromptEvalCallback = std::function<void(const PromptEvalReport &)>;
 
+// Fires BETWEEN batches of the prompt-eval llama_decode loop —
+// one tick per `n_batch` tokens decoded plus a final tick at 100 %.
+// Mirrors llama-server's `prompt_progress` SSE field
+// ({total, cache, processed, time_ms}) so streaming consumers can
+// surface a real "thinking N %" gauge during the prompt-ingestion
+// window, instead of the polite-fiction spinner that just animates
+// in place while the user waits.
+//
+// Args mirror the llama-server payload:
+//   processed — tokens decoded so far in THIS prompt-eval pass
+//   total     — total tokens that need decoding in this pass
+//                (== processed at completion)
+//   cached    — tokens already in the KV cache from a prior turn
+//                (the prefix that did NOT need decoding)
+//   ms        — wall time elapsed since the decode loop started
+//
+// processed / total → overall progress 0..1.
+// (processed - 0) / (total - 0) → same here because cached are NOT
+// part of total in our accounting; the cached count is reported as
+// context only, exactly like llama-server when stream resumes from a
+// shared prefix.
+//
+// Skipped entirely when total == 0 (everything cached). Fires at
+// least twice for any non-trivial prompt: once with processed >= n_batch
+// and once at processed == total. For a tiny prompt that fits in one
+// batch the only tick is the final one.
+struct PromptProgressReport {
+    int    processed = 0;
+    int    total     = 0;
+    int    cached    = 0;
+    double ms        = 0.0;
+};
+using PromptProgressCallback = std::function<void(const PromptProgressReport &)>;
+
 class Engine {
    public:
     Engine();
@@ -202,6 +236,7 @@ class Engine {
     Engine & on_hop_reset        (HopResetCallback          cb);
     Engine & on_incomplete_retry (IncompleteRetryCallback   cb);
     Engine & on_prompt_eval      (PromptEvalCallback        cb);
+    Engine & on_prompt_progress  (PromptProgressCallback    cb);
 
     // ---------------- lifecycle --------------------------------------------
     bool load();              // loads gguf + builds context. returns true on success.

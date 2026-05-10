@@ -324,9 +324,10 @@ struct Client::Impl {
     std::vector<Tool> tools;
 
     // Callbacks.
-    Client::TokenCallback on_token;
-    Client::TokenCallback on_reason;
-    Client::ToolCallback  on_tool;
+    Client::TokenCallback          on_token;
+    Client::TokenCallback          on_reason;
+    Client::ToolCallback           on_tool;
+    Client::PromptProgressCallback on_prompt_progress;
 
     // Conversation state.  Each entry is one OpenAI message (raw JSON
     // object) so we don't leak nlohmann::json into the public ABI.
@@ -528,6 +529,24 @@ struct Client::Impl {
                 if (ev.event == "easyai.tool_call" ||
                     ev.event == "easyai.tool_result" ||
                     ev.event == "easyai.prompt_eval") continue;
+                // Per-batch prompt-eval progress — fire the typed
+                // callback so cli's shimmer can paint a real "thinking
+                // N%" gauge. The event payload mirrors llama-server's
+                // `prompt_progress` shape so consumers that already
+                // speak that contract work without changes.
+                if (ev.event == "easyai.prompt_progress") {
+                    if (on_prompt_progress) {
+                        try {
+                            auto j = ordered_json::parse(ev.data);
+                            int processed = j.value("processed", 0);
+                            int total     = j.value("total",     0);
+                            int cached    = j.value("cache",     0);
+                            double ms     = j.value("time_ms",   0.0);
+                            on_prompt_progress(processed, total, cached, ms);
+                        } catch (...) { /* best-effort */ }
+                    }
+                    continue;
+                }
                 ordered_json j;
                 try { j = ordered_json::parse(ev.data); }
                 catch (...) { continue; }
@@ -1174,6 +1193,9 @@ const std::vector<Tool> & Client::tools() const { return p_->tools; }
 Client & Client::on_token  (TokenCallback cb) { p_->on_token  = std::move(cb); return *this; }
 Client & Client::on_reason (TokenCallback cb) { p_->on_reason = std::move(cb); return *this; }
 Client & Client::on_tool   (ToolCallback  cb) { p_->on_tool   = std::move(cb); return *this; }
+Client & Client::on_prompt_progress(PromptProgressCallback cb) {
+    p_->on_prompt_progress = std::move(cb); return *this;
+}
 
 // Cooperative cancel — see client.hpp for design notes.
 Client & Client::request_cancel() {

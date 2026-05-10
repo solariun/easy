@@ -2260,6 +2260,54 @@ static void handle_chat_stream(ServerCtx & ctx,
                 prev_msg.role = "assistant";
             });
 
+            // Engine fires this between every batch of the prompt-eval
+            // llama_decode loop (default n_batch=512 → one tick per
+            // 512 tokens, plus a final tick at processed==total). We
+            // surface it as `event: easyai.prompt_progress` carrying
+            // {total, cache, processed, time_ms} — same shape
+            // llama-server emits in its own `prompt_progress` field
+            // (return_progress=true) so any client that already speaks
+            // that contract works without changes. Drives the cli
+            // shimmer's real "thinking N%" gauge and the webui chip's
+            // "processing N%" label.
+            //
+            // Throttle: skip ticks that are < 80 ms apart from the
+            // previous emit AND < 5 percentage points further along.
+            // Keeps the SSE stream cheap on huge prompts (a 32 K-token
+            // prompt at n_batch=512 generates 64 ticks; throttling
+            // collapses them to ~12 visible updates) without losing
+            // the final tick (always emitted).
+            auto last_emit_ms  = std::make_shared<double>(-1.0);
+            auto last_emit_pct = std::make_shared<int>(-1);
+            ctx.engine.on_prompt_progress(
+                [&, last_emit_ms, last_emit_pct]
+                (const easyai::PromptProgressReport & r) {
+                    if (r.total <= 0) return;
+                    const int pct = (int)(100.0 * r.processed / r.total);
+                    const bool is_final = (r.processed >= r.total);
+                    if (!is_final) {
+                        if (*last_emit_ms >= 0
+                                && r.ms - *last_emit_ms < 80.0
+                                && pct - *last_emit_pct < 5) {
+                            return;
+                        }
+                    }
+                    *last_emit_ms  = r.ms;
+                    *last_emit_pct = pct;
+                    ordered_json evt;
+                    evt["choices"] = json::array({{
+                        {"index", 0},
+                        {"delta", json::object()},
+                        {"finish_reason", nullptr},
+                    }});
+                    evt["total"]     = r.total;
+                    evt["cache"]     = r.cached;
+                    evt["processed"] = r.processed;
+                    evt["time_ms"]   = r.ms;
+                    evt["pct"]       = pct;   // convenience for clients
+                    emit_event("easyai.prompt_progress", safe_dump(evt));
+                });
+
             // Engine fires this once per generate() AFTER the prompt-
             // eval llama_decode loop completes and BEFORE the first
             // token is sampled. We surface it as:

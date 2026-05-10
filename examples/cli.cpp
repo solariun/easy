@@ -1154,6 +1154,18 @@ int run_one(easyai::Client & cli, easyai::Plan & plan,
     // moment generation begins.  We also flip it off explicitly after
     // chat() returns to cover the no-output / error / cancel paths.
     spinner.set_thinking(true);
+    // Real prompt-eval progress wired from the server's per-batch
+    // easyai.prompt_progress events (mirrors llama-server's
+    // `prompt_progress` shape). Without this the shimmer's "xx%"
+    // would either be absent or fall back to stale ctx_pct from the
+    // previous turn — neither of which tells the operator how far
+    // through the prompt the model actually is. Cleared automatically
+    // when set_thinking(false) fires on the first generated piece.
+    cli.on_prompt_progress(
+        [&spinner](int processed, int total, int /*cached*/, double /*ms*/) {
+            if (total <= 0) return;
+            spinner.set_thinking_pct((int)(100.0 * processed / total));
+        });
 
     // Mark in-flight: the signal handler reads this to decide between
     // graceful (mid-chat) and prompt-level (between turns) handling.

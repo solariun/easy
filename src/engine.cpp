@@ -623,6 +623,7 @@ struct Engine::Impl {
     HopResetCallback         on_hop_reset;
     IncompleteRetryCallback  on_incomplete_retry;
     PromptEvalCallback       on_prompt_eval;
+    PromptProgressCallback   on_prompt_progress;
 
     // Cooperative cancel — flipped from another thread (typically the
     // server's SSE provider when the client drops) and polled by the
@@ -1092,6 +1093,9 @@ Engine & Engine::on_incomplete_retry(IncompleteRetryCallback cb) {
 Engine & Engine::on_prompt_eval(PromptEvalCallback cb) {
     p_->on_prompt_eval = std::move(cb); return *this;
 }
+Engine & Engine::on_prompt_progress(PromptProgressCallback cb) {
+    p_->on_prompt_progress = std::move(cb); return *this;
+}
 
 bool Engine::load() {
     if (p_->loaded) return true;
@@ -1229,6 +1233,7 @@ std::string Engine::generate() {
         }
         const int n_batch = p_->params.n_batch > 0 ? p_->params.n_batch : 512;
         const auto t_eval0 = std::chrono::steady_clock::now();
+        int processed = 0;
         for (size_t i = 0; i < tail.size(); i += n_batch) {
             int n = std::min<int>(n_batch, tail.size() - i);
             llama_batch b = llama_batch_get_one(tail.data() + i, n);
@@ -1236,7 +1241,25 @@ std::string Engine::generate() {
                 p_->last_error = "llama_decode failed feeding prompt";
                 return {};
             }
-            n_past += n;
+            n_past    += n;
+            processed += n;
+            // Per-batch progress tick — mirrors llama-server's
+            // `prompt_progress` SSE field. Streaming consumers (server
+            // SSE → cli shimmer "thinking N%") read this to render a
+            // real progress gauge during the prompt-ingestion window
+            // instead of a polite-fiction spinner. Always fires at
+            // least once at processed == n_to_eval (loop exit).
+            if (p_->on_prompt_progress) {
+                const double ms_now =
+                    std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - t_eval0).count();
+                p_->on_prompt_progress(PromptProgressReport{
+                    /*processed=*/ processed,
+                    /*total=*/     n_to_eval,
+                    /*cached=*/    n_cached_at_start,
+                    /*ms=*/        ms_now,
+                });
+            }
         }
         const auto t_eval1 = std::chrono::steady_clock::now();
         // Mirror llama-server's "prompt eval time" line. Fired once
