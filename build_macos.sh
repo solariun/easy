@@ -24,20 +24,24 @@
 #   * PrismML fork  → Bonsai-8B-Q1_0 (Q1_0 kernel only lives there)
 #   * Upstream      → every other quant family
 #
-# This script ONLY configures + builds. No install step. Output lands
-# under ./build-macos/. For the full first-time setup, use
-# scripts/install_easyai_macos.sh.
+# By default this script ONLY configures + builds. Output lands under
+# ./build-macos/. Pass --install to ALSO run `sudo cmake --install`
+# into /usr/local (override with --prefix). For the full first-time
+# setup including deps + a default model, use scripts/install_easyai_macos.sh.
 #
 # Build deps (one-time):
 #   xcode-select --install
 #   brew install cmake git curl
 #
 # Usage:
-#   ./build_macos.sh                 # Release, all logical cores
-#   ./build_macos.sh --debug         # Debug build
-#   ./build_macos.sh --jobs 6        # explicit -j 6
-#   ./build_macos.sh --rebuild       # wipe build-macos/ first
+#   ./build_macos.sh                          # Release, all logical cores
+#   ./build_macos.sh --debug                  # Debug build
+#   ./build_macos.sh --jobs 6                 # explicit -j 6
+#   ./build_macos.sh --rebuild                # wipe build-macos/ first
 #   ./build_macos.sh --build-dir build-foo
+#   ./build_macos.sh --install                # build then `sudo cmake --install` to /usr/local
+#   ./build_macos.sh --install --prefix /opt/easyai
+#                                             # custom install prefix (still via sudo)
 # =============================================================================
 
 set -euo pipefail
@@ -48,6 +52,8 @@ BUILD_DIR="${BUILD_DIR:-$script_dir/build-macos}"
 BUILD_TYPE="${BUILD_TYPE:-Release}"
 JOBS="${JOBS:-$(sysctl -n hw.logicalcpu 2>/dev/null || echo 4)}"
 REBUILD=0
+DO_INSTALL=0
+INSTALL_PREFIX="${INSTALL_PREFIX:-/usr/local}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -55,6 +61,8 @@ while [[ $# -gt 0 ]]; do
         --debug)     BUILD_TYPE=Debug; shift ;;
         --jobs)      JOBS="$2"; shift 2 ;;
         --build-dir) BUILD_DIR="$2"; shift 2 ;;
+        --install)   DO_INSTALL=1; shift ;;
+        --prefix)    INSTALL_PREFIX="$2"; DO_INSTALL=1; shift 2 ;;
         -h|--help)
             sed -n '/^# Usage:/,/^# ===/p' "$0" | sed 's/^# \{0,1\}//'
             exit 0 ;;
@@ -156,8 +164,49 @@ cmake --build "$BUILD_DIR" -j "$JOBS"
 echo
 echo "==> Done. Binaries in $BUILD_DIR:"
 ls "$BUILD_DIR" 2>/dev/null | grep -E '^easyai' | sed 's/^/    /'
-echo
-echo "Run one without installing, e.g.:"
-echo "    $BUILD_DIR/easyai-server -m \$HOME/easyai/models/Bonsai-8B-Q1_0.gguf \\"
-echo "        --ngl 99 -c 8192 --temperature 0.5 --top-p 0.85 --top-k 20 \\"
-echo "        --host 0.0.0.0 --port 8080"
+
+if [[ "$DO_INSTALL" == "1" ]]; then
+    # Decide on sudo: anything under /usr/local on Apple Silicon is
+    # root-owned, and even on Intel /usr/local/bin is in the admin group
+    # so unprivileged installs partially fail with confusing chmod
+    # errors. Detect by trying to write a probe file; sudo if not
+    # writable. Honours an explicit --prefix in $HOME so writable
+    # custom prefixes don't gratuitously prompt.
+    sudo_cmd=""
+    probe="$INSTALL_PREFIX/.easyai-write-probe.$$"
+    if mkdir -p "$INSTALL_PREFIX" 2>/dev/null && : > "$probe" 2>/dev/null; then
+        rm -f "$probe"
+    else
+        sudo_cmd="sudo"
+    fi
+
+    echo
+    echo "==> Installing into $INSTALL_PREFIX${sudo_cmd:+ (via sudo)}"
+    # `cmake --install ... --prefix X` overrides CMAKE_INSTALL_PREFIX
+    # at install time so the build directory doesn't need
+    # reconfiguration when the operator points at a non-default prefix.
+    $sudo_cmd cmake --install "$BUILD_DIR" --prefix "$INSTALL_PREFIX"
+
+    echo
+    echo "==> Installed to $INSTALL_PREFIX:"
+    ls "$INSTALL_PREFIX/bin" 2>/dev/null | grep -E '^easyai' | sed "s|^|    $INSTALL_PREFIX/bin/|"
+    echo
+    case ":$PATH:" in
+        *":$INSTALL_PREFIX/bin:"*) : ;;
+        *) echo "    NOTE: $INSTALL_PREFIX/bin is not in \$PATH — add it to use the binaries by name." ;;
+    esac
+    echo "Run e.g.:"
+    echo "    easyai-server -m \$HOME/easyai/models/Bonsai-8B-Q1_0.gguf \\"
+    echo "        --ngl 99 -c 8192 --temperature 0.5 --top-p 0.85 --top-k 20 \\"
+    echo "        --host 0.0.0.0 --port 8080"
+else
+    echo
+    echo "Run one without installing, e.g.:"
+    echo "    $BUILD_DIR/easyai-server -m \$HOME/easyai/models/Bonsai-8B-Q1_0.gguf \\"
+    echo "        --ngl 99 -c 8192 --temperature 0.5 --top-p 0.85 --top-k 20 \\"
+    echo "        --host 0.0.0.0 --port 8080"
+    echo
+    echo "Or install system-wide with:"
+    echo "    ./build_macos.sh --install               # → /usr/local (sudo)"
+    echo "    ./build_macos.sh --install --prefix /opt/easyai"
+fi
