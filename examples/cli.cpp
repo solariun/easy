@@ -1159,11 +1159,24 @@ int run_one(easyai::Client & cli, easyai::Plan & plan,
     // `prompt_progress` shape). Without this the shimmer's "xx%"
     // would either be absent or fall back to stale ctx_pct from the
     // previous turn — neither of which tells the operator how far
-    // through the prompt the model actually is. Cleared automatically
-    // when set_thinking(false) fires on the first generated piece.
+    // through the prompt the model actually is.
+    //
+    // set_thinking(true) here is the multi-hop hook: in agentic flows
+    // the server runs a fresh prompt-eval pass after every tool
+    // dispatch (system + user + ... + tool_result + assistant primer
+    // → llama_decode), and emits easyai.prompt_progress for each.
+    // Without this re-entry the shimmer would only show on the very
+    // first hop; subsequent "model digesting tool result" windows
+    // would silently fall back to the rotating |/- glyph and the
+    // operator would have no visual cue that real work is happening.
+    // Idempotent on hop 0 (already in thinking mode from the
+    // explicit set_thinking(true) above); the next on_token /
+    // on_reason / on_tool from Streaming flips it back off as soon
+    // as generation begins for that hop.
     cli.on_prompt_progress(
         [&spinner](int processed, int total, int /*cached*/, double /*ms*/) {
             if (total <= 0) return;
+            spinner.set_thinking(true);
             spinner.set_thinking_pct((int)(100.0 * processed / total));
         });
 
