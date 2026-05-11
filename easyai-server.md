@@ -324,7 +324,7 @@ unchanged.
 | GET | `/` | webui | (open) | Embedded SvelteKit chat UI. |
 | GET | `/bundle.{js,css}` | webui | (open) | Bundle assets. |
 | GET | `/loading.html` | webui | (open) | Loading splash. |
-| GET | `/favicon` (+ `.ico`/`.svg`) | webui | (open) | Operator-supplied or embedded brain SVG. |
+| GET | `/favicon` (+ `.ico`/`.svg`) | webui | (open) | Operator-supplied (`--webui-icon`) or the embedded AI Box logo SVG (compiled into the binary as `kBrandSvg`; canonical copy at `webui/AI-brain.svg`). |
 | GET | `/health` | easyai | (open) | `{model, backend, tools, preset, compat:{...}}` — liveness probe. |
 | GET | `/metrics` | easyai | api_key | Prometheus exposition (only when `--metrics` is on). |
 | GET | `/v1/models` | OpenAI | api_key | OpenAI-shape list-models. |
@@ -544,7 +544,7 @@ Operator-tunable knobs (all match an INI key — `webui_title`,
 | CLI | INI | Default | Notes |
 | --- | --- | --- | --- |
 | `--webui-title <str>` | `webui_title` | `Deep` | Sidebar / window title text. |
-| `--webui-icon <path>` | `webui_icon` | (embedded brain SVG) | `.ico` / `.png` / `.svg` / `.gif` / `.jpg` / `.webp`. |
+| `--webui-icon <path>` | `webui_icon` | (embedded AI Box logo SVG) | `.ico` / `.png` / `.svg` / `.gif` / `.jpg` / `.webp`. |
 | `--webui <mode>` | `webui_mode` | `modern` | `modern` (embedded bundle) or `minimal` (single-file inline UI). |
 | `--webui-placeholder <str>` | `webui_placeholder` | `Type a message…` | Input box hint. |
 
@@ -746,12 +746,18 @@ Highlights of the work documented in [`SECURITY_AUDIT.md`](SECURITY_AUDIT.md):
   win the race by pre-planting a symlink at the predictable path; mode
   `0600` keeps prompt content (which can include API keys / PII) private
   to the running user even on multi-tenant hosts.
-- **Four audit passes** — first / second / third / fourth (latest
-  2026-05-02, closing the `/tmp` log symlink/race; the third pass on
-  2026-04-30 closed 3 HIGH and 7 MEDIUM findings including the
-  `apply_ini_to_args` dead-code path, `--no-mcp-auth` disconnect,
-  sandbox symlink escape, and `bash` fork-hardening parity with
-  external-tools).
+- **Seven audit passes** — the standing review in
+  [`SECURITY_AUDIT.md`](SECURITY_AUDIT.md) runs end-to-end on every
+  pass and adds a delta section for new surfaces.  Latest pass
+  2026-05-11 (7th), with §22.8 follow-up the same day closing a HIGH
+  data-integrity bug on `fs(action="edit")` (silent seam-line glue
+  when `content` lacked a trailing `\n`).  Earlier passes closed the
+  `/tmp` log symlink race (4th), `apply_ini_to_args` dead code +
+  sandbox symlink escape + `bash` fork-hardening (3rd), `bash`
+  live-mirror terminal-escape injection (5th), `presence_penalty`
+  NaN/Inf accept + persistent-httplib setter races (6th), and the
+  python3-tool banner + sandbox-preamble closure-cell tightening
+  (7th).
 
 For threat models requiring OS-level isolation: run easyai-server
 inside a container / firejail / unprivileged user with disabled
@@ -780,7 +786,7 @@ ask for; the OS bounds what the *agent process* can do.
   `rag(action=...)` tool, workflows.
 - [`EXTERNAL_TOOLS.md`](EXTERNAL_TOOLS.md) — operator-defined
   external tools (`EASYAI-*.tools` JSON manifests).
-- [`SECURITY_AUDIT.md`](SECURITY_AUDIT.md) — three audit passes,
+- [`SECURITY_AUDIT.md`](SECURITY_AUDIT.md) — seven audit passes,
   HIGH / MEDIUM / LOW findings, accepted residual risk.
 - [`design.md`](design.md) — architecture + why decisions.
 - [`manual.md`](manual.md) — hands-on developer manual.

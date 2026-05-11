@@ -723,7 +723,7 @@ What's planned next, roughly in priority order:
   tool, workflows.
 - [`EXTERNAL_TOOLS.md`](EXTERNAL_TOOLS.md) — operator-defined
   external tools (`EASYAI-*.tools` JSON manifests).
-- [`SECURITY_AUDIT.md`](SECURITY_AUDIT.md) — three audit passes,
+- [`SECURITY_AUDIT.md`](SECURITY_AUDIT.md) — seven audit passes,
   HIGH / MEDIUM / LOW findings, accepted residual risk.
 - [`design.md`](design.md) — architecture + why decisions.
 - [`AI_TOOLS.md`](AI_TOOLS.md) — vendor-neutral background on AI
