@@ -37,6 +37,9 @@
 #   ./install_easyai_server.sh --backend vulkan      # force backend
 #   ./install_easyai_server.sh --service-port 8080
 #   ./install_easyai_server.sh --service-host 0.0.0.0
+#   ./install_easyai_server.sh --mdns-hostname my-ai # box becomes my-ai.local
+#                                                    # default: ai (so ai.local)
+#                                                    # ignored under --no-avahi
 #   ./install_easyai_server.sh --ctx-size 32768   # default 100000 (100 K)
 #   ./install_easyai_server.sh --ngl 99            # GPU layers (-1=auto, 0=CPU)
 #   ./install_easyai_server.sh --no-mlock --use-mmap
@@ -108,6 +111,11 @@ service_host="0.0.0.0"
 service_port=80                                # matches install_llama_server.sh default
 service_alias="EasyAi"
 service_name="easyai-server.service"
+# mDNS / kernel hostname. We rename the system hostname here so the box
+# advertises as `<mdns_hostname>.local` via avahi. Default "ai" yields
+# the canonical "ai.local". Skipped entirely when --no-avahi is passed
+# (operator keeps their existing hostname and falls back to LAN-IP).
+mdns_hostname="ai"
 
 config_dir="/etc/easyai"
 # By default the binary's built-in "Deep" prompt wins (no system_file
@@ -235,6 +243,7 @@ while [[ $# -gt 0 ]]; do
         --force)            do_force=1; do_force_service=1; shift ;;
         --service-host)     service_host="$2"; shift 2 ;;
         --service-port)     service_port="$2"; shift 2 ;;
+        --mdns-hostname)    mdns_hostname="$2"; shift 2 ;;
         --alias)            service_alias="$2"; shift 2 ;;
         --ctx-size)         ctx_size="$2"; shift 2 ;;
         --ngl|--n-gpu-layers) ngl="$2"; shift 2 ;;
@@ -301,7 +310,7 @@ while [[ $# -gt 0 ]]; do
             exit 0 ;;
         # -----------------------------------------------------------------
 
-        -h|--help)          sed -n '2,46p' "$0"; exit 0 ;;
+        -h|--help)          sed -n '2,49p' "$0"; exit 0 ;;
         *)
             echo "unknown arg: $1" >&2
             echo "run with --help for usage" >&2
@@ -370,6 +379,13 @@ require_no_injection "--webui-title"  "$webui_title"
 require_no_injection "--cache-type-k" "$cache_type_k"
 require_no_injection "--cache-type-v" "$cache_type_v"
 
+# Hostname must be a valid RFC 1123 label: letters / digits / hyphens,
+# no leading or trailing hyphen, max 63 chars. hostnamectl would reject
+# malformed names anyway; catching it here gives a friendlier error.
+if [[ ! "$mdns_hostname" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$ ]]; then
+    die "--mdns-hostname: must be a valid hostname label (letters/digits/hyphens, ≤63 chars), got: $(printf '%q' "$mdns_hostname")"
+fi
+
 if [[ "$(uname -s)" != "Linux" ]]; then
     die "this installer targets Linux. On macOS, build manually — see README.md (Build for your hardware)."
 fi
@@ -421,6 +437,8 @@ printf '    backend          = %s\n' "$backend_resolved"
 printf '    service_host     = %s\n' "$service_host"
 printf '    service_port     = %s\n' "$service_port"
 printf '    service_alias    = %s\n' "$service_alias"
+printf '    mdns_hostname    = %s   (advertises as %s.local; skipped under --no-avahi)\n' \
+    "$mdns_hostname" "$mdns_hostname"
 printf '    ctx_size         = %s\n' "$ctx_size"
 printf '    ngl              = %s   (-1=auto, 0=CPU only, 99=all GPU layers)\n' "$ngl"
 printf '    threads / batch  = %s / %s\n' "$n_threads_default" "$n_threads_batch_default"
@@ -1383,10 +1401,36 @@ UNIT
 fi
 
 # ---------- avahi / mDNS ----------------------------------------------------
+# Two things together so the box shows up on the LAN as
+# `<mdns_hostname>.local`:
+#   1. Rename the system hostname so the kernel's mDNS announcement
+#      advertises the right A record. avahi-daemon auto-publishes
+#      /etc/hostname; no avahi config edit is needed for the basic
+#      <name>.local resolution. /etc/hosts is kept in sync so sudo
+#      doesn't complain about "unable to resolve host" next boot.
+#   2. Drop /etc/avahi/services/easyai.service so DNS-SD aware clients
+#      discover the easyai HTTP endpoint as a service under
+#      <name>.local._http._tcp.
+# --no-avahi skips both — operator keeps their existing hostname.
 if [[ $do_avahi -eq 1 && $do_service -eq 1 ]]; then
     if command -v avahi-daemon >/dev/null; then
+        current_host="$(hostname)"
+        if [[ "$current_host" != "$mdns_hostname" ]]; then
+            log "renaming host: $current_host → $mdns_hostname (advertises as $mdns_hostname.local)"
+            sudo hostnamectl set-hostname "$mdns_hostname"
+            # Keep /etc/hosts loopback in sync so `sudo`, etc. resolve the new
+            # name. Rewrite the 127.0.1.1 line if it exists; otherwise append.
+            if grep -qE '^127\.0\.1\.1[[:space:]]' /etc/hosts; then
+                sudo sed -i -E "s|^127\\.0\\.1\\.1[[:space:]].*|127.0.1.1\t$mdns_hostname|" /etc/hosts
+            else
+                printf '127.0.1.1\t%s\n' "$mdns_hostname" | sudo tee -a /etc/hosts >/dev/null
+            fi
+        else
+            log "hostname already $mdns_hostname; not renaming"
+        fi
+
         avahi_service="/etc/avahi/services/easyai.service"
-        log "writing $avahi_service ($(hostname).local advertisement)"
+        log "writing $avahi_service ($mdns_hostname.local advertisement)"
         sudo tee "$avahi_service" >/dev/null <<AVA
 <?xml version="1.0" standalone='no'?>
 <!DOCTYPE service-group SYSTEM "avahi-service.dtd">
