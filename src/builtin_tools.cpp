@@ -1576,7 +1576,29 @@ ToolHandler make_fs_edit_handler(std::shared_ptr<Sandbox> sb) {
         for (long long i = 0; i < start_line - 1 && i < line_count; ++i) {
             new_body.append(lines[(size_t) i].data(), lines[(size_t) i].size());
         }
+        // Auto-insert a '\n' on each side of `content` if the boundary
+        // would otherwise glue two lines together.  The tool's line-level
+        // contract says "replace lines [start..end] with content," so a
+        // model passing `content="foo"` to replace one line expects the
+        // result to occupy ONE line — not to fuse onto the next.  Without
+        // these two guards, content that lacks a trailing '\n' silently
+        // corrupts the file (a missing '}' on the seam-line is a common
+        // model-induced compile failure).  Both guards no-op when the
+        // contract is already satisfied (content with trailing '\n', or
+        // a pure delete with content="", or append-at-EOF after a file
+        // that already ended with '\n').
+        if (!content.empty()
+                && !new_body.empty()
+                && new_body.back() != '\n') {
+            new_body.push_back('\n');
+        }
         new_body.append(content);
+        const bool has_tail = (end_line < line_count);
+        if (!content.empty()
+                && content.back() != '\n'
+                && has_tail) {
+            new_body.push_back('\n');
+        }
         for (long long i = end_line; i < line_count; ++i) {
             new_body.append(lines[(size_t) i].data(), lines[(size_t) i].size());
         }
@@ -2120,8 +2142,11 @@ Tool fs(std::string root) {
             "end_line=start_line-1 is a pure insert (zero-width range) "
             "before start_line. start_line=line_count+1 appends at "
             "EOF. The file MUST already exist — use action=\"write\" "
-            "to create. content is inserted verbatim, so include a "
-            "trailing `\\n` if you want a clean line break.\n"
+            "to create. Line semantics are preserved automatically: "
+            "the tool inserts a `\\n` separator on each side of "
+            "`content` if and only if one is needed to keep the seam "
+            "lines from gluing together (you don't need to remember to "
+            "add a trailing `\\n`; it's handled).\n"
             "    Workflow: read with line_numbers=true, look at the "
             "numbered output, plan the edit, fire it. For multiple "
             "edits to the same file, use the ops batch (below) — the "

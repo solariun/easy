@@ -43,6 +43,42 @@ A running log of user-facing changes. Latest first — keep this list
 current as features land so anyone returning to the repo (or
 landing on it for the first time) sees what shipped recently.
 
+### 2026-05-11 — fs(action="edit") seam-line corruption fix (HIGH, post-publish correction)
+
+A user-reported bug: `fs(action="edit")` was silently corrupting
+files when the model passed `content` without a trailing `\n`.
+The last byte of `content` got glued onto the first preserved line
+after the edit range — turning `int b = 22;\n    return a + b;`
+into `int b = 22;    return a + b;`.  When the deleted range
+happened to contain the only `}` between two function bodies,
+this silently swallowed the brace and the file failed to compile
+with "function definition is not allowed here" + "expected '}'"
+on the next build.
+
+Root cause: the tool description said "include a trailing `\n`
+yourself" but the model consistently forgot.  Fix:
+`make_fs_edit_handler` now auto-inserts a `\n` separator on each
+side of `content` if and only if one is needed to keep the seam
+lines apart.  Both guards no-op when `content` is already
+correctly terminated (or empty for a pure delete), so the change
+is invisible to model calls that were already doing the right
+thing.
+
+Tool description updated to drop the "include trailing `\n`"
+advice — line semantics are now preserved automatically.
+
+Verified against a 9-case smoke matrix (middle-replace with/without
+trailing newline, multi-line content lacking newline, pure delete,
+pure insert, append-at-EOF on files with and without trailing
+newline, replace-last-line on a file without trailing newline,
+whole-file replacement) — all nine pass.
+
+Documented as §22.8 (post-publish correction) in
+[`SECURITY_AUDIT.md`](SECURITY_AUDIT.md); §22.4's "no findings"
+claim for the fs.edit/append/ops batch surface has been amended
+with a forward-pointer to §22.8.  No CLI / INI / library API
+changes; rebuild to pick up the fix.
+
 ### 2026-05-11 — Security audit 7th pass (1 HIGH, 1 MEDIUM, 1 LOW; no public-interface change)
 
 Re-applied the standing audit on the ~5,000 LoC added since the 6th

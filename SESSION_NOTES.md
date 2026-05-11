@@ -305,6 +305,63 @@ Webui title default also flips to `"Deep"`.
 ## 5. Recent commits (most recent first)
 
 ```
+2026-05-11 — fs(action="edit") seam-line corruption fix (HIGH; post-publish correction to §22.4).
+             User-reported bug: a model invoking fs.edit with content
+             that lacked a trailing \n had the last byte of content
+             glued onto the first preserved line, producing silent
+             file corruption.  Most common failure shape: replacing
+             one line in a C source caused the `}` of an enclosing
+             function to be consumed → "function definition not
+             allowed here" + "expected '}'" on next compile.
+
+  Code (builtin_tools.cpp make_fs_edit_handler):
+    * Two-sided auto-separator: insert a '\n' before content if the
+      prefix is non-empty + doesn't end with '\n' + content is
+      non-empty (covers append-at-EOF after a no-newline file).
+      Insert a '\n' after content if content is non-empty + doesn't
+      end with '\n' + there's a preserved tail (covers the user-
+      reported bug shape).
+    * Both guards no-op when the contract is already satisfied
+      (content with trailing \n, pure delete content="", append-at-
+      EOF after a \n-terminated file).
+    * Tool description updated: dropped the "include trailing \n
+      yourself" advice — line semantics now preserved automatically.
+
+  Verification: 9-case smoke matrix in /tmp/fsedit_full_test.cpp
+  (since cleaned up) exercises every boundary shape — middle-replace
+  with/without \n, multi-line content lacking \n, pure delete, pure
+  insert, append-at-EOF on files with and without \n, replace-last-
+  line on a file without \n, whole-file replacement.  ALL PASS post-
+  fix; the original bug case now produces what the model intended.
+
+  Docs: SECURITY_AUDIT.md §22.8 (POST-PUBLISH CORRECTION) +
+  amended §22.4 title with forward-pointer + section index updated.
+  README.md "What's new" entry above the 7th-pass entry.
+
+  Auditor's note: §22.4's "audited at intro, no findings" claim
+  reviewed the sandbox containment + O_NOFOLLOW + atomic-write
+  posture, which IS correct.  The line-level *semantic* contract
+  wasn't separately exercised against a seam case.  A behavioural
+  smoke test (handful of fs.edit calls against known-shape inputs,
+  diff the output) would have caught this at §22.4 time.  Adding
+  behavioural smoke for new tool surfaces is the follow-up TODO.
+```
+
+```
+2026-05-11 — Brand asset: AI Box logo inlined as constexpr in server.cpp.
+             Replaced webui/AI-brain.svg's xxd build-step with an
+             inline constexpr std::string_view kBrandSvg in
+             examples/server.cpp.  Removed the brand-specific
+             add_custom_command from CMakeLists.txt.  Canonical
+             copy stays at webui/AI-brain.svg for external rebrand /
+             docs use.  Favicon route's #if EASYAI_BUILD_WEBUI guard
+             dropped (the SVG is now in source, so no-webui builds
+             can serve a favicon too instead of 204).  New AI Box
+             gradient (#ffb547 → #00d4a8) replaces the prior
+             AI-brain mark.
+```
+
+```
 2026-05-11 — Security audit 7th pass: 1 HIGH, 1 MEDIUM, 1 LOW.
              Re-applied the standing audit on the ~5,000 LoC added
              since the 6th pass (2026-05-08). Three findings, all

@@ -32,7 +32,7 @@ narrative record.
 | Predictable /tmp log | [§19](#19-fourth-pass--2026-05-02-predictable-tmp-log-path) |
 | Plan tool rendering | [§20.3](#203-medium--plan-render-passes-model-supplied-text-with-control-bytes-to-the-terminal) |
 | Tool catalogue introspection | [§20.9](#209-new-surface--tool_lookup-builtin-no-findings-audited-at-intro) |
-| `fs.edit` / `fs.append` / `fs.ops` batch | [§22.4](#224-new-surface--fs-edit--append--ops-batch-no-findings-audited-at-intro) |
+| `fs.edit` / `fs.append` / `fs.ops` batch | [§22.4](#224-new-surface--fs-edit--append--ops-batch-audited-at-intro--see-also-228-correction), [§22.8](#228-post-publish-correction--fs-edit-seam-line-glue-corrupts-files-high-fixed) |
 | Installer hardening | [§20.4](#204-medium--installer-numeric-flags-flow-into-ini-via-heredoc-without-validation), [§20.5](#205-low--easyai-ini-bak-could-inherit-loose-permissions), [§22.3](#223-low--installer-non-numeric-knobs-flow-into-ini-without-shape-validation-fixed) |
 | Concurrency | [§10](#10-concurrency) |
 | Memory ownership | [§11](#11-memory--resource-ownership) |
@@ -1887,7 +1887,7 @@ The threat model stays the same as §20.4: "operator typo or hostile
 CI", not "external attacker reaches the installer". This is
 defense-in-depth, not a load-bearing boundary.
 
-### 22.4 NEW SURFACE — `fs.edit` / `fs.append` / `fs.ops` batch (no findings, audited at intro)
+### 22.4 NEW SURFACE — `fs.edit` / `fs.append` / `fs.ops` batch (audited at intro — see also §22.8 correction)
 
 Introduced 2026-05-10 (commit `c0a2f9e`) on the unified `fs(action=…)`
 dispatcher. Three changes audited together:
@@ -2018,8 +2018,122 @@ own PATH is what matters anyway.
   comfortable, larger would let a single batch op materialise
   significant heap. Documented in the tool description.
 
-*Last reviewed against commit immediately before the seventh-pass
-fixes commit.  Re-run when adding a new tool or a new HTTP boundary.*
+### 22.8 POST-PUBLISH CORRECTION — `fs.edit` seam-line glue corrupts files (HIGH, FIXED)
+
+**File:** `src/builtin_tools.cpp` — `make_fs_edit_handler`.
+
+**Status:** §22.4 declared `fs.edit` "no findings" — that was wrong.
+This entry corrects the record. The bug below was reported by a
+user the same day §22 landed (model invoked `fs.edit` to fix one
+line of a C source; the resulting file failed to compile with
+unbalanced-brace errors).
+
+**Issue.** `fs.edit` is documented as line-level: "delete lines
+[start..end] and insert `content` in their place." The model
+reasonably reads that as "the result is a clean replacement; the
+seam joins to the surrounding lines as if you typed it." The
+implementation, however, appended `content` *verbatim* between the
+prefix and the tail, so a `content` argument that lacked a trailing
+`\n` glued its last byte directly onto the first preserved tail
+line.
+
+Concrete repro (reproduced against the live build before the fix):
+
+```cpp
+// file before:
+//   int main() {
+//       int a = 1;
+//       int b = 2;
+//       return a + b;
+//   }
+//   static int helper() { return 0; }
+
+// model call:
+fs(action="edit", path="t.c",
+   start_line=3, end_line=3,
+   content="    int b = 22;")    // ← no trailing '\n'
+
+// file after (bug — note the missing newline on line 3):
+//   int main() {
+//       int a = 1;
+//       int b = 22;    return a + b;
+//   }
+//   static int helper() { return 0; }
+```
+
+When the deleted range *itself* contained the only `}` between two
+function bodies — a common shape for "rewrite this one function" —
+the corrupted seam silently swallowed it. The next compile failed
+with "function definition is not allowed here" inside the
+now-unclosed previous function, mirrored by "expected '}'" at EOF
+matched to the orphaned `{`. The model, seeing the compile error,
+typically responded "the file got corrupted from my edits; let me
+rewrite it completely" — a load-bearing dependency on `fs.edit` was
+quietly becoming a "rewrite the whole file with `write`" workaround
+in practice.
+
+Severity HIGH because:
+- The tool's documented contract was being violated.
+- The corruption was silent (the tool returned `ok` with
+  `edited X: replaced lines 3-3 (1 deleted, 1 inserted)`).
+- The model could not detect the corruption from the success
+  message — it had to run a separate read-and-diff or wait for a
+  downstream compile / parse failure to notice.
+- Every model I observe consistently forgot the
+  `include-a-trailing-\n` advice in the tool description, so the
+  bug fired on the majority of single-line edits.
+
+**Fix.** Two-sided auto-separator inside `make_fs_edit_handler`,
+applied after the prefix has been appended and again after `content`
+has been appended:
+
+```cpp
+// Boundary before content: only fires when the prefix is non-empty
+// AND doesn't already end with '\n' AND content is non-empty —
+// happens when appending past a file that ended without a newline.
+if (!content.empty()
+        && !new_body.empty()
+        && new_body.back() != '\n') {
+    new_body.push_back('\n');
+}
+new_body.append(content);
+// Boundary after content: only fires when content is non-empty AND
+// doesn't end with '\n' AND there's a preserved tail.  This is the
+// path the original bug walked through.
+const bool has_tail = (end_line < line_count);
+if (!content.empty()
+        && content.back() != '\n'
+        && has_tail) {
+    new_body.push_back('\n');
+}
+```
+
+Both guards no-op when the contract is already satisfied (content
+with trailing `\n`, pure delete `content=""`, append-at-EOF after a
+`\n`-terminated file).  Tool description updated to drop the
+"include a trailing `\n` yourself" advice — line semantics are now
+preserved automatically.
+
+**Verification.** A 9-case smoke test exercises every boundary
+shape: middle-replace with/without trailing newline, multi-line
+content lacking newline, pure delete, pure insert, append-at-EOF on
+files with and without trailing newline, replace-last-line on a
+file without trailing newline, and whole-file replacement.  All
+nine cases pass post-fix.  The original bug case ("middle replace,
+no trailing `\n`") now produces the file the model intended.
+
+**Auditor's note.** §22.4's "audited at intro, no findings" claim
+was based on reviewing the sandbox containment + O_NOFOLLOW +
+atomic-write story, which IS correct.  The line-level *semantic*
+contract — the part that's load-bearing for the model's productive
+use of the tool — wasn't separately exercised against a seam case.
+A behavioural smoke test (a handful of `fs.edit` calls against
+known-shape inputs, diff the output) would have caught this at
+§22.4 time.  Adding behavioural smoke for new tool surfaces is the
+follow-up TODO.
+
+*Last reviewed against commit landing this correction.  Re-run when
+adding a new tool or a new HTTP boundary.*
 
 
 
