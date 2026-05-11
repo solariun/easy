@@ -104,25 +104,23 @@ public:
     void set_context_pct(int pct);
 
     // Toggle the "thinking" state — replaces the regular `<glyph><pct>%`
-    // rendering with a coloured "thinking <pct>%" word, lit by a
-    // bright spotlight that sweeps left-to-right across the letters
-    // (mirrors Claude Code's prompt-processing animation). Use this
-    // between the moment a request is sent and the first SSE delta
+    // rendering with a static dark-gray "thinking <pct>%" label.  Use
+    // this between the moment a request is sent and the first SSE delta
     // arrives, so the operator sees that the server is actively
     // ingesting the prompt rather than hung.  set_thinking(false) is
     // idempotent — safe to call after each chat() returns regardless of
     // whether the spinner ever entered the thinking state.  The
-    // heartbeat speeds up to ~10 Hz while thinking_ is on so the sweep
-    // looks smooth, and reverts to the idle 250 ms cadence afterwards.
+    // heartbeat skips its repaint while thinking_ is on (the label is
+    // static — only set_thinking_pct drives a redraw).
     void set_thinking(bool on);
 
     // Set the percentage shown next to the "thinking" word during
     // prompt-eval — replaces the ctx-fill % with a real progress
     // gauge fed by the server's per-batch easyai.prompt_progress
-    // events.  Pass -1 to clear (the shimmer falls back to no
-    // suffix; ctx_pct is intentionally NOT shown during thinking
-    // mode because it's stale data from the previous turn and would
-    // confuse the operator).  No-op when thinking_ is off.
+    // events.  Pass -1 to clear (the label falls back to no suffix;
+    // ctx_pct is intentionally NOT shown during thinking mode because
+    // it's stale data from the previous turn and would confuse the
+    // operator).  No-op when thinking_ is off.
     void set_thinking_pct(int pct);
 
 private:
@@ -132,15 +130,13 @@ private:
     void draw_thinking_locked_();
     void heartbeat_loop_();
 
-    static constexpr int kFrameAdvanceMs    = 100;   // 10 Hz throttle floor
-    static constexpr int kIdleIntervalMs    = 250;   // glyph rotation cadence
-    static constexpr int kThinkingIntervalMs = 100;  // shimmer cadence (10 Hz)
+    static constexpr int kFrameAdvanceMs = 100;   // 10 Hz throttle floor
+    static constexpr int kIdleIntervalMs = 250;   // glyph rotation cadence
 
     bool enabled_      = false;
     bool color_        = false;  // 256-colour ANSI suppressed when off (NO_COLOR / non-tty)
     bool active_       = false;
     int  frame_        = 0;
-    int  shimmer_phase_= 0;      // advances with every heartbeat while thinking_
     int  active_width_ = 0;   // chars currently on stdout — backspace count for erase
     int  context_pct_  = -1;  // -1 = no suffix; 0..100 = "<pct>%"
     int  thinking_pct_ = -1;  // real prompt-eval %, fed by Client::on_prompt_progress
