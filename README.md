@@ -43,6 +43,59 @@ A running log of user-facing changes. Latest first — keep this list
 current as features land so anyone returning to the repo (or
 landing on it for the first time) sees what shipped recently.
 
+### 2026-05-11 — Security audit 7th pass (1 HIGH, 1 MEDIUM, 1 LOW; no public-interface change)
+
+Re-applied the standing audit on the ~5,000 LoC added since the 6th
+pass (2026-05-08). Three findings, all closed in this commit:
+
+* **HIGH — `run_capped_subprocess` banner sanitization.** The
+  `[bash] $ …` / `[python3] $ …` opening banner used to print the
+  model-supplied command/code through `fprintf` verbatim, so a
+  snippet that embedded an ANSI/OSC sequence could repaint the
+  operator's terminal (window title, screen wipe, OSC 52
+  clipboard write) one line before any child output arrived. The
+  live mirror channel was already hardened in §20.1; the banner
+  is now sanitized the same way (CR/LF/TAB pass; ESC rendered as
+  visible `^[` marker; other C0/DEL dropped). For `python3` the
+  banner now shows the *user's code* only — the 25-line sandbox
+  preamble was previously included, cluttering every transcript.
+* **MEDIUM — python3 sandbox preamble closure tightening.** The
+  preamble that wraps `open()` to pin disk access to the sandbox
+  used to leave `_e_open_orig`, `_e_chk`, and `_e_root` at module
+  scope, so user code could trivially call the raw `_e_open_orig`
+  by name and bypass the check — the comment claimed "closure cell"
+  protection that the implementation didn't actually provide.
+  Restructured into an `_e_make_wrappers` factory whose function-
+  local names become real lexical closure cells; the wrappers
+  still work, but the originals are no longer reachable from
+  module scope. (Adversarial bypass via `ctypes` / `subprocess` /
+  `_io.FileIO` is unchanged and still documented as out-of-scope.)
+* **LOW — installer INI-shape validation widened.** §20.4 / §21.4
+  already validated `--temperature`, `--top-p`, `--ctx-size` etc.
+  via `require_numeric` to defeat heredoc injection. Today
+  extended the integer roster (`--service-port`, `--threads`,
+  `--threads-batch`, `--ngl`) and added a new `require_no_injection`
+  helper that rejects `\n` / `\r` / `=` / `[` / `]` in the
+  non-numeric knobs (`--service-host`, `--alias`, `--webui-title`,
+  `--cache-type-k`, `--cache-type-v`). Same operator-typo /
+  hostile-CI threat model as §20.4.
+
+Full narrative in [`SECURITY_AUDIT.md`](SECURITY_AUDIT.md) §22.
+Rebuild to pick up the fixes — no INI, CLI, or library API changes.
+
+### 2026-05-10 — CLI "thinking" label: static dark gray, no shimmer sweep
+
+The CLI's prompt-eval indicator no longer animates. While the server
+is ingesting the prompt the spinner shows a steady `thinking[ N%]`
+in 256-colour grayscale 244 (mid-gray, RGB 128/128/128) — bright
+enough to read on a dark terminal, dim enough to clearly signal "in
+progress, not the model's output." Replaces the 10 Hz spotlight
+sweep that landed in `d7e7202`. Drops the dual-cadence heartbeat —
+the heartbeat now runs at one cadence (250 ms) and skips its
+repaint entirely while the thinking label is up; only
+`set_thinking_pct()` (driven by the server's `easyai.prompt_progress`
+SSE event) triggers a redraw when the % suffix changes.
+
 ### 2026-05-09 — `python3` tool result rendered with the executed snippet
 
 The tool result returned by `python3` now opens with a fenced

@@ -327,6 +327,21 @@ require_numeric() {
     fi
 }
 
+# Reject any value that could carve out a new INI line or section when
+# expanded into the heredoc.  Used for non-numeric knobs (host, alias,
+# webui_title, cache_type_*) where legitimate inputs contain letters /
+# digits / dashes / dots / spaces but NEVER newlines, '=', '[', or ']'.
+# Mirrors require_numeric for the threat model in §20.4 and 21.7.
+require_no_injection() {
+    local name="$1" value="$2"
+    if [[ "$value" == *$'\n'* || "$value" == *$'\r'* ]]; then
+        die "$name: must not contain newlines"
+    fi
+    if [[ "$value" == *'='* || "$value" == *'['* || "$value" == *']'* ]]; then
+        die "$name: must not contain '=', '[' or ']' (would inject into easyai.ini)"
+    fi
+}
+
 # ---------- pre-flight ------------------------------------------------------
 [[ $EUID -eq 0 ]] && die "do not run as root — script calls sudo as needed"
 
@@ -342,6 +357,18 @@ require_numeric "--presence-penalty" "$presence_penalty"
 require_numeric "--max-tokens"      "$max_tokens"
 require_numeric "--http-timeout"    "$http_timeout"
 require_numeric "--ctx-size"        "$ctx_size"
+require_numeric "--service-port"    "$service_port"
+require_numeric "--threads"         "$n_threads_default"
+require_numeric "--threads-batch"   "$n_threads_batch_default"
+require_numeric "--ngl"             "$ngl"
+
+# Non-numeric knobs also flow into the heredoc; reject newline / '=' /
+# '[' / ']' shapes so they can't carve a new section or override key.
+require_no_injection "--service-host" "$service_host"
+require_no_injection "--alias"        "$service_alias"
+require_no_injection "--webui-title"  "$webui_title"
+require_no_injection "--cache-type-k" "$cache_type_k"
+require_no_injection "--cache-type-v" "$cache_type_v"
 
 if [[ "$(uname -s)" != "Linux" ]]; then
     die "this installer targets Linux. On macOS, build manually — see README.md (Build for your hardware)."

@@ -305,6 +305,73 @@ Webui title default also flips to `"Deep"`.
 ## 5. Recent commits (most recent first)
 
 ```
+2026-05-11 — Security audit 7th pass: 1 HIGH, 1 MEDIUM, 1 LOW.
+             Re-applied the standing audit on the ~5,000 LoC added
+             since the 6th pass (2026-05-08). Three findings, all
+             closed in this commit. No public-interface change.
+
+  HIGH — run_capped_subprocess banner sanitization (builtin_tools.cpp).
+    The `[bash] $ ...` / `[python3] $ ...` opening banner used to
+    print the model-supplied command/code through fprintf verbatim,
+    so a snippet that embedded an ANSI/OSC sequence could repaint
+    the operator's terminal (window title, screen wipe, OSC 52
+    clipboard write) one line before any child output arrived. The
+    live mirror was already hardened in §20.1; the banner is now
+    sanitized the same way. For python3 the banner now shows the
+    user's `code` only — the 25-line sandbox preamble was previously
+    included in the body_arg displayed on the banner.
+
+  MEDIUM — python3 sandbox preamble closure tightening (builtin_tools.cpp).
+    The preamble wrapping open() left _e_open_orig / _e_chk / _e_root
+    at module scope, so user code could trivially call _e_open_orig
+    by name and bypass the check — the comment claimed "closure cell"
+    protection the implementation didn't provide. Restructured into
+    an `_e_make_wrappers` factory whose locals become real lexical
+    closure cells; module scope post-preamble carries only the
+    `_e_os` / `_e_b` / `_e_io` module imports. The "ctypes /
+    subprocess / _io.FileIO" bypass class remains documented as
+    out-of-scope.
+
+  LOW — installer INI-shape validation widened (install_easyai_server.sh).
+    Extended require_numeric to --service-port, --threads,
+    --threads-batch, --ngl. Added new `require_no_injection` helper
+    (rejects \n, \r, =, [, ]) for the non-numeric knobs
+    (--service-host, --alias, --webui-title, --cache-type-k,
+    --cache-type-v). Same operator-typo / hostile-CI threat model
+    as §20.4.
+
+  Audit-cleared this pass: easyai.prompt_progress SSE (numeric-only
+  payload, clamped int suffix), CLI thinking label (hardcoded color
+  + word), fs.ops batch reordering (numeric comparison + map key
+  equality), plan 80-char cap, metrics-always-on (§21.6 carry).
+
+  Build: green on macOS Metal (build-macos/) — easyai, easyai_cli,
+  easyai-cli, easyai-server, easyai-mcp-server, easyai-chat,
+  easyai-local, easyai-agent, easyai-recipes all link clean.
+  Python preamble smoke-tested (5 probes pass: in-sandbox write OK,
+  /etc/passwd rejected, _e_open_orig / _e_chk / _e_root all
+  NameError as expected).
+
+  Doc updates: SECURITY_AUDIT.md §22 narrative + TL;DR + section
+  index. README.md "What's new" entry. This SESSION_NOTES line.
+```
+
+```
+2026-05-10 — CLI thinking label: static dark gray (no shimmer sweep).
+             Replaced the 10 Hz spotlight-sweep animation with a
+             single 256-colour grayscale 244 (mid-gray RGB 128/128/128)
+             that paints the "thinking[ N%]" label once and only
+             repaints when set_thinking_pct() fires from the server's
+             easyai.prompt_progress SSE event. Heartbeat drops to one
+             cadence (250 ms idle) and skips its repaint while
+             thinking_ is on.
+
+  Code: ui.cpp::draw_thinking_locked_ + heartbeat_loop_ +
+        set_thinking(). ui.hpp drops shimmer_phase_ field and
+        kThinkingIntervalMs constant.
+```
+
+```
 2026-05-09 — python3 tool result rendered with the executed snippet.
              Tool result now opens with a fenced ```python ...```
              block carrying the snippet that just ran, then a

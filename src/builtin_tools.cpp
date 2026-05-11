@@ -2551,15 +2551,26 @@ enum class CappedExecKind { Bash, Python3 };
 // (`[bash] $ ...`, `[python3] $ ...`) and into the diagnostic strings
 // the child writes on chdir/exec failure. Must be NUL-terminated and
 // short — async-signal-safe writes copy the literal verbatim.
+//
+// `banner_display` is what gets printed in the opening banner so the
+// operator sees what's about to run. Distinct from `body_arg` (what the
+// child actually executes) for python3, where `body_arg` carries the
+// sandbox-preamble + user code and the banner should only show the
+// user-authored part to keep the transcript readable. Sanitized through
+// `sanitize_for_operator_tty` before write so model-supplied ANSI/OSC
+// escapes embedded in the command/code can't repaint the terminal.
 ToolResult run_capped_subprocess(
         const std::shared_ptr<Sandbox> & sb,
         CappedExecKind            kind,
-        const std::string &       body_arg,    // shell command (Bash) or Python source (Python3)
+        const std::string &       body_arg,        // shell command (Bash) or Python source (Python3)
+        const std::string &       banner_display,  // what to show the operator on the opening banner
         long long                 timeout_sec,
         bool                      show_output,
         const char *              tool_label) {
     if (show_output) {
-        std::fprintf(stderr, "\n[%s] $ %s\n", tool_label, body_arg.c_str());
+        std::string safe_banner = sanitize_for_operator_tty(
+            banner_display.data(), banner_display.size());
+        std::fprintf(stderr, "\n[%s] $ %s\n", tool_label, safe_banner.c_str());
         std::fflush(stderr);
     }
 
@@ -2874,7 +2885,7 @@ Tool bash(std::string root, bool show_output) {
             if (timeout_sec < 1)   timeout_sec = 1;
             if (timeout_sec > 300) timeout_sec = 300;
             return run_capped_subprocess(
-                sb, CappedExecKind::Bash, cmd,
+                sb, CappedExecKind::Bash, cmd, cmd,
                 timeout_sec, show_output, "bash");
         })
         .build();
@@ -2910,38 +2921,52 @@ Tool bash(std::string root, bool show_output) {
 
 // Python preamble auto-prepended to every snippet. Locks open()/os.open()
 // to the sandbox root (cwd at exec time). Identifiers are `_e_*`-prefixed
-// to avoid colliding with any reasonable user code; the preamble keeps
-// references to the original open() functions inside its closure cell so
-// straightforward `import builtins; builtins.open = ...` resets restore
-// the patched (still-checking) version, not the raw one.
+// to avoid colliding with any reasonable user code.
+//
+// All references to the raw original open() functions AND the sandbox
+// root path are captured as parameters of `_e_make_wrappers`, then bound
+// into the closure cells of `_e_open` / `_e_os_open`. Module-scope names
+// (`_e_root`, `_e_open_orig`, `_e_os_open_orig`, `_e_chk`) are deleted
+// after wiring so a snippet cannot reach them by name to bypass the
+// check (`open` is also straightforward — but `_e_open_orig` used to be
+// trivially callable from user code at module scope, undoing the
+// protection).
+//
+// This is still NOT a hardened sandbox: a determined snippet can bypass
+// via `import ctypes; ctypes.CDLL("libc.so.6").open(...)`, `os.system`,
+// `subprocess`, `_io.FileIO("/etc/passwd")`, or by re-importing modules
+// and mutating their internals. The preamble defends against ACCIDENT
+// (a stray `open("/etc/hosts")` in generated code) and against the
+// trivial discoverable-by-name bypass — not against adversarial intent.
 static const char * const kPythonSandboxPreamble =
     "import os as _e_os, builtins as _e_b, io as _e_io\n"
-    "_e_root = _e_os.path.realpath(_e_os.getcwd())\n"
-    "_e_open_orig = _e_b.open\n"
-    "_e_os_open_orig = _e_os.open\n"
-    "def _e_chk(p):\n"
-    "    if isinstance(p, int): return\n"
-    "    try: s = _e_os.fspath(p)\n"
-    "    except TypeError: return\n"
-    "    if _e_os.path.isabs(s):\n"
-    "        a = _e_os.path.realpath(s)\n"
-    "    else:\n"
-    "        a = _e_os.path.realpath(_e_os.path.join(_e_root, s))\n"
-    "    if a != _e_root and not a.startswith(_e_root + _e_os.sep):\n"
-    "        raise PermissionError(\n"
-    "            'easyai sandbox: disk access to ' + repr(s) +\n"
-    "            ' denied (resolves to ' + repr(a) + ', outside sandbox '\n"
-    "            'root ' + repr(_e_root) + '). The python3 tool is for '\n"
-    "            'compute / network / data only — use fs(action=...) for '\n"
-    "            'disk work.')\n"
-    "def _e_open(f, *a, **k):\n"
-    "    _e_chk(f); return _e_open_orig(f, *a, **k)\n"
-    "def _e_os_open(p, *a, **k):\n"
-    "    _e_chk(p); return _e_os_open_orig(p, *a, **k)\n"
-    "_e_b.open = _e_open\n"
-    "_e_io.open = _e_open\n"
-    "_e_os.open = _e_os_open\n"
-    "del _e_open, _e_os_open\n"
+    "def _e_make_wrappers(_e_root, _e_open_orig, _e_os_open_orig):\n"
+    "    def _e_chk(p):\n"
+    "        if isinstance(p, int): return\n"
+    "        try: s = _e_os.fspath(p)\n"
+    "        except TypeError: return\n"
+    "        if _e_os.path.isabs(s):\n"
+    "            a = _e_os.path.realpath(s)\n"
+    "        else:\n"
+    "            a = _e_os.path.realpath(_e_os.path.join(_e_root, s))\n"
+    "        if a != _e_root and not a.startswith(_e_root + _e_os.sep):\n"
+    "            raise PermissionError(\n"
+    "                'easyai sandbox: disk access to ' + repr(s) +\n"
+    "                ' denied (resolves to ' + repr(a) + ', outside sandbox '\n"
+    "                'root ' + repr(_e_root) + '). The python3 tool is for '\n"
+    "                'compute / network / data only — use fs(action=...) for '\n"
+    "                'disk work.')\n"
+    "    def _e_open(f, *a, **k):\n"
+    "        _e_chk(f); return _e_open_orig(f, *a, **k)\n"
+    "    def _e_os_open(p, *a, **k):\n"
+    "        _e_chk(p); return _e_os_open_orig(p, *a, **k)\n"
+    "    return _e_open, _e_os_open\n"
+    "_e_o, _e_oo = _e_make_wrappers(\n"
+    "    _e_os.path.realpath(_e_os.getcwd()), _e_b.open, _e_os.open)\n"
+    "_e_b.open = _e_o\n"
+    "_e_io.open = _e_o\n"
+    "_e_os.open = _e_oo\n"
+    "del _e_make_wrappers, _e_o, _e_oo\n"
     "# --- end preamble; user code follows ---\n";
 
 Tool python3(std::string root, bool show_output) {
@@ -3054,8 +3079,11 @@ Tool python3(std::string root, bool show_output) {
             wrapped.append(kPythonSandboxPreamble);
             wrapped.append(code);
 
+            // Banner shows the operator the user-authored `code` only —
+            // the sandbox preamble is implementation detail and would
+            // just dump 25 lines of `_e_*` plumbing on every call.
             ToolResult r = run_capped_subprocess(
-                sb, CappedExecKind::Python3, wrapped,
+                sb, CappedExecKind::Python3, wrapped, code,
                 timeout_sec, show_output, "python3");
 
             // Spawn-side errors (pipe / fork failure) leave the

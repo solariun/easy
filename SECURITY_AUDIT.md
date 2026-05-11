@@ -20,7 +20,8 @@ narrative record.
 | SSRF / web fetch | [§2](#2-ssrf--web_fetch--ddg-web_search-high-fixed), [§14](#14-recommendations-for-high-trust-deployments) |
 | Regex DoS | [§3](#3-regex-dos--fs_glob-medium-fixed), [§4](#4-stdregex-in-strip_html--na-already-migrated), [§15.2](#152-regex-dos-in-fs_grep-medium-fixed) |
 | JSON / arg parsing | [§5](#5-json-parsing--injection-aware), [§18.4](#184-medium-batch-fixed-in-same-commit), [§20.2](#202-high--get_array-stack-bomb-via-stringified-array-recursion) |
-| Bash subprocess | [§15.3](#153-bash-command-runner-new-surface--by-design), [§18.3](#183-high-3--sandbox-symlink-escape--bash-hardening-fixed), [§20.1](#201-high--bash-live-mirror-terminal-escape--unbounded-flood) |
+| Bash subprocess | [§15.3](#153-bash-command-runner-new-surface--by-design), [§18.3](#183-high-3--sandbox-symlink-escape--bash-hardening-fixed), [§20.1](#201-high--bash-live-mirror-terminal-escape--unbounded-flood), [§22.1](#221-high--run_capped_subprocess-banner-leaked-model-bytes-to-the-operator-terminal-fixed) |
+| Python3 subprocess | [§22.1](#221-high--run_capped_subprocess-banner-leaked-model-bytes-to-the-operator-terminal-fixed), [§22.2](#222-medium--python-sandbox-preamble-leaked-raw-open-at-module-scope-fixed) |
 | External tools manifest | [§16](#16-external-tools-manifest--srcexternal_toolscpp-new-surface) |
 | RAG persistent memory | [§16.6b](#166b-rag--persistent-registry-surface) |
 | MCP server (`POST /mcp`) | [§17](#17-mcp-server-endpoint--srcmcpcpp--route_mcp-new-surface-auth-open) |
@@ -31,7 +32,8 @@ narrative record.
 | Predictable /tmp log | [§19](#19-fourth-pass--2026-05-02-predictable-tmp-log-path) |
 | Plan tool rendering | [§20.3](#203-medium--plan-render-passes-model-supplied-text-with-control-bytes-to-the-terminal) |
 | Tool catalogue introspection | [§20.9](#209-new-surface--tool_lookup-builtin-no-findings-audited-at-intro) |
-| Installer hardening | [§20.4](#204-medium--installer-numeric-flags-flow-into-ini-via-heredoc-without-validation), [§20.5](#205-low--easyai-ini-bak-could-inherit-loose-permissions) |
+| `fs.edit` / `fs.append` / `fs.ops` batch | [§22.4](#224-new-surface--fs-edit--append--ops-batch-no-findings-audited-at-intro) |
+| Installer hardening | [§20.4](#204-medium--installer-numeric-flags-flow-into-ini-via-heredoc-without-validation), [§20.5](#205-low--easyai-ini-bak-could-inherit-loose-permissions), [§22.3](#223-low--installer-non-numeric-knobs-flow-into-ini-without-shape-validation-fixed) |
 | Concurrency | [§10](#10-concurrency) |
 | Memory ownership | [§11](#11-memory--resource-ownership) |
 
@@ -46,11 +48,11 @@ narrative record.
 - **Process leakage** — `bash` and external-tool subprocesses inherit no fds beyond `/dev/null` on stdin and the captured stdout/stderr pipe. Linux gets `PR_SET_PDEATHSIG(SIGKILL)` so a crashed agent leaves no orphans. ([§15.3](#153-bash-command-runner-new-surface--by-design), [§16.2](#162-guarantees-enforced-at-call-time))
 - **Predictable-path attacks** — auto-generated `/tmp` log files use `O_EXCL | O_NOFOLLOW | O_CLOEXEC` mode 0600. A planted symlink at the predicted path causes the open to fail cleanly, not get followed. ([§19](#19-fourth-pass--2026-05-02-predictable-tmp-log-path))
 - **JSON depth bombs** — every JSON parser in the request path uses an iterative depth walk capped at 64 levels (`parse_chat_request`, `/mcp`). Stringified-array unwrap in tool-args is depth-capped at 4. ([§18.4](#184-medium-batch-fixed-in-same-commit), [§20.2](#202-high--get_array-stack-bomb-via-stringified-array-recursion))
-- **Terminal escape injection** — output the model emits via `bash` or the `plan` tool is stripped of C0 control bytes (incl. `ESC`) before it reaches the operator's terminal. A model cannot retitle the operator's window or wipe their screen. ([§20.1](#201-high--bash-live-mirror-terminal-escape--unbounded-flood), [§20.3](#203-medium--plan-render-passes-model-supplied-text-with-control-bytes-to-the-terminal))
+- **Terminal escape injection** — output the model emits via `bash`, `python3`, or the `plan` tool is stripped of C0 control bytes (incl. `ESC`) before it reaches the operator's terminal. The opening banner (`[bash] $ …` / `[python3] $ …`) is sanitized the same way as the live mirror, so a model cannot retitle the operator's window or wipe their screen via the command/code argument either. ([§20.1](#201-high--bash-live-mirror-terminal-escape--unbounded-flood), [§20.3](#203-medium--plan-render-passes-model-supplied-text-with-control-bytes-to-the-terminal), [§22.1](#221-high--run_capped_subprocess-banner-leaked-model-bytes-to-the-operator-terminal-fixed))
 
 **What easyai does NOT block — your responsibility:**
 
-- **`bash` is not isolated.** It runs `/bin/sh -c …` with the agent process's full uid/gid. There's a 32 KiB output cap, a per-command timeout, an opt-in flag (`--allow-bash`, off by default), and signal-group teardown — but no namespacing, no seccomp, no chroot. **For untrusted prompts, run easyai inside a container, firejail, or a dedicated unprivileged user with disabled network egress.**
+- **`bash` and `python3` are not isolated.** Both run with the agent process's full uid/gid. There's a 32 KiB output cap, a per-command timeout, signal-group teardown, and fd-inheritance shutdown — but no namespacing, no seccomp, no chroot. `python3` ships in isolated mode (`-I -S -E`) with a `builtins.open` wrapper that pins disk access to the sandbox root, but the snippet can still `import ctypes`, `import socket`, `import subprocess`, etc. **For untrusted prompts, run easyai inside a container, firejail, or a dedicated unprivileged user with disabled network egress.**
 - **Prompt injection is out of scope.** A determined attacker who controls the prompt body can steer the model into asking the agent to do things you didn't intend. Tool gating (`--allow-bash`, `--allow-fs`, `--sandbox <DIR>`) is the defence.
 - **`/mcp` is open by default.** A fresh install accepts MCP requests with no Bearer until you populate `[MCP_USER]` in `/etc/easyai/easyai.ini`. The startup banner says so loudly. Always populate `[MCP_USER]` (or set `--no-mcp-auth` deliberately) before exposing the port. ([§17](#17-mcp-server-endpoint--srcmcpcpp--route_mcp-new-surface-auth-open))
 - **TLS verification is on by default but `--insecure-tls` exists.** Don't pass it in production. Same for `--api-key '' ` on a public listener — the binary will start, but the chat endpoint is then unauthenticated.
@@ -1654,6 +1656,370 @@ The sixth pass also examined and found no actionable concerns in:
   consistent across `fs_read_file`, `fs_write_file`, `fs_list_dir`,
   `fs_glob`, `fs_grep`, `fs_check_path`. The `O_NOFOLLOW` posture
   is uniform on every leaf open.
+
+---
+
+## 22. SEVENTH PASS — 2026-05-11
+
+A targeted review of the ~5,000 LoC that landed between 2026-05-08 (the
+sixth-pass commit `58420f0`) and today, focused on the three biggest
+new surfaces — the **`python3` builtin tool**, the **`fs.edit` /
+`fs.append` / `fs.ops`-batch** additions, and the **per-batch
+`easyai.prompt_progress` SSE event** plus its CLI-side "thinking"
+rendering.  One HIGH, one MEDIUM, one LOW finding — all fixed in this
+commit.  Public interface unchanged.
+
+### 22.1 HIGH — `run_capped_subprocess` banner leaked model bytes to the operator terminal (FIXED)
+
+**File:** `src/builtin_tools.cpp` — `run_capped_subprocess`,
+`Tool bash`, `Tool python3`.
+
+**Issue.** §20.1 closed terminal-escape injection on the bash *live
+mirror* (the byte stream the child writes while it runs) by routing
+every chunk through `sanitize_for_operator_tty()` before `fwrite(...,
+stderr)`. That fix did not cover the OPENING banner:
+
+```cpp
+std::fprintf(stderr, "\n[%s] $ %s\n", tool_label, body_arg.c_str());
+```
+
+`body_arg` is model-controlled — the `command` string passed to `bash`
+or the `code` string passed to `python3`. A model that ships an ANSI
+or OSC sequence inside its tool argument got that sequence painted
+verbatim to the operator's terminal one line before any child output
+appeared. Same hijack class as §20.1 (window-title rewrite, screen
+wipe, clipboard write via OSC 52, key-rebinding), just on a different
+output channel.
+
+Concrete reproducer (would have worked before the fix):
+
+```
+bash(command="\x1b]0;HACKED\a\n echo done")
+# banner prints: [bash] $ \x1b]0;HACKED\a\n echo done
+# operator's terminal interprets OSC 0 → window title becomes "HACKED"
+```
+
+For `python3` the surface was wider — `body_arg` carried the wrapped
+`sandbox-preamble + user code`, so the banner was already a poor
+operator UX (25 lines of `_e_*` plumbing on every call) AND the user-
+authored code segment at the tail of `body_arg` was still
+model-controlled.
+
+**Fix.** Two changes:
+
+1. `run_capped_subprocess` takes an additional `const std::string &
+   banner_display` parameter — what to show on the opening banner —
+   distinct from `body_arg` which is what the child actually
+   executes. The bash call site passes `cmd` for both (same string).
+   The python3 call site passes `code` (the user-authored input, not
+   the wrapped preamble+code) for `banner_display`.
+2. Every byte of `banner_display` flows through
+   `sanitize_for_operator_tty()` before reaching `fprintf`. CR, LF,
+   and TAB pass through (formatting bytes the operator wants to
+   see); ESC is replaced with the visible `^[` marker so the
+   operator notices the model tried to emit an escape; other C0 +
+   DEL are dropped.
+
+Net effect after fix:
+
+- The model still sees its own command/code verbatim in its tool
+  result (downstream parsing is unaffected; the model is not the
+  audience for the terminal hijack anyway).
+- The operator sees a sanitized rendering — ANSI/OSC sequences in the
+  command appear as visible `^[` markers, the terminal cannot
+  interpret them.
+- For python3, the operator now sees only the user's snippet on the
+  banner — no preamble noise — and the snippet is sanitized.
+
+**Verification.** A bash command of `"\x1b]0;HIJACK\a echo ok"`:
+- Pre-fix banner: `[bash] $ <ESC>]0;HIJACK<BEL> echo ok` — terminal
+  interprets the OSC, window title flips to "HIJACK".
+- Post-fix banner: `[bash] $ ^[]0;HIJACK echo ok` — `^[` rendered as
+  literal characters, `\a` dropped, no interpretation. Window title
+  untouched.
+
+### 22.2 MEDIUM — Python sandbox preamble leaked raw open() at module scope (FIXED)
+
+**File:** `src/builtin_tools.cpp` — `kPythonSandboxPreamble`.
+
+**Issue.** The python3 tool prepends a short preamble to every snippet
+that wraps `builtins.open`, `io.open`, and `os.open` with a
+sandbox-containment check. The contract — spelled out in the tool
+description and in the preamble comment — is: *defense-in-depth
+against ACCIDENTAL out-of-sandbox open() calls in generated code; the
+preamble cannot defeat an adversarial snippet that imports `ctypes` /
+`subprocess` / `_io.FileIO` and bypasses Python-level wrapping*.
+
+The preamble's comment claimed: *"the preamble keeps references to
+the original open() functions inside its closure cell so
+straightforward `import builtins; builtins.open = ...` resets restore
+the patched (still-checking) version, not the raw one."*
+
+The implementation did NOT match that claim. Walk through the
+previous version:
+
+```python
+_e_open_orig = _e_b.open                # raw open, at module scope
+_e_os_open_orig = _e_os.open            # raw os.open, at module scope
+def _e_chk(p): ...                      # check fn, at module scope
+def _e_open(f, *a, **k):
+    _e_chk(f); return _e_open_orig(...) # global lookup of _e_open_orig
+def _e_os_open(...): ...
+_e_b.open = _e_open
+_e_io.open = _e_open
+_e_os.open = _e_os_open
+del _e_open, _e_os_open                 # only the WRAPPER locals gone
+```
+
+After the preamble, four module-scope names remained reachable by
+user code: `_e_root`, `_e_open_orig`, `_e_os_open_orig`, and
+`_e_chk`. The advertised "closure cell" protection was an illusion —
+the wrappers do a global lookup of `_e_open_orig` at call time, and
+user code can read or replace that global by name:
+
+```python
+# (in the user-supplied snippet)
+print(_e_open_orig("/etc/passwd").read())   # bypass: trivial
+_e_chk = lambda p: None                     # disable the check entirely
+_e_root = "/"                               # widen the root to everywhere
+```
+
+The MEDIUM severity is the gap between the claim and reality — the
+documented threat model says "defense against accident, NOT
+adversarial intent," but a snippet that *only knows the names of the
+preamble's globals* trivially bypasses it, which feels closer to
+adversarial than accidental. The closure-cell story is the easy fix.
+
+**Fix.** Restructure the preamble so the originals are real lexical
+closures, not module-scope names:
+
+```python
+import os as _e_os, builtins as _e_b, io as _e_io
+def _e_make_wrappers(_e_root, _e_open_orig, _e_os_open_orig):
+    def _e_chk(p): ...     # closes over _e_root via _e_make_wrappers scope
+    def _e_open(f, *a, **k):
+        _e_chk(f); return _e_open_orig(...)   # closes over _e_open_orig
+    def _e_os_open(p, *a, **k):
+        _e_chk(p); return _e_os_open_orig(...)
+    return _e_open, _e_os_open
+_e_o, _e_oo = _e_make_wrappers(
+    _e_os.path.realpath(_e_os.getcwd()), _e_b.open, _e_os.open)
+_e_b.open  = _e_o
+_e_io.open = _e_o
+_e_os.open = _e_oo
+del _e_make_wrappers, _e_o, _e_oo
+```
+
+Now `_e_root`, `_e_open_orig`, `_e_os_open_orig`, and `_e_chk` are
+function-local names inside `_e_make_wrappers`. Once that function
+returns, Python's normal scoping makes them inaccessible from module
+scope. The closure cells in `_e_open` / `_e_os_open` still hold them,
+so the wrappers continue to function.
+
+Module-scope post-preamble: `_e_os`, `_e_b`, `_e_io` (the module-
+object imports). The model can `import builtins` to get the same
+patched object back; it cannot recover the raw `open` by name.
+
+The doc disclaimers (NOT a hardened sandbox; `ctypes` / `subprocess`
+/ `_io.FileIO` bypasses remain) stay in place — this fix closes the
+"discoverable by name" bypass that wasn't supposed to exist per the
+comment, not the architectural bypass classes.
+
+**Verification.** Standalone smoke test against the new preamble
+(cwd = sandbox root):
+
+| Probe | Pre-fix | Post-fix |
+| --- | --- | --- |
+| `open("local.txt", "w")` inside sandbox | OK | OK |
+| `open("/etc/passwd")` outside sandbox | PermissionError | PermissionError |
+| `_e_open_orig("/etc/passwd")` | OPENS (bypass) | NameError |
+| `_e_chk` reassign | DISABLES check | NameError |
+| `_e_root` reassign | WIDENS scope | NameError |
+
+The `import ctypes` / `_io.FileIO("/etc/passwd")` bypasses are
+unchanged in both versions — same documented limitation as before.
+
+### 22.3 LOW — Installer non-numeric knobs flow into INI without shape validation (FIXED)
+
+**File:** `scripts/install_easyai_server.sh`.
+
+**Issue.** §20.4 added `require_numeric` validation for every
+sampling/timeout flag flowing into the INI heredoc. §21.4 extended
+the roster to cover `--presence-penalty`. Today's audit found the
+same class of gap on the *non-numeric* knobs and on a handful of
+integer-shaped flags that escaped the original sweep:
+
+| Flag | INI key | Shape | Pre-fix validation |
+| --- | --- | --- | --- |
+| `--service-port`   | `[SERVER] port`              | int     | none |
+| `--threads`        | `[ENGINE] threads`           | int     | none |
+| `--threads-batch`  | `[ENGINE] threads_batch`     | int     | none |
+| `--ngl`            | `[ENGINE] ngl`               | int     | none |
+| `--service-host`   | `[SERVER] host`              | str     | none |
+| `--alias`          | `[SERVER] alias`             | str     | none |
+| `--webui-title`    | `[SERVER] webui_title`       | str     | none |
+| `--cache-type-k`   | `[ENGINE] cache_type_k`      | enum    | none |
+| `--cache-type-v`   | `[ENGINE] cache_type_v`      | enum    | none |
+
+Same vector as §20.4: a value containing `$'\n[SERVER]\nallow_bash =
+on'` injects a second `[SERVER]` section into the rendered INI,
+flipping `allow_bash` on (later-key-wins on duplicate in the INI
+loader). The integer-shaped flags are particularly exposed because
+operators frequently parameterise them from CI (`--threads
+"$CORES"`); a CI variable that contains stray bytes would propagate
+without complaint.
+
+**Fix.** Two changes in `install_easyai_server.sh`:
+
+1. `require_numeric` roster extended with `--service-port`,
+   `--threads`, `--threads-batch`, `--ngl`. Same `^-?[0-9]+(\.[0-9]+)?$`
+   regex as before — defends against newline / `=` / `[` / `]` /
+   whitespace / `$(...)` in one shot.
+2. New `require_no_injection "<flag>" "$value"` helper for
+   *non-numeric* knobs. Rejects `\n`, `\r`, `=`, `[`, `]` only —
+   leaves letters, digits, dashes, dots, spaces, slashes, and most
+   punctuation alone so legitimate inputs (a webui title with spaces,
+   a quantization name like `q8_0`, an alias with dots) all pass.
+   Applied to `--service-host`, `--alias`, `--webui-title`,
+   `--cache-type-k`, `--cache-type-v`.
+
+The threat model stays the same as §20.4: "operator typo or hostile
+CI", not "external attacker reaches the installer". This is
+defense-in-depth, not a load-bearing boundary.
+
+### 22.4 NEW SURFACE — `fs.edit` / `fs.append` / `fs.ops` batch (no findings, audited at intro)
+
+Introduced 2026-05-10 (commit `c0a2f9e`) on the unified `fs(action=…)`
+dispatcher. Three changes audited together:
+
+- **`action="append"`** — appends to an existing file (creates it if
+  missing). `O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW | O_CLOEXEC`,
+  mode 0600. Same `Sandbox::resolve` + `inside_sandbox` containment
+  pair as every other fs_* path. Includes the §21.3 post-mkdir
+  re-check so a concurrent attacker can't swap a parent dir to a
+  symlink between containment validation and `create_directories()`.
+- **`action="edit"`** — line-range replace via tempfile + rename(2),
+  8 MiB file-size cap on the in-memory rebuild buffer, the same
+  O_NOFOLLOW posture on both the read fd and the tempfile, and the
+  post-mkdir re-check. The tempfile lives at `<path>.easyai-edit-tmp`
+  — a literal-suffix append to a path already validated as inside
+  the sandbox, so the tempfile is inside too. A pre-planted symlink
+  at the tempfile path would be rejected by `O_NOFOLLOW` at the
+  `open()` step. `rename(2)` operates on directory entries (not
+  followed symlinks) on both Linux and macOS, so a concurrent
+  symlink-swap on the target path between containment check and
+  rename results in the symlink getting replaced atomically rather
+  than followed.
+- **`action="ops"`** (batch) — runs up to 20 ops per call. Hard
+  caps: batch size = 20, no `eval()`-style arg interpolation (each
+  op's args are re-serialised via `nlohmann::json::dump()` and
+  re-parsed by the per-action handler). Pre-validation rejects any
+  op that isn't an object-with-string-`action` *before* dispatch
+  starts, so a malformed late op cannot leave half a batch in
+  partial state. Same-path edits are reordered bottom-up
+  (highest-line-first) so each edit's line numbers reference the
+  file's ORIGINAL state regardless of submission order.
+  `continue_on_error=false` (default) stops at the first error;
+  `continue_on_error=true` is the operator-explicit opt-in for
+  best-effort batches. The `ToolResult` is always `ok` with a
+  per-op report — partial-success reporting would be lost if the
+  batch returned `error` on first failure.
+
+No new vulnerability classes introduced. Sandbox containment, O_NOFOLLOW
+posture, post-mkdir re-check, atomic write are all inherited from the
+existing fs_* audits (§1, §7, §18.3, §21.3).
+
+### 22.5 NEW SURFACE — `python3` builtin tool (audited at intro; one HIGH, one MEDIUM, see §22.1–§22.2)
+
+Introduced 2026-05-09 (commits `c50df49`, `3a4017a`, `adc153b`).
+A Python 3 snippet runner alongside `bash`, sharing the same
+`run_capped_subprocess` machinery (fork / fd close / chdir /
+execvp / drain / timeout / output cap).
+
+**Trust shape.** Same posture as `bash`: NOT a hardened sandbox.
+The interpreter inherits the agent's full uid/gid. Hardening is
+cooperative:
+
+- `python3 -I -S -E -c` — isolated mode (no PYTHON* env vars), no
+  `site.py` / `.pth` auto-load, no `cwd` on `sys.path`. The snippet
+  runs against the bare stdlib regardless of the host user's Python
+  config.
+- A short preamble wraps `builtins.open`, `io.open`, `os.open` to
+  reject any path resolving outside the cwd (the sandbox root).
+  Defense-in-depth against accidental disk access; documented
+  *bypassable* via `ctypes`, `subprocess`, `_io.FileIO`, etc.
+- 32 KB cap on the model-facing capture buffer.
+- 128 KB cap on the operator-facing live mirror (the same one as
+  bash, fed through `sanitize_for_operator_tty()`).
+- Output cap, timeout (default 30 s, max 300 s), SIGTERM/SIGKILL
+  process-group teardown, `PR_SET_PDEATHSIG(SIGKILL)` on Linux,
+  fds 3..maxfd closed before exec — all shared with bash via
+  `run_capped_subprocess`.
+
+**execvp PATH lookup.** Like bash uses `/bin/sh`, python3 uses
+`execvp("python3", …)` — the operator's `PATH` decides which python3
+is launched (Homebrew, system, conda). Operator-controlled, no PATH
+search from the model. The bash hardcode at `/bin/sh` is more
+defensive but inflexible; the python3 PATH lookup is the right
+trade-off given multi-distribution support, and the agent process's
+own PATH is what matters anyway.
+
+**Findings during the intro audit:**
+
+- §22.1 (HIGH) — banner sanitization gap (shared with bash, fixed
+  together).
+- §22.2 (MEDIUM) — preamble closure-cell gap (python3-specific,
+  fixed).
+- No other findings.
+
+### 22.6 Audit-cleared this pass (no action)
+
+- **`easyai.prompt_progress` SSE event.** Server payload is
+  integers + a double (`processed`, `total`, `cached`, `time_ms`);
+  no model-controlled strings. Consumer side parses via
+  `j.value(key, default)` inside `try{...}catch(...)`, falls back
+  to defaults on type mismatch — malformed event silently ignored.
+  CLI maps to `int` via `(int)(100.0 * processed / total)` with an
+  early-return on `total <= 0`, then `set_thinking_pct()` clamps to
+  `[-1, 100]`. The clamped int feeds `snprintf("%d%%", …)` — no
+  injection vector through the spinner suffix.
+- **CLI "thinking" rendering** (the recent shimmer → static
+  dark-gray switch). Color code is a hardcoded literal
+  (`\x1b[38;5;244m`), text is the hardcoded word `"thinking"` plus
+  the clamped-int `%d%%` suffix. No model input on this path.
+- **`fs.ops` batch reordering.** Same-path edits sorted by
+  `start_line` descending — purely numeric comparison; the path
+  string is used as a `std::map` key (string equality). No regex,
+  no shell, no command construction.
+- **Plan tool 80-char cap.** §20.3's `sanitize_plan_text` still in
+  place at render time; the new `kMaxTextChars = 80` is a
+  belt-and-suspenders content-shape guard that rejects the
+  numbered-list-stuffed-in-one-step anti-pattern. Cap is enforced
+  on every code path that mutates `Plan::items_` (add, set, batch
+  ops). No injection surface added.
+- **METRICS thread always-on default.** Commit `67ee85a` made
+  `metrics_interval=300` the installer default. The /proc parsing
+  and TIME_WAIT-pressure tagging audited in §21.6 are unchanged —
+  always-on simply means the same code path runs more often.
+
+### 22.7 Accepted residual risk (still)
+
+- All of §13 and §16.4 carry forward.
+- **python3 sandbox is not hardened.** Same disclaimer as bash:
+  the wrapper around `open()` is defense against accident, not
+  intent. Adversarial snippets bypass via `ctypes`, `subprocess`,
+  `_io.FileIO`, raw socket reads, etc. Run easyai inside a
+  container / firejail / unprivileged user when the prompt is
+  untrusted. Documented in the tool description AND in the §22.2
+  comment, so an operator reading either path sees the limitation.
+- **`fs.edit` 8 MiB cap.** Files larger than 8 MiB cannot be edited
+  in place — the model must use `action="write"` with the new full
+  content. Trade-off vs. RAM: 8 MiB × concurrent edits stays
+  comfortable, larger would let a single batch op materialise
+  significant heap. Documented in the tool description.
+
+*Last reviewed against commit immediately before the seventh-pass
+fixes commit.  Re-run when adding a new tool or a new HTTP boundary.*
 
 
 
