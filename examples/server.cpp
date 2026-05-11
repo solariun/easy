@@ -49,9 +49,29 @@
 #include "webui_bundle.js.hpp"
 #include "webui_bundle.css.hpp"
 #include "webui_loading.html.hpp"
-// AI-brain.svg → identifier AI_brain_svg (xxd's '.'/'-' → '_' rule).
-#include "easyai_brand_svg.hpp"
 #endif
+
+// Brand asset — the AI Box favicon, served at /favicon[.ico|.svg]. Kept
+// inline as a raw string literal (not xxd-generated) so the bytes are
+// auditable in source and the build skips one codegen step. The canonical
+// copy lives at `webui/AI-brain.svg` for external use (docs, external
+// rebrand, etc.); this constant is the build-baked source of truth.
+constexpr std::string_view kBrandSvg = R"SVG(<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" width="200" height="200" role="img" aria-label="AI BOX">
+  <title>AI BOX</title>
+  <defs>
+    <linearGradient id="ai_box_gradient" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#ffb547"/>
+      <stop offset="100%" stop-color="#00d4a8"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Outer rounded-square ring (transparent middle via even-odd fill) -->
+  <path fill="url(#ai_box_gradient)" fill-rule="evenodd" d="M 50 0 H 150 A 50 50 0 0 1 200 50 V 150 A 50 50 0 0 1 150 200 H 50 A 50 50 0 0 1 0 150 V 50 A 50 50 0 0 1 50 0 Z M 56 31 H 144 A 25 25 0 0 1 169 56 V 144 A 25 25 0 0 1 144 169 H 56 A 25 25 0 0 1 31 144 V 56 A 25 25 0 0 1 56 31 Z"/>
+
+  <!-- Center mark -->
+  <rect x="69" y="69" width="62" height="62" rx="13" ry="13" fill="url(#ai_box_gradient)"/>
+</svg>
+)SVG";
 
 #include <algorithm>
 #include <atomic>
@@ -71,6 +91,7 @@
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <dirent.h>      // opendir/readdir for fd-count
 #include <sys/resource.h>// getrusage, RLIMIT_NOFILE
@@ -6576,13 +6597,9 @@ int main(int argc, char ** argv) {
             res.set_content(ctx_ref.webui_icon, ctx_ref.webui_icon_mime.c_str());
             return;
         }
-#if defined(EASYAI_BUILD_WEBUI)
-        // Embedded default — the AI-brain.svg shipped under src/.
-        res.set_content(reinterpret_cast<const char *>(AI_brain_svg),
-                        AI_brain_svg_len, "image/svg+xml");
-#else
-        res.status = 204;
-#endif
+        // Embedded default — the AI Box favicon, inlined as kBrandSvg
+        // at the top of this file (canonical copy at webui/AI-brain.svg).
+        res.set_content(kBrandSvg.data(), kBrandSvg.size(), "image/svg+xml");
     };
     svr.Get("/favicon",     serve_favicon);
     svr.Get("/favicon.ico", serve_favicon);

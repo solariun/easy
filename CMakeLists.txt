@@ -257,17 +257,9 @@ if (EASYAI_BUILD_EXAMPLES)
         endforeach()
     endif()
 
-    set(_brand_in  "${CMAKE_CURRENT_SOURCE_DIR}/webui/AI-brain.svg")
-    set(_brand_out "${CMAKE_CURRENT_BINARY_DIR}/easyai_brand_svg.hpp")
-    list(APPEND EASYAI_WEBUI_HEADERS ${_brand_out})
-    add_custom_command(
-        DEPENDS "${_brand_in}"
-        OUTPUT  "${_brand_out}"
-        COMMAND ${CMAKE_COMMAND} -DINPUT=${_brand_in} -DOUTPUT=${_brand_out}
-                -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/xxd.cmake
-        COMMENT "[easyai] embed brand asset: AI-brain.svg"
-    )
-    set_source_files_properties(${_brand_out} PROPERTIES GENERATED TRUE)
+    # The brand SVG (AI Box favicon) is no longer xxd-generated; it
+    # lives inline as `kBrandSvg` in examples/server.cpp.  Canonical
+    # copy stays at webui/AI-brain.svg for external use / rebrand.
 
     add_executable(easyai-server examples/server.cpp ${EASYAI_WEBUI_HEADERS})
     target_link_libraries(easyai-server PRIVATE easyai cpp-httplib llama-common ${EASYAI_ATOMIC_LIBS})
