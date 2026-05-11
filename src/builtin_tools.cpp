@@ -1278,6 +1278,23 @@ ToolHandler make_fs_read_handler(std::shared_ptr<Sandbox> sb) {
                                      + sb->virtual_path(p)
                                      + " (" + std::strerror(errno) + ")");
         }
+        // Pre-empt the cryptic "read failed: Is a directory" errno that
+        // ::read returns when fd points at a directory.  open() succeeds
+        // on a dir (you can open it for read; you just can't ::read()
+        // bytes from it), so we have to fstat the result.  A targeted
+        // error message that names the right action keeps the model
+        // from retry-looping against the same path.
+        {
+            struct stat st_kind {};
+            if (::fstat(fd, &st_kind) == 0 && S_ISDIR(st_kind.st_mode)) {
+                ::close(fd);
+                return ToolResult::error(
+                    std::string("path is a directory: ")
+                    + sb->virtual_path(p)
+                    + " — use action=\"list\" to enumerate entries, "
+                    "or action=\"glob\" / \"grep\" for recursive search.");
+            }
+        }
         if (offset > 0 && ::lseek(fd, offset, SEEK_SET) < 0) {
             ::close(fd);
             return ToolResult::error(std::string("seek failed: ")
@@ -1670,8 +1687,12 @@ ToolHandler make_fs_edit_handler(std::shared_ptr<Sandbox> sb) {
 ToolHandler make_fs_list_handler(std::shared_ptr<Sandbox> sb) {
     return [sb](const ToolCall & c) -> ToolResult {
         std::string path;
-        if (!args::get_string(c.arguments_json, "path", path))
-            return ToolResult::error("missing arg: path (fs action=\"list\")");
+        // path is OPTIONAL — empty / missing defaults to ".", the
+        // sandbox root.  Matches the glob / grep convention so the
+        // model can ask "what's in the workspace" without remembering
+        // to spell out the dot.
+        args::get_string(c.arguments_json, "path", path);
+        if (path.empty()) path = ".";
 
         stdfs::path p; std::string err;
         if (!sb->resolve(path, p, err)) return ToolResult::error(err);
@@ -1679,8 +1700,24 @@ ToolHandler make_fs_list_handler(std::shared_ptr<Sandbox> sb) {
             return ToolResult::error("path escapes sandbox via symlink: "
                                      + sb->virtual_path(p));
         }
-        if (!stdfs::is_directory(p))
-            return ToolResult::error("not a directory: " + sb->virtual_path(p));
+        // Dispatch on what `path` actually is.  A regular file isn't
+        // listable but the model probably wanted action="read"; saying
+        // so explicitly saves a retry round-trip.  Anything else (missing
+        // / FIFO / device) gets a clean error too.
+        std::error_code ec_kind;
+        if (stdfs::is_regular_file(p, ec_kind)) {
+            return ToolResult::error(
+                std::string("path is a file, not a directory: ")
+                + sb->virtual_path(p)
+                + " — use action=\"read\" to view its contents, or "
+                "action=\"check_path\" for metadata.");
+        }
+        if (!stdfs::is_directory(p, ec_kind)) {
+            return ToolResult::error(
+                std::string("not a directory: ") + sb->virtual_path(p)
+                + (ec_kind ? std::string(" (") + ec_kind.message() + ")"
+                           : std::string()));
+        }
 
         std::ostringstream o;
         for (auto & e : stdfs::directory_iterator(p)) {
@@ -1797,15 +1834,25 @@ ToolHandler make_fs_grep_handler(std::shared_ptr<Sandbox> sb) {
         if (!sub.empty() && !sb->resolve(sub, start, err))
             return ToolResult::error(err);
         if (!sb->inside_sandbox(start)) {
-            return ToolResult::error("start dir escapes sandbox via symlink: "
+            return ToolResult::error("path escapes sandbox via symlink: "
                                      + sb->virtual_path(start));
         }
-        std::error_code ec_pre;
-        if (!stdfs::is_directory(start, ec_pre)) {
+        // Dispatch on what `start` actually is — mirroring `grep -r`'s
+        // behaviour: a file is searched as one file, a directory is
+        // walked recursively.  Earlier versions of this handler required
+        // a directory and erred on a regular-file path, which surprised
+        // models that called `fs(action="grep", path="foo.c", ...)`
+        // intending to search that specific file.
+        std::error_code ec_kind;
+        const bool start_is_file = stdfs::is_regular_file(start, ec_kind);
+        const bool start_is_dir  = !start_is_file
+                                && stdfs::is_directory(start, ec_kind);
+        if (!start_is_file && !start_is_dir) {
             return ToolResult::error(
-                std::string("not a directory: ") + sb->virtual_path(start)
-                + (ec_pre ? std::string(" (") + ec_pre.message() + ")"
-                          : std::string()));
+                std::string("not a regular file or directory: ")
+                + sb->virtual_path(start)
+                + (ec_kind ? std::string(" (") + ec_kind.message() + ")"
+                           : std::string()));
         }
 
         std::regex::flag_type rf = std::regex::ECMAScript;
@@ -1832,59 +1879,82 @@ ToolHandler make_fs_grep_handler(std::shared_ptr<Sandbox> sb) {
             }
         }
 
-        constexpr auto kIterOpts =
-            stdfs::directory_options::skip_permission_denied;
-        std::error_code ec_it;
-        stdfs::recursive_directory_iterator it(start, kIterOpts, ec_it);
-        if (ec_it) {
-            return ToolResult::error(
-                std::string("cannot iterate: ") + sb->virtual_path(start)
-                + " (" + ec_it.message() + ")");
-        }
-        const stdfs::recursive_directory_iterator end;
-
         std::ostringstream o;
-        int n = 0;
-        for (; it != end; ) {
+        int  n         = 0;
+        bool budget_hit = false;
+
+        // Scan a single regular file against the compiled regex.  Shared
+        // between the single-file and recursive-directory dispatch paths
+        // so the matching, size cap, line cap, and output formatting are
+        // identical regardless of how `start` was reached.
+        auto scan_file = [&](const stdfs::path & p) {
             std::error_code ec_q;
-            const bool is_reg = it->is_regular_file(ec_q);
-            if (ec_q || !is_reg) goto step;
-            {
-                const auto sz = it->file_size(ec_q);
-                if (ec_q || sz > 4 * 1024 * 1024) goto step;
-                std::string fname = it->path().filename().string();
-                if (!file_glob.empty() && !std::regex_match(fname, glob_rx))
-                    goto step;
-                std::ifstream f(it->path());
-                if (!f) goto step;
-                std::string line; int lineno = 0;
-                std::string vpath = sb->virtual_path(it->path());
-                while (std::getline(f, line)) {
-                    ++lineno;
-                    // libstdc++'s regex engine is recursive; running a
-                    // user-supplied pattern against a multi-megabyte
-                    // single line (binary blob, minified JS, base64
-                    // dump) is a DoS vector via catastrophic
-                    // backtracking. 64 KiB is plenty for source code
-                    // and short of the failure regime.
-                    if (line.size() > 64 * 1024) continue;
-                    if (std::regex_search(line, rx)) {
-                        o << vpath << ":" << lineno << ": "
-                          << clip(line, 240) << "\n";
-                        if (++n >= max_matches) goto done;
-                    }
+            const auto sz = stdfs::file_size(p, ec_q);
+            if (ec_q || sz > 4 * 1024 * 1024) return;
+            std::ifstream f(p);
+            if (!f) return;
+            std::string line; int lineno = 0;
+            const std::string vpath = sb->virtual_path(p);
+            while (std::getline(f, line)) {
+                ++lineno;
+                // libstdc++'s regex engine is recursive; running a
+                // user-supplied pattern against a multi-megabyte
+                // single line (binary blob, minified JS, base64
+                // dump) is a DoS vector via catastrophic
+                // backtracking. 64 KiB is plenty for source code
+                // and short of the failure regime.
+                if (line.size() > 64 * 1024) continue;
+                if (std::regex_search(line, rx)) {
+                    o << vpath << ":" << lineno << ": "
+                      << clip(line, 240) << "\n";
+                    if (++n >= max_matches) { budget_hit = true; return; }
                 }
             }
-        step:
-            std::error_code ec_step;
-            it.increment(ec_step);
-            if (ec_step) {
-                if (it == end) break;
-                it.pop();
-                if (it == end) break;
+        };
+
+        if (start_is_file) {
+            // `file_glob` is a directory-walk filter — irrelevant when
+            // the caller has already pointed `path` at a specific file.
+            // Apply it only as a name guard so a typo'd call like
+            // path="foo.c" file_glob="*.py" still produces "no matches"
+            // instead of silently grepping foo.c against a Python
+            // filter the caller probably intended for a dir walk.
+            std::string fname = start.filename().string();
+            if (file_glob.empty()
+                    || std::regex_match(fname, glob_rx)) {
+                scan_file(start);
+            }
+        } else {
+            constexpr auto kIterOpts =
+                stdfs::directory_options::skip_permission_denied;
+            std::error_code ec_it;
+            stdfs::recursive_directory_iterator it(start, kIterOpts, ec_it);
+            if (ec_it) {
+                return ToolResult::error(
+                    std::string("cannot iterate: ") + sb->virtual_path(start)
+                    + " (" + ec_it.message() + ")");
+            }
+            const stdfs::recursive_directory_iterator end;
+            for (; it != end && !budget_hit; ) {
+                std::error_code ec_q;
+                const bool is_reg = it->is_regular_file(ec_q);
+                if (!ec_q && is_reg) {
+                    std::string fname = it->path().filename().string();
+                    if (file_glob.empty()
+                            || std::regex_match(fname, glob_rx)) {
+                        scan_file(it->path());
+                    }
+                }
+                std::error_code ec_step;
+                it.increment(ec_step);
+                if (ec_step) {
+                    if (it == end) break;
+                    it.pop();
+                    if (it == end) break;
+                }
             }
         }
-    done:
+
         if (n == 0) return ToolResult::ok("No matches.");
         return ToolResult::ok(clip(o.str(), 32 * 1024));
     };
@@ -2156,10 +2226,11 @@ Tool fs(std::string root) {
             "\n"
             "  action=\"list\"\n"
             "    List entries in one directory, non-recursively. "
-            "Required: path (use `.` for the sandbox root). Output is "
-            "one entry per line, sorted, with `d` / `f` prefix and file "
-            "sizes. Use action=\"glob\" for recursive / pattern "
-            "matching.\n"
+            "Optional: path (default `.`, the sandbox root). Output is "
+            "one entry per line, with `d` / `f` prefix and file sizes. "
+            "If `path` points at a regular file the error suggests "
+            "action=\"read\" instead. Use action=\"glob\" for recursive "
+            "/ pattern matching.\n"
             "\n"
             "  action=\"glob\"\n"
             "    Find files by wildcard pattern, recursive by default. "
@@ -2171,12 +2242,15 @@ Tool fs(std::string root) {
             "file); pointing it at a single file is an error.\n"
             "\n"
             "  action=\"grep\"\n"
-            "    Search file contents for a regex, recursively. "
-            "Required: pattern. Optional: path (start dir, default "
-            "`.`), file_glob (limit by basename, e.g. `*.cpp`), "
-            "max_matches (default 100), case_insensitive (default "
-            "false). Regex flavor is ECMAScript. Output: "
-            "`<path>:<lineno>:<line>`. Stops after max_matches.\n"
+            "    Search file contents for a regex. Required: pattern. "
+            "Optional: path (a directory to walk recursively OR a "
+            "specific regular file to search; default `.`, the sandbox "
+            "root), file_glob (limit by basename, e.g. `*.cpp` — "
+            "ignored when path is a single file unless it's used as a "
+            "sanity guard on that file's name), max_matches (default "
+            "100), case_insensitive (default false). Regex flavor is "
+            "ECMAScript. Output: `<path>:<lineno>:<line>`. Stops after "
+            "max_matches.\n"
             "\n"
             "  action=\"check_path\"\n"
             "    AUTHORITATIVE PRE-FLIGHT — confirm a path's existence "
