@@ -12,16 +12,17 @@
 
     <!-- Aura: two stacked Gaussian blurs of the alpha silhouette,
          each tinted with the same cyan flood, merged behind the
-         source.  The outer pass (stdDeviation=14, opacity=0.5)
-         spreads far for atmospheric presence; the inner pass
-         (stdDeviation=4, opacity=1.0) tightens close to the contour
-         for the "neon" core glow.  Reads as one cohesive halo with
-         depth rather than a single flat blur. -->
+         source.  Tuned subtle — the outer pass (stdDeviation=10,
+         opacity=0.3) gives a soft atmospheric breath, the inner
+         pass (stdDeviation=3, opacity=0.6) keeps a gentle contour
+         emission.  Reads as a quiet halo rather than a neon sign.
+         Bump opacities (0.5 / 1.0 was the previous "loud" tuning)
+         if more presence is wanted. -->
     <filter id="ai_box_aura" x="-60%" y="-60%" width="220%" height="220%">
-      <feGaussianBlur in="SourceAlpha" stdDeviation="14" result="outerBlur"/>
-      <feGaussianBlur in="SourceAlpha" stdDeviation="4"  result="innerBlur"/>
-      <feFlood flood-color="#00bcd4" flood-opacity="0.5" result="outerColor"/>
-      <feFlood flood-color="#00bcd4" flood-opacity="1.0" result="innerColor"/>
+      <feGaussianBlur in="SourceAlpha" stdDeviation="10" result="outerBlur"/>
+      <feGaussianBlur in="SourceAlpha" stdDeviation="3"  result="innerBlur"/>
+      <feFlood flood-color="#00bcd4" flood-opacity="0.3" result="outerColor"/>
+      <feFlood flood-color="#00bcd4" flood-opacity="0.6" result="innerColor"/>
       <feComposite in="outerColor" in2="outerBlur" operator="in" result="outerHalo"/>
       <feComposite in="innerColor" in2="innerBlur" operator="in" result="innerHalo"/>
       <feMerge>

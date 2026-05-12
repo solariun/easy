@@ -64,10 +64,10 @@ constexpr std::string_view kBrandSvg = R"SVG(<svg xmlns="http://www.w3.org/2000/
       <stop offset="100%" stop-color="#2196f3"/>
     </linearGradient>
     <filter id="ai_box_aura" x="-60%" y="-60%" width="220%" height="220%">
-      <feGaussianBlur in="SourceAlpha" stdDeviation="14" result="outerBlur"/>
-      <feGaussianBlur in="SourceAlpha" stdDeviation="4"  result="innerBlur"/>
-      <feFlood flood-color="#00bcd4" flood-opacity="0.5" result="outerColor"/>
-      <feFlood flood-color="#00bcd4" flood-opacity="1.0" result="innerColor"/>
+      <feGaussianBlur in="SourceAlpha" stdDeviation="10" result="outerBlur"/>
+      <feGaussianBlur in="SourceAlpha" stdDeviation="3"  result="innerBlur"/>
+      <feFlood flood-color="#00bcd4" flood-opacity="0.3" result="outerColor"/>
+      <feFlood flood-color="#00bcd4" flood-opacity="0.6" result="innerColor"/>
       <feComposite in="outerColor" in2="outerBlur" operator="in" result="outerHalo"/>
       <feComposite in="innerColor" in2="innerBlur" operator="in" result="innerHalo"/>
       <feMerge>
