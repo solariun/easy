@@ -1196,14 +1196,22 @@ if [[ $do_kernel -eq 1 && "$backend_resolved" == "vulkan" ]]; then
     if grep -qiE 'amd|radeon' <(lspci 2>/dev/null) \
             && [[ -f /etc/default/grub ]]; then
         log "patching /etc/default/grub for ttm.pages_limit=$gtt_pages (GTT $gtt_gb GiB)"
-        if ! grep -q 'ttm.pages_limit' /etc/default/grub; then
+        if grep -qE 'ttm\.pages_limit=' /etc/default/grub; then
+            current=$(grep -oE 'ttm\.pages_limit=[0-9]+' /etc/default/grub | head -n1 | cut -d= -f2)
+            if [[ "$current" == "$gtt_pages" ]]; then
+                log "ttm.pages_limit=$gtt_pages already set in /etc/default/grub; nothing to do"
+            else
+                log "updating ttm.pages_limit: $current → $gtt_pages (GTT $(( current / 262144 )) → $gtt_gb GiB)"
+                sudo sed -ri "s|ttm\.pages_limit=[0-9]+|ttm.pages_limit=$gtt_pages|g" /etc/default/grub
+                sudo update-grub || sudo grub-mkconfig -o /boot/grub/grub.cfg || true
+                warn "kernel cmdline updated — REBOOT required; verify with: cat /proc/cmdline"
+            fi
+        else
             sudo sed -ri \
                 "s|^(GRUB_CMDLINE_LINUX_DEFAULT=\")(.*)\"|\\1\\2 ttm.pages_limit=$gtt_pages\"|" \
                 /etc/default/grub
             sudo update-grub || sudo grub-mkconfig -o /boot/grub/grub.cfg || true
-            warn "kernel cmdline updated — reboot needed for the new GTT to take effect"
-        else
-            log "ttm.pages_limit already present; skipping"
+            warn "kernel cmdline updated — REBOOT required; verify with: cat /proc/cmdline"
         fi
     fi
 fi
