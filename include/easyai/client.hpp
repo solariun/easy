@@ -209,6 +209,24 @@ public:
     std::string chat_continue ();
     void        clear_history ();
 
+    // ----- session persistence ---------------------------------------------
+    // dump_history() returns the user / assistant / tool messages in the
+    // OpenAI on-wire shape, as a JSON array string.  The system prompt is
+    // NOT included — it lives on the Client as config and is re-attached
+    // on every request.  Empty history returns "[]".  Intended for
+    // serialising to disk so a later process can resume the conversation
+    // via load_history().
+    //
+    // load_history(json_array) replaces the existing message history
+    // with the messages parsed from `json_array`.  Returns false on parse
+    // failure or schema mismatch (must be an array of objects, each with
+    // a "role" string); on success the new history is in effect for the
+    // next chat() / chat_continue() call.  Pass `err` to capture a
+    // diagnostic.
+    std::string dump_history() const;
+    bool        load_history(const std::string & json_array,
+                             std::string * err = nullptr);
+
     // ----- direct endpoints (optional helpers) -----------------------------
     // Each method returns false on transport / HTTP failure; on success
     // the parsed value is written to the out parameter.  See last_error()

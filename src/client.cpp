@@ -1229,6 +1229,64 @@ void Client::clear_history() {
     p_->last_error.clear();
 }
 
+std::string Client::dump_history() const {
+    // history_json is already a vector of per-message JSON strings; we
+    // just reassemble them into a single array and dump.  Use ordered_json
+    // so the resulting file preserves message field order (role / content
+    // / tool_calls / tool_call_id), which makes diffs against a saved
+    // session readable.
+    ordered_json arr = ordered_json::array();
+    for (const auto & raw : p_->history_json) {
+        try {
+            arr.push_back(ordered_json::parse(raw));
+        } catch (const std::exception &) {
+            // Skip an unparseable cached entry rather than corrupt the
+            // whole dump.  In practice this is unreachable — every entry
+            // in history_json was produced by a `.dump()` call on the
+            // same library — but defensive against future code paths
+            // that might push a malformed string.
+        }
+    }
+    return arr.dump(2);
+}
+
+bool Client::load_history(const std::string & json_array, std::string * err) {
+    ordered_json parsed;
+    try {
+        parsed = ordered_json::parse(json_array);
+    } catch (const std::exception & e) {
+        if (err) *err = std::string("invalid JSON: ") + e.what();
+        return false;
+    }
+    if (!parsed.is_array()) {
+        if (err) *err = "expected a JSON array of message objects";
+        return false;
+    }
+    std::vector<std::string> new_history;
+    new_history.reserve(parsed.size());
+    for (std::size_t i = 0; i < parsed.size(); ++i) {
+        const auto & msg = parsed[i];
+        if (!msg.is_object()) {
+            if (err) {
+                *err = "messages[" + std::to_string(i)
+                     + "] is not an object";
+            }
+            return false;
+        }
+        if (!msg.contains("role") || !msg["role"].is_string()) {
+            if (err) {
+                *err = "messages[" + std::to_string(i)
+                     + "] missing string field \"role\"";
+            }
+            return false;
+        }
+        new_history.push_back(msg.dump());
+    }
+    p_->history_json = std::move(new_history);
+    p_->last_error.clear();
+    return true;
+}
+
 // ---- direct endpoints -----------------------------------------------------
 bool Client::list_models(std::vector<RemoteModel> & out) {
     out.clear();

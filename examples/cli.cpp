@@ -27,8 +27,14 @@
 //   /exit, /quit       leave
 //   /clear             clear conversation history (keep tools + system)
 //   /reset             clear history AND plan
+//   /compress          ask the model for a lossless recap of the session,
+//                      replace history with the recap, save .easyai_session
 //   /plan              re-render the plan checklist
 //   /tools             list registered tools and their descriptions
+//
+// Session persistence: every invocation writes .easyai_session in cwd
+// after each turn.  --continue resumes the last session in this dir;
+// --continue --compress resumes AND recaps before the first prompt.
 //
 // Configuration is layered: CLI flags > env vars > defaults.  Env vars:
 //   EASYAI_URL, EASYAI_API_KEY, EASYAI_MODEL.
@@ -67,7 +73,8 @@
 #include <sstream>
 #include <string>
 #include <sys/types.h>
-#include <unistd.h>      // getpid
+#include <fcntl.h>       // open / O_* flags for atomic session write
+#include <unistd.h>      // getpid, write, close
 #include <vector>
 
 namespace {
@@ -89,6 +96,213 @@ inline void vlog(const char * fmt, ...) {
     std::vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
     easyai::log::write("%s", buf);
+}
+
+// ===========================================================================
+// Session persistence — `.easyai_session` in cwd
+// ---------------------------------------------------------------------------
+// Every easyai-cli invocation drops a `.easyai_session` file in the
+// current working directory, atomically updated after each chat() turn
+// and after every history-mutating slash command (/clear, /reset,
+// /compress).  The file is the raw JSON array produced by
+// Client::dump_history() — OpenAI-shape messages, no envelope.
+//
+//   easyai-cli                  -> fresh history, save on every turn
+//   easyai-cli --continue       -> load existing .easyai_session first
+//                                  (warn if none; start fresh)
+//   easyai-cli --continue \
+//              --compress       -> load, ask the model for a lossless
+//                                  recap of the conversation, replace
+//                                  history with the recap, save
+//   /compress  (inside the REPL) -> same compress flow, run mid-session
+// ===========================================================================
+constexpr const char * kSessionFileName = "easyai-session.json";
+
+// `.easyai_session` is the canonical name (hidden, dot-prefixed); the
+// non-hidden alias above is what the constant currently spells.  Keep
+// the dot-prefixed form as the literal on disk:
+inline std::filesystem::path session_file_path() {
+    std::error_code ec;
+    auto cwd = std::filesystem::current_path(ec);
+    if (ec) cwd = std::filesystem::path(".");
+    return cwd / ".easyai_session";
+}
+
+// Atomic write: tempfile + rename(2).  O_NOFOLLOW so a planted symlink
+// at the session path doesn't redirect us out of cwd; mode 0600 because
+// the file echoes prompts, tool results, and reasoning content (which
+// can contain secrets, API keys mentioned in passing, or private notes).
+bool save_session(const easyai::Client & cli, std::string * err = nullptr) {
+    const std::string body = cli.dump_history();
+    const auto target = session_file_path();
+    const std::string tmp = target.string() + ".tmp";
+
+    int fd = ::open(tmp.c_str(),
+                    O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC,
+                    0600);
+    if (fd < 0) {
+        if (err) *err = std::string("open .easyai_session.tmp: ")
+                       + std::strerror(errno);
+        return false;
+    }
+    const char * data = body.data();
+    size_t       left = body.size();
+    while (left > 0) {
+        ssize_t n = ::write(fd, data, left);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            ::close(fd);
+            ::unlink(tmp.c_str());
+            if (err) *err = std::string("write .easyai_session.tmp: ")
+                           + std::strerror(errno);
+            return false;
+        }
+        data += n;
+        left -= (size_t) n;
+    }
+    ::close(fd);
+    if (::rename(tmp.c_str(), target.c_str()) != 0) {
+        const int e = errno;
+        ::unlink(tmp.c_str());
+        if (err) *err = std::string("rename .easyai_session.tmp: ")
+                       + std::strerror(e);
+        return false;
+    }
+    return true;
+}
+
+// Returns true on success.  Sets `*err` on failure (and on the
+// "session file missing" case, which the caller treats as informational
+// when --continue was passed against an unprimed cwd).
+bool load_session(easyai::Client & cli, std::string * err = nullptr) {
+    const auto target = session_file_path();
+    std::ifstream f(target);
+    if (!f) {
+        if (err) *err = "no session file at " + target.string();
+        return false;
+    }
+    std::stringstream ss;
+    ss << f.rdbuf();
+    return cli.load_history(ss.str(), err);
+}
+
+// The compress prompt is the entire instruction we hand to the model
+// for the summarise-this-conversation turn.  Spelled out deliberately —
+// "lossless" is aspirational (no LLM is truly lossless), but the
+// constraint list forces the model toward density over polish and toward
+// preserving every facet that future turns might lean on.
+constexpr const char * kCompressPrompt =
+    "Summarize this entire conversation as densely as possible without "
+    "losing information needed for continuation.  Preserve verbatim: "
+    "every file path mentioned, every decision made, every code change "
+    "applied, every error encountered with its cause, every tool result "
+    "that may still be relevant, every user constraint or stated "
+    "preference.  Strip: pleasantries, abandoned exploratory branches "
+    "that were superseded, retries of the same query.  Output ONE "
+    "markdown block, no preamble, no closing remarks — just the dense "
+    "summary, ordered by topic.  Do NOT call any tool — reply with the "
+    "summary text only.";
+
+// Runs the compress flow against the Client's current history.  Returns
+// true on success; on failure prints a diagnostic and leaves history
+// untouched.  Caller is responsible for save_session() after.
+//
+// No spinner — the compress turn can take 30–90 s on a long
+// conversation, but there's no per-turn streaming wiring at the
+// callsites that invoke this (startup --compress runs before the REPL
+// is up; /compress runs between turns where the per-run_one Spinner is
+// torn down).  A simple "compressing... done" pair on stderr is the
+// best we can do without plumbing a fresh Streaming/Spinner instance.
+bool do_compress(easyai::Client & cli, const Style & st) {
+    // Empty history → nothing to compress.  Return false so callers can
+    // refrain from saving a no-op state.
+    const std::string before = cli.dump_history();
+    if (before == "[]") {
+        std::fprintf(stderr,
+            "%scompress:%s history is empty — nothing to compress.\n",
+            st.yellow(), st.reset());
+        return false;
+    }
+
+    std::fprintf(stderr, "%scompressing session...%s\n",
+                 st.dim(), st.reset());
+    std::fflush(stderr);
+
+    const std::string summary = cli.chat(kCompressPrompt);
+
+    if (summary.empty() || !cli.last_error().empty()) {
+        std::fprintf(stderr, "%scompress failed:%s %s\n",
+                     st.red(), st.reset(),
+                     cli.last_error().empty() ? "empty reply"
+                                               : cli.last_error().c_str());
+        // Restore prior history so the failed compress turn doesn't
+        // leave a half-mutated state behind.
+        std::string ignored;
+        cli.load_history(before, &ignored);
+        return false;
+    }
+
+    // Replace the entire history with a synthetic user / assistant pair.
+    // user → "Previous conversation summarised below; continue from here."
+    // assistant → the model's own summary.
+    // This shape works for every chat template (single user/assistant
+    // turn looks like a normal exchange to the model) and ensures the
+    // first thing the next turn sees is the recap, not the original
+    // long history.
+    std::string compressed_array;
+    {
+        compressed_array.reserve(summary.size() + 256);
+        // Hand-built JSON — small, two messages, no need to pull a JSON
+        // dependency into the CLI for this one spot.  We escape backslash
+        // and double-quote on the values.
+        auto json_escape = [](const std::string & s) {
+            std::string out;
+            out.reserve(s.size() + 16);
+            for (char c : s) {
+                switch (c) {
+                    case '\\': out += "\\\\"; break;
+                    case '"':  out += "\\\""; break;
+                    case '\n': out += "\\n";  break;
+                    case '\r': out += "\\r";  break;
+                    case '\t': out += "\\t";  break;
+                    default:
+                        if ((unsigned char) c < 0x20) {
+                            char buf[8];
+                            std::snprintf(buf, sizeof(buf),
+                                          "\\u%04x", (unsigned) c);
+                            out += buf;
+                        } else {
+                            out += c;
+                        }
+                }
+            }
+            return out;
+        };
+        compressed_array =
+            "[\n"
+            "  {\"role\":\"user\",\"content\":\"Previous conversation "
+            "summarised below; continue from here.\"},\n"
+            "  {\"role\":\"assistant\",\"content\":\""
+              + json_escape(summary) + "\"}\n"
+            "]";
+    }
+
+    std::string lh_err;
+    if (!cli.load_history(compressed_array, &lh_err)) {
+        std::fprintf(stderr,
+            "%scompress load_history failed:%s %s — keeping original "
+            "history.\n",
+            st.red(), st.reset(), lh_err.c_str());
+        std::string ignored;
+        cli.load_history(before, &ignored);
+        return false;
+    }
+
+    std::fprintf(stderr,
+        "%scompressed.%s recap is %zu chars; original history "
+        "(%zu chars) replaced.\n",
+        st.dim(), st.reset(), summary.size(), before.size());
+    return true;
 }
 
 
@@ -338,6 +552,13 @@ struct Options {
     bool        quiet            = false;  // --quiet/-q: disable spinner + ctx-% gauge
                                             // (batch / scripted / service usage)
     std::string log_file_path;             // explicit --log-file override
+
+    // Session persistence — drop a `.easyai_session` in cwd updated after
+    // every turn.  Always on; `--continue` opts into picking up where the
+    // last session left off in this cwd, otherwise we start fresh and
+    // overwrite the file as soon as the first turn lands.
+    bool        continue_session = false;
+    bool        compress_session = false;   // requires --continue
     int         max_reasoning    = 0;      // 0 = unlimited (disable runaway abort)
     bool        retry_on_incomplete = true;    // matches libeasyai-cli default; --no-retry-on-incomplete to opt out
     bool        no_plan          = false;     // skip auto-registering Plan
@@ -526,14 +747,9 @@ void usage(const char * argv0) {
 "    --retry-on-incomplete      legacy alias for the now-default behaviour;\n"
 "                                kept for backwards compatibility, no-op.\n"
 "    --verbose                  log HTTP+SSE traffic to stderr (timestamps +\n"
-"                                per-piece diagnostics).  When set,\n"
-"                                ALSO writes the same diagnostics PLUS\n"
-"                                the raw HTTP transaction (request body,\n"
-"                                every SSE chunk byte-for-byte, every\n"
-"                                tool dispatch input/output) into a log\n"
-"                                file at /tmp/easyai-cli-{pid}-{epoch}.log.\n"
-"                                The path is printed at startup.  Override\n"
-"                                with --log-file PATH.\n"
+"                                per-piece diagnostics).  Stderr-only;\n"
+"                                does NOT create a /tmp log file (use\n"
+"                                --log-file PATH for that).\n"
 "    -q, --quiet                disable the spinner glyph + context-fill\n"
 "                                gauge (e.g. |45%%).  Use for batch / scripted\n"
 "                                runs where stdout is captured.  Streamed\n"
@@ -547,9 +763,29 @@ void usage(const char * argv0) {
 "                                banner and lets the current AI session\n"
 "                                finish before the program quits; press\n"
 "                                Ctrl-C a second time to force-cancel.\n"
-"    --log-file PATH            write the raw transaction log here instead\n"
-"                                of the auto-generated /tmp path.  Implies\n"
-"                                --verbose if --verbose wasn't passed.\n"
+"    --log-file PATH            opt in to a raw transaction log at PATH\n"
+"                                (request body + every SSE chunk + every\n"
+"                                tool dispatch input/output).  Default\n"
+"                                OFF — no log file is created without\n"
+"                                this flag.  Implies --verbose.\n"
+"    --continue                 load `.easyai_session` from the current\n"
+"                                directory and resume that conversation.\n"
+"                                Without --continue (default) every\n"
+"                                invocation starts fresh and overwrites\n"
+"                                `.easyai_session` on the first turn.\n"
+"                                The file is written atomically after\n"
+"                                EVERY turn regardless of this flag, so\n"
+"                                you can always come back with --continue\n"
+"                                later.\n"
+"    --compress                 requires --continue.  After loading the\n"
+"                                session, ask the model for a single\n"
+"                                lossless recap of the entire conversation\n"
+"                                and replace the history with that recap\n"
+"                                before the next prompt fires.  Useful\n"
+"                                when context gets long; the recap drops\n"
+"                                tool result noise + abandoned branches\n"
+"                                and keeps facts / decisions / file paths.\n"
+"                                Also reachable mid-REPL via /compress.\n"
 "    --config PATH              INI overlay (CLI > INI > hardcoded). Default\n"
 "                                /etc/easyai/easyai-cli.ini; missing file is\n"
 "                                NOT an error (just keeps hardcoded\n"
@@ -689,6 +925,8 @@ bool parse_args(int argc, char ** argv, Options & o) {
         else if (a == "--verbose" || a == "-v") o.verbose = true;
         else if (a == "--quiet"   || a == "-q") o.quiet   = true;
         else if (a == "--log-file")       o.log_file_path     = need(i, "--log-file");
+        else if (a == "--continue")       o.continue_session  = true;
+        else if (a == "--compress")       o.compress_session  = true;
         else if (a == "--insecure-tls")   o.tls_insecure = true;
         else if (a == "--ca-cert")        o.tls_ca_path  = need(i, "--ca-cert");
         else if (a == "-p" || a == "--prompt") o.prompt = need(i, "--prompt");
@@ -1191,6 +1429,21 @@ int run_one(easyai::Client & cli, easyai::Plan & plan,
     spinner.finish();
     std::fputc('\n', stdout);
 
+    // Persist the post-turn state to .easyai_session.  Best-effort: a
+    // disk failure here doesn't fail the turn (the model already
+    // replied; the user already saw the answer), but the warning lets
+    // the operator notice an out-of-space / permission issue.  Atomic
+    // tempfile + rename — a partial write never replaces the prior
+    // session file.
+    {
+        std::string save_err;
+        if (!save_session(cli, &save_err)) {
+            std::fprintf(stderr,
+                "%swarning:%s could not save .easyai_session: %s\n",
+                st.yellow(), st.reset(), save_err.c_str());
+        }
+    }
+
     // Cancel guard fires BEFORE every other diagnostic.
     //
     // Two paths now:
@@ -1256,9 +1509,14 @@ int run_repl(easyai::Client & cli, easyai::Plan & plan,
              const Options & o, const Style & st) {
     std::fprintf(stderr,
         "%seasyai-cli-remote%s — interactive.  /exit to quit, /help for commands.\n"
+        "Session auto-saves to %s.easyai_session%s in the current "
+        "directory after every turn; pass %s--continue%s next time to "
+        "resume.  /compress to recap mid-session.\n"
         "Ctrl+C during a turn → exits AFTER the current turn finishes "
         "(press again to force-cancel).\n"
         "Ctrl+C at an empty prompt → exits immediately.\n",
+        st.bold(), st.reset(),
+        st.bold(), st.reset(),
         st.bold(), st.reset());
     std::string line;
     while (true) {
@@ -1286,16 +1544,39 @@ int run_repl(easyai::Client & cli, easyai::Plan & plan,
         }
         if (line.empty()) continue;
 
+        // Best-effort save after a history-mutating slash command so
+        // .easyai_session reflects the post-command state.  A disk
+        // failure here is a warning, not a fatal — the REPL keeps going.
+        auto save_after_mutation = [&]() {
+            std::string save_err;
+            if (!save_session(cli, &save_err)) {
+                std::fprintf(stderr,
+                    "%swarning:%s could not save .easyai_session: %s\n",
+                    st.yellow(), st.reset(), save_err.c_str());
+            }
+        };
+
         if (is_special(line, "/exit") || is_special(line, "/quit")) break;
         if (is_special(line, "/clear")) {
             cli.clear_history();
+            save_after_mutation();
             std::fprintf(stderr, "%shistory cleared%s\n", st.dim(), st.reset());
             continue;
         }
         if (is_special(line, "/reset")) {
             cli.clear_history(); plan.clear();
+            save_after_mutation();
             std::fprintf(stderr, "%shistory + plan cleared%s\n",
                          st.dim(), st.reset());
+            continue;
+        }
+        if (is_special(line, "/compress")) {
+            // do_compress() mutates history in place when it succeeds.
+            // We save AFTER so .easyai_session carries the compressed
+            // recap and a subsequent --continue picks it up.
+            if (do_compress(cli, st)) {
+                save_after_mutation();
+            }
             continue;
         }
         if (is_special(line, "/plan")) { render_plan(plan, st); continue; }
@@ -1308,7 +1589,9 @@ int run_repl(easyai::Client & cli, easyai::Plan & plan,
             continue;
         }
         if (is_special(line, "/help")) {
-            std::fputs("/exit /quit /clear /reset /plan /tools /help\n", stdout);
+            std::fputs(
+                "/exit /quit /clear /reset /compress /plan /tools /help\n",
+                stdout);
             continue;
         }
         if (line[0] == '/') {
@@ -1331,10 +1614,17 @@ int main(int argc, char ** argv) {
     Options o;
     if (!parse_args(argc, argv, o)) { usage(argv[0]); return 2; }
 
-    // --show-system-prompt is a pure diagnostic — it never makes a
-    // network call. Suppress libeasyai-cli's auto-log open so we don't
-    // leave an empty /tmp/easyai-client-*.log behind on every invocation.
-    if (o.show_system_prompt && std::getenv("EASYAI_NO_AUTO_LOG") == nullptr) {
+    // The library-side auto-log in src/log.cpp::auto_open opens a fresh
+    // /tmp/easyai-client-<pid>-<epoch>.log on every Client construction
+    // unless EASYAI_NO_AUTO_LOG is set.  We want logging to be OPT-IN
+    // through --log-file PATH from the binary side; otherwise no /tmp
+    // log files should appear.  Set the env var by default (only if the
+    // operator hasn't already set it, so an explicit
+    // `EASYAI_NO_AUTO_LOG=0` from the environment still wins as an
+    // override).  When --log-file is on, the binary's open_log_tee
+    // already handles the logging and cli.log_file(log_fp) feeds the
+    // library — no double-log needed.
+    if (std::getenv("EASYAI_NO_AUTO_LOG") == nullptr) {
         ::setenv("EASYAI_NO_AUTO_LOG", "1", /*overwrite=*/0);
     }
     Style st = easyai::ui::detect_style();
@@ -1411,19 +1701,19 @@ int main(int argc, char ** argv) {
         return 2;
     }
 
-    // --log-file implies --verbose so the user gets the full diagnostic
-    // stream (otherwise the file would only carry the wire-level RAW data
-    // and miss CLI-side context).
+    // --log-file PATH is the ONLY way to materialise a raw transaction
+    // log on disk now.  --verbose stays a pure stderr-verbosity knob;
+    // the previous "verbose-implies-auto-/tmp-log" behaviour is gone
+    // because operators kept ending up with a stale `/tmp/easyai-cli-
+    // remote-<pid>-<epoch>.log` per session whether they wanted one or
+    // not.  --log-file implies --verbose so the file carries CLI-side
+    // diagnostics alongside the raw HTTP/SSE bytes (otherwise the log
+    // would just be wire dumps with no context).
     if (!o.log_file_path.empty()) o.verbose = true;
 
-    // Open the diagnostic log file when --verbose (or --log-file) is on.
-    // open_log_tee handles auto-path (/tmp/easyai-cli-remote-<pid>-<epoch>.log),
-    // header (timestamp + pid + argv), and registers the FILE* as the
-    // sink for easyai::log so vlog() tees here.  libeasyai-cli also
-    // writes raw SSE here via cli.log_file(log_fp) below.
     std::string resolved_log_path;
     std::FILE * log_fp = nullptr;
-    if (o.verbose) {
+    if (!o.log_file_path.empty()) {
         log_fp = easyai::cli::open_log_tee(
             o.log_file_path, "easyai-cli-remote",
             argc, argv, &resolved_log_path);
@@ -1614,6 +1904,47 @@ int main(int argc, char ** argv) {
     // chat path / REPL also has them ready.
     easyai::Plan plan;
     register_tools(cli, plan, o, st);
+
+    // --------------- session persistence --------------------------------
+    // `.easyai_session` in cwd is the per-process state.  Default
+    // behaviour: write it on every turn, start fresh on each invocation
+    // (overwrites any previous file).  `--continue` opts in to loading
+    // the existing file before the first prompt; `--compress` (only
+    // valid alongside --continue) asks the model to recap the loaded
+    // history losslessly and replace it with the recap.
+    if (o.compress_session && !o.continue_session) {
+        std::fprintf(stderr,
+            "%serror:%s --compress requires --continue (nothing to "
+            "compress on a fresh session).\n", st.red(), st.reset());
+        return 2;
+    }
+    if (o.continue_session && !any_management(o)) {
+        std::string load_err;
+        if (load_session(cli, &load_err)) {
+            std::fprintf(stderr,
+                "%s[easyai-cli-remote]%s continued from "
+                "%s.easyai_session%s in %s\n",
+                st.dim(),  st.reset(),
+                st.bold(), st.reset(),
+                session_file_path().parent_path().string().c_str());
+        } else {
+            std::fprintf(stderr,
+                "%s[easyai-cli-remote]%s --continue requested but no "
+                "session to resume (%s) — starting fresh.\n",
+                st.dim(), st.reset(), load_err.c_str());
+        }
+        if (o.compress_session && !any_management(o)) {
+            if (do_compress(cli, st)) {
+                std::string save_err;
+                if (!save_session(cli, &save_err)) {
+                    std::fprintf(stderr,
+                        "%swarning:%s could not persist compressed "
+                        "session: %s\n",
+                        st.yellow(), st.reset(), save_err.c_str());
+                }
+            }
+        }
+    }
 
     auto close_log_fp = [&]() {
         easyai::cli::close_log_tee(log_fp);
