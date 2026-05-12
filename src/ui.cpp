@@ -532,6 +532,10 @@ void Streaming::on_tool_(const ToolCall & call, const ToolResult & result) {
     }
 }
 
+void Streaming::notify_tool(const ToolCall & c, const ToolResult & r) {
+    on_tool_(c, r);
+}
+
 Streaming & Streaming::attach(Engine & engine) {
     engine.on_token([this](const std::string & p){ this->on_token_(p); });
     engine.on_tool ([this](const ToolCall & c, const ToolResult & r){

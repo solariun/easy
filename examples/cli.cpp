@@ -1434,6 +1434,30 @@ int run_one(easyai::Client & cli, easyai::Plan & plan,
              .attach        (cli)
              .attach        (plan);
 
+    // Checkpoint .easyai_session after every tool round-trip so a
+    // long agentic turn that gets force-exited (3-stage Ctrl-C → stage
+    // 3 → _exit(130)) still leaves the last completed tool's state on
+    // disk.  Stages 1-2 (graceful / cancel) already get a save via
+    // the post-chat() path; only the force-exit case needs this.
+    //
+    // Composes with Streaming's on_tool_ via notify_tool() so the
+    // canonical UI prints first, then we persist.  Replaces the
+    // single on_tool callback that streaming.attach(cli) just
+    // installed — we keep its content/reasoning callbacks intact
+    // because cli.on_tool() only touches the tool slot.
+    cli.on_tool([&streaming, &cli, &st]
+                (const easyai::ToolCall & call,
+                 const easyai::ToolResult & result) {
+        streaming.notify_tool(call, result);
+        std::string save_err;
+        if (!save_session(cli, &save_err)) {
+            std::fprintf(stderr,
+                "%s[easyai-cli] warning:%s checkpoint "
+                ".easyai_session: %s\n",
+                st.yellow(), st.reset(), save_err.c_str());
+        }
+    });
+
     spinner.initial_draw();
     spinner.start_heartbeat();
     // Enter the "thinking" state right after the request goes out so

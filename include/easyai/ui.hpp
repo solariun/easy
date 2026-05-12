@@ -259,6 +259,18 @@ public:
     Streaming & attach(Client & client);  // on_token + on_reason + on_tool
     Streaming & attach(Plan   & plan);    // on_change → render_plan
 
+    // Public forwarder for the private on_tool_ UI logic.  Use this
+    // when a caller wants to COMPOSE additional behaviour onto the
+    // on_tool callback (e.g., checkpointing session state to disk
+    // after every tool dispatch) without losing the streaming UI.
+    // Pattern:
+    //   streaming.attach(cli);           // wires the canonical handler
+    //   cli.on_tool([&](const auto& c, const auto& r) {
+    //       streaming.notify_tool(c, r); // run the UI work
+    //       my_extra_work();             // then your hook
+    //   });
+    void notify_tool(const ToolCall & call, const ToolResult & result);
+
 private:
     // Helpers shared between Engine/Client attach paths.
     void on_token_(const std::string & piece);
