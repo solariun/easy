@@ -1,15 +1,42 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" width="200" height="200" role="img" aria-label="AI BOX">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="-50 -50 300 300" width="300" height="300" role="img" aria-label="AI BOX">
   <title>AI BOX</title>
   <defs>
+    <!-- Subtle gradient: vibrant mint-green at the top-left,
+         Material blue at the bottom-right.  Same hue arc as the
+         aura colour below so the halo reads as a natural emission
+         from the mark, not as a separate sticker. -->
     <linearGradient id="ai_box_gradient" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0%" stop-color="#ffb547"/>
-      <stop offset="100%" stop-color="#00d4a8"/>
+      <stop offset="0%"   stop-color="#1de9b6"/>
+      <stop offset="100%" stop-color="#2196f3"/>
     </linearGradient>
+
+    <!-- Aura: two stacked Gaussian blurs of the alpha silhouette,
+         each tinted with the same cyan flood, merged behind the
+         source.  The outer pass (stdDeviation=14, opacity=0.5)
+         spreads far for atmospheric presence; the inner pass
+         (stdDeviation=4, opacity=1.0) tightens close to the contour
+         for the "neon" core glow.  Reads as one cohesive halo with
+         depth rather than a single flat blur. -->
+    <filter id="ai_box_aura" x="-60%" y="-60%" width="220%" height="220%">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="14" result="outerBlur"/>
+      <feGaussianBlur in="SourceAlpha" stdDeviation="4"  result="innerBlur"/>
+      <feFlood flood-color="#00bcd4" flood-opacity="0.5" result="outerColor"/>
+      <feFlood flood-color="#00bcd4" flood-opacity="1.0" result="innerColor"/>
+      <feComposite in="outerColor" in2="outerBlur" operator="in" result="outerHalo"/>
+      <feComposite in="innerColor" in2="innerBlur" operator="in" result="innerHalo"/>
+      <feMerge>
+        <feMergeNode in="outerHalo"/>
+        <feMergeNode in="innerHalo"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
   </defs>
 
-  <!-- Outer rounded-square ring (transparent middle via even-odd fill) -->
-  <path fill="url(#ai_box_gradient)" fill-rule="evenodd" d="M 50 0 H 150 A 50 50 0 0 1 200 50 V 150 A 50 50 0 0 1 150 200 H 50 A 50 50 0 0 1 0 150 V 50 A 50 50 0 0 1 50 0 Z M 56 31 H 144 A 25 25 0 0 1 169 56 V 144 A 25 25 0 0 1 144 169 H 56 A 25 25 0 0 1 31 144 V 56 A 25 25 0 0 1 56 31 Z"/>
+  <g filter="url(#ai_box_aura)">
+    <!-- Outer rounded-square ring (transparent middle via even-odd fill) -->
+    <path fill="url(#ai_box_gradient)" fill-rule="evenodd" d="M 50 0 H 150 A 50 50 0 0 1 200 50 V 150 A 50 50 0 0 1 150 200 H 50 A 50 50 0 0 1 0 150 V 50 A 50 50 0 0 1 50 0 Z M 56 31 H 144 A 25 25 0 0 1 169 56 V 144 A 25 25 0 0 1 144 169 H 56 A 25 25 0 0 1 31 144 V 56 A 25 25 0 0 1 56 31 Z"/>
 
-  <!-- Center mark -->
-  <rect x="69" y="69" width="62" height="62" rx="13" ry="13" fill="url(#ai_box_gradient)"/>
+    <!-- Center mark -->
+    <rect x="69" y="69" width="62" height="62" rx="13" ry="13" fill="url(#ai_box_gradient)"/>
+  </g>
 </svg>
