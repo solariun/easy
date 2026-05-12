@@ -554,11 +554,17 @@ struct Options {
     std::string log_file_path;             // explicit --log-file override
 
     // Session persistence — drop a `.easyai_session` in cwd updated after
-    // every turn.  Always on; `--continue` opts into picking up where the
-    // last session left off in this cwd, otherwise we start fresh and
-    // overwrite the file as soon as the first turn lands.
-    bool        continue_session = false;
-    bool        compress_session = false;   // requires --continue
+    // every turn.  Loading is DEFAULT-ON: if a session file exists in
+    // cwd, we resume from it; otherwise we start fresh silently.
+    // `--no-continue` (or [cli] auto_continue = off) overrides to start
+    // fresh even when a session file exists.  `--compress` (or [cli]
+    // auto_compress = on) runs a lossless recap on load.
+    bool        auto_continue       = true;     // load .easyai_session if present
+    bool        auto_continue_cli_set = false;  // CLI > INI > hardcoded default
+    bool        auto_compress       = false;    // recap on every load when on
+    bool        auto_compress_cli_set = false;
+    bool        log_file_path_cli_set = false;  // tracks --log-file vs INI log_file
+    bool        auto_log            = false;    // legacy /tmp auto-log: opt-in via INI
     int         max_reasoning    = 0;      // 0 = unlimited (disable runaway abort)
     bool        retry_on_incomplete = true;    // matches libeasyai-cli default; --no-retry-on-incomplete to opt out
     bool        no_plan          = false;     // skip auto-registering Plan
@@ -768,29 +774,47 @@ void usage(const char * argv0) {
 "                                tool dispatch input/output).  Default\n"
 "                                OFF — no log file is created without\n"
 "                                this flag.  Implies --verbose.\n"
-"    --continue                 load `.easyai_session` from the current\n"
-"                                directory and resume that conversation.\n"
-"                                Without --continue (default) every\n"
-"                                invocation starts fresh and overwrites\n"
-"                                `.easyai_session` on the first turn.\n"
-"                                The file is written atomically after\n"
-"                                EVERY turn regardless of this flag, so\n"
-"                                you can always come back with --continue\n"
-"                                later.\n"
-"    --compress                 requires --continue.  After loading the\n"
-"                                session, ask the model for a single\n"
-"                                lossless recap of the entire conversation\n"
-"                                and replace the history with that recap\n"
-"                                before the next prompt fires.  Useful\n"
-"                                when context gets long; the recap drops\n"
-"                                tool result noise + abandoned branches\n"
-"                                and keeps facts / decisions / file paths.\n"
-"                                Also reachable mid-REPL via /compress.\n"
+"                                INI: [cli] log_file = PATH.\n"
+"    --continue                 force-load `.easyai_session` from the\n"
+"                                current directory (default ON since\n"
+"                                2026-05-12).  Explicit form is useful in\n"
+"                                scripts to assert resume behaviour even\n"
+"                                when an operator's INI sets\n"
+"                                auto_continue = off.  The file is\n"
+"                                written atomically after EVERY turn\n"
+"                                regardless of how loading was decided.\n"
+"                                INI: [cli] auto_continue = true|false.\n"
+"    --no-continue              start fresh — ignore any existing\n"
+"                                `.easyai_session` and overwrite it on\n"
+"                                the first turn.  Overrides INI\n"
+"                                auto_continue = on for this invocation.\n"
+"    --compress                 after loading the session, ask the model\n"
+"                                for a single lossless recap of the\n"
+"                                entire conversation and replace the\n"
+"                                history with that recap before the\n"
+"                                next prompt fires.  Useful when context\n"
+"                                gets long; the recap drops tool result\n"
+"                                noise + abandoned branches and keeps\n"
+"                                facts / decisions / file paths.  Also\n"
+"                                reachable mid-REPL via /compress.\n"
+"                                No-op when combined with --no-continue\n"
+"                                (nothing in memory to recap).\n"
+"                                INI: [cli] auto_compress = true|false.\n"
 "    --config PATH              INI overlay (CLI > INI > hardcoded). Default\n"
 "                                /etc/easyai/easyai-cli.ini; missing file is\n"
 "                                NOT an error (just keeps hardcoded\n"
-"                                defaults). Today the [cli] section\n"
-"                                supports: show_bash = true|false.\n"
+"                                defaults).  The [cli] section supports:\n"
+"                                  auto_continue = true|false  (default true)\n"
+"                                  auto_compress = true|false  (default false)\n"
+"                                  log_file      = PATH         (default \"\")\n"
+"                                  auto_log      = true|false  (default false;\n"
+"                                                  when true, restores the\n"
+"                                                  legacy library auto-log\n"
+"                                                  at /tmp/easyai-client-*.log)\n"
+"                                  show_bash     = true|false  (default true)\n"
+"                                  show_python   = true|false  (default true)\n"
+"                                CLI flags override INI; INI overrides hardcoded\n"
+"                                defaults.\n"
 "    --unattended               inject an [unattended] block into the system\n"
 "                                prompt: tells the model there is no human at\n"
 "                                the terminal, so it cannot ask clarifying\n"
@@ -924,9 +948,28 @@ bool parse_args(int argc, char ** argv, Options & o) {
         else if (a == "--no-retry-on-incomplete") o.retry_on_incomplete = false;
         else if (a == "--verbose" || a == "-v") o.verbose = true;
         else if (a == "--quiet"   || a == "-q") o.quiet   = true;
-        else if (a == "--log-file")       o.log_file_path     = need(i, "--log-file");
-        else if (a == "--continue")       o.continue_session  = true;
-        else if (a == "--compress")       o.compress_session  = true;
+        else if (a == "--log-file") {
+            o.log_file_path = need(i, "--log-file");
+            o.log_file_path_cli_set = true;
+        }
+        else if (a == "--continue") {
+            // Kept for explicit-intent / backward compat — default is
+            // already auto_continue=true.  Setting cli_set guards it
+            // from being flipped off by `[cli] auto_continue = off` in
+            // the INI for this invocation.
+            o.auto_continue         = true;
+            o.auto_continue_cli_set = true;
+        }
+        else if (a == "--no-continue") {
+            // Start fresh even if a `.easyai_session` exists.  Overrides
+            // the default-on behaviour and any INI `auto_continue = on`.
+            o.auto_continue         = false;
+            o.auto_continue_cli_set = true;
+        }
+        else if (a == "--compress") {
+            o.auto_compress         = true;
+            o.auto_compress_cli_set = true;
+        }
         else if (a == "--insecure-tls")   o.tls_insecure = true;
         else if (a == "--ca-cert")        o.tls_ca_path  = need(i, "--ca-cert");
         else if (a == "-p" || a == "--prompt") o.prompt = need(i, "--prompt");
@@ -986,7 +1029,7 @@ bool parse_args(int argc, char ** argv, Options & o) {
                 "easyai-cli: %s warnings:\n%s\n",
                 o.config_path.c_str(), ini_err.c_str());
         }
-        auto load_show_flag = [&](const char * key, bool & target,
+        auto load_bool_flag = [&](const char * key, bool & target,
                                   bool cli_set) {
             if (cli_set) return;
             const std::string v = ini.get("cli", key);
@@ -1005,8 +1048,19 @@ bool parse_args(int argc, char ** argv, Options & o) {
                     target ? "true" : "false");
             }
         };
-        load_show_flag("show_bash",   o.show_bash,   o.show_bash_cli_set);
-        load_show_flag("show_python", o.show_python, o.show_python_cli_set);
+        auto load_str_flag = [&](const char * key, std::string & target,
+                                 bool cli_set) {
+            if (cli_set) return;
+            const std::string v = ini.get("cli", key);
+            if (v.empty()) return;
+            target = v;
+        };
+        load_bool_flag("show_bash",    o.show_bash,    o.show_bash_cli_set);
+        load_bool_flag("show_python",  o.show_python,  o.show_python_cli_set);
+        load_bool_flag("auto_continue", o.auto_continue, o.auto_continue_cli_set);
+        load_bool_flag("auto_compress", o.auto_compress, o.auto_compress_cli_set);
+        load_bool_flag("auto_log",      o.auto_log,      /*cli_set=*/false);
+        load_str_flag ("log_file",      o.log_file_path, o.log_file_path_cli_set);
     }
     return true;
 }
@@ -1617,14 +1671,19 @@ int main(int argc, char ** argv) {
     // The library-side auto-log in src/log.cpp::auto_open opens a fresh
     // /tmp/easyai-client-<pid>-<epoch>.log on every Client construction
     // unless EASYAI_NO_AUTO_LOG is set.  We want logging to be OPT-IN
-    // through --log-file PATH from the binary side; otherwise no /tmp
-    // log files should appear.  Set the env var by default (only if the
-    // operator hasn't already set it, so an explicit
-    // `EASYAI_NO_AUTO_LOG=0` from the environment still wins as an
-    // override).  When --log-file is on, the binary's open_log_tee
-    // already handles the logging and cli.log_file(log_fp) feeds the
-    // library — no double-log needed.
-    if (std::getenv("EASYAI_NO_AUTO_LOG") == nullptr) {
+    // through --log-file PATH (or [cli] log_file) from the binary side;
+    // otherwise no /tmp log files should appear.
+    //
+    // Precedence:
+    //   - Operator-set EASYAI_NO_AUTO_LOG in env always wins (so
+    //     `EASYAI_NO_AUTO_LOG=0 easyai-cli ...` still restores the
+    //     legacy library log if the operator explicitly asks).
+    //   - Otherwise, if `[cli] auto_log = on` is in the INI, leave the
+    //     env var unset so the library opens its log.
+    //   - Otherwise (default), set EASYAI_NO_AUTO_LOG=1 so the library
+    //     skips its auto-open.  --log-file PATH from the binary side
+    //     handles the logging via open_log_tee + cli.log_file(log_fp).
+    if (std::getenv("EASYAI_NO_AUTO_LOG") == nullptr && !o.auto_log) {
         ::setenv("EASYAI_NO_AUTO_LOG", "1", /*overwrite=*/0);
     }
     Style st = easyai::ui::detect_style();
@@ -1907,18 +1966,15 @@ int main(int argc, char ** argv) {
 
     // --------------- session persistence --------------------------------
     // `.easyai_session` in cwd is the per-process state.  Default
-    // behaviour: write it on every turn, start fresh on each invocation
-    // (overwrites any previous file).  `--continue` opts in to loading
-    // the existing file before the first prompt; `--compress` (only
-    // valid alongside --continue) asks the model to recap the loaded
-    // history losslessly and replace it with the recap.
-    if (o.compress_session && !o.continue_session) {
-        std::fprintf(stderr,
-            "%serror:%s --compress requires --continue (nothing to "
-            "compress on a fresh session).\n", st.red(), st.reset());
-        return 2;
-    }
-    if (o.continue_session && !any_management(o)) {
+    // behaviour: load it if present, write it on every turn.
+    // `--no-continue` (or [cli] auto_continue = off) flips to "start
+    // fresh and overwrite on first turn".  `--compress` (or [cli]
+    // auto_compress = on) asks the model for a lossless recap on
+    // load and replaces history with that recap.  Compressing
+    // implies loading first; running compress with --no-continue
+    // (or auto_continue=off) is a no-op because there's no history
+    // in memory to recap.
+    if (o.auto_continue && !any_management(o)) {
         std::string load_err;
         if (load_session(cli, &load_err)) {
             std::fprintf(stderr,
@@ -1927,13 +1983,14 @@ int main(int argc, char ** argv) {
                 st.dim(),  st.reset(),
                 st.bold(), st.reset(),
                 session_file_path().parent_path().string().c_str());
-        } else {
-            std::fprintf(stderr,
-                "%s[easyai-cli-remote]%s --continue requested but no "
-                "session to resume (%s) — starting fresh.\n",
-                st.dim(), st.reset(), load_err.c_str());
         }
-        if (o.compress_session && !any_management(o)) {
+        // No session file is a normal first-run state — start fresh
+        // silently.  (Earlier versions warned here because --continue
+        // was the explicit opt-in; with the auto-on default that
+        // warning fires every time the operator opens a new project
+        // dir, which is just noise.)
+
+        if (o.auto_compress) {
             if (do_compress(cli, st)) {
                 std::string save_err;
                 if (!save_session(cli, &save_err)) {
@@ -1944,6 +2001,14 @@ int main(int argc, char ** argv) {
                 }
             }
         }
+    } else if (o.auto_compress) {
+        // auto_continue=off + auto_compress=on is contradictory:
+        // nothing in memory to recap.  Don't error — just warn so
+        // the operator notices the wiring is off.
+        std::fprintf(stderr,
+            "%s[easyai-cli-remote] warning:%s auto_compress is on "
+            "but auto_continue is off — nothing to compress on a "
+            "fresh session.\n", st.yellow(), st.reset());
     }
 
     auto close_log_fp = [&]() {

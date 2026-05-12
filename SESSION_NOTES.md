@@ -305,6 +305,197 @@ Webui title default also flips to `"Deep"`.
 ## 5. Recent commits (most recent first)
 
 ```
+2026-05-12 — Cli: session resume default-ON + every session knob in [cli] INI.
+             Iteration on the persistence feature that landed earlier
+             today (99a9efc).  Two motivating asks from the operator:
+             (1) "auto-load .easyai_session if present" — flip the
+             default so you don't need --continue to pick up where you
+             left off; (2) "expose every command we discussed in the
+             INI + documentation" — surface session knobs as [cli]
+             keys.
+
+  Semantics flip:
+    Before: default = start fresh; --continue = resume.
+    Now:    default = resume if .easyai_session exists, fresh if not;
+            --no-continue = start fresh anyway.
+    --continue is kept as a no-op alias (useful in scripts that
+    assert resume semantics against an operator's INI that may have
+    flipped auto_continue off).
+    --compress + --no-continue now warns instead of erroring (the
+    auto_continue=off + auto_compress=on case from INI).
+
+  Options struct (examples/cli.cpp):
+    * Renamed: continue_session -> auto_continue (default true)
+    * Renamed: compress_session -> auto_compress (default false)
+    * Added: auto_continue_cli_set, auto_compress_cli_set,
+             log_file_path_cli_set — to track CLI override vs INI
+             (CLI > INI > hardcoded precedence)
+    * Added: auto_log (default false) — controls whether the
+             library's auto-/tmp log is allowed (default suppressed
+             via EASYAI_NO_AUTO_LOG=1)
+
+  Flag parsing:
+    * --continue: still works (sets auto_continue=true + cli_set)
+    * --no-continue: new flag (sets auto_continue=false + cli_set)
+    * --compress: sets auto_compress=true + cli_set
+    * --log-file PATH: also marks cli_set so INI log_file doesn't
+                      override
+
+  INI overlay (parse_args end):
+    * Generalised load_show_flag -> load_bool_flag
+    * Added load_str_flag for log_file
+    * Loads: auto_continue, auto_compress, auto_log, log_file
+             (plus existing show_bash, show_python)
+
+  Dispatch (main):
+    * Dropped --compress-requires-continue hard-error
+    * Replaced explicit "no session to resume" warn with silent
+      fresh-start (a missing file is the natural first-run case)
+    * auto_log=on path leaves EASYAI_NO_AUTO_LOG unset so the
+      library's auto-/tmp log returns
+
+  Help text:
+    * --continue: rewritten to explain it's a no-op default
+    * --no-continue: new entry
+    * --compress: drop "requires --continue", mention auto_compress INI
+    * --log-file: mention log_file INI
+    * --config: full table of [cli] keys with defaults
+
+  Docs:
+    * easyai-cli.md §10 rewritten: default-ON semantics, new
+      4-row control-points table, full INI-mapping table with
+      defaults + CLI flag cross-refs, example easyai-cli.ini.
+    * Flag table (§4) rewritten for --continue / --no-continue /
+      --compress with INI references inline.
+    * README.md "What's new" entry above the previous session
+      feature entry, with before/after table and the INI block.
+
+  Verification (build-macos):
+    * Build green
+    * --help shows --continue / --no-continue / --compress with
+      INI cross-refs + a [cli] table on --config
+    * --no-continue parses cleanly
+    * Backward compat: --continue still works (no-op)
+
+  No public-API change to libeasyai-cli (Client::dump_history /
+  load_history unchanged).  Operators who pinned [cli] sections
+  for show_bash / show_python keep them; new keys default to the
+  previous behaviour.
+```
+
+```
+2026-05-12 — easyai-cli session persistence + raw log default OFF.
+             New feature on easyai-cli (the OpenAI-protocol client
+             binary, not the local-engine `easyai-local`).  Adds
+             per-process conversation persistence and silences the
+             previously-default /tmp raw-log files.
+
+  Behaviour:
+    easyai-cli                       fresh history, .easyai_session
+                                     auto-saved in cwd after each turn
+    easyai-cli --continue            resume the .easyai_session from
+                                     cwd (warn + start fresh if none)
+    easyai-cli --continue --compress resume AND ask the model for a
+                                     lossless recap before the first
+                                     prompt; recap replaces history
+                                     and gets saved as the new ctx
+    /compress (mid-REPL)             same recap flow on demand
+
+  Code (libeasyai-cli):
+    * include/easyai/client.hpp: new Client::dump_history() /
+      Client::load_history(json_array, err?).  Serialise the in-memory
+      history (OpenAI message-shape array, no system prompt) to a
+      JSON string for save-to-disk, and replace it from a JSON string
+      on load.  Validates each message has a string "role" field.
+    * src/client.cpp: implementations.  Works on the existing
+      history_json vector<string> the streaming loop already
+      populates — no separate serialisation path to maintain.
+
+  Code (examples/cli.cpp):
+    * session_file_path() resolves to <cwd>/.easyai_session.
+    * save_session() atomic write (tempfile + rename, O_NOFOLLOW,
+      mode 0600) — called after every cli.chat() return in
+      run_one() and after every history-mutating slash command.
+    * load_session() reads and feeds Client::load_history().
+    * do_compress() runs the recap turn (single chat() call with a
+      "summarise this losslessly + don't call any tool" prompt),
+      then replaces history with a synthetic user/assistant pair
+      carrying the recap.  Restores original history on failure.
+    * --continue / --compress flags wired with validation
+      (--compress without --continue rejected at parse time).
+    * /compress slash command added in the REPL loop, next to
+      /clear and /reset.  History-mutating slash commands now save
+      .easyai_session so the post-command state survives a later
+      --continue.
+    * REPL banner + /help listing updated to mention the new flags
+      and /compress.
+    * Top-of-file comment block updated with the new specials.
+
+  Code (raw log default flipped to OFF):
+    * examples/cli.cpp: the binary's open_log_tee() only fires when
+      --log-file PATH is given.  Previous --verbose-implies-auto-/tmp
+      behaviour removed — operators got a stale .log per session
+      whether they wanted one or not.
+    * examples/cli.cpp main(): EASYAI_NO_AUTO_LOG=1 is set by default
+      (only if the env var is not already set, so operator override
+      still wins) — suppresses the library-side auto-open in
+      src/log.cpp::auto_open that was firing on every Client
+      construction with its own /tmp/easyai-client-<pid>-<epoch>.log.
+
+  Verification (build-macos):
+    --compress without --continue  -> "error: --compress requires
+                                       --continue", exits 2
+    --continue with no session     -> warns + starts fresh
+    --help                         -> all three new entries shown
+    default invocation             -> 0 /tmp log files created
+    --log-file /tmp/x.log          -> still works (mode 0600)
+
+  Docs: README.md "What's new" entry. easyai-cli.md new §10 "Session
+  persistence", §9 "Raw transaction log" rewritten as opt-in, flag
+  table rows for --continue / --compress / updated --verbose /
+  --log-file, TOC renumbered.  Cross-refs in the file fixed up to
+  the new section numbers.
+
+  Tag: v0.5.5 cut at HEAD~1 (commit d6bb546) as a pre-feature
+  checkpoint, in case the new persistence path regresses anything.
+
+  Commit: 99a9efc
+```
+
+```
+2026-05-12 — fs: friendlier dispatch in read / list / grep
+             (file-vs-dir hints + optional path on list).
+             Three small UX fixes to the unified fs() tool, motivated
+             by a model that called fs(action="grep",
+             path="adelide_bitnet.c", ...) and got "not a directory"
+             — a legit input treated as an error.  Same class of
+             "do what the model wants" issue showed up in two
+             adjacent actions when I scanned the rest of the surface.
+
+    fs.grep: dispatches on is_regular_file vs is_directory at the
+             top (mirrors `grep -r`).  Per-file scan factored into a
+             shared lambda so matching, size cap, line cap, and
+             output formatting are identical on both paths.
+             file_glob acts as a name-guard when path is a single
+             file (so path="foo.c" file_glob="*.py" returns
+             "No matches" instead of grepping foo.c with a Python
+             filter).
+    fs.read: pre-empts the cryptic "read failed: Is a directory"
+             errno with an fstat-after-open check.  Returns
+             "path is a directory: X — use action=\"list\" to
+             enumerate entries, or action=\"glob\"/\"grep\" for
+             recursive search."
+    fs.list: path is now OPTIONAL — empty/missing defaults to "."
+             matching glob/grep convention.  When path points at a
+             regular file, friendly redirect to action="read".
+
+  Smoke matrix: 9-case suite (file/dir/empty path × match/no-match
+  × glob-miss/missing) — ALL PASS.
+
+  Commit: d6bb546
+```
+
+```
 2026-05-11 — fs(action="edit") seam-line corruption fix (HIGH; post-publish correction to §22.4).
              User-reported bug: a model invoking fs.edit with content
              that lacked a trailing \n had the last byte of content

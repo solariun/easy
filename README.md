@@ -43,6 +43,75 @@ A running log of user-facing changes. Latest first — keep this list
 current as features land so anyone returning to the repo (or
 landing on it for the first time) sees what shipped recently.
 
+### 2026-05-12 — Session resume default-ON + every session knob now in `[cli]` INI
+
+Iteration on yesterday's session-persistence feature: loading the
+existing `.easyai_session` is now the **default** (you don't need
+`--continue` to pick up where you left off).  The semantics flip:
+
+| | Previous (2026-05-12 morning) | Now |
+| --- | --- | --- |
+| Resume on launch | opt-in via `--continue` | **default ON** |
+| Start fresh | default | opt-in via `--no-continue` |
+| `--compress` without `--continue` | hard error | warning (no-op when combined with `--no-continue`) |
+
+The cli also now exposes every session-related knob plus the raw-log
+knobs through `[cli]` in `/etc/easyai/easyai-cli.ini`:
+
+```ini
+[cli]
+auto_continue = true       # default; load .easyai_session if present
+auto_compress = false      # default; recap on every load when on
+log_file      =            # default empty; path enables --log-file equivalent
+auto_log      = false      # default; when true, restores the library's legacy /tmp auto-log
+show_bash     = true       # default; mirror bash subprocess output to the operator terminal
+show_python   = true       # default; same for python3
+```
+
+CLI flag precedence is unchanged: explicit flag > INI > hardcoded
+default.  All `--continue` / `--no-continue` / `--compress` /
+`--log-file` flags continue to work and override the INI for that
+invocation.
+
+`--continue` is kept as a no-op alias for backward compat (useful in
+scripts that want to force resume even when an operator's INI flipped
+`auto_continue` off).
+
+Full doc: [`easyai-cli.md`](easyai-cli.md) §10.
+
+### 2026-05-12 — easyai-cli session persistence + raw log default OFF
+
+Every `easyai-cli` invocation now writes a `.easyai_session` file in
+the current working directory after each chat turn (atomic tempfile
++ rename, mode 0600).  Three control points:
+
+| Surface | What it does |
+| --- | --- |
+| (no flag) | Start fresh, overwrite on first turn, save every turn |
+| `--continue` | Resume the `.easyai_session` in cwd; warn + start fresh if none |
+| `--continue --compress` | Resume + ask the model for one lossless recap; replace history with the recap before the first prompt |
+| `/compress` (REPL) | Same recap flow, fired mid-session |
+
+The file is the raw OpenAI-shape message array (greppable, diffable,
+re-loadable).  Two new methods on the public `Client` API
+(`dump_history()` / `load_history()`) make the same persistence
+available to library embedders.
+
+**Raw log default flipped to OFF.**  Prior versions created
+`/tmp/easyai-cli-remote-<pid>-<epoch>.log` whenever `--verbose` was
+set, AND the library opened a separate `/tmp/easyai-client-<pid>-<epoch>.log`
+on every Client construction.  Both are now opt-in:
+
+* The binary's transaction log opens **only** when `--log-file PATH`
+  is given (mode 0600 at PATH).  `--verbose` is now stderr-only.
+* The library's auto-log is suppressed by setting
+  `EASYAI_NO_AUTO_LOG=1` in the cli binary's `main()` before the
+  Client is constructed.  Operator override
+  (`EASYAI_NO_AUTO_LOG=0` in the env) still wins.
+
+Net: a default invocation leaves nothing in `/tmp`.  See
+[`easyai-cli.md`](easyai-cli.md) §9 and §10 for full docs.
+
 ### 2026-05-11 — fs(action="edit") seam-line corruption fix (HIGH, post-publish correction)
 
 A user-reported bug: `fs(action="edit")` was silently corrupting
@@ -913,9 +982,12 @@ upstream `llama-server`, OpenAI itself, etc.).
 | `--no-reasoning` | shown | Hide `delta.reasoning_content`. |
 | `--max-reasoning N` | 0 (off) | Abort SSE when accumulated reasoning > N chars. |
 | `--no-retry-on-incomplete` | retry on | Disable auto-retry-with-nudge. |
-| `--verbose` | off | Log HTTP+SSE traffic + dispatch to stderr + tee log. |
+| `--verbose` | off | Log HTTP+SSE traffic to stderr (stderr only — no file). |
 | `-q, --quiet` | off | Disable spinner glyph + ctx-fill gauge. |
-| `--log-file PATH` | auto-`/tmp` | Tee raw transaction log here (implies `--verbose`). |
+| `--log-file PATH` | off | Opt in to a raw transaction log at PATH (mode 0600). Implies `--verbose`. No `/tmp` file is created by default. |
+| `--continue` | **on** | Resume `.easyai_session` from cwd (default ON since 2026-05-12; flag form is a no-op except to override `[cli] auto_continue = off`). Session is always saved per turn. INI: `[cli] auto_continue`. |
+| `--no-continue` | — | Ignore the existing `.easyai_session`; start fresh and overwrite on the first turn. Inverse of `--continue`. |
+| `--compress` | off | Ask the model for a lossless recap, replace history with it, save. No-op with `--no-continue`. Also `/compress` mid-REPL. INI: `[cli] auto_compress`. |
 | `--list-tools` | — | Print local tools (no chat). |
 | `--list-remote-tools` | — | `GET /v1/tools` (no chat). |
 | `--list-models` | — | `GET /v1/models`. |

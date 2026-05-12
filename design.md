@@ -762,8 +762,12 @@ with it.
 Each retry logs once via `easyai::log::error("[easyai-cli] HTTP
 attempt N/M failed (REASON); retrying in Bms\n")`.  `easyai::log::error`
 tees to stderr, so operators see the retry pattern in journalctl
-output without `--verbose`.  The same wire bytes still land in the
-auto-opened `/tmp/easyai-client-PID-EPOCH.log` for postmortem.
+output without `--verbose`.  When `--log-file PATH` is set on the
+cli (default OFF since 2026-05-12) the same wire bytes also land
+in `PATH` for postmortem.  Earlier versions auto-opened a
+`/tmp/easyai-client-PID-EPOCH.log` unconditionally; that was
+silenced because operators kept ending up with a stale `.log`
+file per invocation whether they wanted one or not.
 
 The same retry shape is replicated (with the same backoff schedule
 but a libcurl-flavoured retryable-error set: `CURLE_COULDNT_CONNECT`,

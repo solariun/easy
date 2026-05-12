@@ -20,11 +20,12 @@
 7. [Sampling and penalty knobs](#7-sampling-and-penalty-knobs)
 8. [Reasoning streams](#8-reasoning-streams)
 9. [The raw transaction log](#9-the-raw-transaction-log)
-10. [RAG — persistent memory](#10-rag--persistent-memory)
-11. [External tools](#11-external-tools)
-12. [Management subcommands](#12-management-subcommands)
-13. [Worked examples](#13-worked-examples)
-14. [Cross-references](#14-cross-references)
+10. [Session persistence](#10-session-persistence)
+11. [RAG — persistent memory](#11-rag--persistent-memory)
+12. [External tools](#12-external-tools)
+13. [Management subcommands](#13-management-subcommands)
+14. [Worked examples](#14-worked-examples)
+15. [Cross-references](#15-cross-references)
 
 ---
 
@@ -108,7 +109,7 @@ on the command line and stdin.
 | **REPL** | No `-p`, no positional prompt, stdin is a TTY | Interactive prompt loop. `Ctrl-D` to exit. History persists during the session. `Ctrl-C` during a turn → graceful exit (see below). |
 | **One-shot** | `-p <text>` OR a positional argument | Send the single prompt, stream the reply, exit. |
 | **Piped** | stdin is a pipe (anything redirected in) | Reads stdin into the prompt and runs once. Same as one-shot. |
-| **Management** | `--list-models`, `--list-tools`, `--list-remote-tools`, `--health`, `--props`, `--metrics`, `--set-preset`, `--show-system-prompt` | Hits the named endpoint (or, for `--show-system-prompt`, just resolves locally), prints the result, exits. No chat. See [§12](#12-management-subcommands). |
+| **Management** | `--list-models`, `--list-tools`, `--list-remote-tools`, `--health`, `--props`, `--metrics`, `--set-preset`, `--show-system-prompt` | Hits the named endpoint (or, for `--show-system-prompt`, just resolves locally), prints the result, exits. No chat. See [§13](#13-management-subcommands). |
 
 The four are mutually exclusive: passing `-p` AND a management flag is
 an error.
@@ -195,13 +196,16 @@ prepended (see [§6](#6-system-prompt--injected-blocks)).
 | `--max-reasoning N` | Abort the SSE stream when this turn's reasoning exceeds N chars. 0 = unlimited (default). Useful for thinking models that fall into long deliberation loops. |
 | `--no-retry-on-incomplete` | Disable the auto-retry-with-nudge for incomplete turns (default: ON). |
 | `--retry-on-incomplete` | Legacy alias for the now-default behaviour. No-op. |
-| `--verbose`, `-v` | Log HTTP+SSE traffic to stderr. ALSO writes the raw transaction (request body, every SSE chunk, every tool dispatch input/output) to `/tmp/easyai-cli-{pid}-{epoch}.log`. |
+| `--verbose`, `-v` | Log HTTP+SSE diagnostics to stderr (timestamps + per-piece traces). Stderr-only — does NOT create a /tmp log file (use `--log-file` for that). |
 | `-q`, `--quiet` | Disable the spinner glyph + context-fill gauge. Use for batch / scripted runs. **Also changes `Ctrl-C` / `SIGTERM` semantics** — see [§3 → Ctrl-C and SIGTERM](#ctrl-c-and-sigterm). |
-| `--log-file PATH` | Override the auto-generated transaction log path. Implies `--verbose`. |
+| `--log-file PATH` | Opt in to a raw transaction log at PATH (request body + every SSE chunk + every tool dispatch input/output, mode 0600). Default OFF — no log file is written without this flag. Implies `--verbose`. |
+| `--continue` | Force-load `.easyai_session` from cwd. **Default ON** since 2026-05-12 — existing sessions are auto-resumed. Explicit form is a no-op except when an operator's INI sets `auto_continue = off` (then `--continue` overrides it for this invocation). INI: `[cli] auto_continue = true\|false`. See [§10](#10-session-persistence). |
+| `--no-continue` | Start fresh — ignore any existing `.easyai_session` and overwrite it on the first turn. Inverse of `--continue`. |
+| `--compress` | After loading, ask the model for one lossless recap of the conversation and replace the history with that recap. Also reachable mid-REPL via `/compress`. No-op when combined with `--no-continue` (nothing in memory to recap). INI: `[cli] auto_compress = true\|false`. |
 
 ### Management subcommands (one only, no chat)
 
-See [§12](#12-management-subcommands) for the full picture.
+See [§13](#13-management-subcommands) for the full picture.
 
 | Flag | Result |
 | --- | --- |
@@ -405,16 +409,15 @@ raw incomplete signal for debugging.
 
 ## 9. The raw transaction log
 
-`--verbose` enables stderr diagnostics AND writes a complete
-transaction log to disk. Default path:
+The raw transaction log is **opt-in** via `--log-file PATH`. Without
+that flag, no log file is created — neither the binary nor the
+library writes to `/tmp` by default.
 
+```bash
+easyai-cli --url http://ai.local --log-file /tmp/run.log "your prompt"
 ```
-/tmp/easyai-cli-{pid}-{epoch}.log
-```
 
-Override with `--log-file PATH` (which implies `--verbose`).
-
-The log is a verbatim record of:
+The log at `PATH` is a verbatim record of:
 
 * The HTTP request body (every turn — including the resolved system
   prompt with injected blocks, the full tools array, the message
@@ -424,23 +427,118 @@ The log is a verbatim record of:
   duration.
 * Connection-level events (retries, timeouts, status codes).
 
-Mode 0600. Suitable for replaying / diffing / grepping. The CLI prints
-the resolved path at startup unless `EASYAI_NO_AUTO_LOG=1` is set.
+Mode 0600. `--log-file` implies `--verbose` (so the file carries
+CLI-side diagnostics alongside the raw wire bytes). Suitable for
+replaying / diffing / grepping.
 
-To see what the model actually saw:
+For one-off debugging without a persistent file, `--verbose` alone
+streams the same diagnostics to stderr.
 
-```bash
-easyai-cli --url ... --log-file /tmp/run.log "your prompt"
-python3 -c "import json,re; t=open('/tmp/run.log').read();
-            # extract the first request body's system message
-            ..."
-```
-
-(See [§13](#13-worked-examples) for a copy-pasteable extractor.)
+> **What changed (2026-05-12):** prior versions auto-opened
+> `/tmp/easyai-cli-{pid}-{epoch}.log` whenever `--verbose` was set,
+> AND the library-side `easyai::Client` opened a separate
+> `/tmp/easyai-client-{pid}-{epoch}.log` on every construction
+> unless `EASYAI_NO_AUTO_LOG=1` was in the env. Both auto-opens are
+> now disabled by the cli binary so a default invocation leaves no
+> artifacts behind. To restore the library auto-open behaviour, set
+> `EASYAI_NO_AUTO_LOG=0` explicitly in the environment.
 
 ---
 
-## 10. RAG — persistent memory
+## 10. Session persistence
+
+Every `easyai-cli` invocation writes a `.easyai_session` file in the
+current working directory after each chat turn (atomic tempfile +
+`rename(2)`, mode 0600, `O_NOFOLLOW`).  The file is the OpenAI-shape
+message array — same format the CLI sends on the wire — so it's
+plain-text greppable, diffable, and re-loadable in a future
+invocation.
+
+**Loading is default-ON since 2026-05-12.**  If a `.easyai_session`
+already exists in the current directory, `easyai-cli` resumes from
+it without any flag.  Otherwise it starts fresh silently (no warning
+— a missing file is the natural first-run case).
+
+```bash
+$ cd ~/project
+$ easyai-cli --url http://ai.local
+> fix the build error in src/main.cpp
+[turn completes; .easyai_session updated]
+> /exit
+
+# Tomorrow, same project — picks up where it left off, no flag needed:
+$ cd ~/project
+$ easyai-cli --url http://ai.local
+[easyai-cli-remote] continued from .easyai_session in /Users/x/project
+> what was the build error again?
+[model has the prior context]
+```
+
+Four control points:
+
+| Surface | What it does |
+| --- | --- |
+| (no flag) | **Default**: load `.easyai_session` if present, start fresh if not.  Save on every turn. |
+| `--no-continue` | Ignore the existing `.easyai_session` and start fresh.  Overwrites the file on the first turn. |
+| `--compress` | After loading, ask the model for one lossless recap of the conversation and replace history with the recap.  No-op when combined with `--no-continue`. |
+| `/compress` (in the REPL) | Same compress flow, fired mid-session when context gets long. |
+
+`--continue` still exists as a no-op alias for backward compatibility
+— it's only useful in scripts that want to assert resume semantics
+against an operator's INI that may have flipped `auto_continue` off.
+
+The compress prompt instructs the model to preserve verbatim: every
+file path, every decision made, every code change, every error with
+its cause, every tool result still relevant, every user-stated
+constraint or preference.  And to strip: pleasantries, abandoned
+exploratory branches, retries of the same query.  The output replaces
+history as a synthetic two-message pair
+(`{user: "Previous conversation summarised below; continue from here."}
+{assistant: "<recap>"}`) so the chat template sees a normal turn
+shape.
+
+History-mutating slash commands (`/clear`, `/reset`, `/compress`)
+also save `.easyai_session` so a later resume picks up the
+post-command state.
+
+### INI mapping
+
+Every session-related knob is also reachable via `[cli]` keys in
+`/etc/easyai/easyai-cli.ini` (override with `--config PATH`).
+Precedence: CLI flag > INI > hardcoded default.
+
+| INI key (`[cli]`) | Default | CLI flag(s) | Effect |
+| --- | --- | --- | --- |
+| `auto_continue` | `true`  | `--continue` / `--no-continue` | Load `.easyai_session` from cwd before the first prompt. |
+| `auto_compress` | `false` | `--compress` | Run the compress flow on every load (rare; usually you want `/compress` on demand). |
+| `log_file`      | `""`    | `--log-file PATH` | Raw transaction log path.  Empty = no log file. |
+| `auto_log`      | `false` | (no flag) | When `true`, removes the cli's default `EASYAI_NO_AUTO_LOG=1` so the library reopens its legacy `/tmp/easyai-client-{pid}-{epoch}.log` per Client.  Keep off unless you want that postmortem trail. |
+| `show_bash`     | `true`  | `--show-bash` / `--no-show-bash` | Print bash subprocess input/output to the operator's terminal in real time. |
+| `show_python`   | `true`  | `--show-python` / `--no-show-python` | Same for `python3`. |
+
+Example `easyai-cli.ini` for an "always resume, never auto-log" workstation:
+
+```ini
+[cli]
+auto_continue = true
+auto_compress = false
+log_file      =
+auto_log      = false
+show_bash     = true
+show_python   = true
+```
+
+Operators who don't want session files in cwd at all: set
+`auto_continue = off` in the INI (or pass `--no-continue` per
+invocation) and `rm .easyai_session` if it leaks past — there's no
+`--no-session` flag today.  The file is local to **cwd**, not `~`,
+so the unit of persistence is naturally the project directory
+you're working in: two projects in two different dirs have two
+independent sessions.
+
+---
+
+## 11. RAG — persistent memory
 
 `--RAG <dir>` mounts a directory as the agent's long-term memory. It
 exposes ONE `rag` tool with seven sub-actions (`save`, `append`,
@@ -455,7 +553,7 @@ See [`RAG.md`](RAG.md) for the full guide.
 
 ---
 
-## 11. External tools
+## 12. External tools
 
 `--external-tools <dir>` loads every `EASYAI-<name>.tools` JSON manifest
 in `<dir>` as an operator-defined tool pack. Per-file fault isolation —
@@ -468,7 +566,7 @@ worked examples.
 
 ---
 
-## 12. Management subcommands
+## 13. Management subcommands
 
 Each one hits a known endpoint, prints the result, and exits. They're
 mutually exclusive with chat; if you pass any of them with `-p` or a
@@ -493,7 +591,7 @@ network call and works without `--url`.
 
 ---
 
-## 13. Worked examples
+## 14. Worked examples
 
 ### One-shot chat
 
@@ -606,7 +704,7 @@ through cleanly for models that emit them.
 
 ---
 
-## 14. Cross-references
+## 15. Cross-references
 
 - [`README.md`](README.md) — sales overview + quickstart for the whole
   project.
