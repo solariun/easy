@@ -43,6 +43,45 @@ A running log of user-facing changes. Latest first — keep this list
 current as features land so anyone returning to the repo (or
 landing on it for the first time) sees what shipped recently.
 
+### 2026-05-13 — Installer: ship only `system.txt_template`; default install uses the binary's built-in prompt
+
+`scripts/install_easyai_server.sh` no longer drops an active
+`/etc/easyai/system.txt` on first install.  Out-of-the-box, only the
+template `/etc/easyai/system.txt_template` ships (the canonical
+"factory" copy of the Deep persona, refreshed on every `--upgrade`),
+and `SERVER.system_file` is left commented out in `easyai.ini` — so
+the server uses the binary's built-in prompt, which is **already
+gated on actually-registered tools**: it never advertises `fs` /
+`bash` if those are off in the INI.
+
+The template file was also renamed `system.txt_modelo` →
+`system.txt_template` (English-only convention).
+
+| State | Before (≤ 2026-05-12) | Now (2026-05-13+) |
+| --- | --- | --- |
+| Template file at `/etc/easyai/` | `system.txt_modelo` (Portuguese) | `system.txt_template` |
+| Active `/etc/easyai/system.txt` on first install | dropped (Deep persona) | **NOT installed** |
+| `--force` rewrites `system.txt` | yes | no (file isn't there) |
+| `SERVER.system_file` in `easyai.ini` | commented out | commented out (unchanged) |
+| Out-of-the-box prompt | active `system.txt` (same Deep body) | binary's built-in, tool-gated |
+
+To activate a custom persona — same one-liner as before:
+
+```bash
+sudo cp /etc/easyai/system.txt_template /etc/easyai/system.txt
+sudoedit /etc/easyai/system.txt              # tweak as needed
+sudoedit /etc/easyai/easyai.ini              # uncomment SERVER.system_file
+sudo systemctl restart easyai-server
+```
+
+Existing installs are unaffected: the installer still **preserves**
+any existing `/etc/easyai/system.txt` across `--upgrade` and `--force`
+runs (it just no longer creates one when it doesn't exist).
+
+Full doc: [`LINUX_SERVER.md`](LINUX_SERVER.md) §6
+("`/etc/easyai/system.txt` (operator-supplied) + `system.txt_template`")
+and §12 ("Upgrading").
+
 ### 2026-05-12 — Installer: `ttm.pages_limit` updated in place on re-run
 
 `scripts/install_easyai_server.sh` used to print

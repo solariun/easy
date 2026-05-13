@@ -305,6 +305,71 @@ Webui title default also flips to `"Deep"`.
 ## 5. Recent commits (most recent first)
 
 ```
+2026-05-13 — install_easyai_server.sh: ship only system.txt_template;
+             default install uses the binary's built-in prompt.
+             Two motivating asks from the operator:
+             (1) "do not install the system.txt it must be created
+             as the system.txt_template" — the active system.txt
+             should not exist out of the box, only the template;
+             (2) implicit rename to English (`_modelo` was Portuguese).
+
+  Behaviour change:
+    Before: first install dropped both /etc/easyai/system.txt_modelo
+            (template) AND /etc/easyai/system.txt (active, mode 640).
+            --force or first-install path rewrote system.txt.
+    Now:    installer drops ONLY /etc/easyai/system.txt_template
+            (mode 644).  system.txt is NOT created at install time;
+            the binary's built-in "Deep" prompt (already gated on
+            actually-registered tools) is what the server uses.
+            Operator activates a custom persona by:
+              sudo cp system.txt_template system.txt
+              sudoedit system.txt
+              # uncomment SERVER.system_file in easyai.ini
+              sudo systemctl restart easyai-server
+
+  Code (scripts/install_easyai_server.sh):
+    * system_template_file: $config_dir/system.txt_modelo
+                          → $config_dir/system.txt_template
+    * Heredoc tag MODELO → TEMPLATE; header comment block above
+      the template body rewritten (drop "DORMANT" framing; explain
+      the cp-to-activate workflow).
+    * Drop the entire `if [[ ! -f $system_file || $do_force ]] …
+      cat > $system_file <<SYS … SYS` block.  Replaced with a
+      one-line "preserving existing $system_file" log when one
+      happens to already exist (legacy install).
+    * easyai.ini hint block above `# system_file = $system_file`
+      rewritten to describe the cp+uncomment activation flow.
+    * Final printout: "system :" row split into two lines —
+      template first ("TEMPLATE; refreshed every --upgrade"),
+      then system.txt with a conditional message ("active custom
+      prompt — uncomment SERVER.system_file" when it exists, or
+      "NOT created; built-in Deep prompt is in use" when it doesn't).
+    * Header banner comment (line 14) + --force / do_force comment
+      blocks updated to drop the "AND system.txt" reference.
+
+  Upgrade safety: existing installs that already have
+  /etc/easyai/system.txt KEEP it across --upgrade and --force runs.
+  The installer only stopped *creating* system.txt; it doesn't
+  delete one if it's there.  Operators who customised the prompt
+  before this change see no behavioural diff.
+
+  Verification:
+    * bash -n install_easyai_server.sh — syntax OK
+    * grep system.txt_modelo / MODELO — zero matches (clean rename)
+
+  Docs:
+    * README.md "What's new" entry with before/after table.
+    * LINUX_SERVER.md §6 file-layout table updated (template now
+      listed alongside the operator-supplied system.txt row, both
+      with explicit mode + "NOT installed by default" note).
+    * LINUX_SERVER.md §6.X "/etc/easyai/system.txt (operator-
+      supplied) + system.txt_template" rewritten to lead with the
+      activation workflow.
+    * LINUX_SERVER.md §12 (Upgrading) updated: --upgrade WILL
+      refresh system.txt_template; will NOT touch system.txt.
+```
+
+```
 2026-05-12 — install_easyai_server.sh: ttm.pages_limit updated in place
              on re-run (was: "already present; skipping" left stale
              value behind).

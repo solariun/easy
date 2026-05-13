@@ -191,7 +191,8 @@ roughly:
 | `/usr/bin/easyai-local` | root:root | 755 | single-process REPL with a local model |
 | `/usr/lib/easyai/` | root:root | 755 | bundled `.so` files (libllama, libggml, libeasyai, …) |
 | `/etc/easyai/` | root:easyai | 750 | operator configuration |
-| `/etc/easyai/system.txt` | root:easyai | 640 | system prompt |
+| `/etc/easyai/system.txt_template` | root:easyai | 644 | system prompt template (refreshed on every `--upgrade`); copy to `system.txt` to activate a custom persona |
+| `/etc/easyai/system.txt` | root:easyai | 640 | **NOT installed by default** — created only by the operator (e.g. `sudo cp system.txt_template system.txt`); when present and `SERVER.system_file` is uncommented in `easyai.ini`, replaces the binary's built-in "Deep" prompt |
 | `/etc/easyai/api_key` | easyai:easyai | 600 | optional bearer-token gate |
 | `/etc/easyai/external-tools/` | root:easyai | 750 | operator-defined tools (`EASYAI-*.tools`) |
 | `/etc/easyai/favicon[.ext]` | root:easyai | 644 | optional webui favicon |
@@ -345,18 +346,30 @@ To temporarily reopen `/mcp` without editing the INI: pass
 `--no-mcp-auth` on the systemd unit's `ExecStart` (or run the
 binary by hand). The flag always wins.
 
-### `/etc/easyai/system.txt`
+### `/etc/easyai/system.txt` (operator-supplied) + `system.txt_template`
 
-The system prompt. Plain text. Edit with `sudo nano`. Restart the
-server:
+By default the installer ships **only** the template
+(`/etc/easyai/system.txt_template`) — the active `system.txt` is
+NOT created.  Out of the box the binary's built-in "Deep" prompt
+(gated on actually-registered tools) is what the model sees, and
+`SERVER.system_file` is left commented out in `easyai.ini`.
+
+To activate a custom persona:
 
 ```bash
+sudo cp /etc/easyai/system.txt_template /etc/easyai/system.txt
+sudo nano /etc/easyai/system.txt              # tweak as needed
+sudoedit /etc/easyai/easyai.ini               # uncomment SERVER.system_file
 sudo systemctl restart easyai-server
 ```
 
-The default the installer drops is short and tool-friendly. Customise
-to add domain context, persona, language preferences. If you want
-the model to use RAG aggressively, mention it here:
+The template is refreshed on every `--upgrade` (it's the canonical
+"factory reset" copy); the active `system.txt` is **never** touched
+by the installer once created — operator edits survive every
+`--upgrade` / `--force` run.
+
+Customise to add domain context, persona, language preferences. If
+you want the model to use RAG aggressively, mention it here:
 
 ```
 You have a persistent registry called RAG. Save important things
@@ -856,7 +869,10 @@ git pull
 
 - Refreshes `/usr/bin/easyai-*` and `/usr/lib/easyai/`
 - Re-renders the systemd unit (so flag changes propagate)
-- Does NOT touch `/etc/easyai/system.txt`, `/etc/easyai/api_key`,
+- WILL refresh `/etc/easyai/system.txt_template` (the canonical
+  factory copy)
+- Does NOT touch `/etc/easyai/system.txt` (operator-supplied; not
+  installed by default), `/etc/easyai/api_key`,
   `/var/lib/easyai/rag/*` — your data is safe
 - Does NOT touch `/etc/easyai/external-tools/*` — your manifests
   are safe

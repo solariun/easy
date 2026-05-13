@@ -10,8 +10,10 @@
 #      + easyai-agent + easyai-recipes + easyai-chat) with the selected
 #      GPU backend.
 #   4. Installs the binaries to $prefix/bin.
-#   5. Creates a system user, /var/lib/easyai/{models,workspace}, an
-#      /etc/easyai/system.txt + api_key file.
+#   5. Creates a system user, /var/lib/easyai/{models,workspace}, and
+#      /etc/easyai/{easyai.ini, system.txt_template, api_key} —
+#      out-of-the-box uses the binary's built-in "Deep" prompt; copy
+#      system.txt_template to system.txt to activate a custom persona.
 #   6. Drops a hardened systemd unit that runs easyai-server with mlock,
 #      flash-attn, q8_0 KV cache, Bearer auth, Prometheus /metrics, and
 #      coredump capture (LimitCORE=infinity + systemd-coredump package).
@@ -50,12 +52,16 @@
 #   ./install_easyai_server.sh --webui-icon /path/to/logo.svg   # ico|png|svg|gif|jpg|webp
 #   ./install_easyai_server.sh --upgrade             # git pull + rebuild
 #   ./install_easyai_server.sh --force               # also rewrite easyai.ini
-#                                                    # AND system.txt AND
-#                                                    # systemd unit (use after
-#                                                    # changing installer
+#                                                    # AND systemd unit (use
+#                                                    # after changing installer
 #                                                    # defaults to push them
 #                                                    # to the box).  Backs up
 #                                                    # easyai.ini → .bak first.
+#                                                    # Note: system.txt is no
+#                                                    # longer installed (only
+#                                                    # the template ships),
+#                                                    # so --force does not
+#                                                    # touch it.
 #   ./install_easyai_server.sh --enable-now          # systemctl start now
 #   ./install_easyai_server.sh --enable-verbose      # bake --verbose into ExecStart (noisy)
 #   ./install_easyai_server.sh --no-service          # build/install only
@@ -88,11 +94,14 @@ do_service=1
 do_force_service=0
 do_force=0                                    # --force: superset of
                                               # --force-service; also rewrites
-                                              # /etc/easyai/easyai.ini AND
-                                              # /etc/easyai/system.txt even if
-                                              # they already exist.  Use after
+                                              # /etc/easyai/easyai.ini even if
+                                              # it already exists.  Use after
                                               # changing installer defaults to
                                               # propagate them to the box.
+                                              # The active system.txt is no
+                                              # longer installed — only the
+                                              # template — so --force does not
+                                              # touch it.
 do_enable_now=0
 do_avahi=1
 do_presets=1                                  # symlink easyai-cli → /usr/bin/ai
@@ -120,10 +129,16 @@ mdns_hostname="ai"
 config_dir="/etc/easyai"
 # By default the binary's built-in "Deep" prompt wins (no system_file
 # set in the INI).  We drop a documented TEMPLATE next to it that the
-# operator can copy/edit/rename to take over: `system.txt_modelo`.
-# Rename to system.txt + uncomment the INI line to activate.
-system_template_file="$config_dir/system.txt_modelo"
-system_file="$config_dir/system.txt"  # kept for upgrade-detection only
+# operator can copy/edit/rename to take over: `system.txt_template`.
+# Out-of-the-box: only the template ships; the active system.txt is
+# NOT created so the built-in default persona is what the server uses.
+# Operators who want a custom prompt:
+#     sudo cp system.txt_template system.txt
+#     sudo $EDITOR system.txt                # tweak as needed
+#     # uncomment SERVER.system_file in /etc/easyai/easyai.ini
+#     sudo systemctl restart easyai-server
+system_template_file="$config_dir/system.txt_template"
+system_file="$config_dir/system.txt"  # NOT created by default; path used by INI hint only
 api_key_file="$config_dir/api_key"
 external_tools_dir="$config_dir/external-tools"
 ini_file="$config_dir/easyai.ini"
@@ -708,16 +723,15 @@ if [[ $do_service -eq 1 ]]; then
     log "creating $config_dir"
     sudo install -d -o root -g "$service_group" -m 750 "$config_dir"
 
-    # We drop TWO files:
-    #   * system.txt_modelo — refreshed on every upgrade, the canonical
-    #     reference operators can always restore from
-    #   * system.txt       — created on FIRST INSTALL only.  Operators
-    #     edit it without losing their changes on --upgrade.  The INI
-    #     `system_file = …` line points here.
+    # We drop ONLY the TEMPLATE file:
+    #   * system.txt_template — refreshed on every upgrade, the canonical
+    #     reference the operator copies to system.txt when they want a
+    #     custom persona.  Active system.txt is NOT created by default,
+    #     so the binary's built-in "Deep" prompt (gated on actually-
+    #     registered tools) is what the server uses out of the box.
     #
     # The Deep prompt lives in $system_prompt_body (defined below);
-    # both files share the same content but the *_modelo file gets a
-    # short header explaining how to restore.
+    # the template file gets a short header explaining how to activate.
     system_prompt_body=$(cat <<'PROMPT'
 You are Deep — a clear, honest assistant. Answer briefly and let the
 user steer. Lead with the answer; show work only when the user would
@@ -784,54 +798,45 @@ Be terse. Be honest about uncertainty: "I'm not sure — let me check"
 PROMPT
 )
 
-    # Always refresh the *_modelo reference (the operator's "factory reset" copy).
+    # Always refresh the template (the operator's "factory reset" copy).
     log "writing $system_template_file (reference / restore-from copy, refreshed on upgrade)"
-    sudo bash -c "cat > '$system_template_file'" <<MODELO
+    sudo bash -c "cat > '$system_template_file'" <<TEMPLATE
 # easyai-server — system prompt TEMPLATE (Deep persona)
 #
 # This file is REFRESHED on every --upgrade.  It's the canonical copy
-# of the default Deep prompt — restore from here if you ever need to
-# reset $system_file:
+# of the default Deep prompt — copy it to activate a CUSTOM persona:
 #
 #     sudo cp $system_template_file $system_file
+#     sudo \$EDITOR $system_file
+#     # then uncomment SERVER.system_file in /etc/easyai/easyai.ini
 #     sudo systemctl restart easyai-server
 #
-# By default $system_file is DORMANT — easyai.ini ships with
-# [SERVER] system_file commented out, so the binary's built-in prompt
-# (gated on actually-registered tools) is what the model sees.
-# Uncomment system_file in easyai.ini to take over with $system_file.
+# By default $system_file does NOT exist — easyai.ini ships with
+# [SERVER] system_file commented out and no active prompt file on
+# disk, so the binary's built-in prompt (gated on actually-registered
+# tools) is what the model sees.
+#
 # Lines starting with # are NOT stripped from the prompt; they go
 # straight to the model — keep edits clean.
 #
 # This template lists ONLY tools the default install registers
 # (datetime / web_* / rag).  If you flip allow_fs=on or allow_bash=on
-# in easyai.ini, also paste the matching tool bullets back into
+# in easyai.ini, also paste the matching tool bullets back into your
 # $system_file — operator-supplied prompts are NOT auto-gated.
 # ----------------------------------------------------------------------
 
 $system_prompt_body
-MODELO
+TEMPLATE
     sudo chmod 644 "$system_template_file"
     sudo chown root:"$service_group" "$system_template_file"
 
-    # Drop system.txt only on FIRST INSTALL — or when --force is set,
-    # which is the explicit "yes, blow away my edits" gesture.
-    # Operators normally edit the active prompt and keep their changes
-    # through --upgrade; if they want the new defaults they
-    # `cp system.txt_modelo system.txt` manually OR run with --force.
-    if [[ ! -f "$system_file" || $do_force -eq 1 ]]; then
-        if [[ -f "$system_file" && $do_force -eq 1 ]]; then
-            log "rewriting $system_file (--force)"
-        else
-            log "writing $system_file (active system prompt; safe to edit, survives --upgrade)"
-        fi
-        sudo bash -c "cat > '$system_file'" <<SYS
-$system_prompt_body
-SYS
-        sudo chmod 640 "$system_file"
-        sudo chown root:"$service_group" "$system_file"
-    else
-        log "preserving existing $system_file (operator edits kept through --upgrade; pass --force to overwrite)"
+    # The active system.txt is intentionally NOT created.  Out of the
+    # box the binary's built-in "Deep" prompt (gated on actually-
+    # registered tools) is what the server uses.  Operators who want
+    # a custom persona run `sudo cp system.txt_template system.txt`,
+    # edit, then uncomment SERVER.system_file in easyai.ini.
+    if [[ -f "$system_file" ]]; then
+        log "preserving existing $system_file (created by operator; not refreshed by installer)"
     fi
 
     if [[ -n "$api_key" ]]; then
@@ -1007,10 +1012,14 @@ sandbox         = $service_workspace
 # system_file: path to a custom persona that REPLACES the binary's
 # built-in. Commented OUT by default — the built-in prompt is gated
 # on actually-registered tools (allow_fs / allow_bash / rag), so it
-# never advertises tools that aren't there. The shipped
-# /etc/easyai/system.txt is a starting template; uncomment the line
-# below to take over with it. If you do, AND you flip allow_fs=on or
-# allow_bash=on below, also paste the matching tool bullets back into
+# never advertises tools that aren't there. The installer ships ONLY
+# the template at /etc/easyai/system.txt_template; the active
+# system.txt is NOT created out of the box. To activate a custom
+# persona:
+#     sudo cp $system_template_file $system_file
+#     sudo \$EDITOR $system_file
+# then uncomment the line below. If you do, AND you flip allow_fs=on
+# or allow_bash=on, also paste the matching tool bullets back into
 # system.txt — the operator-supplied prompt is NOT auto-gated.
 # system_file     = $system_file
 
@@ -1470,8 +1479,12 @@ printf '  api base  : http://%s:%s/v1\n' \
 printf '  health    : http://localhost:%s/health\n' "$service_port"
 [[ $enable_metrics -eq 1 ]] && \
     printf '  metrics   : http://localhost:%s/metrics\n' "$service_port"
-printf '  system    : %s   (dormant by default — uncomment SERVER.system_file in easyai.ini to activate)\n' "$system_file"
-printf '              %s   (factory copy; refreshed every --upgrade)\n' "$system_template_file"
+printf '  system    : %s   (TEMPLATE; refreshed every --upgrade)\n' "$system_template_file"
+if [[ -f "$system_file" ]]; then
+    printf '              %s   (active custom prompt — uncomment SERVER.system_file in easyai.ini)\n' "$system_file"
+else
+    printf '              %s   (NOT created; built-in "Deep" prompt is in use — `sudo cp system.txt_template system.txt` to customise)\n' "$system_file"
+fi
 printf '  webui     : title="%s"\n' "$webui_title"
 [[ -n "$webui_icon_dest" ]] && \
     printf '              icon="%s" (served at /favicon and /favicon.ico)\n' "$webui_icon_dest"
