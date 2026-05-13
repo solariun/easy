@@ -1292,6 +1292,18 @@ Documentation=https://github.com/solariun/easy
 After=network-online.target
 Wants=network-online.target
 
+# Cap restart attempts: allow up to 2 starts within a 60-second window
+# (initial start + 1 retry on failure), then give up and leave the unit
+# in the "failed" state instead of looping forever on a broken model /
+# bad config / missing GPU.  A long-running successful start that fails
+# 2+ minutes later is NOT counted against this burst because the look-
+# back window resets — only rapid back-to-back boot failures stop the
+# service.  Inspect the journal (`journalctl -u easyai-server`) to see
+# why the two attempts failed, then `sudo systemctl reset-failed` +
+# `sudo systemctl start easyai-server` to try again.
+StartLimitBurst=2
+StartLimitIntervalSec=60
+
 [Service]
 Type=simple
 User=$service_user
@@ -1326,6 +1338,9 @@ ExecStartPre=/bin/sh -c 'test -f $install_prefix/lib/easyai/libllama-common.so.0
 $( [[ -f "$api_key_file" ]] && echo "Environment=\"EASYAI_API_KEY_FILE=$api_key_file\"" )
 $( [[ -f "$api_key_file" ]] && echo "ExecStartPre=/bin/sh -c 'test -r \"$api_key_file\"'" )
 ExecStart=/bin/sh -c '$( [[ -f "$api_key_file" ]] && echo "EASYAI_API_KEY=\$(cat $api_key_file) " )exec $install_prefix/bin/easyai-server$arg_string'
+# Restart=on-failure pairs with StartLimitBurst=2 in [Unit] above: the
+# first failure triggers ONE retry after RestartSec; the second failure
+# leaves the unit in the failed state (no infinite restart loop).
 Restart=on-failure
 RestartSec=10
 KillSignal=SIGINT

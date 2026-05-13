@@ -238,11 +238,21 @@ ExecStart=/bin/sh -c '...EASYAI_API_KEY=$(cat /etc/easyai/api_key) ...
                           --RAG /var/lib/easyai/rag \
                           ... '
 Restart=on-failure
-RestartSec=2
+RestartSec=10
 
 [Install]
 WantedBy=multi-user.target
 ```
+
+Note: the actual unit also carries `StartLimitBurst=2` +
+`StartLimitIntervalSec=60` in `[Unit]`, so the server attempts to
+start at most twice before giving up.  Rapid back-to-back failures
+(missing model file, bad CLI flag, GPU not exposed) leave the unit
+in the `failed` state instead of looping forever — check the journal,
+fix the root cause, then `sudo systemctl reset-failed easyai-server`
++ `sudo systemctl start easyai-server`.  A long-running service that
+fails after running successfully for more than the 60 s window is
+NOT penalised — only boot-time failures hit the cap.
 
 Important pieces:
 

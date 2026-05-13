@@ -43,6 +43,36 @@ A running log of user-facing changes. Latest first — keep this list
 current as features land so anyone returning to the repo (or
 landing on it for the first time) sees what shipped recently.
 
+### 2026-05-13 — Installer: cap `easyai-server` restart attempts at 2
+
+The systemd unit now carries `StartLimitBurst=2` +
+`StartLimitIntervalSec=60` in `[Unit]`, so the service attempts to
+start at most **twice** in any 60-second window before giving up and
+leaving the unit in the `failed` state.
+
+Before, `Restart=on-failure` + `RestartSec=10` with no burst cap
+would retry indefinitely — a missing model file, a bad CLI flag, or
+a GPU that wasn't exposed to the container produced an infinite
+restart loop that filled journald and never surfaced the real
+problem.
+
+Now:
+
+| State | Behaviour |
+| --- | --- |
+| Initial start fails | Wait `RestartSec=10`, retry once |
+| Retry also fails | Unit enters `failed` state; no further attempts |
+| Long-running service fails after running > 60 s | Burst counter has reset → still gets one retry (not penalised for late failures) |
+
+Recovery: `journalctl -u easyai-server` to inspect the two failed
+attempts, fix the root cause, then
+`sudo systemctl reset-failed easyai-server`
++ `sudo systemctl start easyai-server`.
+
+Existing installs: re-run `install_easyai_server.sh --force` (or
+`--upgrade`) to refresh the unit file.  `Restart=on-failure` and
+`RestartSec=10` are unchanged.
+
 ### 2026-05-13 — Installer: ship only `system.txt_template`; default install uses the binary's built-in prompt
 
 `scripts/install_easyai_server.sh` no longer drops an active

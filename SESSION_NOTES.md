@@ -305,6 +305,53 @@ Webui title default also flips to `"Deep"`.
 ## 5. Recent commits (most recent first)
 
 ```
+2026-05-13 — install_easyai_server.sh: cap easyai-server restart at 2.
+             Operator ask: "change the easyai-server service to try
+             to initialize twice and stop".  Previous unit had
+             Restart=on-failure + RestartSec=10 with no burst cap,
+             so a broken config (missing model, bad flag, GPU not
+             exposed) produced an infinite restart loop and filled
+             journald.
+
+  Patch (scripts/install_easyai_server.sh ~line 1296):
+    Added to the [Unit] section:
+      StartLimitBurst=2
+      StartLimitIntervalSec=60
+
+  Semantics: at most 2 starts allowed within any 60s look-back
+  window.  Initial start + 1 retry on failure → if the retry also
+  fails, the unit enters "failed" state instead of looping.  A
+  long-running service that fails 2+ minutes after a successful
+  start is NOT penalised because the burst counter resets when no
+  starts happen within the interval window.
+
+  [Service] block: kept Restart=on-failure + RestartSec=10
+  unchanged; added a comment cross-referencing the new burst cap
+  so future readers don't wonder why the cap isn't in the [Service]
+  section (it's a systemd quirk — StartLimit* lives under [Unit]).
+
+  Recovery flow: journalctl -u easyai-server to see what broke;
+  fix; sudo systemctl reset-failed easyai-server; sudo systemctl
+  start easyai-server.  Without reset-failed the start command
+  would still be blocked by the rate limit.
+
+  Existing installs: --force or --upgrade to refresh the unit.
+
+  Verification:
+    * bash -n install_easyai_server.sh — syntax OK
+    * systemd-analyze verify path (manual): not run; live test
+      requires a Linux box.
+
+  Docs:
+    * README.md "What's new" entry with before/after table.
+    * LINUX_SERVER.md systemd-unit excerpt updated:
+      RestartSec value corrected from stale "2" to actual "10",
+      added a note paragraph describing the burst cap, recovery
+      command, and the "long-running failures aren't penalised"
+      semantics.
+```
+
+```
 2026-05-13 — install_easyai_server.sh: ship only system.txt_template;
              default install uses the binary's built-in prompt.
              Two motivating asks from the operator:
