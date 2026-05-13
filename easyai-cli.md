@@ -199,9 +199,9 @@ prepended (see [§6](#6-system-prompt--injected-blocks)).
 | `--verbose`, `-v` | Log HTTP+SSE diagnostics to stderr (timestamps + per-piece traces). Stderr-only — does NOT create a /tmp log file (use `--log-file` for that). |
 | `-q`, `--quiet` | Disable the spinner glyph + context-fill gauge. Use for batch / scripted runs. **Also changes `Ctrl-C` / `SIGTERM` semantics** — see [§3 → Ctrl-C and SIGTERM](#ctrl-c-and-sigterm). |
 | `--log-file PATH` | Opt in to a raw transaction log at PATH (request body + every SSE chunk + every tool dispatch input/output, mode 0600). Default OFF — no log file is written without this flag. Implies `--verbose`. |
-| `--continue` | Force-load `.easyai_session` from cwd. **Default ON** since 2026-05-12 — existing sessions are auto-resumed. Explicit form is a no-op except when an operator's INI sets `auto_continue = off` (then `--continue` overrides it for this invocation). INI: `[cli] auto_continue = true\|false`. See [§10](#10-session-persistence). |
-| `--no-continue` | Start fresh — ignore any existing `.easyai_session` and overwrite it on the first turn. Inverse of `--continue`. |
-| `--compress` | After loading, ask the model for one lossless recap of the conversation and replace the history with that recap. Also reachable mid-REPL via `/compress`. No-op when combined with `--no-continue` (nothing in memory to recap). INI: `[cli] auto_compress = true\|false`. |
+| `--continue` | Load `.easyai_session` from cwd before the first prompt. **Default OFF** (since 2026-05-13) — any existing session file is ignored and overwritten on the first turn unless this flag is set. INI: `[cli] auto_continue = true\|false`. See [§10](#10-session-persistence). |
+| `--no-continue` | Explicit form of the default — ignore any existing `.easyai_session` and overwrite on the first turn. Useful to override `[cli] auto_continue = on` set in INI. |
+| `--compress` | After loading, ask the model for one lossless recap of the conversation and replace the history with that recap. Also reachable mid-REPL via `/compress`. No-op without `--continue` (nothing in memory to recap). INI: `[cli] auto_compress = true\|false`. |
 
 ### Management subcommands (one only, no chat)
 
@@ -454,10 +454,12 @@ message array — same format the CLI sends on the wire — so it's
 plain-text greppable, diffable, and re-loadable in a future
 invocation.
 
-**Loading is default-ON since 2026-05-12.**  If a `.easyai_session`
-already exists in the current directory, `easyai-cli` resumes from
-it without any flag.  Otherwise it starts fresh silently (no warning
-— a missing file is the natural first-run case).
+**Loading is default-OFF since 2026-05-13.**  Even when a
+`.easyai_session` already exists in the current directory,
+`easyai-cli` starts fresh silently — and overwrites the file on the
+first turn.  Pass `--continue` (or set `[cli] auto_continue = on` in
+INI) to resume from the existing file before the first prompt.
+Saving on every turn is unchanged.
 
 ```bash
 $ cd ~/project
@@ -466,26 +468,29 @@ $ easyai-cli --url http://ai.local
 [turn completes; .easyai_session updated]
 > /exit
 
-# Tomorrow, same project — picks up where it left off, no flag needed:
+# Tomorrow, same project — resume requires --continue:
 $ cd ~/project
-$ easyai-cli --url http://ai.local
+$ easyai-cli --url http://ai.local --continue
 [easyai-cli-remote] continued from .easyai_session in /Users/x/project
 > what was the build error again?
 [model has the prior context]
+
+# Without --continue the existing file is overwritten on the first turn:
+$ cd ~/project
+$ easyai-cli --url http://ai.local
+> hello
+[turn completes; .easyai_session overwritten with this fresh history]
 ```
 
 Four control points:
 
 | Surface | What it does |
 | --- | --- |
-| (no flag) | **Default**: load `.easyai_session` if present, start fresh if not.  Save on every turn. |
-| `--no-continue` | Ignore the existing `.easyai_session` and start fresh.  Overwrites the file on the first turn. |
-| `--compress` | After loading, ask the model for one lossless recap of the conversation and replace history with the recap.  No-op when combined with `--no-continue`. |
+| (no flag) | **Default**: ignore any `.easyai_session` and overwrite it on the first turn.  Save on every turn. |
+| `--continue` | Load the existing `.easyai_session` (if any) before the first prompt; otherwise start fresh.  Overrides `[cli] auto_continue = off`. |
+| `--no-continue` | Explicit form of the default — useful to override an operator's `[cli] auto_continue = on` for this invocation. |
+| `--compress` | After loading, ask the model for one lossless recap of the conversation and replace history with the recap.  No-op without `--continue` (nothing in memory to recap). |
 | `/compress` (in the REPL) | Same compress flow, fired mid-session when context gets long. |
-
-`--continue` still exists as a no-op alias for backward compatibility
-— it's only useful in scripts that want to assert resume semantics
-against an operator's INI that may have flipped `auto_continue` off.
 
 ### Save cadence (force-exit survival)
 
@@ -529,14 +534,16 @@ Precedence: CLI flag > INI > hardcoded default.
 
 | INI key (`[cli]`) | Default | CLI flag(s) | Effect |
 | --- | --- | --- | --- |
-| `auto_continue` | `true`  | `--continue` / `--no-continue` | Load `.easyai_session` from cwd before the first prompt. |
+| `auto_continue` | `false` | `--continue` / `--no-continue` | Load `.easyai_session` from cwd before the first prompt. |
 | `auto_compress` | `false` | `--compress` | Run the compress flow on every load (rare; usually you want `/compress` on demand). |
 | `log_file`      | `""`    | `--log-file PATH` | Raw transaction log path.  Empty = no log file. |
 | `auto_log`      | `false` | (no flag) | When `true`, removes the cli's default `EASYAI_NO_AUTO_LOG=1` so the library reopens its legacy `/tmp/easyai-client-{pid}-{epoch}.log` per Client.  Keep off unless you want that postmortem trail. |
 | `show_bash`     | `true`  | `--show-bash` / `--no-show-bash` | Print bash subprocess input/output to the operator's terminal in real time. |
 | `show_python`   | `true`  | `--show-python` / `--no-show-python` | Same for `python3`. |
 
-Example `easyai-cli.ini` for an "always resume, never auto-log" workstation:
+Example `easyai-cli.ini` for an "always resume, never auto-log" workstation
+(flip `auto_continue` to `true` so every invocation resumes without
+needing `--continue` on the command line):
 
 ```ini
 [cli]
@@ -548,13 +555,13 @@ show_bash     = true
 show_python   = true
 ```
 
-Operators who don't want session files in cwd at all: set
-`auto_continue = off` in the INI (or pass `--no-continue` per
-invocation) and `rm .easyai_session` if it leaks past — there's no
-`--no-session` flag today.  The file is local to **cwd**, not `~`,
-so the unit of persistence is naturally the project directory
-you're working in: two projects in two different dirs have two
-independent sessions.
+Operators who don't want session files in cwd at all: leave
+`auto_continue = false` (the default) so existing files are
+overwritten rather than read, and `rm .easyai_session` if it leaks
+past — there's no `--no-session` flag today.  The file is local to
+**cwd**, not `~`, so the unit of persistence is naturally the
+project directory you're working in: two projects in two different
+dirs have two independent sessions.
 
 ---
 

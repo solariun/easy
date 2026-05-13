@@ -554,12 +554,12 @@ struct Options {
     std::string log_file_path;             // explicit --log-file override
 
     // Session persistence — drop a `.easyai_session` in cwd updated after
-    // every turn.  Loading is DEFAULT-ON: if a session file exists in
-    // cwd, we resume from it; otherwise we start fresh silently.
-    // `--no-continue` (or [cli] auto_continue = off) overrides to start
-    // fresh even when a session file exists.  `--compress` (or [cli]
-    // auto_compress = on) runs a lossless recap on load.
-    bool        auto_continue       = true;     // load .easyai_session if present
+    // every turn.  Loading is DEFAULT-OFF: even if a session file exists
+    // in cwd, we start fresh (and overwrite it on the first turn) unless
+    // `--continue` (or [cli] auto_continue = on) is set.  `--compress`
+    // (or [cli] auto_compress = on) runs a lossless recap on load and
+    // therefore implies --continue at use time.
+    bool        auto_continue       = false;    // load .easyai_session only when explicitly enabled
     bool        auto_continue_cli_set = false;  // CLI > INI > hardcoded default
     bool        auto_compress       = false;    // recap on every load when on
     bool        auto_compress_cli_set = false;
@@ -775,19 +775,20 @@ void usage(const char * argv0) {
 "                                OFF — no log file is created without\n"
 "                                this flag.  Implies --verbose.\n"
 "                                INI: [cli] log_file = PATH.\n"
-"    --continue                 force-load `.easyai_session` from the\n"
-"                                current directory (default ON since\n"
-"                                2026-05-12).  Explicit form is useful in\n"
-"                                scripts to assert resume behaviour even\n"
-"                                when an operator's INI sets\n"
-"                                auto_continue = off.  The file is\n"
-"                                written atomically after EVERY turn\n"
-"                                regardless of how loading was decided.\n"
+"    --continue                 load `.easyai_session` from the current\n"
+"                                directory before the first prompt.\n"
+"                                Default OFF: without this flag, any\n"
+"                                existing session file is ignored and\n"
+"                                overwritten on the first turn.  The\n"
+"                                file is written atomically after EVERY\n"
+"                                turn regardless of how loading was\n"
+"                                decided.\n"
 "                                INI: [cli] auto_continue = true|false.\n"
-"    --no-continue              start fresh — ignore any existing\n"
-"                                `.easyai_session` and overwrite it on\n"
-"                                the first turn.  Overrides INI\n"
-"                                auto_continue = on for this invocation.\n"
+"    --no-continue              explicit form of the default — ignore\n"
+"                                any existing `.easyai_session` and\n"
+"                                overwrite it on the first turn.  Useful\n"
+"                                in scripts to override an operator's\n"
+"                                INI that sets auto_continue = on.\n"
 "    --compress                 after loading the session, ask the model\n"
 "                                for a single lossless recap of the\n"
 "                                entire conversation and replace the\n"
@@ -797,14 +798,14 @@ void usage(const char * argv0) {
 "                                noise + abandoned branches and keeps\n"
 "                                facts / decisions / file paths.  Also\n"
 "                                reachable mid-REPL via /compress.\n"
-"                                No-op when combined with --no-continue\n"
-"                                (nothing in memory to recap).\n"
+"                                No-op without --continue (nothing in\n"
+"                                memory to recap on a fresh session).\n"
 "                                INI: [cli] auto_compress = true|false.\n"
 "    --config PATH              INI overlay (CLI > INI > hardcoded). Default\n"
 "                                /etc/easyai/easyai-cli.ini; missing file is\n"
 "                                NOT an error (just keeps hardcoded\n"
 "                                defaults).  The [cli] section supports:\n"
-"                                  auto_continue = true|false  (default true)\n"
+"                                  auto_continue = true|false  (default false)\n"
 "                                  auto_compress = true|false  (default false)\n"
 "                                  log_file      = PATH         (default \"\")\n"
 "                                  auto_log      = true|false  (default false;\n"
@@ -953,16 +954,17 @@ bool parse_args(int argc, char ** argv, Options & o) {
             o.log_file_path_cli_set = true;
         }
         else if (a == "--continue") {
-            // Kept for explicit-intent / backward compat — default is
-            // already auto_continue=true.  Setting cli_set guards it
-            // from being flipped off by `[cli] auto_continue = off` in
-            // the INI for this invocation.
+            // Opt in to loading `.easyai_session` before the first
+            // prompt.  Default is auto_continue=false; setting cli_set
+            // also guards against `[cli] auto_continue = off` in the
+            // INI flipping this back off for this invocation.
             o.auto_continue         = true;
             o.auto_continue_cli_set = true;
         }
         else if (a == "--no-continue") {
-            // Start fresh even if a `.easyai_session` exists.  Overrides
-            // the default-on behaviour and any INI `auto_continue = on`.
+            // Explicit form of the default — useful when an operator's
+            // INI sets `auto_continue = on` and a script wants to force
+            // a fresh start for this invocation.
             o.auto_continue         = false;
             o.auto_continue_cli_set = true;
         }
@@ -1990,14 +1992,13 @@ int main(int argc, char ** argv) {
 
     // --------------- session persistence --------------------------------
     // `.easyai_session` in cwd is the per-process state.  Default
-    // behaviour: load it if present, write it on every turn.
-    // `--no-continue` (or [cli] auto_continue = off) flips to "start
-    // fresh and overwrite on first turn".  `--compress` (or [cli]
-    // auto_compress = on) asks the model for a lossless recap on
-    // load and replaces history with that recap.  Compressing
-    // implies loading first; running compress with --no-continue
-    // (or auto_continue=off) is a no-op because there's no history
-    // in memory to recap.
+    // behaviour: start fresh and overwrite any existing file on the
+    // first turn.  `--continue` (or [cli] auto_continue = on) loads
+    // the existing file before the first prompt.  `--compress` (or
+    // [cli] auto_compress = on) asks the model for a lossless recap
+    // on load and replaces history with that recap.  Compressing
+    // implies loading first; running compress without auto_continue
+    // is a no-op because there's no history in memory to recap.
     if (o.auto_continue && !any_management(o)) {
         std::string load_err;
         if (load_session(cli, &load_err)) {

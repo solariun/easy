@@ -43,6 +43,41 @@ A running log of user-facing changes. Latest first — keep this list
 current as features land so anyone returning to the repo (or
 landing on it for the first time) sees what shipped recently.
 
+### 2026-05-13 — `easyai-cli` session resume flips back to opt-in
+
+Reverts the 2026-05-12 default flip: loading the existing
+`.easyai_session` is **opt-in again** via `--continue`.  Without the
+flag, any file in cwd is ignored and overwritten on the first turn
+— matching the behaviour shipped originally on 2026-05-12 morning
+before the auto-on flip.
+
+Why: the auto-on default surprised operators who opened a project
+directory expecting a fresh agent and instead picked up history
+from a previous experiment.  An explicit opt-in matches the rest
+of the cli's surface (nothing else implicitly carries state across
+invocations) and removes the silent action-at-a-distance.
+
+| | Previous (2026-05-12 → 2026-05-13) | Now |
+| --- | --- | --- |
+| Resume on launch | default ON | opt-in via `--continue` |
+| Start fresh | opt-in via `--no-continue` | **default** |
+| `--compress` without `--continue` | no-op (warning) | no-op (warning) |
+
+Saving is unchanged: every turn (and every tool round-trip) still
+rewrites `.easyai_session` atomically.  `--no-continue` stays as the
+explicit form of the default — useful for scripts overriding an
+operator's `[cli] auto_continue = on` INI line.
+
+Default for `[cli] auto_continue` flips to `false`.  Operators who
+prefer the auto-on behaviour can opt in once via INI:
+
+```ini
+[cli]
+auto_continue = true
+```
+
+Full doc: [`easyai-cli.md`](easyai-cli.md) §10.
+
 ### 2026-05-13 — Installer: cap `easyai-server` restart attempts at 2
 
 The systemd unit now carries `StartLimitBurst=2` +
@@ -1126,9 +1161,9 @@ upstream `llama-server`, OpenAI itself, etc.).
 | `--verbose` | off | Log HTTP+SSE traffic to stderr (stderr only — no file). |
 | `-q, --quiet` | off | Disable spinner glyph + ctx-fill gauge. |
 | `--log-file PATH` | off | Opt in to a raw transaction log at PATH (mode 0600). Implies `--verbose`. No `/tmp` file is created by default. |
-| `--continue` | **on** | Resume `.easyai_session` from cwd (default ON since 2026-05-12; flag form is a no-op except to override `[cli] auto_continue = off`). Session is always saved per turn. INI: `[cli] auto_continue`. |
-| `--no-continue` | — | Ignore the existing `.easyai_session`; start fresh and overwrite on the first turn. Inverse of `--continue`. |
-| `--compress` | off | Ask the model for a lossless recap, replace history with it, save. No-op with `--no-continue`. Also `/compress` mid-REPL. INI: `[cli] auto_compress`. |
+| `--continue` | off | Load `.easyai_session` from cwd before the first prompt. Default OFF (since 2026-05-13): without this flag any existing session file is ignored and overwritten on the first turn. Session is always saved per turn regardless. INI: `[cli] auto_continue`. |
+| `--no-continue` | — | Explicit form of the default — ignore any existing `.easyai_session` and overwrite on the first turn. Useful to override `[cli] auto_continue = on` set in INI. |
+| `--compress` | off | Ask the model for a lossless recap, replace history with it, save. No-op without `--continue` (nothing in memory to recap). Also `/compress` mid-REPL. INI: `[cli] auto_compress`. |
 | `--list-tools` | — | Print local tools (no chat). |
 | `--list-remote-tools` | — | `GET /v1/tools` (no chat). |
 | `--list-models` | — | `GET /v1/models`. |
