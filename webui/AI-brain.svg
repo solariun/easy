@@ -10,24 +10,19 @@
       <stop offset="100%" stop-color="#2196f3"/>
     </linearGradient>
 
-    <!-- Aura: two stacked Gaussian blurs of the alpha silhouette,
-         each tinted with the same cyan flood, merged behind the
-         source.  Tuned subtle — the outer pass (stdDeviation=10,
-         opacity=0.3) gives a soft atmospheric breath, the inner
-         pass (stdDeviation=3, opacity=0.6) keeps a gentle contour
-         emission.  Reads as a quiet halo rather than a neon sign.
-         Bump opacities (0.5 / 1.0 was the previous "loud" tuning)
-         if more presence is wanted. -->
-    <filter id="ai_box_aura" x="-60%" y="-60%" width="220%" height="220%">
-      <feGaussianBlur in="SourceAlpha" stdDeviation="10" result="outerBlur"/>
-      <feGaussianBlur in="SourceAlpha" stdDeviation="3"  result="innerBlur"/>
-      <feFlood flood-color="#00bcd4" flood-opacity="0.3" result="outerColor"/>
-      <feFlood flood-color="#00bcd4" flood-opacity="0.6" result="innerColor"/>
-      <feComposite in="outerColor" in2="outerBlur" operator="in" result="outerHalo"/>
-      <feComposite in="innerColor" in2="innerBlur" operator="in" result="innerHalo"/>
+    <!-- Aura: a single Gaussian blur of the alpha silhouette at
+         stdDeviation=1 (essentially a 1px halo), tinted with the
+         same cyan flood and merged behind the source.  Reads as
+         a hint of emission rather than a halo proper — just enough
+         to lift the mark off the background without competing with
+         the silhouette.  Bump stdDeviation (3, 6, 10) for a more
+         visible aura. -->
+    <filter id="ai_box_aura" x="-10%" y="-10%" width="120%" height="120%">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="1" result="haloBlur"/>
+      <feFlood flood-color="#00bcd4" flood-opacity="0.6" result="haloColor"/>
+      <feComposite in="haloColor" in2="haloBlur" operator="in" result="halo"/>
       <feMerge>
-        <feMergeNode in="outerHalo"/>
-        <feMergeNode in="innerHalo"/>
+        <feMergeNode in="halo"/>
         <feMergeNode in="SourceGraphic"/>
       </feMerge>
     </filter>
