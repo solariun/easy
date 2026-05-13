@@ -6153,11 +6153,11 @@ int main(int argc, char ** argv) {
             // "<icon> EasyAi" instead of just text.  The styling keeps the
             // icon vertically aligned with the title text and sized to the
             // h1's line-height; brand h1 in the bundle is small (about 1rem),
-            // so 1.05em hits "slightly bigger than the text" for visual
-            // weight.  No external image lookup, no CDN.
+            // so 1.575em (≈50% larger than the text) gives the logo clear
+            // visual prominence.  No external image lookup, no CDN.
             const std::string brand_html =
-                "><img src=\"/favicon\" alt=\"\" style=\"height:1.05em;"
-                "width:1.05em;vertical-align:-.18em;margin-right:.35em;"
+                "><img src=\"/favicon\" alt=\"\" style=\"height:1.575em;"
+                "width:1.575em;vertical-align:-.18em;margin-right:.35em;"
                 "border-radius:4px;background:transparent;display:inline-block\">"
                 + title + "</h1>";
             js = str_replace_all(js, ">llama.cpp</h1>", brand_html);
