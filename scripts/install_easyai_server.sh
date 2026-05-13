@@ -40,7 +40,9 @@
 #   ./install_easyai_server.sh --service-port 8080
 #   ./install_easyai_server.sh --service-host 0.0.0.0
 #   ./install_easyai_server.sh --mdns-hostname my-ai # box becomes my-ai.local
-#                                                    # default: ai (so ai.local)
+#                                                    # default: current system
+#                                                    # hostname (so <host>.local
+#                                                    # — e.g. ai-pro → ai-pro.local)
 #                                                    # ignored under --no-avahi
 #   ./install_easyai_server.sh --ctx-size 32768   # default 100000 (100 K)
 #   ./install_easyai_server.sh --ngl 99            # GPU layers (-1=auto, 0=CPU)
@@ -121,10 +123,13 @@ service_port=80                                # matches install_llama_server.sh
 service_alias="EasyAi"
 service_name="easyai-server.service"
 # mDNS / kernel hostname. We rename the system hostname here so the box
-# advertises as `<mdns_hostname>.local` via avahi. Default "ai" yields
-# the canonical "ai.local". Skipped entirely when --no-avahi is passed
-# (operator keeps their existing hostname and falls back to LAN-IP).
-mdns_hostname="ai"
+# advertises as `<mdns_hostname>.local` via avahi. Default mirrors the
+# current system hostname so the box keeps the name the operator has
+# already given it (e.g. host `ai-pro` → `ai-pro.local`, host `ai` →
+# `ai.local`, host `xx` → `xx.local`). Pass --mdns-hostname to override.
+# Skipped entirely when --no-avahi is passed (operator keeps their
+# existing hostname and falls back to LAN-IP).
+mdns_hostname="$(hostname -s 2>/dev/null || hostname)"
 
 config_dir="/etc/easyai"
 # By default the binary's built-in "Deep" prompt wins (no system_file
