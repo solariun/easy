@@ -2271,6 +2271,29 @@ cli.on_tool([](const easyai::ToolCall & call,
 the visible reply; `on_tool` fires once per dispatched tool round-trip
 (call + result already paired).
 
+**Composing extra behaviour onto `on_tool`.** Each callback slot is
+single-valued — calling `cli.on_tool(...)` again **replaces** the
+previous handler, it does not chain.  If you want to add a checkpoint
+or audit step on top of the canonical UI handler that
+`easyai::ui::Streaming::attach(cli)` installs, use the public
+forwarder `Streaming::notify_tool(call, result)` and wrap both:
+
+```cpp
+easyai::ui::Streaming streaming(spinner, stats, style);
+streaming.attach(cli);   // sets the canonical UI on_tool handler
+
+cli.on_tool([&](const easyai::ToolCall & c,
+                 const easyai::ToolResult & r) {
+    streaming.notify_tool(c, r);   // canonical UI (tool indicator,
+                                   // dim styling, plan re-render)
+    checkpoint_to_disk(cli);       // your extra work
+});
+```
+
+This pattern is how `easyai-cli` saves `.easyai_session` after every
+tool dispatch (so a force-exit mid-turn still leaves the
+conversation up to the last completed tool on disk).
+
 ### 4.6 Driving the conversation
 
 ```cpp

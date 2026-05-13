@@ -487,6 +487,26 @@ Four control points:
 — it's only useful in scripts that want to assert resume semantics
 against an operator's INI that may have flipped `auto_continue` off.
 
+### Save cadence (force-exit survival)
+
+The `.easyai_session` is checkpointed at three layers, in this order:
+
+1. **After every tool dispatch** during a turn — written from the
+   `on_tool` callback, so even mid-turn progress hits disk before
+   the model continues reasoning.
+2. **After every `chat()` return** in `run_one()` — covers graceful
+   completion and stage-1 cancel (Ctrl-C once, model lets the SSE
+   close).
+3. **After every history-mutating slash command** (`/clear`,
+   `/reset`, `/compress`).
+
+The first layer is what makes a **force-exit** (Ctrl-C 3×, stage 3 →
+`_exit(130)` from the signal handler) still leave a useful session
+behind: the file on disk reflects the conversation up to the last
+completed tool round-trip, only the in-flight partial reply is lost.
+Stages 1 and 2 (graceful + cancel) also work because their `chat()`
+returns normally and layer 2 fires.
+
 The compress prompt instructs the model to preserve verbatim: every
 file path, every decision made, every code change, every error with
 its cause, every tool result still relevant, every user-stated

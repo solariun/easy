@@ -589,6 +589,13 @@ earlier installs) and reboot. Gustavo's MINISFORUM UM690L (Radeon
 (29 GiB GTT) — leaves enough headroom for a Q5_K_M / MXFP4_MOE 30B
 MoE plus a 32k KV cache fully on the iGPU.
 
+Since 2026-05-12: re-running the installer with a **different**
+`--gtt` value now rewrites the existing `ttm.pages_limit=N` token in
+`/etc/default/grub` and re-runs `update-grub`, instead of bailing
+with "already present; skipping" and leaving the stale value behind.
+After reboot, verify with `cat /proc/cmdline` (or `grep ttm.pages
+/proc/cmdline`).  Same `--gtt` value across re-runs still no-ops.
+
 ### Model uses a tool that's disabled in the INI
 
 Symptom: `allow_bash = off` in `easyai.ini`, but the model still

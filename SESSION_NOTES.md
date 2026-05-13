@@ -305,6 +305,136 @@ Webui title default also flips to `"Deep"`.
 ## 5. Recent commits (most recent first)
 
 ```
+2026-05-12 — install_easyai_server.sh: ttm.pages_limit updated in place
+             on re-run (was: "already present; skipping" left stale
+             value behind).
+             Operator-reported: re-running with a different --gtt
+             previously printed "ttm.pages_limit already present;
+             skipping" and silently left the prior page count in
+             /etc/default/grub, so the next reboot kept the stale
+             GTT.
+
+  Patch: the existing token comparison was a bare grep -q presence
+  check.  Now it scrapes the current page count out of GRUB_CMDLINE_
+  LINUX_DEFAULT, compares against the target, rewrites in place via
+  sed -i when they differ, and runs update-grub so /boot/grub/grub.cfg
+  picks the new value up.  Reboot reminder also points at
+  /proc/cmdline so operators can verify after restart.
+
+  No flag change.  Same --gtt value on every run still hits the
+  "already present; skipping" path (true no-op).
+
+  Commit: ab8a99d
+```
+
+```
+2026-05-12 — Brand: AI Box logo aura softened (loud → quiet).
+             Earlier tuning (07c2347) introduced a two-layer cyan
+             aura around the mark; operator feedback was "vamos
+             diminuir a aura do logo por favor para ser subita"
+             (subtler).  Tuned both stacked Gaussian blurs down:
+
+    Outer pass: stdDeviation 14→10, flood-opacity 0.5→0.3
+    Inner pass: stdDeviation 4→3,   flood-opacity 1.0→0.6
+
+  Gradient (#1de9b6 → #2196f3), mark geometry (50/100/200 ring +
+  rounded 62×62 center), viewBox (-50 -50 300 300 with 60% filter
+  headroom) and flood color (#00bcd4) all unchanged.
+
+  Wiring: webui/AI-brain.svg (canonical) + inline kBrandSvg in
+  examples/server.cpp updated in lockstep so the favicon route
+  serves the same softened version downstream embedders see.
+
+  Docs: README.md "What's new" entry with before/after table.
+
+  Commit: cc92d51
+```
+
+```
+2026-05-12 — Cli: checkpoint .easyai_session after every tool dispatch
+             (survives force-exit).
+             Operator-reported: a long agentic turn that got
+             force-exited (Ctrl-C 3x → stage 3 → _exit(130)) left no
+             .easyai_session behind.  Previous save points covered
+             every interruption mode EXCEPT force-exit:
+
+    Stage 1 (graceful, Ctrl-C once during turn) — chat() finishes
+      naturally, save fires from the post-chat() path in run_one
+    Stage 2 (cancel, Ctrl-C twice) — request_cancel() flag set,
+      chat() returns with last_error="cancelled", save fires
+    Stage 3 (force-exit, Ctrl-C three times) — _exit(130) from the
+      signal handler skips atexit AND skips run_one's post-chat()
+      path → save NEVER fires
+
+  Adding a save after every tool round-trip means a partial turn that
+  gets force-exited still leaves the state up to the last completed
+  tool on disk.  Only the in-flight partial reply is lost.
+
+  Wiring: run_one() already calls streaming.attach(cli) which sets a
+  single on_tool callback driving the canonical UI (tool indicators,
+  dim styling, etc.).  cli.on_tool() replaces (not composes), so we
+  expose a public forwarder on Streaming and then register a wrapped
+  callback that calls both:
+
+    include/easyai/ui.hpp
+      + Streaming::notify_tool(const ToolCall &, const ToolResult &)
+        Public alias for the private on_tool_ UI handler, so external
+        callers can compose extra behaviour onto the on_tool slot
+        without losing the streaming output.
+
+    src/ui.cpp
+      + void Streaming::notify_tool(...) { on_tool_(...); }
+        One-line forwarder.
+
+    examples/cli.cpp run_one()
+      The post-streaming.attach(cli) wrapper:
+        cli.on_tool([&](const ToolCall & c, const ToolResult & r) {
+            streaming.notify_tool(c, r);   // canonical UI
+            std::string save_err;
+            if (!save_session(cli, &save_err)) {
+                std::printf("%s[easyai-cli-remote] warning: failed "
+                            "to save .easyai_session: %s%s\n",
+                            st.yellow(), save_err.c_str(), st.reset());
+            }
+        });
+
+  Docs: README.md "What's new" entry.  easyai-cli.md §10 new
+  "Save cadence (force-exit survival)" subsection enumerating the
+  three layers (per-tool / per-chat / per-slash-command) and which
+  signal-handler stage each one covers.
+
+  No public-API change other than the new notify_tool forwarder.
+  Library embedders not using Streaming::attach() are unaffected.
+
+  Commit: 3b95ef4
+```
+
+```
+2026-05-12 — Brand: AI Box logo green → blue gradient + two-layer cyan aura.
+             Replaced the prior orange→teal gradient with a cleaner
+             mint→Material-blue arc and added a quiet two-pass
+             cyan aura around the mark to give it presence.
+
+    Gradient: #1de9b6 (top-left) → #2196f3 (bottom-right)
+    Aura: feGaussianBlur stacked (outer + inner) with #00bcd4
+          flood; merged behind SourceGraphic.
+
+  Geometry: outer rounded-square ring (50 → 150, r=50, evenodd) +
+  center mark (rect 69×69→62 wide rx=13).  ViewBox bumped to
+  -50 -50 300 300 with filter x=-60% width=220% so the halo has
+  headroom and doesn't get clipped at the SVG edge.
+
+  Same SVG content in webui/AI-brain.svg (canonical) and inline
+  kBrandSvg in examples/server.cpp (compiled into the binary,
+  served at /favicon route).
+
+  Subsequent tuning (cc92d51) softened the aura — see the aura
+  softening entry above for the final intensity numbers.
+
+  Commit: 07c2347
+```
+
+```
 2026-05-12 — Cli: session resume default-ON + every session knob in [cli] INI.
              Iteration on the persistence feature that landed earlier
              today (99a9efc).  Two motivating asks from the operator:

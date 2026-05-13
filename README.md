@@ -43,6 +43,78 @@ A running log of user-facing changes. Latest first — keep this list
 current as features land so anyone returning to the repo (or
 landing on it for the first time) sees what shipped recently.
 
+### 2026-05-12 — Installer: `ttm.pages_limit` updated in place on re-run
+
+`scripts/install_easyai_server.sh` used to print
+`ttm.pages_limit already present; skipping` when `/etc/default/grub`
+already had a `ttm.pages_limit=N` token — even if N differed from
+the value the operator just passed via `--gtt`.  Result: re-running
+the installer with a new GTT size was silently a no-op on the
+GRUB side, and the next reboot kept the stale page count.
+
+The patch now compares the existing token's page count against the
+target, rewrites it in place when they differ (via `sed -i`), and
+runs `update-grub` so the change lands in `/boot/grub/grub.cfg`.
+The reboot reminder also points at `/proc/cmdline` so operators
+can verify the new value boots cleanly.
+
+No flag change.  Operators who pass the same `--gtt` value on every
+run see the same idempotent "already present; skipping" message.
+
+### 2026-05-12 — AI Box logo: softer two-layer aura
+
+Tuned the aura halo on the AI Box mark so it reads as a quiet
+emission instead of a neon outline.  The earlier tuning was
+described internally as "loud"; this pass cuts both stacked
+Gaussian blurs to subtler values:
+
+| Layer | Before (07c2347) | Now (cc92d51) |
+| --- | --- | --- |
+| Outer halo `stdDeviation` | 14 | **10** |
+| Outer halo `flood-opacity` | 0.5 | **0.3** |
+| Inner halo `stdDeviation` | 4  | **3**  |
+| Inner halo `flood-opacity` | 1.0 | **0.6** |
+
+Gradient, mark geometry, viewBox headroom and filter cyan flood
+(`#00bcd4`) all unchanged.  Both `webui/AI-brain.svg` (the
+canonical SVG source) and the inline `constexpr kBrandSvg` in
+[`examples/server.cpp`](examples/server.cpp) updated in lockstep,
+so the favicon route serves the same softened version every
+embedder sees.
+
+### 2026-05-12 — `easyai-cli` session: per-tool checkpoint survives force-exit
+
+The previous save points covered every interruption mode **except
+force-exit** — three Ctrl-Cs in a row trigger stage 3 of the signal
+handler (`_exit(130)`), which bypasses `atexit` and the post-`chat()`
+save in `run_one()`.  Operators reported that a long agentic turn
+that got force-exited left no `.easyai_session` on disk.
+
+Fix: layer an additional save into the `on_tool` callback so
+`.easyai_session` is rewritten **after every tool round-trip** in a
+turn, not just at the end of the turn.  Only the in-flight partial
+reply since the last completed tool is lost; everything earlier
+(file edits, bash output, plan steps, RAG queries) is on disk and
+re-loadable.
+
+Wiring: `easyai::ui::Streaming::notify_tool(call, result)` is now a
+public forwarder for the private on_tool UI handler, so external
+embedders can compose extra behaviour onto the `on_tool` slot
+(checkpoint to disk, telemetry, audit log) without losing the
+streaming output (tool indicators, dim styling, plan rendering).
+The cli's binary uses it as:
+
+```cpp
+cli.on_tool([&](const ToolCall & c, const ToolResult & r) {
+    streaming.notify_tool(c, r);   // canonical UI
+    save_session(cli, &err);       // disk checkpoint
+});
+```
+
+Pattern is documented inline in
+[`include/easyai/ui.hpp`](include/easyai/ui.hpp) above the
+`notify_tool` declaration.  No flag / INI change.
+
 ### 2026-05-12 — Session resume default-ON + every session knob now in `[cli]` INI
 
 Iteration on yesterday's session-persistence feature: loading the
