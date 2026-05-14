@@ -1337,6 +1337,57 @@ pattern. Header: [`include/easyai/cli.hpp`](include/easyai/cli.hpp).
 | `.tools()` | — | Materialise `vector<Tool>`. |
 | `.apply(engine) / .apply(client)` | — | Register on the consumer + bump hops if bash. |
 
+### Sampling — what each knob does
+
+At every step the model emits a probability distribution over the whole
+vocabulary (~100k+ tokens). These knobs decide how a token is picked
+from it. They work in sequence: the *cutters* (`top_k`, `top_p`,
+`min_p`) narrow the candidate pool over the raw distribution, then
+`temperature` controls how randomly the final token is drawn from the
+survivors.
+
+* **`temperature`** — the focus-vs-risk dial; divides the logits before
+  softmax. `→ 0` is greedy (always the top token: deterministic, can
+  repeat). `0.2–0.5` keeps the model tight on format, syntax, and
+  facts. `1.0` is the model's unmodified distribution. `> 1.0` flattens
+  the curve so unlikely tokens get a real chance — more varied and
+  creative, but more prone to error and incoherence. This is the main
+  *behaviour* dial.
+* **`top_k`** — a *fixed* cut of the tail: keep only the K
+  most-probable tokens, discard the rest. Non-adaptive — it always cuts
+  at K whether the model is certain or unsure. A cheap guardrail
+  against ever picking junk from the long tail.
+* **`top_p`** (nucleus) — an *adaptive* cut: keep the smallest set of
+  top tokens whose probabilities sum to P. Adapts to confidence — when
+  the model is sure (one token at 0.9) the nucleus is tiny; when it's
+  unsure (mass spread wide) the nucleus is large. Cuts the tail
+  proportionally.
+* **`min_p`** — also adaptive, but anchored to the *top* token instead
+  of cumulative mass: keep tokens with `prob ≥ min_p × prob_of_top`.
+  `min_p 0.1` keeps anything within 10× of the best; `min_p 0.5` keeps
+  only what's within 2× — aggressive, very focused output.
+
+**How they interact.** They stack. Tightening all of them at once (low
+`top_k` + low `top_p` + low `temperature`) is redundant — they do the
+same job and you over-constrain into robotic output. Practical rule:
+pick *one* adaptive cutter (`top_p ~0.9–0.95` **or** `min_p ~0.05–0.1`),
+leave `top_k` generous as a cheap backstop, and use `temperature` as
+the real behaviour dial.
+
+**How to tune.**
+* *Code, agentic / tool-calling, structured output, factual Q&A* — low
+  `temperature` (0.2–0.6) and a tight tail cut. High temperature on
+  code means syntax errors, hallucinated APIs, broken tool calls.
+* *Creative writing, brainstorming* — higher `temperature` (0.8–1.2),
+  looser cutters.
+* *Heavily quantised models* — be more conservative (lower
+  `temperature`, tighter cut). Quantisation already adds noise to the
+  logits; high temperature amplifies that noise into real errors.
+
+The presets below are just curated combinations of these four knobs —
+e.g. `precise` (the project default) encodes `temp 0.2, top_p 0.95,
+top_k 40, min_p 0.10`.
+
 ### Sampling presets
 
 Named profiles applied via `--preset NAME` (binaries) or

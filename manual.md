@@ -2827,6 +2827,38 @@ systemd unit (the installer sets this).
 
 ### 8.5 Sampling
 
+**What each knob does.** At every step the model emits a probability
+distribution over the whole vocabulary (~100k+ tokens); these knobs
+decide how a token is picked from it. They work in sequence — the
+*cutters* (`top_k`, `top_p`, `min_p`) narrow the candidate pool over
+the raw distribution, then `temperature` controls how randomly the
+final token is drawn from the survivors.
+
+* **`temperature`** — focus-vs-risk dial; divides the logits before
+  softmax. `→ 0` is greedy (always the top token: deterministic).
+  `0.2–0.5` keeps the model tight on format, syntax, and facts. `1.0`
+  is the unmodified distribution. `> 1.0` flattens the curve so
+  unlikely tokens get a real chance — more creative, more prone to
+  error. The main *behaviour* dial.
+* **`top_k`** — *fixed* tail cut: keep the K most-probable tokens,
+  discard the rest. Non-adaptive; a cheap guardrail against junk from
+  the long tail.
+* **`top_p`** (nucleus) — *adaptive* tail cut: keep the smallest set of
+  top tokens summing to P. Tiny nucleus when the model is confident,
+  large when it's unsure.
+* **`min_p`** — adaptive too, but anchored to the *top* token: keep
+  tokens with `prob ≥ min_p × prob_of_top`. `min_p 0.5` keeps only
+  what's within 2× of the best — aggressive, very focused.
+
+They stack — tightening all of them at once is redundant. Practical
+rule: pick *one* adaptive cutter (`top_p ~0.9–0.95` **or** `min_p
+~0.05–0.1`), leave `top_k` generous as a backstop, and use
+`temperature` as the real behaviour dial. Low `temperature` (0.2–0.6)
+for code / agentic / structured output; higher (0.8–1.2) for creative
+work; lean conservative on heavily quantised models (quantisation
+already adds logit noise, and high temperature amplifies it into real
+errors).
+
 Presets order (project-wide default is **`precise`**):
 * `deterministic`  — temp 0.0, greedy.  Same prompt → byte-identical reply. Reproducibility / CI / eval harnesses.
 * `precise`        — temp 0.2, min_p 0.10.  **Default.** Code, math, factual Q&A, tool-call workloads, structured output.
