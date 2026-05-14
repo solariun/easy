@@ -206,10 +206,10 @@ struct CliArgs {
         "                                 other files still load. -q hides the\n"
         "                                 security sanity-check warnings (errors\n"
         "                                 are always shown). See EXTERNAL_TOOLS.md.\n"
-        "      --RAG <dir>               Enable RAG, the agent's persistent\n"
-        "                                 registry / long-term memory. Each\n"
-        "                                 entry is one Markdown file in <dir>.\n"
-        "                                 Registers ONE `rag(action=...)`\n"
+        "      --memory <dir>            Enable the agent's persistent memory\n"
+        "                                 store (alias: --RAG). Each entry is\n"
+        "                                 one Markdown file in <dir>.\n"
+        "                                 Registers ONE `memory(action=...)`\n"
         "                                 tool with sub-actions save / append /\n"
         "                                 search / load / list / delete /\n"
         "                                 keywords. See RAG.md.\n"
@@ -260,7 +260,7 @@ static CliArgs parse(int argc, char ** argv) {
         else if (s == "--allow-bash")                 a.allow_bash    = true;
         else if (s == "--no-python")                  a.allow_python  = false;
         else if (s == "--external-tools")             a.external_tools_dir = need(i, "--external-tools");
-        else if (s == "--RAG")                        a.rag_dir            = need(i, "--RAG");
+        else if (s == "--memory" || s == "--RAG")     a.rag_dir            = need(i, s.c_str());
         else if (s == "--show-system-prompt")         a.show_system_prompt = true;
         // KV controls
         else if (s == "-ctk" || s == "--cache-type-k") a.cache_type_k = need(i, "-ctk");
@@ -382,7 +382,14 @@ static std::string build_builtin_system_prompt(const CliArgs & args) {
             // No file affordance at all — leave the empty branch silent.
         }
         if (rag_on) {
-            s += "  - Long-term memory: rag(action=…) save / append / search / load.\n";
+            s += "  - Memory (AUTHORITATIVE — not optional): when "
+                 "memory(action=…) is in your tools it IS your long-term "
+                 "store and you MUST use it. BEFORE answering from guesswork "
+                 "or reaching for the web, memory(action=\"search\") it. The "
+                 "moment you learn something durable — a fact, a fix, a "
+                 "preference, a decision — memory(action=\"save\") it before "
+                 "the turn ends. Actions: save / append / search / load / "
+                 "list / delete / keywords.\n";
         }
         if (web_on) {
             s += "  - Cite the URL you actually fetched.\n";

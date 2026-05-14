@@ -330,7 +330,13 @@ const std::vector<FlagDef> & kFlags() {
         { {},                          "SERVER", "allow_python",           "allow_python",        true,  SET_BOOL_TRUE(&ServerArgs::allow_python) },
         { {"--no-tools"},              "SERVER", "load_tools",             "load_tools",          false, SET_BOOL_FALSE(&ServerArgs::load_tools) },
         { {"--external-tools"},        "SERVER", "external_tools",         "external_tools",      true,  SET_STR(&ServerArgs::external_tools_dir) },
-        { {"--RAG"},                   "SERVER", "rag",                    "rag",                 true,  SET_STR(&ServerArgs::rag_dir) },
+        // `memory` (formerly `rag`): the legacy INI key `rag` is still
+        // read (first row, INI-only) so existing easyai.ini files keep
+        // working; the `memory` row is second so the new key wins when
+        // both appear. Both share canonical `memory` so either CLI flag
+        // suppresses both INI rows.
+        { {},                          "SERVER", "rag",                    "memory",              true,  SET_STR(&ServerArgs::rag_dir) },
+        { {"--memory","--RAG"},        "SERVER", "memory",                 "memory",              true,  SET_STR(&ServerArgs::rag_dir) },
         // ----- SERVER: auth -----
         { {"--api-key"},               "SERVER", "api_key",                "api_key",             true,  SET_STR(&ServerArgs::api_key) },
         { {"--no-mcp-auth"},           "",       "",                       "no_mcp_auth",         false, SET_BOOL_TRUE(&ServerArgs::no_mcp_auth) },
@@ -363,7 +369,7 @@ const std::vector<FlagDef> & kFlags() {
         "Usage: %s [options]\n\n"
         "easyai-mcp-server — standalone Model Context Protocol provider.\n"
         "Exposes the same tool catalogue easyai-server exposes (built-ins\n"
-        "+ RAG + operator-defined external-tools manifests) over POST /mcp\n"
+        "+ memory + operator-defined external-tools manifests) over POST /mcp\n"
         "without loading a model. Designed for high-concurrency multi-client\n"
         "deployments.\n"
         "\nConfig:\n"
@@ -412,12 +418,12 @@ const std::vector<FlagDef> & kFlags() {
         "      --external-tools <dir>   Load every EASYAI-*.tools manifest\n"
         "                                in <dir>. Per-file fault isolation.\n"
         "                                See EXTERNAL_TOOLS.md.\n"
-        "      --RAG <dir>              Enable RAG, the agent's persistent\n"
-        "                                registry, rooted at <dir>. Registers\n"
-        "                                ONE `rag(action=...)` tool with\n"
-        "                                sub-actions save / append / search /\n"
-        "                                load / list / delete / keywords.\n"
-        "                                See RAG.md.\n"
+        "      --memory <dir>           Enable the agent's persistent memory\n"
+        "                                store, rooted at <dir> (alias: --RAG).\n"
+        "                                Registers ONE `memory(action=...)`\n"
+        "                                tool with sub-actions save / append /\n"
+        "                                search / load / list / delete /\n"
+        "                                keywords. See RAG.md.\n"
         "\nAuth:\n"
         "      --api-key <token>        Bearer required for /health,\n"
         "                                /metrics, /v1/tools when set.\n"
@@ -434,7 +440,7 @@ const std::vector<FlagDef> & kFlags() {
         "  [SERVER]      every flag above (host, port, sandbox, threads,\n"
         "                 max_concurrent_calls, allow_fs, allow_bash,\n"
         "                 allow_python,\n"
-        "                 external_tools, rag, api_key, mcp_auth,\n"
+        "                 external_tools, memory (legacy: rag), api_key, mcp_auth,\n"
         "                 metrics, verbose, max_body, name).\n"
         "  [MCP_USER]    one user per line: name = bearer-token.\n"
         "                 Populating any line enables Bearer auth on /mcp.\n",
@@ -862,13 +868,13 @@ int main(int argc, char ** argv) {
         for (auto & t : tb.tools()) ctx->default_tools.push_back(std::move(t));
     }
 
-    // -------- RAG ---------------------------------------------------------
-    // One `rag(action=...)` tool dispatching all seven sub-actions.
+    // -------- memory ------------------------------------------------------
+    // One `memory(action=...)` tool dispatching all seven sub-actions.
     if (!args.rag_dir.empty()) {
         ctx->default_tools.push_back(
             easyai::tools::make_rag_tool(args.rag_dir));
         std::fprintf(stderr,
-            "easyai-mcp-server: RAG enabled (single rag tool), "
+            "easyai-mcp-server: memory enabled (single memory tool), "
             "root = %s\n",
             args.rag_dir.c_str());
     }

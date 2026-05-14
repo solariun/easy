@@ -305,6 +305,14 @@ static const char * const kEdgeUserAgent =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0";
 
+// Google Chrome on Windows 11 — current-stable User-Agent.  Used by the
+// DDG search POST (append_chrome_xhr_headers below), which impersonates
+// a JS fetch() rather than a page navigation.  Bump manually as Chrome
+// releases; keep the version in sync with the sec-ch-ua line.
+static const char * const kChromeUserAgent =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36";
+
 // Companion headers Edge always sends.  Appended to whatever header list
 // the caller is already building so we don't clobber Content-Type for
 // the search POST.
@@ -324,6 +332,31 @@ static curl_slist * append_edge_browser_headers(curl_slist * headers) {
     headers = curl_slist_append(headers, "Sec-Fetch-Mode: navigate");
     headers = curl_slist_append(headers, "Sec-Fetch-Site: none");
     headers = curl_slist_append(headers, "Sec-Fetch-User: ?1");
+    return headers;
+}
+
+// Chrome XHR/fetch persona — the header set a real Chrome attaches when
+// page JavaScript issues a cross-site `fetch()` to html.duckduckgo.com:
+// `*/*` Accept, the client-hint trio, an Origin/Referer pointing back at
+// duckduckgo.com, X-Requested-With, and Sec-Fetch-* describing a fetch
+// (mode=cors, dest=empty, site=same-site) rather than a navigation.
+// Used only by the search POST; http_get / web-fetch keeps the
+// navigation-style append_edge_browser_headers (correct for whole-page
+// loads). Pair with kChromeUserAgent so UA and sec-ch-ua agree.
+static curl_slist * append_chrome_xhr_headers(curl_slist * headers) {
+    headers = curl_slist_append(headers, "Accept: */*");
+    headers = curl_slist_append(headers, "Accept-Language: en-US,en;q=0.9");
+    headers = curl_slist_append(headers,
+        "sec-ch-ua: \"Chromium\";v=\"133\", \"Google Chrome\";v=\"133\", "
+        "\"Not(A:Brand\";v=\"99\"");
+    headers = curl_slist_append(headers, "sec-ch-ua-mobile: ?0");
+    headers = curl_slist_append(headers, "sec-ch-ua-platform: \"Windows\"");
+    headers = curl_slist_append(headers, "Origin: https://duckduckgo.com");
+    headers = curl_slist_append(headers, "Referer: https://duckduckgo.com/");
+    headers = curl_slist_append(headers, "X-Requested-With: XMLHttpRequest");
+    headers = curl_slist_append(headers, "Sec-Fetch-Dest: empty");
+    headers = curl_slist_append(headers, "Sec-Fetch-Mode: cors");
+    headers = curl_slist_append(headers, "Sec-Fetch-Site: same-site");
     return headers;
 }
 
@@ -502,9 +535,9 @@ static bool http_post_form(const std::string & url,
                      (long) (CURLPROTO_HTTP | CURLPROTO_HTTPS));
 #endif
     curl_easy_setopt(c, CURLOPT_TIMEOUT,         timeout_s);
-    // Impersonate Microsoft Edge — html.duckduckgo.com (and most search
-    // backends) reject or degrade non-browser UAs.
-    curl_easy_setopt(c, CURLOPT_USERAGENT,        kEdgeUserAgent);
+    // Impersonate Chrome issuing a JS fetch() — html.duckduckgo.com
+    // (and most search backends) reject or degrade non-browser UAs.
+    curl_easy_setopt(c, CURLOPT_USERAGENT,        kChromeUserAgent);
     curl_easy_setopt(c, CURLOPT_WRITEFUNCTION,   curl_write_cb);
     curl_easy_setopt(c, CURLOPT_WRITEDATA,       &sink);
     curl_easy_setopt(c, CURLOPT_NOSIGNAL,        1L);
@@ -513,14 +546,14 @@ static bool http_post_form(const std::string & url,
     curl_easy_setopt(c, CURLOPT_POSTFIELDS,      form_body.c_str());
     curl_easy_setopt(c, CURLOPT_POSTFIELDSIZE,   (long) form_body.size());
 
-    // Form POST + Edge persona.  append_edge_browser_headers() sets
-    // Accept/Accept-Language/sec-ch-ua/etc; we add Content-Type for
-    // the form payload.  The richer Accept from the Edge helper
-    // supersedes the trimmed one we used to send.
+    // Form POST + Chrome XHR persona.  append_chrome_xhr_headers()
+    // sends the Sec-Fetch-* / client-hint / Origin / Referer set a real
+    // Chrome attaches to a cross-site fetch(); we add Content-Type for
+    // the form payload.
     curl_slist * headers = nullptr;
     headers = curl_slist_append(headers,
         "Content-Type: application/x-www-form-urlencoded");
-    headers = append_edge_browser_headers(headers);
+    headers = append_chrome_xhr_headers(headers);
     curl_easy_setopt(c, CURLOPT_HTTPHEADER, headers);
 
     const int max_attempts = (retries < 0 ? 0 : retries) + 1;
@@ -757,9 +790,28 @@ ToolResult web_search_ddg(const std::string & query, long long page,
     }
 
     if (hits.empty()) {
+        // DDG's anti-bot "anomaly" page comes back HTTP 202 with a
+        // non-empty body that carries zero result__a anchors — the
+        // regex parse above yields nothing. Distinguish that hard
+        // block from a genuine empty result set / markup drift so the
+        // operator gets an honest, actionable error: an anomaly block
+        // is IP/client-level, NOT a transient rate-limit, so "try
+        // again in a minute" is misleading — the real fix is a
+        // different egress IP or the Google engine.
+        if (body.find("anomaly") != std::string::npos) {
+            return ToolResult::error(
+                "DuckDuckGo blocked this request — it returned its "
+                "anti-bot \"anomaly\" page instead of results. This is "
+                "an IP/client-level block, not a transient rate-limit, "
+                "so retrying soon usually won't help. Use the Google "
+                "engine instead: set GOOGLE_API_KEY + GOOGLE_CSE_ID and "
+                "pass engine=\"google\".");
+        }
         return ToolResult::error(
-            "no results parsed (DuckDuckGo may have rate-limited the "
-            "request; try again in a minute)");
+            "no results parsed — DuckDuckGo returned a page with no "
+            "recognisable result entries (possible HTML markup change, "
+            "or a genuinely empty result set for this query). If this "
+            "persists across queries, switch to engine=\"google\".");
     }
 
     const long long total = (long long) hits.size();
@@ -2153,171 +2205,120 @@ Tool fs(std::string root) {
 
     return Tool::builder("fs")
         .describe(
-            "The filesystem, accessed through one tool. Pick an action; "
-            "the parameters needed depend on which action you choose. "
-            "Ten actions are supported, plus a batch mode that runs up "
-            "to 20 operations in a single call.\n"
+            "The filesystem — one tool, ten actions selected by "
+            "`action`, plus a batch mode (`ops`) that runs up to 20 "
+            "operations in one call.\n"
             "\n"
             "AUTHORITATIVE SANDBOX RULE — at the start of every "
             "filesystem or shell task, run action=\"sandbox\" once "
-            "(absolute on-disk root, pinned at registration; this is "
-            "the truth) and then action=\"check_path\" against the "
-            "specific file or directory you intend to touch. Skipping "
-            "this is the most common cause of avoidable error loops: "
-            "the model guesses a path, the open() fails, the model "
-            "guesses again. Don't guess — probe.\n"
+            "(absolute on-disk root, pinned at registration — the "
+            "truth) then action=\"check_path\" on the file or "
+            "directory you intend to touch. Skipping this is the most "
+            "common cause of avoidable error loops. Don't guess paths "
+            "— probe.\n"
             "\n"
-            "PATHS ARE RELATIVE to the sandbox root. Use `report.md`, "
-            "`docs/spec.md`, `src/main.cpp`, `.` for the root itself "
-            "— NEVER prefix with `/`. Absolute / `..`-bearing inputs "
-            "are silently re-anchored under the root for safety, but "
-            "the relative form is what you should always pass.\n"
+            "PATHS ARE RELATIVE to the sandbox root — `report.md`, "
+            "`src/main.cpp`, `.` for the root. NEVER prefix with `/`. "
+            "Absolute or `..`-bearing inputs are silently re-anchored "
+            "under the root, but always pass the relative form.\n"
             "\n"
-            "  action=\"read\"\n"
-            "    Read a UTF-8 text file. Required: path. Optional: "
-            "offset (skip N bytes; default 0), limit (max bytes; "
-            "default 65536, max 1048576), line_numbers (default false; "
-            "when true, prefixes each line with `<lineno>| ` so the "
-            "model can plan an action=\"edit\" call without counting "
-            "manually). Use offset to page through files larger than "
-            "the limit.\n"
+            "  action=\"read\" — read a UTF-8 text file. Required: "
+            "path. Optional: offset (skip N bytes, default 0), limit "
+            "(max bytes, default 65536, max 1048576), line_numbers "
+            "(default false; prefixes each line `<lineno>| ` so you "
+            "can plan an edit). Use offset to page through files "
+            "larger than the limit.\n"
             "\n"
-            "  action=\"write\"\n"
-            "    Write UTF-8 text to a file. Default mode OVERWRITES "
-            "any existing content; pass append=true to extend (or use "
-            "action=\"append\" — same thing, cleaner verb). Missing "
-            "parent directories are created automatically. Required: "
-            "path, content. Optional: append (default false). Returns "
-            "`wrote N bytes to <path>` on success. Don't use bash for "
-            "`cat > file` / `echo \"...\" > file` / `cat <<EOF` — call "
-            "this instead, no shell-quoting minefield.\n"
+            "  action=\"write\" — write UTF-8 text to a file "
+            "(OVERWRITES existing content; pass append=true to extend, "
+            "or use action=\"append\"). Missing parent dirs are "
+            "created. Required: path, content. Optional: append "
+            "(default false). Don't use bash for `cat > file` / `echo "
+            "> file` / `cat <<EOF` — call this, no shell-quoting "
+            "minefield.\n"
             "\n"
-            "  action=\"append\"\n"
-            "    Append UTF-8 text to the END of a file (creates the "
-            "file and any missing parent dirs if needed). Required: "
-            "path, content. Returns `appended N bytes to <path>`. "
-            "Equivalent to action=\"write\" with append=true, but as a "
-            "first-class verb so ops batches can stack sequential "
-            "appends — `ops=[{append a}, {append b}, {append c}]` "
-            "writes a then b then c in order. Use this for building up "
-            "a log / report / running notes incrementally; for a "
-            "wholesale overwrite, use action=\"write\".\n"
+            "  action=\"append\" — append UTF-8 text to the END of a "
+            "file (creates the file and parent dirs if needed). "
+            "Required: path, content. Equivalent to write with "
+            "append=true, but a first-class verb so an ops batch can "
+            "stack sequential appends in order. Use it to build up a "
+            "log / report incrementally; for a wholesale overwrite use "
+            "write.\n"
             "\n"
-            "  action=\"edit\"\n"
-            "    Replace a line range in an existing file. Required: "
-            "path, start_line (1-based, inclusive), end_line (1-based, "
-            "inclusive), content. The lines [start_line..end_line] are "
-            "deleted and `content` is inserted in their place; atomic "
-            "via tempfile + rename. content=\"\" is a pure delete; "
-            "end_line=start_line-1 is a pure insert (zero-width range) "
-            "before start_line. start_line=line_count+1 appends at "
-            "EOF. The file MUST already exist — use action=\"write\" "
-            "to create. Line semantics are preserved automatically: "
-            "the tool inserts a `\\n` separator on each side of "
-            "`content` if and only if one is needed to keep the seam "
-            "lines from gluing together (you don't need to remember to "
-            "add a trailing `\\n`; it's handled).\n"
-            "    Workflow: read with line_numbers=true, look at the "
-            "numbered output, plan the edit, fire it. For multiple "
-            "edits to the same file, use the ops batch (below) — the "
-            "tool reorders same-path edits bottom-up so the line "
-            "numbers stay consistent with the file's ORIGINAL state "
-            "for every op.\n"
+            "  action=\"edit\" — replace lines [start_line..end_line] "
+            "in an EXISTING file with `content`; atomic via tempfile + "
+            "rename. Required: path, start_line, end_line (both "
+            "1-based, inclusive), content. content=\"\" is a pure "
+            "delete; end_line=start_line-1 is a pure insert before "
+            "start_line; start_line=line_count+1 appends at EOF. The "
+            "file MUST exist — use write to create. Seam `\\n` "
+            "separators are inserted automatically as needed. "
+            "Workflow: read with line_numbers=true, plan the edit, "
+            "fire it. For multiple edits to one file use the ops batch "
+            "— it reorders same-path edits bottom-up so line numbers "
+            "stay consistent with the file's ORIGINAL state.\n"
             "\n"
-            "  action=\"list\"\n"
-            "    List entries in one directory, non-recursively. "
-            "Optional: path (default `.`, the sandbox root). Output is "
-            "one entry per line, with `d` / `f` prefix and file sizes. "
-            "If `path` points at a regular file the error suggests "
-            "action=\"read\" instead. Use action=\"glob\" for recursive "
-            "/ pattern matching.\n"
+            "  action=\"list\" — list one directory, non-recursively. "
+            "Optional: path (default `.`, the sandbox root). One entry "
+            "per line with `d`/`f` prefix and sizes. If path is a "
+            "regular file the error suggests read. Use glob for "
+            "recursive / pattern matching.\n"
             "\n"
-            "  action=\"glob\"\n"
-            "    Find files by wildcard pattern, recursive by default. "
-            "Required: pattern. Optional: path (starting directory; "
-            "default `.`, the sandbox root). Pattern grammar: `*` "
-            "matches any run except `/`; `**` crosses directory "
-            "boundaries; `?` matches one char; `[abc]` matches a set. "
-            "The path argument names a starting DIRECTORY (not a "
-            "file); pointing it at a single file is an error.\n"
+            "  action=\"glob\" — find files by wildcard pattern, "
+            "recursive by default. Required: pattern (`*` = any run "
+            "except `/`, `**` crosses directories, `?` = one char, "
+            "`[abc]` = a set). Optional: path (starting DIRECTORY, "
+            "default `.`; pointing it at a file is an error).\n"
             "\n"
-            "  action=\"grep\"\n"
-            "    Search file contents for a regex. Required: pattern. "
-            "Optional: path (a directory to walk recursively OR a "
-            "specific regular file to search; default `.`, the sandbox "
-            "root), file_glob (limit by basename, e.g. `*.cpp` — "
-            "ignored when path is a single file unless it's used as a "
-            "sanity guard on that file's name), max_matches (default "
-            "100), case_insensitive (default false). Regex flavor is "
-            "ECMAScript. Output: `<path>:<lineno>:<line>`. Stops after "
+            "  action=\"grep\" — search file contents for an "
+            "ECMAScript regex. Required: pattern. Optional: path (a "
+            "directory to walk recursively OR a single file; default "
+            "`.`), file_glob (limit by basename, e.g. `*.cpp`), "
+            "max_matches (default 100), case_insensitive (default "
+            "false). Output: `<path>:<lineno>:<line>`, stopping after "
             "max_matches.\n"
             "\n"
-            "  action=\"check_path\"\n"
-            "    AUTHORITATIVE PRE-FLIGHT — confirm a path's existence "
-            "and the running process's effective r/w/x rights BEFORE "
-            "you touch it. Required: path. Optional: touch (default "
-            "false; when true and the path doesn't exist, an empty "
-            "file is created so you can probe write access without "
-            "committing real content). Output is multi-line key:value "
-            "(path, absolute, exists, type, size, mode, readable, "
-            "writable, executable, mtime, optional `created: yes`). "
+            "  action=\"check_path\" — AUTHORITATIVE PRE-FLIGHT: "
+            "confirm a path's existence and your effective r/w/x "
+            "rights BEFORE touching it. Required: path. Optional: "
+            "touch (default false; when true and the path is missing, "
+            "an empty file is created so you can probe write access). "
+            "Output is multi-line key:value (path, absolute, exists, "
+            "type, size, mode, readable, writable, executable, mtime). "
             "Run this once at the start of every fs / bash subtask.\n"
             "\n"
-            "  action=\"cwd\"\n"
-            "    Return the absolute path of the process's CURRENT "
-            "working directory (resolved at call time via getcwd). "
-            "In the standard CLI / server setup the process chdir's "
-            "into the sandbox at startup, so this typically matches "
-            "the sandbox root — but if you specifically want the "
-            "sandbox boundary, use action=\"sandbox\" instead (its "
-            "answer is pinned at registration and won't drift). No "
-            "other parameters.\n"
+            "  action=\"cwd\" — the process's current working "
+            "directory (getcwd at call time). Usually equals the "
+            "sandbox root since the process chdir's there at startup; "
+            "for the pinned sandbox boundary use action=\"sandbox\" "
+            "instead. No other parameters.\n"
             "\n"
-            "  action=\"sandbox\"\n"
-            "    Return the absolute filesystem path of the sandbox "
-            "root, pinned at tool registration. This is the single "
-            "source of truth for where read/write/edit/list/glob/grep "
-            "resolve their RELATIVE paths and where `bash` has its "
-            "cwd. Use this when you need to mention the real on-disk "
-            "path in user-facing output (e.g. \"I created the file "
-            "at <sandbox>/main.cpp\") or in commands handed to "
-            "external tools that don't share our cwd. For day-to-day "
-            "file work you DON'T paste this path into fs/bash "
-            "arguments — those expect relative paths. No other "
-            "parameters.\n"
+            "  action=\"sandbox\" — the absolute filesystem path of "
+            "the sandbox root, pinned at registration. The single "
+            "source of truth for where the relative-path actions "
+            "resolve and where `bash` runs. Use it only to mention the "
+            "real on-disk path in user-facing output or in commands "
+            "handed to external tools — for day-to-day fs/bash work, "
+            "pass RELATIVE paths, not this. No other parameters.\n"
             "\n"
-            "BATCH MODE — `ops` instead of `action`\n"
-            "  Pass an array of operation objects to run up to 20 "
-            "ops in a single call. Each op is a self-contained "
-            "JSON object with the same shape as a single-call "
-            "fs() — `action` plus that action's required / optional "
-            "params. Either `action` (single op) or `ops` (batch) "
-            "must be set, not both.\n"
-            "\n"
+            "BATCH MODE — pass `ops` (an array of up to 20 operation "
+            "objects) instead of `action` to run several operations in "
+            "one call. Each op is a self-contained object: `action` "
+            "plus that action's params. Set `action` OR `ops`, not "
+            "both.\n"
             "    fs(ops=[\n"
             "      {action:\"edit\", path:\"src/foo.cpp\", "
             "start_line:42, end_line:58, content:\"...\"},\n"
-            "      {action:\"edit\", path:\"src/foo.cpp\", "
-            "start_line:100, end_line:100, content:\"...\"},\n"
             "      {action:\"read\", path:\"src/main.cpp\", "
             "line_numbers:true}\n"
             "    ])\n"
-            "\n"
-            "  Same-path edits are AUTOMATICALLY REORDERED to apply "
-            "bottom-up (highest start_line first), so each edit's "
-            "line numbers stay consistent with the file's ORIGINAL "
-            "state — you don't have to manually offset for the "
-            "preceding edits. Submit edits in any order.\n"
-            "\n"
-            "  Ops execute one at a time. By default a failing op "
-            "STOPS the batch and the remaining ops are skipped; "
-            "pass continue_on_error=true to run all ops and report "
-            "each result independently (useful for "
-            "ops=[read,read,read,...] where one missing file "
-            "shouldn't abort the others). Per-op atomicity only — "
-            "no cross-op rollback; ops 1..N-1 stay committed if op "
-            "N fails. Output is a `[i/N] action target: result` "
-            "line per op.\n"
+            "  Same-path edits are AUTO-REORDERED bottom-up so each "
+            "edit's line numbers stay consistent with the file's "
+            "ORIGINAL state — submit in any order. Ops run one at a "
+            "time; by default a failing op STOPS the batch (pass "
+            "continue_on_error=true to run all and report each). "
+            "Per-op atomicity only — no cross-op rollback. Output is a "
+            "`[i/N] action target: result` line per op.\n"
             "\n"
             "Errors return a single-line message starting with `error:`. "
             "Reading a binary file returns the raw bytes — prefer the "
@@ -2912,61 +2913,42 @@ Tool bash(std::string root, bool show_output) {
     auto sb = std::make_shared<Sandbox>(std::move(root));
     return Tool::builder("bash")
         .describe(
-            "Run a shell command via `/bin/sh -c`. Output is stdout and "
-            "stderr merged.\n"
+            "Run a shell command via `/bin/sh -c`; stdout and stderr "
+            "are merged.\n"
             "\n"
-            "AUTHORITATIVE SANDBOX RULE — before your first fs / bash "
-            "call in a task, run fs(action=\"sandbox\") (the absolute "
-            "on-disk root, pinned at registration; this is the truth) "
-            "and then fs(action=\"check_path\") against any file the "
-            "command will read from or write to. The command runs with "
-            "cwd PINNED to the sandbox root, so the path you probe with "
-            "fs(action=\"check_path\") is the same path the shell will "
-            "see. Skipping the precheck is the most common cause of "
-            "avoidable error loops.\n"
+            "SANDBOX PRE-FLIGHT — before your first fs / bash call in a "
+            "task, run fs(action=\"sandbox\") (absolute on-disk root, "
+            "pinned at registration) then fs(action=\"check_path\") on "
+            "any file the command touches. cwd is PINNED to the sandbox "
+            "root, so the probed path is what the shell sees. Skipping "
+            "this is the most common cause of avoidable error loops.\n"
             "\n"
-            "WORKING DIRECTORY & PATHS — cwd is the sandbox root. USE "
-            "RELATIVE PATHS in your commands: `ls`, `cat report.md`, "
-            "`./build/run`, `src/main.cpp`. Do NOT type absolute paths "
-            "for sandbox files — they break portability across "
-            "sandboxes. If you need the absolute root for a log line "
-            "or an external command, fetch it once via "
-            "fs(action=\"sandbox\") and quote that.\n"
+            "PATHS — cwd is the sandbox root; use RELATIVE paths (`ls`, "
+            "`cat report.md`, `./build/run`). Don't type absolute paths "
+            "for sandbox files. Need the absolute root for a log line "
+            "or external command? Fetch it once via "
+            "fs(action=\"sandbox\").\n"
             "\n"
-            "FILE WORK — PREFER THE `fs` TOOL. For reading, writing, "
-            "listing, finding, or searching files use the unified `fs` "
-            "tool: action=read / write / list / glob / grep. It's "
-            "faster, can't be foot-gunned with quoting / redirection "
-            "mistakes, and produces structured output the model parses "
-            "reliably.\n"
+            "PREFER OTHER TOOLS:\n"
+            "  - File work (read / write / list / find / search) → the "
+            "`fs` tool. Faster, no quoting foot-guns, structured "
+            "output. If your command is `cat > file` / `cat <<EOF` / "
+            "`echo > file` / `mkdir`, call fs(action=\"write\") "
+            "instead.\n"
+            "  - Data / compute (JSON, regex, arithmetic, stats, date "
+            "math) → the `python3` tool when available.\n"
+            "Reach for `bash` only for genuine shell needs: pipelines "
+            "(`grep | xargs`, `find -exec`), process orchestration "
+            "(builds, test suites), tooling with no fs/python "
+            "equivalent (git, package managers, make / cmake, diff, "
+            "file), and non-trivial in-place edits (sed/awk — "
+            "fs(action=\"write\") only overwrites or appends).\n"
             "\n"
-            "DATA / COMPUTE WORK — PREFER THE `python3` TOOL when "
-            "available. For JSON wrangling, regex on a chunk of text, "
-            "arithmetic, statistics, date math, anything that's "
-            "naturally a few lines of code, `python3` is faster and "
-            "less error-prone than chained shell pipelines. Reach for "
-            "`bash` only when you genuinely need shell features:\n"
-            "\n"
-            "  - pipelines (`grep | xargs`, `find ... -exec`, `... | "
-            "    awk ...`)\n"
-            "  - process orchestration (running a build, a test "
-            "    suite, a script)\n"
-            "  - tooling that has no equivalent fs / python tool "
-            "    (git, package managers, `make`, `cmake`, diff, file)\n"
-            "  - non-trivial in-place edits (sed/awk for line-range "
-            "    replacements; fs(action=\"write\") overwrites or "
-            "    appends only)\n"
-            "\n"
-            "If your command is `cat > file` / `cat <<EOF` / "
-            "`echo \"...\" > file` / `mkdir`, call fs(action=\"write\") "
-            "instead — it does the same thing without the shell-quoting "
-            "minefield.\n"
-            "\n"
-            "WARNING: this is NOT a hardened sandbox — the command "
-            "runs with the caller's full uid/gid and can read/write "
-            "files, hit the network, spawn long-lived processes, etc. "
-            "Output is capped at 32 KB and a SIGTERM/SIGKILL deadline "
-            "(default 30s, max 300s) bounds the runtime."
+            "WARNING: NOT a hardened sandbox — the command runs with the "
+            "caller's full uid/gid and can read/write files, hit the "
+            "network, spawn processes. Output is capped at 32 KB; a "
+            "SIGTERM/SIGKILL deadline (default 30s, max 300s) bounds "
+            "runtime."
         )
         .param("command", "string",
                "Shell command line. Quoted, piped, redirected etc. as you "
@@ -3285,7 +3267,7 @@ Tool tool_lookup(ToolListGetter get_tools) {
             "Use this when you have a specific name in mind and just "
             "need to confirm it. Examples: name=\"fs\" finds the unified "
             "filesystem tool; name=\"web\" finds the unified web tool; "
-            "name=\"rag\" finds the rag store tool.\n"
+            "name=\"memory\" finds the memory store tool.\n"
             "\n"
             "OUTPUT SHAPE (what you'll see)\n"
             "  1. <tool_name>: <one-line summary>\n"

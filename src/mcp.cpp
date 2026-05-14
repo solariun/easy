@@ -139,11 +139,13 @@ json handle_tools_list(const json & /*params*/,
     return result;
 }
 
-// Find a tool by exact name. Returns nullptr if not registered.
+// Find a tool by name (back-compat aliases resolved). Returns nullptr
+// if not registered.
 const Tool * lookup_tool(const std::vector<Tool> & tools,
                           const std::string &       name) {
+    const std::string canon = canonical_tool_name(name);
     for (const auto & t : tools) {
-        if (t.name == name) return &t;
+        if (t.name == canon) return &t;
     }
     return nullptr;
 }

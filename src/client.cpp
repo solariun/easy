@@ -800,7 +800,8 @@ struct Client::Impl {
     // -----------------------------------------------------------------
     std::string dispatch_one_tool(const PendingToolCall & p) {
         const Tool * found = nullptr;
-        for (const auto & t : tools) if (t.name == p.name) { found = &t; break; }
+        const std::string canon = canonical_tool_name(p.name);
+        for (const auto & t : tools) if (t.name == canon) { found = &t; break; }
 
         ToolCall   call{ p.name, p.arguments.empty() ? "{}" : p.arguments,
                          p.id.empty() ? ("call_" + std::to_string(p.index)) : p.id };

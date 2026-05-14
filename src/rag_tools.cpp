@@ -1278,7 +1278,7 @@ ToolHandler make_list_handler(std::shared_ptr<RagStore> store) {
 
         if (rows.empty()) {
             return ToolResult::ok(prefix.empty()
-                ? "RAG is empty. Use rag_save to add entries."
+                ? "Memory is empty. Use rag_save to add entries."
                 : "no titles match prefix \"" + prefix + "\".");
         }
 
@@ -1421,10 +1421,10 @@ ToolHandler make_keywords_handler(std::shared_ptr<RagStore> store) {
 
         if (rows.empty()) {
             if (total_entries == 0) {
-                o << "RAG is empty. Use rag_save to add the first entry.";
+                o << "Memory is empty. Use rag_save to add the first entry.";
             } else if (min_count > 1) {
                 o << "no keywords reach min_count=" << min_count
-                  << ". The RAG has " << total_entries
+                  << ". Memory has " << total_entries
                   << " entr" << (total_entries == 1 ? "y" : "ies")
                   << " but every keyword is below the threshold. "
                   << "Try min_count=1 (default) to see the full list.";
@@ -1505,109 +1505,86 @@ Tool make_rag_tool(std::string root_dir) {
     auto h_delete   = make_delete_handler  (store);
     auto h_keywords = make_keywords_handler(store);
 
-    return Tool::builder("rag")
+    return Tool::builder("memory")
         .describe(
-            "Your memory, accessed through one tool. Pick an action; the "
-            "parameters needed depend on which action you choose. "
-            "Seven actions are supported:\n"
+            "Your memory — one tool, seven actions selected by `action`; "
+            "the other params depend on which.\n"
             "\n"
-            "PRIVATE — MODEL-ONLY STORE. The RAG is YOUR own long-term "
-            "memory; it is NOT visible to the user. The user has no UI, "
-            "no command, and no API to read, list, or browse what's "
-            "stored here. NEVER answer the user with 'check the RAG', "
-            "'I saved it to memory', 'look at the entry I stored', or "
-            "'see the rag for the code' — that points them at a place "
-            "they cannot see. When the user asks for content you have "
-            "in memory, load it yourself with action=\"load\" and "
-            "include the body in your reply. Treat the RAG as your "
-            "private notebook, not a shared inbox.\n"
+            "PRIVATE — MODEL-ONLY. This store is yours; the user cannot "
+            "see, list, or browse it. NEVER tell the user 'check the "
+            "memory' / 'I saved it to memory' / 'see the entry I stored' "
+            "— that points them somewhere they can't reach. When they "
+            "ask for something you have stored, load it yourself and put "
+            "the body in your reply. It's your private notebook, not a "
+            "shared inbox.\n"
             "\n"
-            "  action=\"save\"\n"
-            "    Store a memory (creates new or overwrites existing). Required: "
-            "    title, keywords (array, 1..8), content. Optional: fix (boolean "
-            "    — when true, the title is auto-prepended with `fix-easyai-` "
-            "    and the memory becomes immutable: future save / delete / "
-            "    append on it are refused).\n"
+            "  action=\"save\" — store new / overwrite existing. Required: "
+            "title, keywords (array, 1..8), content. Optional: fix (true "
+            "→ title auto-prefixed `fix-easyai-` and the memory becomes "
+            "immutable: future save / append / delete on it are "
+            "refused).\n"
             "\n"
-            "  action=\"append\"\n"
-            "    Add new content to the end of an EXISTING memory without losing "
-            "    the previous body. Required: title (must already exist), "
-            "    content. Optional: keywords (array — extra keywords to merge, "
-            "    deduped against existing, total still capped at 8). The "
-            "    library inserts a Markdown `---` rule before the appendix so "
-            "    each addition is visually delimited on disk. Use this for "
-            "    chronological logs and for growing what you already know "
-            "    about the user. Refuses on fix-easyai-* (immutable) titles "
-            "    and on titles that don't exist (use save to create).\n"
+            "  action=\"append\" — add to the end of an EXISTING memory, "
+            "keeping the previous body (a Markdown `---` rule delimits "
+            "each addition). Required: title (must exist), content. "
+            "Optional: keywords (merged into the existing list, deduped, "
+            "cap 8). For chronological logs and growing what you know "
+            "about the user. Refused on fix-easyai-* and on titles that "
+            "don't exist (use save to create).\n"
             "\n"
-            "  action=\"search\"\n"
-            "    Search memories by keyword(s). Required: keywords — a "
-            "    JSON array of strings, e.g. [\"bitnet\", \"paper\"] "
-            "    (a real array, NOT a quoted string). The FIRST keyword "
-            "    is MANDATORY: every result is guaranteed to carry it. "
-            "    Any further keywords are OPTIONAL — they never exclude "
-            "    a result, they only rank it higher (more overlap = "
-            "    higher). So lead with the keyword the memory MUST have, "
-            "    then add softer keywords to bias the ranking. Every "
-            "    result is tagged `[matched N/M: ...]` so you can see "
-            "    how many of your keywords it hit. Optional params: "
-            "    max_results (default 10, max 20), page (default 1; the "
-            "    response includes `total_entries`, `page: P of N`, "
-            "    `has_more` for pagination). Example: "
-            "    rag(action=\"search\", keywords=[\"bitnet\", \"paper\", "
-            "    \"1-bit\"]) returns every memory tagged `bitnet`, with "
-            "    those also tagged `paper` / `1-bit` ranked first.\n"
+            "  action=\"search\" — find by keyword(s). Required: keywords "
+            "— a real JSON array of strings, e.g. [\"bitnet\", "
+            "\"paper\"] (NOT a quoted string). keywords[0] is MANDATORY "
+            "(every result carries it); the rest are OPTIONAL — they "
+            "never exclude a result, only rank it (more overlap → "
+            "higher). Lead with the must-have keyword, add softer ones "
+            "to rank. Results are tagged `[matched N/M]`. Optional: "
+            "max_results (default 10, max 20), page (default 1; response "
+            "carries total_entries / page / has_more). Example: "
+            "memory(action=\"search\", keywords=[\"bitnet\", \"paper\"]) "
+            "→ every memory tagged `bitnet`, those also tagged `paper` "
+            "ranked first.\n"
             "\n"
-            "  action=\"load\"\n"
-            "    Recall the FULL content of up to 4 memories by exact "
-            "    title. Required: titles (array of 1..4 exact titles from "
-            "    a previous search). Cap is 4 to keep the prompt slim — "
-            "    narrow your search if you need more.\n"
+            "  action=\"load\" — full content of up to 4 memories by "
+            "exact title. Required: titles (1..4 exact titles from a "
+            "search). Cap is 4 to keep the prompt slim — narrow your "
+            "search if you need more.\n"
             "\n"
-            "  action=\"list\"\n"
-            "    Browse memories without loading bodies. Optional: prefix "
-            "    (filter titles; pass `fix-easyai-` to see every immutable "
-            "    memory), max (default 50, max 200).\n"
+            "  action=\"list\" — browse titles without bodies. Optional: "
+            "prefix (filter; `fix-easyai-` shows every immutable "
+            "memory), max (default 50, max 200).\n"
             "\n"
-            "  action=\"delete\"\n"
-            "    Forget a memory. Required: title (exact). Memories whose "
-            "    title starts with `fix-easyai-` are immutable and cannot "
-            "    be forgotten through this tool.\n"
+            "  action=\"delete\" — forget a memory. Required: title "
+            "(exact). fix-easyai-* memories are immutable and cannot be "
+            "deleted here.\n"
             "\n"
-            "  action=\"keywords\"\n"
-            "    Vocabulary overview: every distinct keyword you've used "
-            "    with how many memories carry it. CALL BEFORE save / search "
-            "    when you're not sure what vocabulary you've established. "
-            "    Optional: min_count (default 1), max (default 200, max 500).\n"
+            "  action=\"keywords\" — vocabulary overview: every distinct "
+            "keyword and how many memories carry it. CALL BEFORE save / "
+            "search when unsure what vocabulary you've established. "
+            "Optional: min_count (default 1), max (default 200, max "
+            "500).\n"
             "\n"
-            "Search and list responses include a human-readable `modified` "
-            "date on every memory and tag immutable ones with [FIXED]. "
-            "Load responses include the same plus a `fixed: yes/no` line.\n"
+            "search / list responses carry a `modified` date per memory "
+            "and tag immutable ones [FIXED]; load adds a `fixed: yes/no` "
+            "line.\n"
             "\n"
-            "USE THIS AGGRESSIVELY: anything worth remembering across "
-            "sessions — user preferences, project decisions, command "
-            "recipes, error fixes, domain knowledge — should land here. "
-            "Future conversations will rag(action=\"search\") and find "
-            "what THIS conversation taught you.\n"
-            "\n"
-            "INVIOLABLE RULES — not suggestions, not best-effort:\n"
+            "INVIOLABLE RULES — not suggestions:\n"
             "  1. SAVE WHAT YOU LEARN. The moment you learn something "
-            "new that could matter later — a fact, a fix, a working "
-            "command, a user preference, a piece of domain knowledge — "
-            "you MUST rag(action=\"save\") it (or append to an existing "
-            "memory) before the turn ends. Do not wait to be asked.\n"
-            "  2. SEARCH THE RAG BEFORE THE INTERNET. Before ANY web "
-            "search or web fetch, you MUST first rag(action=\"search\") "
-            "for the topic. Your own memory is the first source of "
-            "truth — only reach for the internet when the RAG has "
-            "nothing on it. After any web lookup, save what you found "
-            "so the next attempt hits the RAG instead.\n"
-            "  3. SKILLS ARE FIRST-CLASS. Any reusable procedure, "
-            "recipe, or how-to is a \"skill\": you MUST save it with "
-            "the keyword \"skill\" (alongside its topic keywords), and "
-            "you MUST rag(action=\"search\", keywords=[\"skill\", ...]) "
-            "for an existing skill before working a procedure out from "
-            "scratch."
+            "that could matter later — a fact, a fix, a working command, "
+            "a user preference, a project decision, domain knowledge — "
+            "you MUST save it (or append to an existing memory) before "
+            "the turn ends. Don't wait to be asked. Future sessions "
+            "search this and find what THIS one taught you.\n"
+            "  2. SEARCH MEMORY BEFORE THE INTERNET. Before ANY web "
+            "search or fetch, you MUST first memory(action=\"search\") "
+            "the topic — your memory is the first source of truth. Only "
+            "go to the internet when memory has nothing; then save what "
+            "you found.\n"
+            "  3. SKILLS ARE FIRST-CLASS. Any reusable procedure / "
+            "recipe / how-to is a \"skill\": save it with the keyword "
+            "\"skill\" (plus topic keywords), and search "
+            "keywords=[\"skill\", ...] for an existing one before "
+            "working a procedure out from scratch."
         )
         .param("action",      "string",
                "Required. One of: \"save\", \"append\", \"search\", "
@@ -1689,27 +1666,26 @@ Tool make_rag_tool(std::string root_dir) {
                     "\"delete\", \"keywords\".");
             }
 
-            // The inner handlers still cite the seven-tool names
-            // (rag_save, rag_append, rag_search, ...) in their
-            // guidance prose. In unified mode the model has only
-            // `rag` in its catalog, so any literal `rag_<verb>`
-            // reference would be a dangling identifier. Rewrite
-            // each occurrence in place to the dispatch form the
-            // model can actually call. Cheap (O(n) over a small
-            // message); the set of substitutions is closed and
-            // stable.
+            // The inner handlers still cite the legacy seven-tool
+            // names (rag_save, rag_append, rag_search, ...) in their
+            // guidance prose. The model only has `memory` in its
+            // catalog, so any literal `rag_<verb>` reference would be
+            // a dangling identifier. Rewrite each occurrence in place
+            // to the dispatch form the model can actually call. Cheap
+            // (O(n) over a small message); the set of substitutions is
+            // closed and stable.
             struct Sub { const char * from; const char * to; };
             static const Sub kSubs[] = {
                 // Order matters: rag_append must come before rag_a... siblings
                 // would, but only rag_save shares the leading 'rag_' so any
                 // order works. Keep alphabetical for grep-ability.
-                { "rag_append",   "rag(action=\"append\")"   },
-                { "rag_delete",   "rag(action=\"delete\")"   },
-                { "rag_keywords", "rag(action=\"keywords\")" },
-                { "rag_list",     "rag(action=\"list\")"     },
-                { "rag_load",     "rag(action=\"load\")"     },
-                { "rag_save",     "rag(action=\"save\")"     },
-                { "rag_search",   "rag(action=\"search\")"   },
+                { "rag_append",   "memory(action=\"append\")"   },
+                { "rag_delete",   "memory(action=\"delete\")"   },
+                { "rag_keywords", "memory(action=\"keywords\")" },
+                { "rag_list",     "memory(action=\"list\")"     },
+                { "rag_load",     "memory(action=\"load\")"     },
+                { "rag_save",     "memory(action=\"save\")"     },
+                { "rag_search",   "memory(action=\"search\")"   },
             };
             for (const auto & s : kSubs) {
                 std::string from = s.from;

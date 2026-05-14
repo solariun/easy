@@ -1032,9 +1032,10 @@ struct Engine::Impl {
         return msg;
     }
 
-    // Find the registered tool by name.
+    // Find the registered tool by name (back-compat aliases resolved).
     const Tool * find_tool(const std::string & name) const {
-        for (const auto & t : tools) if (t.name == name) return &t;
+        const std::string canon = canonical_tool_name(name);
+        for (const auto & t : tools) if (t.name == canon) return &t;
         return nullptr;
     }
 };

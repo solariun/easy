@@ -656,11 +656,11 @@ void usage(const char * argv0) {
 "                                 bash (only with --allow-bash),\n"
 "                                 system_meminfo, system_loadavg,\n"
 "                                 system_cpu_usage, system_swaps,\n"
-"                                 rag (only with --RAG DIR)\n"
+"                                 memory (only with --memory DIR)\n"
 "                               default: datetime,plan,web,\n"
 "                                 system_meminfo,system_loadavg,\n"
 "                                 system_cpu_usage,system_swaps,\n"
-"                                 (rag is auto-registered when --RAG is set;\n"
+"                                 (memory is auto-registered when --memory is set;\n"
 "                                  fs and python3 are auto-registered when\n"
 "                                  --sandbox or --allow-bash is set)\n"
 "    --sandbox DIR              enable file work scoped to DIR.\n"
@@ -719,9 +719,9 @@ void usage(const char * argv0) {
 "                                 still load. -q hides security sanity-check\n"
 "                                 warnings (errors are always shown).\n"
 "                                 See EXTERNAL_TOOLS.md.\n"
-"    --RAG DIR                  enable RAG (the agent's persistent registry)\n"
-"                                 rooted at DIR. Registers ONE\n"
-"                                 `rag(action=...)` tool with sub-actions\n"
+"    --memory DIR               enable the agent's persistent memory store\n"
+"                                 rooted at DIR (alias: --RAG). Registers ONE\n"
+"                                 `memory(action=...)` tool with sub-actions\n"
 "                                 save / append / search / load / list /\n"
 "                                 delete / keywords. Each memory is a small\n"
 "                                 Markdown file in DIR. See RAG.md.\n"
@@ -920,7 +920,8 @@ bool parse_args(int argc, char ** argv, Options & o) {
         else if (a == "--unattended")     o.unattended    = true;
         else if (a == "--use-google")     o.use_google    = true;
         else if (a == "--external-tools") o.external_tools_dir = need(i, "--external-tools");
-        else if (a == "--RAG")            o.rag_dir            = need(i, "--RAG");
+        else if (a == "--memory" ||
+                 a == "--RAG")            o.rag_dir            = need(i, a.c_str());
         else if (a == "--temperature")    o.temperature       = std::stof(need(i, "--temperature"));
         else if (a == "--top-p")          o.top_p             = std::stof(need(i, "--top-p"));
         else if (a == "--top-k")          o.top_k             = std::stoi(need(i, "--top-k"));
@@ -1168,12 +1169,12 @@ void register_tools(easyai::Client & cli,
     if (wants("system_cpu_usage")) cli.add_tool(systools::make_system_cpu_usage());
     if (wants("system_swaps"))     cli.add_tool(systools::make_system_swaps());
 
-    // RAG — the agent's persistent registry / long-term memory.
-    // One `rag(action=...)` tool registered when --RAG <dir> is given.
-    // The dir does not need to exist yet; the tool creates it on first
-    // save. See RAG.md.
+    // Persistent memory — the agent's long-term store.
+    // One `memory(action=...)` tool registered when --memory <dir> is
+    // given. The dir does not need to exist yet; the tool creates it on
+    // first save. See RAG.md.
     if (!o.rag_dir.empty()) {
-        if (o.tools_enabled.empty() || o.tools_enabled.count("rag")) {
+        if (o.tools_enabled.empty() || o.tools_enabled.count("memory")) {
             cli.add_tool(easyai::tools::make_rag_tool(o.rag_dir));
         }
     }

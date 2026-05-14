@@ -213,7 +213,8 @@ http_timeout=86400
 # Sampling defaults written into [ENGINE] ACTIVE (not commented).  Tuned for
 # code / agent workloads on the production AI box: temperature 0.5 trades a
 # bit of determinism for richer tool-use phrasing, top-* for some tail
-# diversity, min_p=0.09 as the adaptive cutoff for confident tokens,
+# diversity, min_p=0.5 as a tight cutoff (only tokens within 2x of the
+# top token's probability survive — keeps output focused),
 # repeat_penalty=1.0 (no penalty — paired with presence_penalty=1.5, the
 # anti-loop floor moved from token-history slope to fixed-cost-per-seen-
 # token, which is gentler on long agentic flows). max_tokens=81920 is the
@@ -222,7 +223,7 @@ http_timeout=86400
 temperature="0.5"
 top_p="0.95"
 top_k=64
-min_p="0.09"
+min_p="0.5"
 repeat_penalty="1.0"
 presence_penalty="1.5"
 max_tokens=81920
@@ -786,7 +787,7 @@ Tool notes:
   - web_search returns snippets only; after ONE search, web_fetch the
     top 1-3 URLs and answer from the fetched body. Two searches in a
     row is wrong.
-  - Long-term memory: rag(action=…) save / append / search / load.
+  - Long-term memory: memory(action=…) save / append / search / load.
   - Cite URLs you actually fetched. Attach dates to dated facts
     ("released April 2026" beats "recently released").
 
@@ -1029,7 +1030,7 @@ sandbox         = $service_workspace
 # system_file     = $system_file
 
 external_tools  = $external_tools_dir
-rag             = $rag_dir
+memory          = $rag_dir
 webui_title     = $webui_title
 metrics         = $([[ "$enable_metrics" -eq 1 ]] && echo on || echo off)
 allow_fs        = off

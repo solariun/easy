@@ -82,6 +82,15 @@ struct Tool {
     static Builder builder(std::string name) { return Builder(std::move(name)); }
 };
 
+// Back-compat tool-name aliases. The `memory` tool was formerly called
+// `rag`; a model (or a resumed pre-rename session) emitting `rag` is
+// routed to `memory` at dispatch time so no second schema is shipped.
+// Single source of truth — every tool-name lookup runs through this.
+inline std::string canonical_tool_name(const std::string & name) {
+    if (name == "rag") return "memory";
+    return name;
+}
+
 // Tiny JSON-arg helpers so handlers don't need a JSON dep.
 // They scan the raw arguments_json for top-level "key":value pairs.
 //
