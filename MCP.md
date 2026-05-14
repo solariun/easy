@@ -1,8 +1,8 @@
 # MCP — easyai-server as a Model Context Protocol provider
 
 > *"You build the tools once. Every AI app that speaks MCP gets to
-> use them — your RAG, your deploy CLI, your monitoring queries —
-> without you writing a plugin per app."*
+> use them — your `memory` tool, your deploy CLI, your monitoring
+> queries — without you writing a plugin per app."*
 
 This document is the authoritative guide to the MCP surface
 exposed by `easyai-server`. Other AI applications (Claude Desktop,
@@ -49,11 +49,12 @@ connect to easyai-server and use its tools as if they were native.
 ## 1. What we expose, and why
 
 `easyai-server` registers a tool catalogue at startup — built-in
-tools, RAG (one `rag(action=...)` tool), and any operator-defined
-tools loaded from `--external-tools`. The MCP layer exposes that
-**same** catalogue via the Model Context Protocol so other AI
-applications can list and dispatch them as if they had registered
-the tools themselves.
+tools, the `memory` tool (one `memory(action=...)` tool — a passive
+RAG technique over keyword-indexed Markdown files), and any
+operator-defined tools loaded from `--external-tools`. The MCP layer
+exposes that **same** catalogue via the Model Context Protocol so
+other AI applications can list and dispatch them as if they had
+registered the tools themselves.
 
 ```
                     ┌─────────────────────────────────────┐
@@ -75,16 +76,16 @@ the tools themselves.
    │     • datetime, web (search/fetch), plan                       │
    │     • fs (read/write/list/glob/grep/check_path/cwd/sandbox)   (+--allow-fs)│
    │     • bash                                          (+--allow-bash)│
-   │     • rag (save/append/search/load/list/delete/keywords)       │
+   │     • memory (save/append/search/load/list/delete/keywords)    │
    │     • every tool in /etc/easyai/external-tools/EASYAI-*.tools  │
    └───────────────────────────────────────────────────────────────┘
 ```
 
-**Why this is useful.** The same RAG you populated by chatting with
-the local model is now reachable from Claude Desktop. The internal
-deploy-cli you wrote a `EASYAI-deploy.tools` manifest for is now
-callable from Cursor's chat. Operators write tools once; every AI
-client benefits.
+**Why this is useful.** The same `memory` tool you populated by
+chatting with the local model is now reachable from Claude Desktop.
+The internal deploy-cli you wrote a `EASYAI-deploy.tools` manifest for
+is now callable from Cursor's chat. Operators write tools once; every
+AI client benefits.
 
 ---
 
@@ -111,7 +112,7 @@ Methods we currently implement:
 
 Methods we do **not** yet implement:
 
-- `resources/list`, `resources/read` — RAG entries as MCP resources is on the roadmap.
+- `resources/list`, `resources/read` — `memory` entries as MCP resources is on the roadmap.
 - `prompts/list`, `prompts/get` — easyai doesn't ship prompt templates.
 - Streaming `notifications/tools/list_changed` — would require SSE on `/mcp` and hot-reload of the tool catalogue, both deferred.
 
@@ -165,7 +166,7 @@ curl -fsS http://localhost/mcp \
 ```
 
 You should see the full catalogue — datetime, the unified `web` tool,
-the unified `rag` tool, any external tools you have configured.
+the unified `memory` tool, any external tools you have configured.
 
 ### Call a tool
 
@@ -176,13 +177,13 @@ curl -fsS http://localhost/mcp \
     "jsonrpc":"2.0","id":3,
     "method":"tools/call",
     "params": {
-      "name": "rag_keywords",
-      "arguments": {}
+      "name": "memory",
+      "arguments": { "action": "keywords" }
     }
   }' | jq -r '.result.content[0].text'
 ```
 
-Returns the live RAG vocabulary the local model has built up.
+Returns the live `memory` vocabulary the local model has built up.
 
 ### Ping
 
@@ -249,10 +250,11 @@ Anthropic ships natively.
 
 ### Verifying
 
-In Claude Desktop, ask: *"Use the rag_keywords tool to show me
-your registry vocabulary."* Claude will dispatch `tools/call` with
-name `rag_keywords` — easyai handles it locally, returns the
-keyword counts, and Claude reads them.
+In Claude Desktop, ask: *"Use the memory tool to show me your
+registry vocabulary."* Claude will dispatch `tools/call` with
+name `memory` and `arguments: {"action": "keywords"}` — easyai
+handles it locally, returns the keyword counts, and Claude reads
+them.
 
 ---
 
@@ -345,7 +347,7 @@ print(call("initialize", {"protocolVersion":"2024-11-05",
                           "clientInfo":{"name":"smoke","version":"0"}}))
 print([t["name"] for t in call("tools/list")["result"]["tools"]])
 print(call("tools/call",
-           {"name":"rag_keywords","arguments":{}})["result"]["content"][0]["text"])
+           {"name":"memory","arguments":{"action":"keywords"}})["result"]["content"][0]["text"])
 ```
 
 Node / TypeScript clients can use any JSON-RPC library
@@ -536,8 +538,8 @@ For high-trust deployments stack:
 3. **Token rotation** — change the values in `[MCP_USER]` and
    restart; old tokens immediately invalid.
 4. **Don't enable `--allow-bash`** with auth-open mode — the
-   worst MCP can dispatch is RAG + read-only `web_*` and your
-   `--external-tools` allowlist.
+   worst MCP can dispatch is the `memory` tool + read-only `web_*`
+   and your `--external-tools` allowlist.
 
 ---
 
@@ -563,7 +565,7 @@ no distinction — local and remote tools sit in the same catalogue.
             ┌────────────┼─────────────┬──────────────┐
             │            │             │              │
             ▼            ▼             ▼              ▼
-       local toolbelt  RAG       external-tools   ┌────────┐
+       local toolbelt  memory    external-tools   ┌────────┐
                                                   │  --mcp │
                                                   │   ▼    │
                                                   │  HTTP  │
@@ -616,9 +618,9 @@ Phase 1 (this version): **tools-only, request/response, no auth.**
 What we'll add next, roughly in priority order:
 
 1. **Bearer auth gate** on `/mcp`. See §9.
-2. **Resources surface.** Expose RAG entries as MCP resources at
+2. **Resources surface.** Expose `memory` entries as MCP resources at
    URIs like `rag://entry-name`, so a client can `resources/read`
-   without going through `tools/call rag_load`.
+   without going through `tools/call memory` with `action="load"`.
 3. **Streaming HTTP transport.** `GET /mcp` returns an SSE stream
    for server-pushed `notifications/tools/list_changed` (when
    external-tools dir is hot-reloaded). Required for a future
@@ -629,7 +631,7 @@ What we'll add next, roughly in priority order:
    image.
 5. **Prompts surface.** A library of pre-built prompts the user
    can invoke.
-6. **Resource subscriptions.** Live updates as the RAG changes.
+6. **Resource subscriptions.** Live updates as the `memory` store changes.
 
 ---
 
@@ -679,10 +681,10 @@ succeeded, only the wrapped tool reported a problem.
 
 ### Tools/list returns more entries than I expected
 
-Every registered tool is exposed: built-ins + RAG (one
-`rag(action=...)` tool) + external-tools (operator's `EASYAI-*.tools`
-manifests). Use `/health` to see the count and `/v1/tools` for a
-brief description list.
+Every registered tool is exposed: built-ins + the `memory` tool (one
+`memory(action=...)` tool) + external-tools (operator's
+`EASYAI-*.tools` manifests). Use `/health` to see the count and
+`/v1/tools` for a brief description list.
 
 ### How do I add or remove tools?
 
@@ -700,7 +702,7 @@ without a restart, but it's not in V1.
 ---
 
 *See also:* `LINUX_SERVER.md` (operator's guide), `RAG.md` (the
-single `rag(action=...)` dispatcher that the model writes to and
+single `memory(action=...)` dispatcher that the model writes to and
 clients read from), `EXTERNAL_TOOLS.md` (operator-defined tool packs
 that show up in the MCP catalogue alongside built-ins), `design.md`
 (architecture).

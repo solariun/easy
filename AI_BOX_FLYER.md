@@ -42,8 +42,8 @@ loader:
 | **HTTP server** | `easyai-server` — drop-in `llama-server` replacement | OpenAI-compatible `/v1/chat/completions` (full SSE streaming) |
 | **Web UI** | llama.cpp's SvelteKit chat, embedded in the binary | `http://ai-box/` — phone, tablet, laptop, any browser |
 | **MCP server** | Model Context Protocol provider | `POST /mcp` — Claude Desktop, Cursor, Continue, Zed |
-| **Tool catalogue** | Auto-registered built-ins | `web_search` · `web_fetch` · `fs` · `bash` · `python3` · `rag` · `plan` · datetime |
-| **Persistent memory** | `rag` tool over `/var/lib/easyai/rag/` | Per-topic markdown — the model can save, append, search across conversations |
+| **Tool catalogue** | Auto-registered built-ins | `web_search` · `web_fetch` · `fs` · `bash` · `python3` · `memory` · `plan` · datetime |
+| **Persistent memory** | `memory` tool over `/var/lib/easyai/rag/` | A passive RAG technique — per-topic markdown the model can save, append, and search across conversations |
 | **Sandbox** | `/var/lib/easyai/workspace/` | Everything `fs` / `bash` / `python3` touches is pinned inside |
 | **Telemetry** | `/metrics` (Prometheus) + journald METRICS line | CPU / GPU / mem / TCP / TIME_WAIT pressure |
 | **Security** | Bearer auth, MCP user tokens, audited tool surface | See `SECURITY_AUDIT.md` for the full standing review |
@@ -65,8 +65,8 @@ double-checked after every parent-dir creation. Seven audit passes
 Open `http://ai-box/` in any browser. Conversations are streamed
 in real time. The model can search the web (`web_search`), pull
 articles (`web_fetch`), run calculations (`python3`), keep
-running notes per topic (`rag`), and execute shell commands in
-the sandbox (`bash`, opt-in). No history is ever uploaded.
+running notes per topic (the `memory` tool), and execute shell
+commands in the sandbox (`bash`, opt-in). No history is ever uploaded.
 
 ### 2. A coding co-pilot in your terminal
 
@@ -80,8 +80,8 @@ leave your machine.
 
 Point Claude Desktop, Cursor, Continue, or Zed at
 `http://ai-box/mcp` with a Bearer token from `[MCP_USER]`. Your
-IDE's coding agent now uses your model and your tools (RAG memory,
-local `bash`, your sandbox, any custom tools you registered via
+IDE's coding agent now uses your model and your tools (the `memory`
+tool, local `bash`, your sandbox, any custom tools you registered via
 `--external-tools`) instead of the vendor's defaults.
 
 ### 4. Home automation with natural language
@@ -96,10 +96,10 @@ the action.
 
 ### 5. A radio / hobbyist knowledge base
 
-`rag_save "callsign-XX0XYZ" "..."` — the model now remembers every
-QSO log, contest entry, propagation note, or contact card you
-hand it. Search across years of memory without burying it in a
-folder hierarchy. Build a custom external tool to query your
+`memory(action="save", title="callsign-XX0XYZ", ...)` — the model now
+remembers every QSO log, contest entry, propagation note, or contact
+card you hand it. Search across years of memory without burying it in
+a folder hierarchy. Build a custom external tool to query your
 linbpq / KISS BBS / SimpleBLE service and the agent can answer
 "who logged into the BBS in the last hour" without you writing a
 query layer.
@@ -122,7 +122,7 @@ runs, and orchestration scripts are in reach.
 ### 8. Offline / WAN-down resilience
 
 Your AI Box keeps working when the internet is down. The local
-RAG, the model, the chat UI, the MCP tool surface — none of
+`memory` tool, the model, the chat UI, the MCP tool surface — none of
 them have a cloud dependency. (Web tools obviously don't work
 without WAN; everything else does.)
 

@@ -21,7 +21,7 @@
 8. [Reasoning streams](#8-reasoning-streams)
 9. [The raw transaction log](#9-the-raw-transaction-log)
 10. [Session persistence](#10-session-persistence)
-11. [RAG — persistent memory](#11-rag--persistent-memory)
+11. [memory — persistent memory](#11-memory--persistent-memory)
 12. [External tools](#12-external-tools)
 13. [Management subcommands](#13-management-subcommands)
 14. [Worked examples](#14-worked-examples)
@@ -183,7 +183,7 @@ prepended (see [§6](#6-system-prompt--injected-blocks)).
 | `--allow-bash` | Register `bash`. **Implies `fs`** (bash subsumes it). cwd = `--sandbox` if given, else the binary's CWD. WARNING: not a hardened sandbox. |
 | `--no-python` | Drop the auto-registered `python3` tool. By default `python3` is **ON** whenever `--sandbox` or `--allow-bash` is set. Stdlib-only interpreter (no PYTHON* env, no site-packages, no cwd on `sys.path`); disk access auto-restricted to the sandbox root via a Python preamble. WARNING: defense-in-depth, not a hardened sandbox — `import os` / `import socket` / `import subprocess` still work. |
 | `--use-google` | Enable `engine="google"` inside the unified `web` tool (Google Custom Search JSON API). Requires `GOOGLE_API_KEY` and `GOOGLE_CSE_ID` env vars. |
-| `--RAG DIR` | Enable RAG persistent memory rooted at DIR. Registers ONE `rag(action=...)` tool. |
+| `--memory DIR` | Enable persistent memory rooted at DIR — a passive RAG technique. Registers ONE `memory(action=...)` tool. `--RAG` is still accepted as a back-compat alias. |
 | `--external-tools DIR` | Load every `EASYAI-*.tools` manifest in DIR. See `EXTERNAL_TOOLS.md`. |
 | `--no-plan` | Don't auto-register the `plan` tool. |
 
@@ -250,7 +250,7 @@ system_meminfo, system_loadavg, system_cpu_usage, system_swaps
 | `--allow-bash` | `bash` (and bumps the agentic loop's `max_tool_hops` to 99999) |
 | `--no-python` | drops the auto-on `python3` tool (otherwise on whenever fs is on) |
 | `--use-google` (+ env vars set) | Enables `engine="google"` inside the unified `web` tool |
-| `--RAG DIR` | `rag` (single-tool dispatcher; sub-actions save / append / search / load / list / delete / keywords) |
+| `--memory DIR` (alias `--RAG`) | `memory` (single-tool dispatcher; sub-actions save / append / search / load / list / delete / keywords) |
 | `--external-tools DIR` | every tool from each loaded `EASYAI-*.tools` manifest |
 
 ### Why `--sandbox` and `--allow-bash` both register `fs`
@@ -276,10 +276,12 @@ Pass `--tools LIST` to override the auto-catalog. Valid names:
 ```
 datetime, plan, web, fs, bash,
 system_meminfo, system_loadavg, system_cpu_usage, system_swaps,
-rag
+memory
 ```
 
-`bash` / `rag` still require their respective opt-in flags even when
+(`rag` is still accepted as a back-compat alias for `memory`.)
+
+`bash` / `memory` still require their respective opt-in flags even when
 explicitly listed; `engine="google"` inside `web` likewise depends on
 `--use-google` plus the env vars.
 
@@ -565,12 +567,14 @@ dirs have two independent sessions.
 
 ---
 
-## 11. RAG — persistent memory
+## 11. memory — persistent memory
 
-`--RAG <dir>` mounts a directory as the agent's long-term memory. It
-exposes ONE `rag` tool with seven sub-actions (`save`, `append`,
-`search`, `load`, `list`, `delete`, `keywords`); each memory is a
-single Markdown file in `<dir>` that the operator can hand-edit.
+`--memory <dir>` mounts a directory as the agent's long-term memory.
+It exposes ONE `memory` tool with seven sub-actions (`save`, `append`,
+`search`, `load`, `list`, `delete`, `keywords`); under the hood it's a
+passive RAG technique — each memory is a single keyword-indexed
+Markdown file in `<dir>` that the operator can hand-edit. The legacy
+flag `--RAG` is still accepted as a back-compat alias.
 
 Memories whose title starts with `fix-easyai-` are immutable: save /
 append / delete refuse them. Pass `fix=true` (sub-action `save`) to
@@ -603,7 +607,7 @@ runs.
 | Flag | What it does |
 | --- | --- |
 | `--list-tools` | Print every LOCAL tool (the catalog the CLI sends to the server in `tools[]`) with name + full description. The fastest way to confirm what the model will see. |
-| `--list-remote-tools` | `GET /v1/tools`. easyai-server extension — lists tools the *server* registered (its built-ins + RAG + external + MCP-fetched). May 404 against other OpenAI-compat servers. |
+| `--list-remote-tools` | `GET /v1/tools`. easyai-server extension — lists tools the *server* registered (its built-ins + the `memory` tool + external + MCP-fetched). May 404 against other OpenAI-compat servers. |
 | `--list-models` | `GET /v1/models`. Standard. |
 | `--health` | `GET /health`. Prints `ok` / `unhealthy: <reason>`. |
 | `--props` | `GET /props`. Server-side configuration dump. |
@@ -662,7 +666,7 @@ easyai-cli --url http://ai.local:8080 --tools datetime,web \
 ```
 
 `--tools` overrides the auto-catalog completely. `--allow-bash` /
-`--sandbox` / `--RAG` are still respected for their specific tools but
+`--sandbox` / `--memory` are still respected for their specific tools but
 the rest of the catalog is whatever's in the explicit list.
 
 ### Confirming the system prompt

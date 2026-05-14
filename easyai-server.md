@@ -4,7 +4,8 @@
 > `/v1/chat/completions` (streaming SSE + tool calls), serves an
 > embedded SvelteKit webui, and answers MCP / Ollama clients out of the
 > same process.** Single binary, hardened systemd unit, central INI
-> config, RAG-backed long-term memory, operator-defined external tools.
+> config, `memory`-tool long-term memory (a passive RAG technique),
+> operator-defined external tools.
 
 ---
 
@@ -98,7 +99,7 @@ The HTTP layer, paths, tool gating, MCP auth.
 | `system_file` | path | `-s`, `--system-file` | (none — uses built-in default) | File containing the server-default system prompt. |
 | `system_inline` | string | `--system` | (none) | Inline system prompt. Beats `system_file` if both are set. |
 | `external_tools` | path | `--external-tools` | (none — feature off) | Directory of `EASYAI-*.tools` manifests. See `EXTERNAL_TOOLS.md`. |
-| `rag` | path | `--RAG` | (none — feature off) | Directory of RAG entries. See `RAG.md`. |
+| `memory` | path | `--memory` | (none — feature off) | Directory of `memory`-tool entries. The legacy key `rag` (CLI `--RAG`) is still read for back-compat. See `RAG.md`. |
 | `webui_title` | string | `--webui-title` | `Deep` | Document title pinned in the embedded webui. |
 | `webui_icon` | path | `--webui-icon` | (none) | `.ico` / `.png` / `.svg` / `.gif` / `.jpg` / `.webp`. |
 | `webui_mode` | enum | `--webui` | `modern` | `modern` (embedded llama-server bundle) or `minimal` (inline). |
@@ -110,11 +111,11 @@ The HTTP layer, paths, tool gating, MCP auth.
 | `allow_bash` | bool | `--allow-bash` | `off` | Register the `bash` tool. **Not** a hardened sandbox. Note: on the server, `--allow-bash` alone does NOT auto-register `fs` — pass `--allow-fs` alongside if you want both. (The cli / local helpers DO auto-register `fs` whenever `--allow-bash` or `--allow-python` is on, since they treat the operator's intent as "let the model touch files".) |
 | `allow_python` | bool | (no `--allow-python`; `--no-python` flips off) | `on` | Register the `python3` tool — runs snippets via `python3 -I -S -E -c <code>`. **Defaults ON**, auto-registered whenever `--sandbox` is set or `--allow-bash` is on (the embedded webui inherits this since the systemd unit ships with `--sandbox`). Isolated stdlib-only interpreter: no PYTHON* env, no site-packages, no cwd on `sys.path`; third-party imports fail with ModuleNotFoundError. **Disk access auto-restricted to the sandbox root** via a Python preamble that monkey-patches `builtins.open` / `io.open` / `os.open` — `open("/etc/passwd")` raises `PermissionError`. Defense-in-depth, not a hardened sandbox: `import os` / `import socket` / `import subprocess` / `import ctypes` all still work. Pass `--no-python` (or `[SERVER] allow_python = off`) to skip registration. |
 | `use_google` | bool | `--use-google` | `off` | Enable `engine="google"` inside the unified `web` tool (Google Custom Search JSON API). Requires `GOOGLE_API_KEY` and `GOOGLE_CSE_ID` env vars. Counts against your Google quota (free tier: 100 queries/day per key). When either env var is missing the option is silently skipped (the default `engine="ddg"` keeps working). |
-| `mcp` | string | `--mcp` | (none — MCP client off) | URL of an upstream MCP server to connect to as a CLIENT. Format: `http(s)://host:port` (the `/mcp` endpoint is appended). Tools fetched from the upstream are merged into the local catalogue; local-tool names take precedence on collision. Failure at startup logs a warning and continues with whatever local / RAG tools were registered. |
+| `mcp` | string | `--mcp` | (none — MCP client off) | URL of an upstream MCP server to connect to as a CLIENT. Format: `http(s)://host:port` (the `/mcp` endpoint is appended). Tools fetched from the upstream are merged into the local catalogue; local-tool names take precedence on collision. Failure at startup logs a warning and continues with whatever local / `memory` tools were registered. |
 | `mcp_token` | string | `--mcp-token` | (empty) | Bearer token sent on every request to the upstream `mcp` URL. Empty = no `Authorization` header — appropriate when the upstream is in open mode. Don't put a real token in the INI directly if you can help it; load it from a separate file (analogous to how `api_key` is wired through `${EASYAI_API_KEY}` in the systemd installer). |
 | `http_retries` | int | `--http-retries` | `5` | Extra attempts on transient HTTP failures. Applies to the MCP client (`--mcp` upstream calls) and to the unified `web` tool's libcurl calls. 4xx never retries; 5xx + connect/read/write errors do. Each retry logs to stderr unconditionally (e.g. `[easyai-mcp] http://up:8089/mcp attempt 2/6 failed (Couldn't connect to server); retrying in 500ms`). 0 disables. |
 | `http_timeout` | int | `--http-timeout` | `600` | Read/write timeout (seconds) for **both** the listen socket (cpp-httplib) AND the MCP-client connection. Bumped from llama-server's traditional 60 s default to give long-thinking models room to breathe before the network drops them. Echoed in the startup banner. HTTP 408/504 timeouts hit by the listen socket are logged unconditionally as `[easyai-server] WARN HTTP 408 timeout on POST /v1/chat/completions from CLIENT (check --http-timeout, …)`. |
-| `local_tools` | bool | `--no-local-tools` (negative) | `on` | Master switch for the LOCAL built-in toolbelt (datetime, web, fs, bash, ...). Set `off` (or pass `--no-local-tools`) to register zero local default tools. Has no effect on RAG, external tools, or remote tools fetched via `mcp` — those have their own switches. `allow_fs` / `allow_bash` / `use_google` further opt in. **Renamed from `load_tools` / `--no-tools`** to make clear the MCP client (`mcp`) is unaffected. |
+| `local_tools` | bool | `--no-local-tools` (negative) | `on` | Master switch for the LOCAL built-in toolbelt (datetime, web, fs, bash, ...). Set `off` (or pass `--no-local-tools`) to register zero local default tools. Has no effect on the `memory` tool, external tools, or remote tools fetched via `mcp` — those have their own switches. `allow_fs` / `allow_bash` / `use_google` further opt in. **Renamed from `load_tools` / `--no-tools`** to make clear the MCP client (`mcp`) is unaffected. |
 | `max_body` | int | `--max-body` | `8388608` (8 MiB) | Max HTTP request body size. |
 | `api_key` | string | `--api-key` | (none — `/v1/*` open) | Bearer token for `/v1/*`. Don't put real keys in INI directly — use `/etc/easyai/api_key` (file-based, the installer wires `${EASYAI_API_KEY}`). |
 | `mcp_auth` | enum | (no CLI; `--no-mcp-auth` overrides) | `auto` | `auto` (auth iff `[MCP_USER]` non-empty), `on` (force require), `off` (force open). |
@@ -229,7 +230,7 @@ alias           = EasyAi
 sandbox         = /var/lib/easyai/workspace
 system_file     = /etc/easyai/system.txt
 external_tools  = /etc/easyai/external-tools
-rag             = /var/lib/easyai/rag
+memory          = /var/lib/easyai/rag
 webui_title     = EasyAi
 metrics         = on
 verbose         = off
@@ -397,12 +398,12 @@ opt-in is logged at startup with sanity warnings.
 | `--no-python` / `[SERVER] allow_python = off` | Drop the `python3` tool. `python3` defaults ON and auto-registers whenever `--sandbox` is set or `--allow-bash` is on. Isolated stdlib-only interpreter (no PYTHON* env, no site-packages, no cwd on `sys.path`); third-party imports fail with ModuleNotFoundError. Disk access auto-restricted to the sandbox root via a Python preamble — `open("/etc/passwd")` raises `PermissionError`. Defense-in-depth, NOT a hardened sandbox: `import os` / `import socket` / `import subprocess` / `import ctypes` all still work. Bumps `max_tool_hops` to 99999, same as `--allow-bash`. |
 | `--use-google` (`[SERVER] use_google`) | Enables `engine="google"` inside the unified `web` tool (Google Custom Search JSON API). Requires `GOOGLE_API_KEY` and `GOOGLE_CSE_ID` env vars; option is silently skipped if either is missing so a key rotation that briefly drops the env doesn't take down the server. Counts against your Google quota (free tier: 100 queries/day per key). The default `engine="ddg"` keeps working with no env vars. |
 | `--external-tools <dir>` (`[SERVER] external_tools`) | Load every `EASYAI-<name>.tools` file in `<dir>` as an operator-defined tool pack. Per-file fault isolation. Spawns via `fork`+`execve` — never a shell. **The supported way to give the model focused powers without flipping `--allow-bash`.** See [`EXTERNAL_TOOLS.md`](EXTERNAL_TOOLS.md). |
-| `--RAG <dir>` (`[SERVER] rag`) | Enable RAG, the agent's persistent **memory** (search / store / append / recall / update / forget). Registers ONE `rag(action=...)` tool with sub-actions `save`, `append` (grow an existing memory without losing its body), `search`, `load`, `list`, `delete`, `keywords` — each entry one Markdown file in `<dir>`, operator-readable and hand-editable. Memories whose title starts with `fix-easyai-` are immutable: save/append/delete refuse them. Pass `fix=true` (sub-action `save`) to mint one. The systemd-installed server passes this by default (`/var/lib/easyai/rag`). See [`RAG.md`](RAG.md). |
-| `--mcp <url>` (`[SERVER] mcp`) | Connect to a remote MCP server as a CLIENT. The upstream's tool catalogue is merged into ours via `tools/list` at startup; each remote tool's handler proxies `tools/call` over HTTP. Local-tool names take precedence on collision (warning logged, remote dup skipped). Pair with `--mcp-token` for bearer-auth servers. Transient failures (connect refused, read timeout, 5xx) retry per `--http-retries`; each retry is logged. Connect failure after the retry budget logs a warning and continues with whatever local/RAG tools were registered. |
+| `--memory <dir>` (`[SERVER] memory`) | Enable the agent's persistent **memory** (search / store / append / recall / update / forget) — a passive RAG technique over keyword-indexed Markdown files. Registers ONE `memory(action=...)` tool with sub-actions `save`, `append` (grow an existing memory without losing its body), `search`, `load`, `list`, `delete`, `keywords` — each entry one Markdown file in `<dir>`, operator-readable and hand-editable. Memories whose title starts with `fix-easyai-` are immutable: save/append/delete refuse them. Pass `fix=true` (sub-action `save`) to mint one. The legacy flag `--RAG` (INI key `rag`) is still accepted as an alias. The systemd-installed server passes this by default (`/var/lib/easyai/rag`). See [`RAG.md`](RAG.md). |
+| `--mcp <url>` (`[SERVER] mcp`) | Connect to a remote MCP server as a CLIENT. The upstream's tool catalogue is merged into ours via `tools/list` at startup; each remote tool's handler proxies `tools/call` over HTTP. Local-tool names take precedence on collision (warning logged, remote dup skipped). Pair with `--mcp-token` for bearer-auth servers. Transient failures (connect refused, read timeout, 5xx) retry per `--http-retries`; each retry is logged. Connect failure after the retry budget logs a warning and continues with whatever local / `memory` tools were registered. |
 | `--mcp-token <token>` (`[SERVER] mcp_token`) | Bearer token attached to every `--mcp` request. Empty = no auth header. |
 | `--http-retries N` (`[SERVER] http_retries`) | Default `5`. Extra attempts on transient HTTP failures, applied to the `--mcp` upstream calls AND to the unified `web` tool's libcurl calls. 4xx never retries; 5xx + connect/read/write errors retry with exponential backoff (250 ms → 500 ms → 1 s → 2 s → 4 s, capped). Set 0 to disable. Every retry logs to stderr (visible in journalctl without `--verbose`). |
 | `--http-timeout SECONDS` (`[SERVER] http_timeout`) | Default `600`. Read/write timeout for **both** the listen socket AND the MCP-client connection. Bumped from llama-server's traditional 60 s to give long-thinking models room before the network drops them. The chosen value is echoed in the startup banner; HTTP 408 / 504 listen-side timeouts log unconditionally on stderr with the request method/path/peer. |
-| `--no-local-tools` (`[SERVER] local_tools = off`) | Skip the LOCAL built-in toolbelt entirely (renamed from `--no-tools` / `load_tools`). Useful when you want ONLY external-tools, ONLY RAG, or ONLY tools fetched via `--mcp`. The MCP client remains active even with this flag set. |
+| `--no-local-tools` (`[SERVER] local_tools = off`) | Skip the LOCAL built-in toolbelt entirely (renamed from `--no-tools` / `load_tools`). Useful when you want ONLY external-tools, ONLY the `memory` tool, or ONLY tools fetched via `--mcp`. The MCP client remains active even with this flag set. |
 
 Sandbox semantics: paths sent by the model are anchored to the root
 by iterating path components and dropping any `..`, `.`, or absolute
@@ -411,9 +412,9 @@ no path the model can construct that escapes. The model sees a
 virtual `/`-rooted filesystem (`/report.md`, `/docs/spec.md`); the
 real sandbox path is hidden from descriptions and result messages.
 
-Concurrency: built-in tools that share state (RAG's index,
+Concurrency: built-in tools that share state (the `memory` tool's index,
 the web tool's fetch LRU cache) use lock-free or fine-grained synchronisation
-internally. RAG specifically uses `std::shared_mutex` so parallel
+internally. The `memory` tool specifically uses `std::shared_mutex` so parallel
 reads from multiple workers don't serialise — the same tools used by
 [`easyai-mcp-server`](easyai-mcp-server.md) under thousands-of-clients
 load. See [`SECURITY_AUDIT.md`](SECURITY_AUDIT.md) §16, §16.6b.
@@ -468,7 +469,7 @@ tokens after restart).
 3. **Token rotation** — `[MCP_USER]` edits land on next restart;
    old tokens are immediately invalid.
 4. **Don't enable `--allow-bash` with auth-open mode** — the worst
-   `/mcp` can dispatch is RAG + read-only `web_*` + your
+   `/mcp` can dispatch is the `memory` tool + read-only `web_*` + your
    `--external-tools` allowlist.
 
 Full security model: [`SECURITY_AUDIT.md`](SECURITY_AUDIT.md) §17.
@@ -733,7 +734,7 @@ Highlights of the work documented in [`SECURITY_AUDIT.md`](SECURITY_AUDIT.md):
   `fs::weakly_canonical()` + path-component containment, plus
   `O_NOFOLLOW | O_CLOEXEC` on `fs(action="read")` / `fs(action="write")`
   so a TOCTOU race can't follow a last-second symlink.
-- **RAG entries written mode 0600** so the OS-level ACL is
+- **`memory` entries written mode 0600** so the OS-level ACL is
   owner-only even if the operator's umask leaves a wider default.
 - **Authoritative date/time preamble** appended to whichever system
   message reaches the model (server's default OR client-supplied).
@@ -785,7 +786,7 @@ ask for; the OS bounds what the *agent process* can do.
   per-client connection cookbook (Claude Desktop / Cursor / Continue /
   curl).
 - [`RAG.md`](RAG.md) — persistent registry, the unified
-  `rag(action=...)` tool, workflows.
+  `memory(action=...)` tool, workflows.
 - [`EXTERNAL_TOOLS.md`](EXTERNAL_TOOLS.md) — operator-defined
   external tools (`EASYAI-*.tools` JSON manifests).
 - [`SECURITY_AUDIT.md`](SECURITY_AUDIT.md) — seven audit passes,

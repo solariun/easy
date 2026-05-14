@@ -519,7 +519,7 @@ Vague or under-described tools produce malformed calls, the wrong action,
 or silent loops where the model retries variants until the budget runs
 out. Two patterns are used in-tree:
 
-**Multi-action tools** (`plan`, `rag`) dispatch on a top-level `action`
+**Multi-action tools** (`plan`, `memory`) dispatch on a top-level `action`
 field. The description must enumerate every action and state, per action,
 what is Required and what is Optional. The shape:
 
@@ -948,7 +948,7 @@ and aggregates results.
 ### The trust boundary
 
 Built-in tools (`datetime`, the unified `web` and `fs` tools, `bash`,
-the unified `rag` dispatcher, …) are C++ code we wrote and reviewed. Adding a new built-in is a code change,
+the unified `memory` dispatcher, …) are C++ code we wrote and reviewed. Adding a new built-in is a code change,
 goes through review, ships in a binary release. That's the right
 process for tools that the agent's *author* controls.
 
@@ -1122,22 +1122,24 @@ let the model use it" without leaving JSON.
 These are deliberate non-goals — adding any of them would expand
 the trust surface in ways the operator didn't sign up for.
 
-## 5g. RAG — persistent registry / long-term memory
+## 5g. memory — persistent registry / long-term memory
 
 Lives in `src/rag_tools.cpp` and `include/easyai/rag_tools.hpp`.
 User-facing documentation: [`RAG.md`](RAG.md). Operator guide:
 [`LINUX_SERVER.md`](LINUX_SERVER.md). This section describes *why*
-the subsystem is shaped the way it is.
+the subsystem is shaped the way it is. The `memory` tool is **a
+passive RAG technique** — keyword-indexed Markdown files the agent
+saves and searches itself, no embedding model or vector store.
 
 ### Architecture at a glance
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                            MODEL                                 │
-│              (sees 6 tools registered as a group)                │
+│            (sees ONE `memory` tool with seven actions)           │
 │                                                                  │
-│   rag_save  rag_search  rag_load  rag_list  rag_delete           │
-│                            rag_keywords                          │
+│   memory(action="save" | "append" | "search" | "load" |         │
+│          "list" | "delete" | "keywords", …)                      │
 └─────────────────────────────────────────────────────────────────┘
                                 │
                                 │  tool_call(name, arguments_json)
@@ -1170,26 +1172,26 @@ the subsystem is shaped the way it is.
 │             /var/lib/easyai/rag/    (filesystem)                 │
 │                                                                  │
 │   <title>.md           one file per entry, plain Markdown        │
-│   <title>.md.tmp.<pid> transient — only during rag_save          │
+│   <title>.md.tmp.<pid> transient — only during a save            │
 │   README.md            operator-readable, no `keywords:` header  │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
 The flow has four invariants worth calling out:
 
-1. **The model is the only writer.** `rag_save` and `rag_delete`
-   are called from the model's tool-call loop; the operator may
-   hand-edit files but the runtime never auto-writes from the
-   server side. This makes "what's in RAG" a function of "what
+1. **The model is the only writer.** The `save` and `delete`
+   actions are called from the model's tool-call loop; the operator
+   may hand-edit files but the runtime never auto-writes from the
+   server side. This makes "what's in memory" a function of "what
    the agent decided to remember", which is the part vector
    stores get wrong.
 2. **The index is small.** Every search / list / keywords call
    stays in memory — no disk read. The body is only read when the
-   model commits to one specific entry via `rag_load`. A 1000-entry
-   RAG with avg 200-byte body uses ~200 KiB on disk and a few
-   hundred bytes per entry in the index.
+   model commits to one specific entry via the `load` action. A
+   1000-entry store with avg 200-byte body uses ~200 KiB on disk and
+   a few hundred bytes per entry in the index.
 3. **Atomic-rename writes.** The tempfile + rename pattern means a
-   concurrent reader (another rag_load while a save is in flight)
+   concurrent reader (another `load` while a save is in flight)
    sees the OLD body or the NEW body but never a torn write. No
    locking needed on the read path.
 4. **Path-safety by regex.** Title and keyword identifiers must
@@ -1209,10 +1211,10 @@ us look up entries in O(1) per lookup with zero embedding inference.
 
 When we later want progressive recall (auto-inject the K most
 relevant entries on session start), THAT layer can do similarity
-scoring on top. RAG itself stays simple: just files and keywords.
-The composition order matters: vector store on top of RAG works
-fine; RAG on top of a vector store would be either redundant or
-fighting the index.
+scoring on top. The `memory` tool itself stays simple: just files
+and keywords. The composition order matters: vector store on top of
+the `memory` tool works fine; the `memory` tool on top of a vector
+store would be either redundant or fighting the index.
 
 ### Why one Markdown file per entry, not a database
 
@@ -1229,12 +1231,13 @@ process — fast).
 
 ### One tool with seven sub-actions
 
-The surface is **one** `rag(action=...)` tool with seven sub-actions
+The surface is **one** `memory(action=...)` tool with seven sub-actions
 (save / append / search / load / list / delete / keywords). This
 keeps the model's tool catalog short — one entry instead of seven —
 which most modern tool-callers handle cleanly and which saves a few
 hundred tokens per turn that would otherwise go to schema
-definitions in the prompt.
+definitions in the prompt. (A model emitting `rag(action=...)` is
+routed to `memory` as a back-compat alias.)
 
 The schema is flat (every parameter optional except `action`) because
 JSON Schema's discriminated-union shapes (`oneOf` with a
@@ -1245,8 +1248,8 @@ fields with a crisp message naming the dispatch form.
 
 Behind the discriminator the seven handlers are still distinct
 closures with the same validation messages and the same audit shape
-— just multiplexed through one entry point. `rag(action="save",
-...)` and `rag(action="search", ...)` are still distinguishable in
+— just multiplexed through one entry point. `memory(action="save",
+...)` and `memory(action="search", ...)` are still distinguishable in
 hooks / logs by their `action` argument, so curating by intent
 remains possible.
 
@@ -1260,7 +1263,7 @@ existing one without losing its body), search + load (read in two
 steps because previewing keeps the prompt slim), list (browse),
 delete (curate), keywords (vocabulary review).
 
-### Why max 4 entries per `rag(action="load")`
+### Why max 4 entries per `memory(action="load")`
 
 Past 4, the model is almost always trying to drown the prompt in
 stale content. The cap forces "preview first, narrow second" —
@@ -1279,22 +1282,22 @@ This is the same lever the system prompt uses, but at finer
 granularity — one tool's behaviour at a time. As we accumulate
 operational experience we'll tune the descriptions further.
 
-### Where RAG fits in the four-tier API rule
+### Where the `memory` tool fits in the four-tier API rule
 
-| Tier | Audience | RAG surface |
+| Tier | Audience | `memory` surface |
 | --- | --- | --- |
-| 1 — façade | beginner | `easyai::Agent` could opt into RAG with a single setter (future). |
-| 2 — fluent | intermediate | One factory: `make_rag_tool(dir)` returns the `rag(action=...)` dispatcher. |
-| 3 — operator | deployment | `--RAG <dir>` flag on all three CLIs; systemd unit passes `--RAG` for free. |
+| 1 — façade | beginner | `easyai::Agent` could opt into the `memory` tool with a single setter (future). |
+| 2 — fluent | intermediate | One factory: `make_rag_tool(dir)` returns the `memory(action=...)` dispatcher. |
+| 3 — operator | deployment | `--memory <dir>` flag on all three CLIs (legacy alias `--RAG`); systemd unit passes `--memory` for free. |
 | 4 — escape hatch | extension | The `RagStore` private class is replaceable: a future variant could swap files for SQLite or a vector store while keeping the same handler signatures. |
 
-### What RAG is not
+### What the `memory` tool is not
 
 - **Not a knowledge base.** The agent decides what goes in. Stale
   entries persist until the agent (or operator) deletes them.
 - **Not a search engine.** Keyword exact match, no semantic search,
   no fuzzy match. We ship the simple thing.
-- **Not multi-tenant.** One process, one RAG dir. Per-user
+- **Not multi-tenant.** One process, one memory dir. Per-user
   namespaces are on the roadmap.
 - **Not transactional across calls.** Each tool call commits its
   own state. There's no `BEGIN ... COMMIT`. The model is the
@@ -1322,10 +1325,11 @@ A multi-action shape (vs. four separate tools) is deliberate:
    per action.
 
 The trade-off — one less informative tool name in audit logs — is
-worth it for catalogue compactness.  RAG (§5g) chose differently
-(seven tools) because there the action names ARE the audit
-signal; for the plan tool, the `action` argument suffices because
-operators read the rendered checklist, not the raw tool calls.
+worth it for catalogue compactness.  The `memory` tool (§5g) is the
+same single-tool shape; for both, the `action` argument is what
+distinguishes calls in hooks / logs, and operators read the rendered
+checklist (plan) or the on-disk Markdown (`memory`), not the raw
+tool calls.
 
 ### Statuses encode display intent, not workflow
 
@@ -1408,7 +1412,7 @@ The callback runs synchronously on the dispatching thread
 default rendered path is one `ostringstream` build + a single
 `spinner_.write()` and that's it.
 
-### Plan vs. RAG vs. external-tools
+### Plan vs. `memory` vs. external-tools
 
 Three persistence-shaped tool families coexist; their roles
 are distinct:
@@ -1416,17 +1420,17 @@ are distinct:
 | Tool      | Lifetime          | Audience       | Writer |
 |-----------|-------------------|----------------|--------|
 | Plan      | one chat session  | the user, live | model  |
-| RAG       | across sessions   | the model     | model  |
+| `memory`  | across sessions   | the model     | model  |
 | Manifest  | across deploys    | the operator  | operator |
 
-A plan item is the next ten minutes of work.  A RAG entry is
+A plan item is the next ten minutes of work.  A `memory` entry is
 "things the model wants to remember next time."  A manifest
 tool is "binaries the operator pre-authorised."  Confusing them
-produces predictable failure modes (RAG entries that are stale
+produces predictable failure modes (`memory` entries that are stale
 within an hour because the model used them as a plan; manifest
 tools the model never calls because it expects them to behave
-like RAG).  Keeping the surfaces distinct keeps the model
-oriented.
+like the `memory` tool).  Keeping the surfaces distinct keeps the
+model oriented.
 
 ---
 
@@ -1522,8 +1526,8 @@ The agent loop has two consumers of the tool catalogue:
    OpenWebUI, custom clients) over MCP.
 
 Both consume the SAME `ctx->default_tools` vector. The work that
-went into wiring `Toolbelt` + RAG + external-tools is reused
-verbatim — no second serialiser, no second registry, no second
+went into wiring `Toolbelt` + the `memory` tool + external-tools is
+reused verbatim — no second serialiser, no second registry, no second
 auth surface. Adding a new tool means one C++ change (or one
 manifest file) and every consumer sees it on next restart.
 
@@ -1609,7 +1613,7 @@ with the same `inputSchema` declared in the manifest. An operator
 who declares `git_log` in `EASYAI-internal.tools` exposes it
 simultaneously to:
 
-- The local model (which rag_search'es and dispatches).
+- The local model (which calls `memory(action="search")` and dispatches).
 - Cursor's chat (via MCP `tools/call`).
 - Claude Desktop (via the stdio bridge).
 

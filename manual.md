@@ -835,7 +835,7 @@ example, and has been told what NOT to use this for.
 
 A single tool that dispatches on a top-level `action` field. Reach for
 this when you have N closely-related operations that share state and
-parameters: `plan` (add / update / delete / list), `rag` (save / append
+parameters: `plan` (add / update / delete / list), `memory` (save / append
 / search / load / list / delete / keywords). Recipe:
 
 1. Open with the purpose sentence + `Pick an action; the parameters
@@ -1480,28 +1480,32 @@ for (const auto & t : loaded.tools) {
   state, write a C++ tool with a captured `std::shared_ptr` to a
   state object.
 
-### 3.3.6 RAG — persistent registry / long-term memory
+### 3.3.6 memory — persistent registry / long-term memory
 
 > The authoritative guide is [`RAG.md`](RAG.md). The summary below
 > is a quick reference.
 
-RAG gives the agent a tool surface for remembering things across
-sessions. One tool with seven sub-actions:
+The `memory` tool gives the agent a tool surface for remembering
+things across sessions. Under the hood it uses **a passive RAG
+technique** — keyword-indexed Markdown files the agent saves and
+searches itself, with no embedding model or vector store. One tool
+with seven sub-actions:
 
 ```cpp
 engine.add_tool(easyai::tools::make_rag_tool("/var/lib/easyai/rag"));
-// rag(action="save",     title, keywords[], content, fix?)
-// rag(action="append",   title, content, keywords?)        — grow an existing memory
-// rag(action="search",   keywords[], max_results=10)
-// rag(action="load",     titles[1..4])
-// rag(action="list",     prefix?, max=50)
-// rag(action="delete",   title)
-// rag(action="keywords", min_count=1, max=200)
+// memory(action="save",     title, keywords[], content, fix?)
+// memory(action="append",   title, content, keywords?)        — grow an existing memory
+// memory(action="search",   keywords[], max_results=10)
+// memory(action="load",     titles[1..4])
+// memory(action="list",     prefix?, max=50)
+// memory(action="delete",   title)
+// memory(action="keywords", min_count=1, max=200)
 ```
 
-Or via the `--RAG <dir>` flag in `easyai-server`, `easyai-cli`, and
-`easyai-local`. The systemd-installed server passes
-`--RAG /var/lib/easyai/rag` by default.
+Or via the `--memory <dir>` flag in `easyai-server`, `easyai-cli`, and
+`easyai-local` (the legacy `--RAG` flag is still accepted as an
+alias). The systemd-installed server passes
+`--memory /var/lib/easyai/rag` by default.
 
 Each entry is one Markdown file `<title>.md` in the configured
 directory:
@@ -1519,9 +1523,10 @@ call.
 
 The model is encouraged (in the tool descriptions) to save
 aggressively, search before assuming it doesn't know something, and
-delete stale entries to keep the index sharp. See `RAG.md` for the
-full workflow including document ingestion, the positive cycle, and
-the operator's audit / backup recipes.
+delete stale entries to keep the index sharp. A model that emits
+`rag(action=...)` is routed to `memory` as a back-compat alias. See
+`RAG.md` for the full workflow including document ingestion, the
+positive cycle, and the operator's audit / backup recipes.
 
 ### 3.4 Streaming token output
 
@@ -2969,8 +2974,8 @@ state. To run `easyai-local` without any tools at all:
 For the server: `--no-local-tools` (renamed from `--no-tools` so the
 flag's scope is unambiguous now that `easyai-server` can also be an
 MCP client — `--no-local-tools` skips the LOCAL toolbelt only,
-leaving RAG, external-tools, and any tools fetched via `--mcp`
-intact).
+leaving the `memory` tool, external-tools, and any tools fetched via
+`--mcp` intact).
 
 ### 9.4 Production deployment — replacing `llama-server`
 

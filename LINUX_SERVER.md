@@ -12,9 +12,9 @@ of (or alongside) the chat server, see
 [`easyai-mcp-server.md`](easyai-mcp-server.md). If you're a developer,
 see `design.md` and `manual.md`. If you're writing tool manifests,
 see `EXTERNAL_TOOLS.md`. If you want to understand the agent's
-long-term memory, see `RAG.md`. If you want to expose easyai's tools
-to other AI applications (Claude Desktop, Cursor, Continue), see
-`MCP.md`.
+long-term memory (the `memory` tool), see `RAG.md`. If you want to
+expose easyai's tools to other AI applications (Claude Desktop,
+Cursor, Continue), see `MCP.md`.
 
 ---
 
@@ -26,7 +26,7 @@ to other AI applications (Claude Desktop, Cursor, Continue), see
 3. [Configuration files](#3-configuration-files)
 4. [The four mutable directories](#4-the-four-mutable-directories)
 5. [The `--external-tools` directory](#5-the---external-tools-directory)
-6. [The RAG directory](#6-the-reg-directory)
+6. [The `memory` directory](#6-the-reg-directory)
 7. [Performance tuning](#7-performance-tuning)
 8. [Common gotchas](#8-common-gotchas)
 9. [Hitting the API](#9-hitting-the-api)
@@ -139,7 +139,7 @@ cd ~/some/project && opencode
 OpenCode runs its own fs/bash sandboxing on YOUR local machine —
 unrelated to the server's `[SERVER] sandbox` and `allow_fs` /
 `allow_bash` gates. The server-side gates only affect tools that
-the model itself calls server-side (web/RAG/etc.).
+the model itself calls server-side (web / `memory` / etc.).
 
 ### VSCode + Cline (heavier agent)
 
@@ -197,7 +197,7 @@ roughly:
 | `/etc/easyai/external-tools/` | root:easyai | 750 | operator-defined tools (`EASYAI-*.tools`) |
 | `/etc/easyai/favicon[.ext]` | root:easyai | 644 | optional webui favicon |
 | `/var/lib/easyai/` | easyai:easyai | 750 | mutable agent state |
-| `/var/lib/easyai/rag/` | easyai:easyai | 750 | RAG long-term memory |
+| `/var/lib/easyai/rag/` | easyai:easyai | 750 | `memory` tool long-term store |
 | `/var/lib/easyai/workspace/` | easyai:easyai | 750 | sandbox for fs_* and bash tools |
 | `/var/lib/easyai/models/` | easyai:easyai | 750 | the GGUF symlink target |
 | `/etc/systemd/system/easyai-server.service` | root:root | 644 | the unit file |
@@ -235,7 +235,7 @@ ExecStart=/bin/sh -c '...EASYAI_API_KEY=$(cat /etc/easyai/api_key) ...
                           --sandbox /var/lib/easyai/workspace \
                           --system-file /etc/easyai/system.txt \
                           --external-tools /etc/easyai/external-tools \
-                          --RAG /var/lib/easyai/rag \
+                          --memory /var/lib/easyai/rag \
                           ... '
 Restart=on-failure
 RestartSec=10
@@ -264,12 +264,13 @@ Important pieces:
   `fs(action="cwd")` reports this path.
 - `--external-tools /etc/easyai/external-tools`. Operator-defined
   tools live here. Empty dir is a normal state.
-- `--RAG /var/lib/easyai/rag`. The agent's persistent **memory**
-  (search / store / recall / update / forget). Registers ONE
-  `rag(action=...)` tool with sub-actions save / append / search /
-  load / list / delete / keywords. Memories whose title starts with
-  `fix-easyai-` are immutable — the model can't overwrite or forget
-  them, useful for seeding system designs and hard rules.
+- `--memory /var/lib/easyai/rag` (legacy alias: `--RAG`). The agent's
+  persistent **memory** (search / store / recall / update / forget).
+  Registers ONE `memory(action=...)` tool with sub-actions save /
+  append / search / load / list / delete / keywords — a passive RAG
+  technique over keyword-indexed Markdown files. Memories whose title
+  starts with `fix-easyai-` are immutable — the model can't overwrite
+  or forget them, useful for seeding system designs and hard rules.
 
 Optional add-ons the systemd unit does NOT pass by default but the
 installer leaves room for in `/etc/easyai/easyai.ini`:
@@ -283,9 +284,9 @@ installer leaves room for in `/etc/easyai/easyai.ini`:
   `GOOGLE_API_KEY` and `GOOGLE_CSE_ID` in `Environment=` lines of a
   drop-in. Counts against your Google quota (free tier: 100/day).
 - `[SERVER] local_tools = false` (or pass `--no-local-tools`).
-  Skips the LOCAL built-in toolbelt — the model only sees RAG,
-  external-tools, and any `--mcp` upstream. **Renamed from
-  `load_tools` / `--no-tools`** so the scope is unambiguous now
+  Skips the LOCAL built-in toolbelt — the model only sees the
+  `memory` tool, external-tools, and any `--mcp` upstream. **Renamed
+  from `load_tools` / `--no-tools`** so the scope is unambiguous now
   that the MCP client is its own concern.
 - `LimitMEMLOCK=infinity` (in the drop-in) so `mlock` works.
 - `LimitCORE=infinity` (in the drop-in) so coredumps land for
@@ -325,7 +326,7 @@ sudo systemctl restart easyai-server
 All operator-tunable knobs live in one INI file. The systemd unit's
 `ExecStart` is intentionally short — `--config /etc/easyai/easyai.ini`
 plus the model path and the api-key plumbing — and **everything else**
-(host, port, alias, sandbox, RAG dir, KV cache types, mlock, flash-attn,
+(host, port, alias, sandbox, memory dir, KV cache types, mlock, flash-attn,
 threads, MCP auth, …) lives in this file.
 
 Precedence: **CLI flag in the systemd unit > INI value > hardcoded
@@ -379,13 +380,15 @@ by the installer once created — operator edits survive every
 `--upgrade` / `--force` run.
 
 Customise to add domain context, persona, language preferences. If
-you want the model to use RAG aggressively, mention it here:
+you want the model to use the `memory` tool aggressively, mention it
+here:
 
 ```
-You have a persistent registry called RAG. Save important things
-the user tells you (preferences, project facts, recipes that worked)
-with rag_save. Search RAG with rag_search before assuming you don't
-know something the user might have told you in a past session.
+You have a persistent registry: the `memory` tool. Save important
+things the user tells you (preferences, project facts, recipes that
+worked) with memory(action="save"). Search it with
+memory(action="search") before assuming you don't know something the
+user might have told you in a past session.
 ```
 
 The installer also injects an authoritative date/time prefix at
@@ -424,7 +427,7 @@ swap.
 | --- | --- | --- |
 | `/var/lib/easyai/models/` | GGUF symlink target. The unit's `-m` arg points here. | Big files. Easy to fill the disk. |
 | `/var/lib/easyai/workspace/` | The sandbox for `bash` / `fs_*` tools. | The agent reads / writes here. Keep it on a partition with room. |
-| `/var/lib/easyai/rag/` | RAG long-term memory (one `.md` per entry). | Tiny. Backup-friendly. See `RAG.md`. |
+| `/var/lib/easyai/rag/` | The `memory` tool's long-term store (one `.md` per entry). | Tiny. Backup-friendly. See `RAG.md`. |
 | `/etc/easyai/external-tools/` | Operator-defined tools (`EASYAI-*.tools`). | Operator-curated. See `EXTERNAL_TOOLS.md`. |
 
 ---
@@ -458,20 +461,21 @@ anti-patterns, troubleshooting, collaboration workflow.
 
 ---
 
-## 6. The RAG directory
+## 6. The `memory` directory
 
 Active by default. The systemd unit always passes
-`--RAG /var/lib/easyai/rag`. The agent writes here at runtime — that
-is why it's under `/var/lib` (mutable state) rather than `/etc`
-(operator config).
+`--memory /var/lib/easyai/rag` (the legacy `--RAG` flag is still
+accepted as an alias). The agent writes here at runtime — that is why
+it's under `/var/lib` (mutable state) rather than `/etc` (operator
+config).
 
-**Visibility:** RAG is the model's PRIVATE long-term memory — there
-is no end-user UI, command, or API to browse or read entries. The
-operator can `cat` files on disk; the user talking to the model
-cannot. Current builds spell this out in the `rag` tool description
-itself so the model stops saying things like "check the rag for the
-code" — but if you ship a custom system prompt, repeat the rule
-there too.
+**Visibility:** the `memory` tool is the model's PRIVATE long-term
+memory — there is no end-user UI, command, or API to browse or read
+entries. The operator can `cat` files on disk; the user talking to the
+model cannot. Current builds spell this out in the `memory` tool
+description itself so the model stops saying things like "check the
+memory for the code" — but if you ship a custom system prompt, repeat
+the rule there too.
 
 **Quick checks:**
 
@@ -502,7 +506,7 @@ sudo systemctl restart easyai-server
 ```
 
 **Full reference:** `RAG.md`. File format, the unified
-`rag(action=...)` tool, workflows, roadmap, troubleshooting.
+`memory(action=...)` tool, workflows, roadmap, troubleshooting.
 
 ---
 
@@ -681,13 +685,14 @@ sudo systemctl restart easyai-server
 
 ### Agent doesn't seem to remember anything
 
-Either RAG isn't enabled or the dir is wrong:
+Either the `memory` tool isn't enabled or the dir is wrong:
 
 ```bash
-journalctl -u easyai-server | grep "RAG enabled"
+journalctl -u easyai-server | grep "memory enabled"
 ```
 
-If absent, re-run installer or check `systemctl cat` for `--RAG`.
+If absent, re-run installer or check `systemctl cat` for
+`--memory` (or the legacy `--RAG`).
 
 ---
 
@@ -755,7 +760,7 @@ for chunk in resp:
 ```
 
 The model dispatches whatever tools the operator declared on the
-server side (built-ins + `--external-tools` + RAG).
+server side (built-ins + `--external-tools` + the `memory` tool).
 
 ### `X-Easyai-Inject: off` to skip date/time injection
 
@@ -794,7 +799,7 @@ curl -fsS http://localhost/health | jq .tool_count
 Expected (rough):
 
 - 3 (datetime, the unified `web` tool, plan)
-- + 1 (`--RAG`: the unified `rag(action=...)` tool)
+- + 1 (`--memory`: the unified `memory(action=...)` tool)
 - + 1 (`--allow-fs`: the unified `fs` tool)
 - + 1 (`--allow-bash`: bash)
 - + N (your `--external-tools` packs)
@@ -802,11 +807,11 @@ Expected (rough):
 - `--use-google` enables `engine="google"` *inside* the unified `web`
   tool — does NOT add a new entry to the catalogue.
 
-### RAG working?
+### `memory` tool working?
 
 ```bash
 ls /var/lib/easyai/rag/
-journalctl -u easyai-server | grep "RAG enabled"
+journalctl -u easyai-server | grep "memory enabled"
 ```
 
 ### External tools loaded?
@@ -897,7 +902,7 @@ git pull
 After upgrading, sanity-check:
 
 ```bash
-journalctl -u easyai-server -n 50 --no-pager | grep -E "RAG enabled|external-tools|loaded"
+journalctl -u easyai-server -n 50 --no-pager | grep -E "memory enabled|external-tools|loaded"
 ```
 
 ---
@@ -996,7 +1001,7 @@ prefix). Configurable via `--http-retries N` (default 5, set 0 to disable).
 The tool's `timeout_ms` is too high (cap is 5 min). Edit the
 `.tools` file, lower `timeout_ms`, restart the server.
 
-### RAG entries appear duplicated
+### `memory` entries appear duplicated
 
 Two things to check:
 

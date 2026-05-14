@@ -22,7 +22,7 @@ against, plus six ready-to-run binaries:
 | `easyai-local`       | Local-only REPL: loads a GGUF in-process via `easyai::Engine`. Drop-in `llama-cli` replacement — one-shot scripting (`-p`), tools, presets, optional `<think>` strip, sandboxed `fs_*` tools, opt-in `bash` tool. |
 | `easyai-cli`         | Agentic OpenAI-protocol client built on `libeasyai-cli` — no local model.  REPL or `-p`, full sampling control (`--temperature`, `--top-p`, `--top-k`, `--min-p`, `--repeat-penalty`, `--frequency-penalty`, `--presence-penalty`, `--seed`, `--max-tokens`, `--stop`), plan tool, server-management subcommands (`--list-models`, `--list-tools`, `--health`, `--props`, `--metrics`, `--set-preset`).  HTTPS via OpenSSL; `--insecure-tls` / `--ca-cert` for dev/internal CAs.  Full doc: [`easyai-cli.md`](easyai-cli.md). |
 | `easyai-server`      | Drop-in `llama-server` replacement: OpenAI-compat HTTP **with full SSE streaming**, embedded SvelteKit webui, Bearer auth, Prometheus `/metrics`, KV-cache controls, flash-attn, mlock.  Speaks MCP, OpenAI, Ollama from one process.  Full doc: [`easyai-server.md`](easyai-server.md). |
-| `easyai-mcp-server`  | **Standalone Model Context Protocol provider — no model loaded.** Same tool catalogue as `easyai-server` (built-ins + RAG + external-tools), exposed over `POST /mcp` with a configurable cpp-httplib worker pool (`--threads`) and an in-flight `tools/call` cap (`--max-concurrent-calls`) for thousands-of-clients deployments.  Full doc: [`easyai-mcp-server.md`](easyai-mcp-server.md). |
+| `easyai-mcp-server`  | **Standalone Model Context Protocol provider — no model loaded.** Same tool catalogue as `easyai-server` (built-ins + the `memory` tool + external-tools), exposed over `POST /mcp` with a configurable cpp-httplib worker pool (`--threads`) and an in-flight `tools/call` cap (`--max-concurrent-calls`) for thousands-of-clients deployments.  Full doc: [`easyai-mcp-server.md`](easyai-mcp-server.md). |
 | `easyai-agent`       | A demo agent showing every built-in tool plus an inline custom tool.                                                                                |
 | `easyai-recipes`     | Tutorial agent paired with `manual.md` — implements `today_is` and `weather` (HTTP-calling) from scratch.                                          |
 | `easyai-chat`        | A bare-bones REPL with no tools — useful as a sanity check.                                                                                          |
@@ -1054,7 +1054,7 @@ has a matching INI key (see [`easyai-server.md`](easyai-server.md) §1).
 | `--no-python` | python3 on | Drop the `python3` tool. By default it's auto-registered alongside `fs` whenever `--sandbox` is set or `--allow-bash` is on. Stdlib-only interpreter; disk access auto-restricted to the sandbox root. |
 | `--use-google` | off | Enable engine=`"google"` inside the unified `web` tool (needs `GOOGLE_API_KEY` + `GOOGLE_CSE_ID`). |
 | `--external-tools DIR` | — | Load every `EASYAI-*.tools` manifest in `DIR`. |
-| `--RAG DIR` | — | Enable RAG: registers one `rag(action=…)` tool with sub-actions save / append / search / load / list / delete / keywords. Persistent memory. |
+| `--memory DIR` | — | Enable persistent memory: registers one `memory(action=…)` tool with sub-actions save / append / search / load / list / delete / keywords — a passive RAG technique. `--RAG` is still accepted as a back-compat alias. |
 | `--preset NAME` | `precise` | Ambient sampling preset. See [Sampling presets](#sampling-presets) for what each implies. |
 | `--temperature F` | per preset | Override temperature (0.0–2.0). |
 | `--top-p F` | per preset | Nucleus sampling p. |
@@ -1113,7 +1113,7 @@ reference: [`easyai-mcp-server.md`](easyai-mcp-server.md).
 | `--allow-bash` | off | Register `bash`. |
 | `--no-tools` | off | Skip the built-in toolbelt entirely. |
 | `--external-tools DIR` | — | Load `EASYAI-*.tools` manifests. |
-| `--RAG DIR` | — | Enable the six RAG tools. |
+| `--memory DIR` | — | Enable the unified `memory` tool (alias `--RAG`). |
 | `--api-key TOK` | — | Bearer required for `/health`, `/metrics`, `/v1/tools`. |
 | `--no-mcp-auth` | off | Force `/mcp` open. |
 | `--metrics` | off | Enable Prometheus `/metrics`. |
@@ -1152,7 +1152,7 @@ upstream `llama-server`, OpenAI itself, etc.).
 | `--no-python` | python3 on | Drop the auto-registered `python3` tool (default-on whenever `--sandbox` or `--allow-bash` is set). |
 | `--use-google` | off | Enable engine=`"google"` inside the unified `web` tool. |
 | `--external-tools DIR` | — | Load `EASYAI-*.tools` manifests. |
-| `--RAG DIR` | — | Enable RAG (one `rag(action=…)` tool). |
+| `--memory DIR` | — | Enable persistent memory (one `memory(action=…)` tool; alias `--RAG`). |
 | `--no-plan` | off | Don't auto-register the planning tool. |
 | `-p, --prompt TEXT` | (REPL) | One-shot prompt; without it you get a REPL. |
 | `--no-reasoning` | shown | Hide `delta.reasoning_content`. |
@@ -1202,7 +1202,7 @@ use `easyai-cli`.
 | `--allow-bash` | off | Register `bash`. |
 | `--no-python` | python3 on | Drop the auto-registered `python3` tool. |
 | `--external-tools DIR` | — | Load `EASYAI-*.tools` manifests. |
-| `--RAG DIR` | — | Enable RAG. |
+| `--memory DIR` | — | Enable persistent memory (alias `--RAG`). |
 | `-ctk, --cache-type-k TYPE` | `f16` | K-cache dtype. |
 | `-ctv, --cache-type-v TYPE` | `f16` | V-cache dtype. |
 | `-nkvo, --no-kv-offload` | off | Keep KV cache on CPU. |
@@ -1349,7 +1349,7 @@ when you need looser sampling.
 | Name | temp | top_p | top_k | min_p | Behaviour | Pick when… |
 |---|---|---|---|---|---|---|
 | `deterministic` | 0.0 | 1.0 | 1 | 0.00 | Greedy: always picks the single most likely token. Same prompt → byte-identical answer every time. No randomness, no exploration. | You need reproducibility (CI, benchmarks, eval harnesses), or when even tiny variation breaks downstream parsing. |
-| `precise` (default) | 0.2 | 0.95 | 40 | 0.10 | Sticks to high-confidence tokens. Concise, follows instructions tightly, rarely contradicts itself or invents facts. min_p of 0.10 aggressively prunes low-probability tokens — good for stable tool calls and structured output. | Code generation, math, factual Q&A, RAG, tool-calling agents, structured output (JSON/SQL/cypher), anything you'd want to be "right" rather than "interesting". |
+| `precise` (default) | 0.2 | 0.95 | 40 | 0.10 | Sticks to high-confidence tokens. Concise, follows instructions tightly, rarely contradicts itself or invents facts. min_p of 0.10 aggressively prunes low-probability tokens — good for stable tool calls and structured output. | Code generation, math, factual Q&A, the `memory` tool, tool-calling agents, structured output (JSON/SQL/cypher), anything you'd want to be "right" rather than "interesting". |
 | `balanced` | 0.7 | 0.95 | 40 | 0.05 | A bit of variety while still mostly committing to the most-likely answer. Phrasing varies between runs; the substance shouldn't. | General-purpose chat, summarisation, casual Q&A, anywhere you want natural-sounding prose without surprises. |
 | `creative` | 1.0 | 0.95 | 40 | 0.05 | More phrasing variety, occasional surprising word choices, willingness to take a less-obvious angle. | Brainstorming, fiction, marketing copy, ideation, anything where "interesting" beats "literal". |
 | `wild` | 1.4 | 0.98 | 60 | 0.00 | Maximum entropy. Frequently picks low-probability tokens; can wander off-topic, contradict itself, hallucinate. | Pure exploration, "show me something I wouldn't have thought of", stylistic experiments. Don't ship it. |
@@ -1407,13 +1407,14 @@ no API bill, no data leaving the box.**
   Model Context Protocol client auto-discovers the tool catalogue.
   **Write one tool — every AI app on your machine can call it.**
 
-* **Long-term memory built in.** RAG: one `rag(action=...)` tool
-  (sub-actions save / append / search / load / list / delete /
-  keywords) the agent uses to save, append (grow what you already
-  know about the user without losing the previous body), search,
-  load, list, delete, and inventory its own knowledge. One
-  human-readable Markdown file per entry — `cat`, `vim`, `grep`
-  it. No vector DB to babysit.
+* **Long-term memory built in.** The `memory` tool: one
+  `memory(action=...)` tool (sub-actions save / append / search /
+  load / list / delete / keywords) the agent uses to save, append
+  (grow what you already know about the user without losing the
+  previous body), search, load, list, delete, and inventory its own
+  knowledge. It's a passive RAG technique — one human-readable
+  Markdown file per entry, `cat`, `vim`, `grep` it. No vector DB to
+  babysit.
 
 * **Operator-defined tool packs.** Drop a JSON manifest in
   `/etc/easyai/external-tools/`, the agent picks it up at startup.
@@ -1615,14 +1616,14 @@ no shell.
 | `--allow-bash`        | `bash` (run `/bin/sh -c`). cwd = `--sandbox <dir>` if given, otherwise the binary's CWD. NOT a hardened sandbox — runs with your user privileges. Also bumps the agentic-loop `max_tool_hops` to 99999 (bash flows naturally span many turns). |
 | `--use-google`        | Enables `engine="google"` inside the unified `web` tool (Google Custom Search JSON API). Requires `GOOGLE_API_KEY` and `GOOGLE_CSE_ID` env vars. Counts against your Google quota — free tier is 100 queries/day per key. Silently skipped if either env var is missing; the default `engine="ddg"` keeps working. |
 | `--external-tools <dir>` | Load every `EASYAI-<name>.tools` file in `<dir>` as an operator-defined tool pack. Per-file fault isolation (a bad file is logged + skipped, the agent still starts). Spawns via `fork`+`execve` — never a shell. **This is the supported way to give the model focused powers without flipping `--allow-bash`.** See [`EXTERNAL_TOOLS.md`](EXTERNAL_TOOLS.md). |
-| `--RAG <dir>`         | Enable RAG, the agent's persistent **memory** (search / store / append / recall / update / forget). Registers ONE `rag(action=...)` tool with sub-actions `save`, `append` (grow an existing memory without losing its body), `search`, `load`, `list`, `delete`, `keywords` — each memory one Markdown file in `<dir>`. Memories whose title starts with `fix-easyai-` are immutable: pass `fix=true` (sub-action `save`) to mint one. The systemd-installed server passes this by default (`/var/lib/easyai/rag`). See [`RAG.md`](RAG.md). |
+| `--memory <dir>`      | Enable the agent's persistent **memory** (search / store / append / recall / update / forget) — a passive RAG technique over keyword-indexed Markdown files. Registers ONE `memory(action=...)` tool with sub-actions `save`, `append` (grow an existing memory without losing its body), `search`, `load`, `list`, `delete`, `keywords` — each memory one Markdown file in `<dir>`. Memories whose title starts with `fix-easyai-` are immutable: pass `fix=true` (sub-action `save`) to mint one. `--RAG` is still accepted as a back-compat alias. The systemd-installed server passes this by default (`/var/lib/easyai/rag`). See [`RAG.md`](RAG.md). |
 | `--mcp <url>`         | Connect to a remote MCP server as a CLIENT (e.g. another `easyai-server` or `easyai-mcp-server`). The upstream's tool catalogue is fetched via `tools/list` and merged into the local one; each remote tool's handler proxies `tools/call` back to it. Local tool names win on collision (remote dup skipped with a warning). Pair with `--mcp-token <token>` when the upstream requires bearer auth. |
-| `--no-local-tools`    | Skip the LOCAL built-in toolbelt entirely (datetime, web, fs, bash, ...). Useful when you want ONLY external tools, ONLY RAG, or ONLY tools fetched via `--mcp`. Does NOT disable the MCP client — that's controlled by `--mcp`. **Renamed from `--no-tools`.** |
+| `--no-local-tools`    | Skip the LOCAL built-in toolbelt entirely (datetime, web, fs, bash, ...). Useful when you want ONLY external tools, ONLY the `memory` tool, or ONLY tools fetched via `--mcp`. Does NOT disable the MCP client — that's controlled by `--mcp`. **Renamed from `--no-tools`.** |
 
 #### Single config file: `/etc/easyai/easyai.ini`
 
 The systemd-installed server reads every operator-tunable knob —
-host, port, alias, sandbox, RAG dir, KV cache types, mlock, flash-attn,
+host, port, alias, sandbox, memory dir, KV cache types, mlock, flash-attn,
 threads, MCP auth, the works — from one INI file. **CLI flags on the
 unit override INI values; INI overrides hardcoded defaults.** So
 tweak the file + restart, no `systemctl edit` cadence:
@@ -1649,7 +1650,7 @@ Full key reference + worked examples: [`easyai-server.md`](easyai-server.md) §1
 
 #### easyai-server speaks **MCP** — every tool also reachable from Claude Desktop / Cursor / Continue
 
-`easyai-server` exposes its full tool catalogue (built-ins + RAG + every operator-defined `--external-tools` pack) via the **Model Context Protocol** at `POST /mcp`. Other AI applications connect, list, and dispatch:
+`easyai-server` exposes its full tool catalogue (built-ins + the `memory` tool + every operator-defined `--external-tools` pack) via the **Model Context Protocol** at `POST /mcp`. Other AI applications connect, list, and dispatch:
 
 ```
 Claude Desktop ──► [stdio bridge] ──► POST /mcp ──┐
@@ -1658,7 +1659,7 @@ Continue        ─────────────────────�
                                                         many consumers)
 ```
 
-You build the tools once. Your RAG, your deploy CLI, your monitoring queries — written ONCE for your easyai-server — become available in every AI app you already use. No plugin per app.
+You build the tools once. Your `memory` tool, your deploy CLI, your monitoring queries — written ONCE for your easyai-server — become available in every AI app you already use. No plugin per app.
 
 ```sh
 # List tools the server is exposing right now
@@ -1670,22 +1671,23 @@ It also speaks the **OpenAI** (`/v1/chat/completions`, `/v1/models`) and **Ollam
 
 Full guide: [`MCP.md`](MCP.md). Bridge script for Claude Desktop: `scripts/mcp-stdio-bridge.py`.
 
-#### Why `--RAG` makes the agent useful
+#### Why `--memory` makes the agent useful
 
 Without long-term memory, every session starts from zero: the model
 re-derives your preferences, re-learns your project, re-asks the same
-questions. With `--RAG`, the model decides what's worth remembering
-and writes it to a directory of small Markdown files. Next session,
-it `rag_search`es by keyword, finds what its past self saved, and
-picks up where you left off.
+questions. With `--memory`, the model decides what's worth remembering
+and writes it to a directory of small Markdown files — a passive RAG
+technique, no embedding model or vector store. Next session, it
+searches by keyword, finds what its past self saved, and picks up
+where you left off.
 
 ```
 > "I prefer terse responses in PT-BR."
-[model: rag_save("user-prefs", ["user","prefs","locale"], "...")]
+[model: memory(action="save", title="user-prefs", keywords=["user","prefs","locale"], content="...")]
 
 [next session]
 > "build easyai on the AI box"
-[model: rag_search(["easyai"]) → finds your saved build recipe]
+[model: memory(action="search", keywords=["easyai"]) → finds your saved build recipe]
 [model loads it and answers in your style]
 ```
 
@@ -1693,6 +1695,7 @@ The dir is at `/var/lib/easyai/rag/` on the installed server. You
 can `cat`, `vim`, `grep`, hand-author entries, back it up with `tar`
 — it's a directory of plain text files. The model is the curator;
 you, the operator, can read and edit anything it decided to keep.
+(`--RAG` still works as a back-compat alias for `--memory`.)
 
 Future evolution (see `RAG.md`): progressive recall on session start,
 automatic document ingestion, per-user namespaces. The on-disk format

@@ -36,10 +36,11 @@ your first manifest, start with [§2. Quickstart (3 minutes)](#2-quickstart-3-mi
 ## 1. What this is, and why
 
 easyai ships with a small set of built-in tools (`web`, `fs`,
-`datetime`, `bash`, `python3`, `rag`, `tool_lookup`). Those are the tools we
+`datetime`, `bash`, `python3`, `memory`, `tool_lookup`). Those are the tools we
 — the agent's authors — wrote, reviewed, and take responsibility
 for. They are the right answer for tools that should ship in every
-easyai install.
+easyai install. (`memory` is also reachable under its legacy name
+`rag` as a back-compat alias.)
 
 But that is not the full story. **You** — the agent's operator —
 have your own programs:
@@ -170,7 +171,7 @@ Each tool object:
 
 | Field | Required | Notes |
 | --- | --- | --- |
-| `name` | yes | Identifier the model uses. `^[a-zA-Z][a-zA-Z0-9_]{0,63}$`. Cannot collide with built-ins (`bash`, `python3`, `web`, `fs`, `rag`, `datetime`, `tool_lookup`) or with tools declared in earlier-sorted files. |
+| `name` | yes | Identifier the model uses. `^[a-zA-Z][a-zA-Z0-9_]{0,63}$`. Cannot collide with built-ins (`bash`, `python3`, `web`, `fs`, `memory`, `datetime`, `tool_lookup`; the legacy alias `rag` is reserved too) or with tools declared in earlier-sorted files. |
 | `description` | yes | Plain English. 1..4096 chars. **The single most important field.** The model reads this to decide *when* to call your tool. Mention edge cases ("returns empty when nothing matches"), expected use ("call this AFTER `web(action=\"search\")`"), and units ("returns kilobytes"). |
 | `command` | yes | **Absolute** path to a regular, executable file. Validated via stat() + access(X_OK) at load. No PATH lookup. |
 | `argv` | yes | Array of strings. Each element is either a literal (no `{` / `}`) or exactly `"{paramname}"`. Embedded placeholders (`"--flag={x}"`) are rejected — split into `["--flag", "{x}"]`. |
