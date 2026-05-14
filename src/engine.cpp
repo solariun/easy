@@ -137,6 +137,107 @@ std::string strip_tool_call_blocks(std::string s) {
     return s;
 }
 
+// Named-tag tool-call recovery.
+// ---------------------------------------------------------------------------
+// Some weak / aggressively-quantised models drop the <tool_call> envelope
+// entirely and use the TOOL NAME itself as the XML tag:
+//
+//     <tool_lookup>
+//     </tool_lookup>
+//
+// or, when they do pass arguments, with a JSON body:
+//
+//     <rag>{"action":"search","keywords":["bitnet"]}</rag>
+//
+// The PEG parser doesn't recognise this shape, tool_calls comes back
+// empty, and the tag leaks into msg.content as the "final answer" —
+// killing the agentic loop. We recover by scanning for <NAME>...</NAME>
+// where NAME is a *registered* tool. Body handling: empty -> "{}"; a
+// JSON object -> used verbatim; anything else -> "{}" (the tool's own
+// argument validation then drives the model to a correct retry).
+//
+// `tool_names` MUST be the live registry — matching arbitrary <tags>
+// would misfire on prose. Even so this is the most false-positive-prone
+// recovery path, so the caller gates it hard (runs last, content-only,
+// and only when stripping the spans leaves a whitespace-only remainder
+// — i.e. the WHOLE visible turn was just tool-name tags). See the
+// dispatch site.
+std::vector<common_chat_tool_call>
+recover_named_tag_tool_calls(const std::string & content,
+                             const std::vector<std::string> & tool_names) {
+    std::vector<common_chat_tool_call> out;
+    size_t pos = 0;
+    while (pos < content.size()) {
+        size_t lt = content.find('<', pos);
+        if (lt == std::string::npos) break;
+        // Which registered tool (if any) does this tag open?
+        const std::string * matched = nullptr;
+        for (const auto & name : tool_names) {
+            if (name.empty()) continue;
+            if (content.compare(lt + 1, name.size(), name) == 0 &&
+                lt + 1 + name.size() < content.size() &&
+                content[lt + 1 + name.size()] == '>') {
+                matched = &name;
+                break;
+            }
+        }
+        if (!matched) { pos = lt + 1; continue; }
+        const std::string & name = *matched;
+        size_t body_begin = lt + 1 + name.size() + 1;       // past "<name>"
+        const std::string close_tag = "</" + name + ">";
+        size_t b = content.find(close_tag, body_begin);
+        if (b == std::string::npos) { pos = body_begin; continue; }
+
+        // Trim the body.
+        std::string body = content.substr(body_begin, b - body_begin);
+        size_t s = 0, e = body.size();
+        while (s < e && std::isspace((unsigned char) body[s]))     ++s;
+        while (e > s && std::isspace((unsigned char) body[e - 1])) --e;
+        body = body.substr(s, e - s);
+
+        std::string arguments_json = "{}";
+        if (!body.empty() && body.front() == '{') {
+            size_t end = walk_balanced_braces(body, 0);
+            if (end != std::string::npos) arguments_json = body.substr(0, end);
+        }
+
+        common_chat_tool_call tc;
+        tc.name      = name;
+        tc.arguments = std::move(arguments_json);
+        out.push_back(std::move(tc));
+        pos = b + close_tag.size();
+    }
+    return out;
+}
+
+// Strip <NAME>...</NAME> spans (NAME a registered tool) from `s` — the
+// content-side counterpart to recover_named_tag_tool_calls.
+std::string strip_named_tag_blocks(std::string s,
+                                   const std::vector<std::string> & tool_names) {
+    size_t pos = 0;
+    while (pos < s.size()) {
+        size_t lt = s.find('<', pos);
+        if (lt == std::string::npos) break;
+        const std::string * matched = nullptr;
+        for (const auto & name : tool_names) {
+            if (name.empty()) continue;
+            if (s.compare(lt + 1, name.size(), name) == 0 &&
+                lt + 1 + name.size() < s.size() &&
+                s[lt + 1 + name.size()] == '>') {
+                matched = &name;
+                break;
+            }
+        }
+        if (!matched) { pos = lt + 1; continue; }
+        const std::string close_tag = "</" + *matched + ">";
+        size_t end = s.find(close_tag, lt);
+        if (end == std::string::npos) { s.erase(lt); break; }
+        s.erase(lt, end + close_tag.size() - lt);
+        pos = lt;
+    }
+    return s;
+}
+
 // Hermes-style tool call recovery.  Some Qwen3 fine-tunes (notably the
 // user's eng_v5 35B-A3) emit tool calls in this XML-ish format instead of
 // the Qwen3 JSON one:
@@ -887,6 +988,45 @@ struct Engine::Impl {
                     "Engine::parse_assistant recovered %zu tool call(s) "
                     "from markdown wrench markers (model abandoned <tool_call> XML)",
                     msg.tool_calls.size());
+            }
+        }
+
+        // 2d) Named-tag recovery — LAST resort. Some weak / aggressively
+        //     quantised models drop the <tool_call> envelope entirely and
+        //     use the tool NAME as the XML tag: `<tool_lookup></tool_lookup>`.
+        //     There's no distinctive marker to gate on (the tag IS a tool
+        //     name), so this is the most false-positive-prone heuristic —
+        //     it runs only when (a) every other recovery came up empty and
+        //     (b) stripping the named-tag spans leaves a whitespace-only
+        //     remainder, i.e. the WHOLE visible turn was just tool-name
+        //     tags. A real prose answer that happens to mention `<plan>`
+        //     keeps a non-empty remainder and is left untouched.
+        if (msg.tool_calls.empty() && !msg.content.empty()) {
+            std::vector<std::string> names;
+            names.reserve(tools.size());
+            for (const auto & t : tools) names.push_back(t.name);
+            auto recovered = recover_named_tag_tool_calls(msg.content, names);
+            if (!recovered.empty()) {
+                std::string stripped = strip_named_tag_blocks(msg.content, names);
+                const bool only_ws = std::all_of(
+                    stripped.begin(), stripped.end(),
+                    [](unsigned char c) { return std::isspace(c); });
+                if (only_ws) {
+                    msg.tool_calls = std::move(recovered);
+                    msg.content.clear();
+                    const size_t tail = std::min<size_t>(600, raw.size());
+                    std::fprintf(stderr,
+                        "[easyai] recovered %zu tool call(s) from bare named "
+                        "tags (model used <toolname> instead of <tool_call>)\n"
+                        "[easyai] broken raw (%zu bytes, last %zu):\n%.*s\n",
+                        msg.tool_calls.size(), raw.size(), tail,
+                        (int) tail, raw.c_str() + raw.size() - tail);
+                    easyai::log::mark_problem(
+                        "Engine::parse_assistant recovered %zu tool call(s) "
+                        "from bare <toolname> tags (model dropped the "
+                        "<tool_call> envelope)",
+                        msg.tool_calls.size());
+                }
             }
         }
         return msg;
