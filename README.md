@@ -990,9 +990,9 @@ default prompts, and the CLI flag wiring at once.
   Full reference in [`easyai-server.md`](easyai-server.md) §1.
 * **RAG: persistent memory.** Seven tools (`rag_save`, `rag_append`,
   `rag_search`, `rag_load`, `rag_list`, `rag_delete`, `rag_keywords`).
-  Multi-keyword search with adaptive threshold + pagination. One
-  Markdown file per entry — operator-readable, hand-editable. See
-  [`RAG.md`](RAG.md).
+  Multi-keyword search (first keyword required, rest rank by overlap)
+  + pagination. One Markdown file per entry — operator-readable,
+  hand-editable. See [`RAG.md`](RAG.md).
 
 ### 2026-04-29 — External tools v2
 

@@ -44,7 +44,7 @@ selected by the `action` parameter:
 ```
 rag(action="save",     title, keywords[], content, fix?)   store / overwrite; fix=true → immutable memory
 rag(action="append",   title, content, keywords?[])        grow an existing memory without losing the previous body
-rag(action="search",   keywords[], page?, max_results?)    find by 1+ keywords (≥2 matches when 2+ given), paginated
+rag(action="search",   keywords[], page?, max_results?)    find by keywords; keyword[0] required, rest rank, paginated
 rag(action="load",     titles[1..4])                       recall up to 4 full bodies
 rag(action="list",     prefix?, max?)                      browse titles
 rag(action="delete",   title)                              forget a stale memory (fixed memories refused)
@@ -432,24 +432,28 @@ discipline as the rest of the RagStore.
 rag_search(keywords: string[], max_results: integer = 10) -> list of {title, keywords, preview, matched/total}
 ```
 
-Pass an array of 1..8 keywords. The threshold is **adaptive**:
+Pass an array of 1..8 keywords. The **first keyword is mandatory**,
+the rest are optional:
 
-- **1 keyword** → returns entries that have that keyword (broad sweep).
-- **2+ keywords** → returns entries that match **at least 2** of them
-  (narrow query, ranked by overlap).
+- **keyword[0]** → required. Every result is guaranteed to carry it.
+- **keyword[1..]** → optional. They never exclude a result; they only
+  rank it higher (more overlap = higher).
 
-Each result reports `matched N/M` so the model can rank: an entry
-that matched 3 of the 4 queried keywords is more relevant than one
-that matched only 2. Best-overlap first, ties broken by recency.
+Lead with the keyword the memory MUST have, then add softer keywords
+to bias the ranking. Each result reports `matched N/M` so the model
+can rank: an entry that matched 3 of the 4 queried keywords is more
+relevant than one that matched only 1. Best-overlap first, ties
+broken by recency.
 
 Returns up to 20 entries (preview ≈ 240 bytes per entry). The model
 picks the most relevant 1–4 titles and calls rag_load to read their
 bodies.
 
-**Optimisation pattern:** start a query with 3-4 related keywords. If
-some entries score `M/M` (full match), you've found exact hits; if
-the best is `2/4`, your space of related notes is sparser than you
-thought — widen your query (drop 1-2 keywords) or use rag_list.
+**Optimisation pattern:** lead with the one keyword every relevant
+memory must carry, then add 2-3 softer keywords to rank. If some
+entries score `M/M` (full match), you've found exact hits; if the
+best is `1/4`, only the required keyword landed — the softer ones
+are too specific, or your notes are sparser than you thought.
 
 **Pagination.** Every response begins with three machine-readable
 header lines:
@@ -676,8 +680,8 @@ Now the next session, when you ask about MQTT, the model
 rag_searches with `["mqtt"]`, finds the 6 titles, loads up to 4, and
 answers from the saved knowledge — no re-reading. If the question
 is more specific ("MQTT QoS levels"), the model uses
-`rag_search(["mqtt", "qos"])` and gets only the entries that score
-on both keywords, ranked by overlap.
+`rag_search(["mqtt", "qos"])` — still every `mqtt` entry, but the
+ones also tagged `qos` rank first.
 
 This is the **positive cycle**: feed knowledge, saved knowledge,
 searched knowledge, recalled knowledge. Each ingestion makes the

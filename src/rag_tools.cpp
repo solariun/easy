@@ -619,6 +619,12 @@ struct RagStore {
 // Helper: parse a JSON array of strings out of the model's tool args.
 // args::get_string handles flat strings; arrays we parse with
 // nlohmann directly so the model can pass proper structured input.
+//
+// Lenient on one common small-model mistake: the array escaped into a
+// JSON string — `"keywords": "[\"a\", \"b\"]"` instead of the spec
+// form `"keywords": ["a", "b"]`. We unwrap one level: if the value is
+// a string that itself parses to a JSON array, we use that. Mirrors
+// args::get_array()'s stringified-array tolerance (see src/tool.cpp).
 // ---------------------------------------------------------------------------
 bool parse_string_array(const std::string & args_json,
                         const std::string & key,
@@ -631,10 +637,23 @@ bool parse_string_array(const std::string & args_json,
             return false;
         }
         if (!j.contains(key)) return true;          // absent → empty
-        const auto & v = j[key];
+        json v = j[key];
         if (v.is_null()) return true;
+        // Stringified-array unwrap: a quoted JSON array becomes a real
+        // one. If the string isn't JSON we leave it alone and let the
+        // is_array() check below produce the proper error.
+        if (v.is_string()) {
+            try {
+                json reparsed = json::parse(v.get<std::string>());
+                if (reparsed.is_array()) v = std::move(reparsed);
+            } catch (const std::exception &) {
+                // not JSON — fall through to the array-type error
+            }
+        }
         if (!v.is_array()) {
-            err = "argument " + key + ": expected array of strings";
+            err = "argument " + key + ": expected an array of strings, "
+                  "e.g. [\"alpha\", \"beta\"] — pass a real JSON array, "
+                  "not a quoted string";
             return false;
         }
         out.clear();
@@ -937,18 +956,16 @@ ToolHandler make_append_handler(std::shared_ptr<RagStore> store) {
 ToolHandler make_search_handler(std::shared_ptr<RagStore> store) {
     return [store](const ToolCall & c) -> ToolResult {
         // Multi-keyword search.
-        //   - 1 keyword passed:  match entries that have THAT keyword
-        //                        (require ≥1 match — same as the
-        //                        original single-keyword behaviour)
-        //   - 2+ keywords passed: match entries that have AT LEAST 2
-        //                        of the queried keywords (require ≥2)
+        //   - keywords[0] is REQUIRED: every result is guaranteed to
+        //     carry the first keyword the model passed.
+        //   - keywords[1..] are OPTIONAL: they never exclude a result,
+        //     they only lift its rank (more overlap → higher).
         //
-        // The threshold is adaptive on purpose: a single-keyword query
-        // is still a useful broad sweep, but the moment the model
-        // sends two or more it's clearly trying to narrow — and we
-        // reward that by demanding overlap. Each result reports how
-        // many of the queried keywords it matched, so the model can
-        // rank / pick.
+        // So a result is returned iff it carries keyword[0]; the rest
+        // just sort the matches. Each result reports how many of the
+        // queried keywords it matched (`[matched N/M]`) so the model
+        // can see the overlap and pick. A single-keyword query is the
+        // degenerate case — that one keyword is the required one.
         std::vector<std::string> keywords;
         std::string err;
         if (!parse_string_array(c.arguments_json, "keywords", keywords, err)) {
@@ -971,13 +988,20 @@ ToolHandler make_search_handler(std::shared_ptr<RagStore> store) {
             }
         }
         // Deduplicate the query — repeated keywords would otherwise
-        // distort the match count.
+        // distort the match count. Order-preserving: keywords[0] is the
+        // required keyword, so its position must not drift (a plain
+        // sort+unique would reorder it).
         {
-            std::sort(keywords.begin(), keywords.end());
-            keywords.erase(std::unique(keywords.begin(), keywords.end()),
-                           keywords.end());
+            std::vector<std::string> deduped;
+            for (const auto & k : keywords) {
+                if (std::find(deduped.begin(), deduped.end(), k)
+                        == deduped.end()) {
+                    deduped.push_back(k);
+                }
+            }
+            keywords = std::move(deduped);
         }
-        const std::size_t min_matches = (keywords.size() >= 2) ? 2 : 1;
+        const std::string & required_kw = keywords.front();
 
         long long max_results = (long long) kSearchResultsDflt;
         args::get_int(c.arguments_json, "max_results", max_results);
@@ -990,6 +1014,7 @@ ToolHandler make_search_handler(std::shared_ptr<RagStore> store) {
             std::string title;
             EntryMeta   meta;
             std::size_t matched = 0;
+            bool        has_required = false;
             std::vector<std::string> matched_keywords;
         };
         std::vector<Hit> hits;
@@ -1003,16 +1028,19 @@ ToolHandler make_search_handler(std::shared_ptr<RagStore> store) {
                 Hit h;
                 h.title = t;
                 h.meta  = m;
-                for (const auto & q : keywords) {
+                for (std::size_t qi = 0; qi < keywords.size(); ++qi) {
+                    const auto & q = keywords[qi];
                     for (const auto & et : m.keywords) {
                         if (et == q) {
                             h.matched_keywords.push_back(q);
+                            if (qi == 0) h.has_required = true;
                             break;
                         }
                     }
                 }
                 h.matched = h.matched_keywords.size();
-                if (h.matched >= min_matches) {
+                // keywords[0] is mandatory; the rest only rank.
+                if (h.has_required) {
                     hits.push_back(std::move(h));
                 }
             }
@@ -1048,12 +1076,11 @@ ToolHandler make_search_handler(std::shared_ptr<RagStore> store) {
             std::ostringstream o;
             o << "total_entries: 0\n";
             o << "page: " << page << " of 0\n\n";
-            o << "no entries match";
-            if (keywords.size() == 1) {
-                o << " keyword \"" << queried_str << "\"";
-            } else {
-                o << " at least " << min_matches
-                  << " of [" << queried_str << "]";
+            o << "no entries carry the required keyword \""
+              << required_kw << "\"";
+            if (keywords.size() > 1) {
+                o << " (the other queried keywords only affect ranking, "
+                     "they don't broaden the match)";
             }
             o << ". Use rag_list to browse, or rag_save to add new entries.";
             return ToolResult::ok(o.str());
@@ -1093,9 +1120,9 @@ ToolHandler make_search_handler(std::shared_ptr<RagStore> store) {
             o << "match keyword \"" << queried_str
               << "\" (newest first):\n\n";
         } else {
-            o << "match ≥" << min_matches << " of ["
-              << queried_str
-              << "] (best-overlap first, then newest):\n\n";
+            o << "required keyword \"" << required_kw
+              << "\" — queried [" << queried_str
+              << "], ranked by overlap (best first, then newest):\n\n";
         }
         for (std::size_t i = offset; i < slice_end; ++i) {
             const auto & h = hits[i];
@@ -1514,12 +1541,22 @@ Tool make_rag_tool(std::string root_dir) {
             "    and on titles that don't exist (use save to create).\n"
             "\n"
             "  action=\"search\"\n"
-            "    Search memories by keyword(s). Required: keywords (array). "
-            "    With one keyword you get any memory carrying it; with two "
-            "    or more, only memories matching ≥2 of them, ranked by "
-            "    overlap. Optional: max_results (default 10, max 20), "
-            "    page (default 1; the response includes `total_entries`, "
-            "    `page: P of N`, `has_more` for pagination).\n"
+            "    Search memories by keyword(s). Required: keywords — a "
+            "    JSON array of strings, e.g. [\"bitnet\", \"paper\"] "
+            "    (a real array, NOT a quoted string). The FIRST keyword "
+            "    is MANDATORY: every result is guaranteed to carry it. "
+            "    Any further keywords are OPTIONAL — they never exclude "
+            "    a result, they only rank it higher (more overlap = "
+            "    higher). So lead with the keyword the memory MUST have, "
+            "    then add softer keywords to bias the ranking. Every "
+            "    result is tagged `[matched N/M: ...]` so you can see "
+            "    how many of your keywords it hit. Optional params: "
+            "    max_results (default 10, max 20), page (default 1; the "
+            "    response includes `total_entries`, `page: P of N`, "
+            "    `has_more` for pagination). Example: "
+            "    rag(action=\"search\", keywords=[\"bitnet\", \"paper\", "
+            "    \"1-bit\"]) returns every memory tagged `bitnet`, with "
+            "    those also tagged `paper` / `1-bit` ranked first.\n"
             "\n"
             "  action=\"load\"\n"
             "    Recall the FULL content of up to 4 memories by exact "
@@ -1585,10 +1622,14 @@ Tool make_rag_tool(std::string root_dir) {
                "Used by load. Array of 1..4 exact memory titles to recall.",
                false)
         .param("keywords",    "array",
-               "Used by save / append / search. 1..8 short keywords "
-               "[A-Za-z0-9._+-]. On save: tags this memory; on append: "
-               "extra keywords merged into the existing list (deduped, "
-               "total still capped at 8); on search: the query.",
+               "Used by save / append / search. A JSON array of 1..8 "
+               "short strings [A-Za-z0-9._+-], e.g. [\"alpha\", "
+               "\"beta\"] — pass a real array, NOT a quoted string. "
+               "On save: tags this memory; on append: extra keywords "
+               "merged into the existing list (deduped, total still "
+               "capped at 8); on search: the query — the FIRST keyword "
+               "is required (every result carries it), the rest are "
+               "optional and only affect ranking.",
                false)
         .param("content",     "string",
                "Used by save / append. On save: the full memory body. On "
