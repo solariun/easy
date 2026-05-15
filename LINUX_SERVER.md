@@ -280,9 +280,12 @@ installer leaves room for in `/etc/easyai/easyai.ini`:
   this one. Pair with `mcp_token = …` if the upstream uses bearer
   auth. Local tool names win on collision.
 - `[SERVER] use_google = true`. Enables `engine="google"` inside the
-  unified `web` tool (Google Custom Search JSON API). Needs
+  unified `web` tool (Google Custom Search JSON API), and lets the
+  default `engine="auto"` cascade try google as its first hop. Needs
   `GOOGLE_API_KEY` and `GOOGLE_CSE_ID` in `Environment=` lines of a
   drop-in. Counts against your Google quota (free tier: 100/day).
+  Without it, the auto cascade falls through to bing (keyless RSS)
+  and then ddg (keyless HTML scrape).
 - `[SERVER] local_tools = false` (or pass `--no-local-tools`).
   Skips the LOCAL built-in toolbelt — the model only sees the
   `memory` tool, external-tools, and any `--mcp` upstream. **Renamed

@@ -16,23 +16,31 @@ Tool datetime();   // returns current UTC + local time in ISO-8601
 // web: unified search + fetch tool. Single dispatcher with two actions:
 //
 //   action="search"  query → numbered title/url/snippet results
-//                    engine: "ddg" (default, DuckDuckGo, no key) or
-//                    "google" (Google Custom Search JSON API; needs
-//                    GOOGLE_API_KEY + GOOGLE_CSE_ID env vars at call
-//                    time, AND `google_enabled=true` at registration —
-//                    the operator-opt-in gate that keeps a billed
-//                    third-party API off by default). Page-based
-//                    pagination over the engine's own ordering.
+//                    engine: "auto" (default) cascades through
+//                    google → bing → ddg and returns the first one
+//                    that succeeds. Explicit picks: "google" (Google
+//                    Custom Search JSON API; needs GOOGLE_API_KEY +
+//                    GOOGLE_CSE_ID env vars at call time AND
+//                    `google_enabled=true` at registration — the
+//                    operator-opt-in gate that keeps a billed third-
+//                    party API off by default), "bing" (Bing RSS feed,
+//                    keyless and captcha-free, ~10 results per query
+//                    with no real pagination), "ddg" (DuckDuckGo HTML
+//                    scrape, keyless but increasingly blocked from
+//                    server IPs by anti-bot heuristics).
+//                    Page-based pagination over the engine's own
+//                    ordering. The output's `engine: <name>` header
+//                    tells the caller which backend actually answered.
 //
 //   action="fetch"   url → text content (HTML stripped, or raw with
 //                    as_html=true). Pagination via start (byte offset)
 //                    + limit (window size, default 8 KB).
 //
 // `google_enabled` only governs whether engine="google" is accepted at
-// CALL time; the env vars are still re-read on every call so a key
-// rotation mid-session works without a restart, and a missing key
-// surfaces a clear actionable error rather than silently disappearing
-// from the catalog.
+// CALL time (or auto-cascade attempts it); the env vars are still
+// re-read on every call so a key rotation mid-session works without a
+// restart, and a missing key in the auto cascade is silently skipped
+// (not a failure) so deployment without Google credentials still works.
 Tool web(bool google_enabled = false);
 
 // Focused per-action variants of `web` (web_search, web_fetch). Same

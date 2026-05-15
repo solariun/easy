@@ -803,15 +803,19 @@ ToolResult web_search_ddg(const std::string & query, long long page,
                 "DuckDuckGo blocked this request — it returned its "
                 "anti-bot \"anomaly\" page instead of results. This is "
                 "an IP/client-level block, not a transient rate-limit, "
-                "so retrying soon usually won't help. Use the Google "
-                "engine instead: set GOOGLE_API_KEY + GOOGLE_CSE_ID and "
-                "pass engine=\"google\".");
+                "so retrying soon usually won't help. The default "
+                "engine=\"auto\" already cascades through bing and "
+                "google before falling here; if you reached this error "
+                "via an explicit engine=\"ddg\", drop the override and "
+                "let auto pick.");
         }
         return ToolResult::error(
             "no results parsed — DuckDuckGo returned a page with no "
             "recognisable result entries (possible HTML markup change, "
-            "or a genuinely empty result set for this query). If this "
-            "persists across queries, switch to engine=\"google\".");
+            "or a genuinely empty result set for this query). The "
+            "default engine=\"auto\" already tries bing before this; "
+            "if you reached this via explicit engine=\"ddg\", switch to "
+            "auto or engine=\"bing\".");
     }
 
     const long long total = (long long) hits.size();
@@ -832,6 +836,116 @@ ToolResult web_search_ddg(const std::string & query, long long page,
     out << "page: "          << page << " of " << total_pages << "\n";
     out << "has_more: "      << (page < total_pages ? "yes" : "no") << "\n";
     out << "engine: ddg\n";
+    out << "Top web results for: " << query << "\n";
+    for (long long i = start_idx; i < end_idx; ++i) {
+        out << "\n" << (i + 1) << ". " << hits[i].title
+            << "\n   " << hits[i].url
+            << "\n   " << clip(hits[i].snippet, 300) << "\n";
+    }
+    return ToolResult::ok(clip(out.str(), 8 * 1024));
+#endif
+}
+
+// ---------- search: Bing RSS feed ----------
+// GET www.bing.com/search?q=...&format=rss — Bing's RSS endpoint returns
+// a clean XML feed of ~10 results per query. Unlike the HTML page (which
+// degrades to an empty layout for non-browser UAs even with a Chrome
+// persona), RSS is a first-class output Microsoft maintains for feed
+// consumers, so it stays keyless, captcha-free, and stable.
+//
+// LIMITS
+//   - ~10 results per query, hard. The `&first=N` pagination parameter
+//     is accepted by the URL but the server ignores it for RSS — every
+//     request returns the same first page. So `page > 1` returns a
+//     past-end marker rather than fabricating duplicates; for deeper
+//     pagination use engine="google".
+//   - No regional bias by default. Pass `mkt=`/`cc=` in the query string
+//     yourself if needed (the wrapper doesn't expose a region knob).
+ToolResult web_search_bing(const std::string & query, long long page,
+                           long long max_results) {
+#if !defined(EASYAI_HAVE_CURL)
+    (void) query; (void) page; (void) max_results;
+    return ToolResult::error(
+        "web search unavailable: easyai built without libcurl");
+#else
+    if (max_results < 1)  max_results = 1;
+    if (max_results > 10) max_results = 10;
+    if (page < 1)         page = 1;
+
+    const std::string url = "https://www.bing.com/search?q="
+        + url_encode(query) + "&format=rss";
+
+    std::string body, err;
+    if (!http_get(url, {}, body, err)) {
+        return ToolResult::error("bing search failed: " + err);
+    }
+    if (body.empty()) {
+        return ToolResult::error("bing search failed: empty response");
+    }
+
+    // Parse <item>…</item> blocks. Bing's RSS doesn't use CDATA; the
+    // <description> field carries HTML entities (&lt;, &amp;, &#39;, …)
+    // and sometimes inline <strong> tags around hit terms. strip_html()
+    // handles both.
+    static const std::regex re_item(
+        R"RSS(<item>([\s\S]*?)</item>)RSS",
+        std::regex::icase);
+    static const std::regex re_title(
+        R"RSS(<title>([\s\S]*?)</title>)RSS",
+        std::regex::icase);
+    static const std::regex re_link(
+        R"RSS(<link>([\s\S]*?)</link>)RSS",
+        std::regex::icase);
+    static const std::regex re_desc(
+        R"RSS(<description>([\s\S]*?)</description>)RSS",
+        std::regex::icase);
+
+    struct Hit { std::string title, url, snippet; };
+    std::vector<Hit> hits;
+    hits.reserve(16);
+
+    auto end_it = std::sregex_iterator();
+    for (auto it = std::sregex_iterator(body.begin(), body.end(), re_item);
+         it != end_it; ++it) {
+        const std::string item = (*it)[1].str();
+        std::smatch m;
+        std::string title, link, desc;
+        if (std::regex_search(item, m, re_title)) title = strip_html(m[1].str());
+        if (std::regex_search(item, m, re_link))  link  = trim(m[1].str());
+        if (std::regex_search(item, m, re_desc))  desc  = strip_html(m[1].str());
+        if (link.empty() || title.empty()) continue;
+        hits.push_back({std::move(title), std::move(link), std::move(desc)});
+    }
+
+    if (hits.empty()) {
+        return ToolResult::error(
+            "no results parsed — Bing RSS returned a feed with no "
+            "items (possible empty result set, IP-level block, or "
+            "schema drift). The default engine=\"auto\" already "
+            "cascades to ddg after this; if you reached this via "
+            "explicit engine=\"bing\", switch to auto.");
+    }
+
+    const long long total = (long long) hits.size();
+    const long long total_pages =
+        (total + max_results - 1) / max_results;
+    if (page > total_pages) {
+        std::ostringstream o;
+        o << "[page " << page << " is past last page (" << total_pages
+          << "); total_entries: " << total
+          << "; bing RSS caps at ~10 results per query — for deeper "
+             "pagination use engine=\"google\"]";
+        return ToolResult::ok(o.str());
+    }
+
+    const long long start_idx = (page - 1) * max_results;
+    const long long end_idx   = std::min(total, start_idx + max_results);
+
+    std::ostringstream out;
+    out << "total_entries: " << total << "\n";
+    out << "page: "          << page << " of " << total_pages << "\n";
+    out << "has_more: "      << (page < total_pages ? "yes" : "no") << "\n";
+    out << "engine: bing\n";
     out << "Top web results for: " << query << "\n";
     for (long long i = start_idx; i < end_idx; ++i) {
         out << "\n" << (i + 1) << ". " << hits[i].title
@@ -952,6 +1066,37 @@ ToolResult web_search_google(const std::string & query, long long page,
 }
 
 // ---------- search: dispatch ----------
+// Default engine is "auto" — a fixed-order cascade through the three
+// backends, picking the first that returns a non-error response:
+//
+//     google  →  bing  →  ddg
+//
+// Why this order:
+//   - Google CSE is the highest-quality result set, but it's billed and
+//     requires both an operator opt-in (`use_google=true` at register
+//     time) and two env vars (GOOGLE_API_KEY, GOOGLE_CSE_ID). When all
+//     of those are in place we prefer it. When any are missing we
+//     SKIP — not error — and move on, so a deployment without Google
+//     credentials silently falls through to the keyless engines.
+//   - Bing RSS (`/search?q=…&format=rss`) is keyless, captcha-free,
+//     stable, and a strict superset of "the engine works for non-
+//     browser clients" (which DDG no longer is for many server IPs).
+//     It caps at ~10 results per query and ignores pagination, but for
+//     the 80% case that's enough.
+//   - DDG HTML scrape is the historical default. Kept as the last
+//     fallback because (a) no key, (b) different result distribution
+//     from bing — sometimes it surfaces a hit the others miss — but
+//     it's the most likely to return the anti-bot "anomaly" page from
+//     a server IP, which is why it's no longer the default.
+//
+// If all three fail, the error aggregates each engine's reason, so the
+// operator can tell at a glance whether it's a credential issue, a
+// network issue, or genuinely no results for the query.
+//
+// Explicit engine= overrides skip the cascade entirely and run that
+// engine alone — useful for diagnosis ("does ddg still work from this
+// box?") or for pinning a known-good engine when the cascade order is
+// not what the caller wants.
 ToolResult web_handle_search(const ToolCall & c, bool google_enabled) {
     std::string query;
     if (!args::get_string(c.arguments_json, "query", query) || query.empty()) {
@@ -962,26 +1107,72 @@ ToolResult web_handle_search(const ToolCall & c, bool google_enabled) {
     args::get_int(c.arguments_json, "max_results", max_results);
     long long page = 1;
     args::get_int(c.arguments_json, "page", page);
-    std::string engine = "ddg";
+    std::string engine;
     args::get_string(c.arguments_json, "engine", engine);
 
-    if (engine == "ddg") {
-        return web_search_ddg(query, page, max_results);
-    }
+    // Explicit engine — run only that engine, no fallback.
+    if (engine == "ddg")  return web_search_ddg(query, page, max_results);
+    if (engine == "bing") return web_search_bing(query, page, max_results);
     if (engine == "google") {
         if (!google_enabled) {
             return ToolResult::error(
                 "engine=\"google\" not enabled on this server — operator "
                 "must pass --use-google (or Toolbelt::use_google()) to "
-                "allow Google CSE. Default engine \"ddg\" works without "
-                "any opt-in.");
+                "allow Google CSE. Default engine \"auto\" cascades "
+                "google → bing → ddg and works without any opt-in.");
         }
         return web_search_google(query, page, max_results);
     }
-    return ToolResult::error(
-        "unknown engine \"" + engine + "\" — valid: \"ddg\" "
-        "(DuckDuckGo, no key) or \"google\" (Google Custom Search, "
-        "needs GOOGLE_API_KEY + GOOGLE_CSE_ID env vars)");
+    if (!engine.empty() && engine != "auto") {
+        return ToolResult::error(
+            "unknown engine \"" + engine + "\" — valid: \"auto\" "
+            "(default; cascades google → bing → ddg), \"google\" "
+            "(needs GOOGLE_API_KEY + GOOGLE_CSE_ID env vars and "
+            "operator opt-in), \"bing\" (RSS, keyless), \"ddg\" "
+            "(HTML scrape, keyless).");
+    }
+
+    // Auto cascade.
+    std::vector<std::string> tried;
+
+    // 1. Google — only if operator opted in AND env vars are present.
+    //    Missing creds is "skip", not "fail".
+    if (google_enabled) {
+        const char * gk = std::getenv("GOOGLE_API_KEY");
+        const char * gc = std::getenv("GOOGLE_CSE_ID");
+        if (gk && *gk && gc && *gc) {
+            ToolResult r = web_search_google(query, page, max_results);
+            if (!r.is_error) return r;
+            tried.push_back("google: " + r.content);
+        } else {
+            tried.push_back(
+                "google: skipped (GOOGLE_API_KEY / GOOGLE_CSE_ID env "
+                "vars not set)");
+        }
+    } else {
+        tried.push_back(
+            "google: skipped (operator did not enable engine=\"google\" "
+            "at registration)");
+    }
+
+    // 2. Bing RSS — keyless, the workhorse fallback.
+    {
+        ToolResult r = web_search_bing(query, page, max_results);
+        if (!r.is_error) return r;
+        tried.push_back("bing: " + r.content);
+    }
+
+    // 3. DDG HTML — last resort, often blocked from server IPs.
+    {
+        ToolResult r = web_search_ddg(query, page, max_results);
+        if (!r.is_error) return r;
+        tried.push_back("ddg: " + r.content);
+    }
+
+    std::ostringstream o;
+    o << "all search engines failed:";
+    for (const auto & e : tried) o << "\n  - " << e;
+    return ToolResult::error(o.str());
 }
 
 // ---------- fetch: GET a URL, return text (or raw HTML), with paging ----------
@@ -1058,9 +1249,14 @@ std::vector<Tool> web_split(bool google_enabled) {
                "1-based page over the engine's own ordering "
                "(default 1).", false)
         .param("engine",      "string",
-               "\"ddg\" (default, DuckDuckGo, no key) or \"google\" "
-               "(Google Custom Search; needs GOOGLE_API_KEY + "
-               "GOOGLE_CSE_ID env vars AND the operator opt-in).", false)
+               "Which backend to use. \"auto\" (default) cascades "
+               "google → bing → ddg and returns the first one that "
+               "succeeds. Explicit picks: \"google\" (Google Custom "
+               "Search; needs GOOGLE_API_KEY + GOOGLE_CSE_ID env vars "
+               "AND operator opt-in), \"bing\" (Bing RSS; keyless, "
+               "~10 results, no real pagination), \"ddg\" (DuckDuckGo "
+               "HTML scrape; keyless but often blocked from server "
+               "IPs). Pin a specific engine only for diagnosis.", false)
         .handle([google_enabled](const ToolCall & c) -> ToolResult {
             return web_handle_search(c, google_enabled);
         })
@@ -1100,15 +1296,18 @@ Tool web(bool google_enabled) {
             "\n"
             "  action=\"search\"\n"
             "    Search the web. Required: query. Optional: max_results "
-            "(default 5; ddg max 20, google max 10), page (1-based, "
-            "default 1; pages slice the engine's own ordering), engine "
-            "(\"ddg\" default — DuckDuckGo, no key, works out of the "
-            "box; \"google\" — Google Custom Search JSON API, needs "
-            "GOOGLE_API_KEY + GOOGLE_CSE_ID env vars and an operator "
-            "opt-in; google may be disabled on this deployment, in "
-            "which case use \"ddg\"). Returns a numbered title / url / "
-            "snippet list with `total_entries`, `page`, `has_more` "
-            "header lines so you can page forward without guessing.\n"
+            "(default 5; ddg max 20, bing max 10, google max 10), page "
+            "(1-based, default 1; pages slice the engine's own "
+            "ordering — note bing RSS only returns ~10 results and "
+            "ignores pagination), engine (default \"auto\" cascades "
+            "google → bing → ddg and returns the first that works; "
+            "explicit picks: \"google\" needs GOOGLE_API_KEY + "
+            "GOOGLE_CSE_ID and operator opt-in, \"bing\" is keyless "
+            "RSS, \"ddg\" is keyless HTML scrape — pin one only for "
+            "diagnosis). Returns a numbered title / url / snippet list "
+            "with `total_entries`, `page`, `has_more`, `engine` "
+            "header lines so you can page forward without guessing "
+            "and see which backend actually answered.\n"
             "\n"
             "  action=\"fetch\"\n"
             "    Read a URL's actual content. Required: url. Optional: "
@@ -1145,8 +1344,10 @@ Tool web(bool google_enabled) {
                "when a previous search returned `has_more: yes`. "
                "Google CSE caps total pageable results at 100.", false)
         .param("engine",      "string",
-               "Used by search. \"ddg\" (default, no key) or "
-               "\"google\" (needs env vars + operator opt-in).", false)
+               "Used by search. \"auto\" (default; cascades google → "
+               "bing → ddg), \"google\" (needs env vars + operator "
+               "opt-in), \"bing\" (RSS, keyless), \"ddg\" (HTML, "
+               "keyless).", false)
         .param("start",       "integer",
                "Used by fetch. Byte offset into the stripped (or raw, "
                "if as_html=true) body for pagination. Default 0.", false)

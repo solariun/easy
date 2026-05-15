@@ -569,10 +569,13 @@ mirrors the rag dispatcher introduced 2026-05-04.
 
 * **`web` tool** — `web(action="search"|"fetch")`. Replaces the
   separate `web_search`, `web_fetch`, and `web_google` tools. Search
-  takes an `engine` parameter (`"ddg"` default — DuckDuckGo, no key;
-  `"google"` opt-in via `--use-google` and the same env-var pair
-  Google CSE has always required). Both actions take `page` for
-  pagination; `fetch` takes `start` + `limit` for byte-window control.
+  takes an `engine` parameter (`"auto"` default — cascades through
+  google → bing → ddg, returning the first that succeeds; explicit
+  picks: `"google"` opt-in via `--use-google` plus the GOOGLE_API_KEY /
+  GOOGLE_CSE_ID env vars, `"bing"` keyless RSS feed, `"ddg"` keyless
+  HTML scrape but increasingly blocked from server IPs). Both actions
+  take `page` for pagination; `fetch` takes `start` + `limit` for
+  byte-window control.
 * **`fs` tool** — `fs(action="read"|"write"|"list"|"glob"|"grep"|"check_path"|"cwd"|"sandbox")`.
   Replaces seven separate factories plus `get_current_dir` and
   `get_sandbox_path`. `--allow-fs` now registers one tool, not seven.
@@ -1666,11 +1669,15 @@ engine.add_tool(
 * `easyai::tools::*` — built-in tools:
   * `datetime` (no deps)
   * `web` — unified search + fetch (`action="search"` / `"fetch"`).
-    Search engine selectable: `"ddg"` (DuckDuckGo, no key, default)
-    or `"google"` (Google Custom Search JSON API, opt-in via the
-    `google_enabled` ctor flag and the GOOGLE_API_KEY + GOOGLE_CSE_ID
-    env vars). Page-based pagination on search; byte-window pagination
-    on fetch. libcurl required at build time.
+    Search engine selectable: `"auto"` (default; cascades google →
+    bing → ddg, returning the first that succeeds — Bing carries the
+    keyless workhorse case since DDG started anti-bot blocking server
+    IPs), or pin one explicitly: `"google"` (Google Custom Search JSON
+    API, opt-in via the `google_enabled` ctor flag and the
+    GOOGLE_API_KEY + GOOGLE_CSE_ID env vars), `"bing"` (Bing RSS feed,
+    keyless), `"ddg"` (DuckDuckGo HTML scrape, keyless). Page-based
+    pagination on search; byte-window pagination on fetch. libcurl
+    required at build time.
   * `fs` — unified filesystem (`action="read"` / `"write"` / `"list"`
     / `"glob"` / `"grep"` / `"check_path"` / `"cwd"` / `"sandbox"`),
     sandboxed to a root directory you provide; the model sees a
@@ -1737,7 +1744,7 @@ no shell.
 | (no flag)             | `datetime` and the unified `web` tool (action=`search` / `fetch`) only. |
 | `--sandbox <dir>`     | The unified `fs` tool (action=`read` / `write` / `list` / `glob` / `grep` / `check_path` / `cwd` / `sandbox`), all scoped to `<dir>`. The CLIs `chdir` into `<dir>` so `fs(action="cwd")` reports the sandbox path back to the model. |
 | `--allow-bash`        | `bash` (run `/bin/sh -c`). cwd = `--sandbox <dir>` if given, otherwise the binary's CWD. NOT a hardened sandbox — runs with your user privileges. Also bumps the agentic-loop `max_tool_hops` to 99999 (bash flows naturally span many turns). |
-| `--use-google`        | Enables `engine="google"` inside the unified `web` tool (Google Custom Search JSON API). Requires `GOOGLE_API_KEY` and `GOOGLE_CSE_ID` env vars. Counts against your Google quota — free tier is 100 queries/day per key. Silently skipped if either env var is missing; the default `engine="ddg"` keeps working. |
+| `--use-google`        | Enables `engine="google"` inside the unified `web` tool (Google Custom Search JSON API), and lets the default `engine="auto"` cascade try google as its first hop. Requires `GOOGLE_API_KEY` and `GOOGLE_CSE_ID` env vars. Counts against your Google quota — free tier is 100 queries/day per key. Without this flag (or without the env vars), the auto cascade silently skips google and falls through to bing → ddg. |
 | `--external-tools <dir>` | Load every `EASYAI-<name>.tools` file in `<dir>` as an operator-defined tool pack. Per-file fault isolation (a bad file is logged + skipped, the agent still starts). Spawns via `fork`+`execve` — never a shell. **This is the supported way to give the model focused powers without flipping `--allow-bash`.** See [`EXTERNAL_TOOLS.md`](EXTERNAL_TOOLS.md). |
 | `--memory <dir>`      | Enable the agent's persistent **memory** (search / store / append / recall / update / forget) — a passive RAG technique over keyword-indexed Markdown files. Registers ONE `memory(action=...)` tool with sub-actions `save`, `append` (grow an existing memory without losing its body), `search`, `load`, `list`, `delete`, `keywords` — each memory one Markdown file in `<dir>`. Memories whose title starts with `fix-easyai-` are immutable: pass `fix=true` (sub-action `save`) to mint one. `--RAG` is still accepted as a back-compat alias. The systemd-installed server passes this by default (`/var/lib/easyai/rag`). See [`RAG.md`](RAG.md). |
 | `--mcp <url>`         | Connect to a remote MCP server as a CLIENT (e.g. another `easyai-server` or `easyai-mcp-server`). The upstream's tool catalogue is fetched via `tools/list` and merged into the local one; each remote tool's handler proxies `tools/call` back to it. Local tool names win on collision (remote dup skipped with a warning). Pair with `--mcp-token <token>` when the upstream requires bearer auth. |
@@ -2086,12 +2093,25 @@ the other explicitly with `-DGGML_METAL=OFF` / `-DGGML_CUDA=OFF`.
 
 ### Web search
 
-`web(action="search")` with the default `engine="ddg"` hits DuckDuckGo's
-HTML endpoint (`html.duckduckgo.com/html/`) directly and parses the result
-page. No API key, no external service to run, no environment variable to
-set. Works as long as the host has outbound HTTPS to duckduckgo.com. Pass
-`engine="google"` (operator opt-in via `--use-google` plus `GOOGLE_API_KEY`
-+ `GOOGLE_CSE_ID`) for Google CSE instead.
+`web(action="search")` with the default `engine="auto"` cascades through
+three backends and returns the first one that succeeds:
+
+1. **Google CSE** — only if `--use-google` is passed AND `GOOGLE_API_KEY`
+   + `GOOGLE_CSE_ID` are set; if any are missing this hop is silently
+   skipped (not a failure).
+2. **Bing RSS** — `www.bing.com/search?q=…&format=rss`. Keyless,
+   captcha-free XML feed maintained for legitimate feed consumers.
+   Caps at ~10 results per query and ignores pagination, but for the
+   80% case that's enough. This is the keyless workhorse.
+3. **DuckDuckGo HTML scrape** — `html.duckduckgo.com/html/`. Keyless,
+   the historical default, kept as last resort because DDG's anti-bot
+   heuristics now return an "anomaly" page (HTTP 202, no results) for
+   most server IPs.
+
+Pin a specific backend with `engine="google"` / `"bing"` / `"ddg"`
+when you want to bypass the cascade (useful for diagnosis: "does ddg
+still work from this box?"). The output's `engine: <name>` header line
+tells the model which backend actually answered.
 
 ---
 
