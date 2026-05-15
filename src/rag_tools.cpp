@@ -67,8 +67,12 @@ using json   = nlohmann::json;
 // of the entry's file, so banning slashes / dots / spaces also
 // closes path traversal as a side effect.
 constexpr std::size_t kMaxTitleBytes      = 64;
-constexpr std::size_t kMaxKeywordBytes        = 32;
-constexpr std::size_t kMaxKeywordsPerEntry    = 8;
+// Roomy caps for keywords: small models naturally extract 10-20
+// terms when prompted, and longer compound keywords (e.g.
+// "bitnet_ternary_quantization") read better than two cramped halves.
+// On-disk impact is negligible — one extra header line per memory.
+constexpr std::size_t kMaxKeywordBytes        = 64;
+constexpr std::size_t kMaxKeywordsPerEntry    = 24;
 
 // Content cap. 256 KiB is generous for "a piece of knowledge worth
 // remembering" — long enough to fit a code recipe + commentary, short
@@ -206,6 +210,72 @@ bool is_valid_title(const std::string & s, std::size_t max_len) {
         }
     }
     return false;          // no alnum → reject
+}
+
+// normalize_id — map a free-form string onto is_valid_id's charset.
+// Goal: let the model say "neural network" or "C++17 features" and
+// have us store a sane on-disk identifier without bouncing the call.
+//
+// Rules (deterministic, no allocation surprises):
+//   * alnum / `-` / `_` / `.` / `+` are kept verbatim.
+//   * whitespace and path-component separators (` `, `\t`, `/`, `\`,
+//     `:`) collapse to a single `_` (runs of separators become one).
+//   * every other byte (quotes, parens, `?`, `!`, multi-byte UTF-8
+//     leading bytes, etc.) is dropped — keeping them as separators
+//     would explode common natural-language input into nonsense.
+//   * trailing `_` is trimmed (a string ending in punctuation that
+//     normalised to `_` shouldn't keep the empty-trailing).
+//   * the result is truncated to max_len, then re-trimmed.
+//
+// Returns the normalised string. Empty result is possible (caller
+// must check) when the input was pure noise (e.g. "???" → "").
+std::string normalize_id(const std::string & s, std::size_t max_len) {
+    std::string out;
+    out.reserve(s.size());
+    auto is_kept = [](char c) {
+        return (c >= 'a' && c <= 'z') ||
+               (c >= 'A' && c <= 'Z') ||
+               (c >= '0' && c <= '9') ||
+               c == '-' || c == '_' || c == '.' || c == '+';
+    };
+    auto is_separator = [](char c) {
+        return c == ' '  || c == '\t' || c == '\r' || c == '\n'
+            || c == '/'  || c == '\\' || c == ':';
+    };
+    for (char c : s) {
+        if (is_kept(c)) {
+            out += c;
+        } else if (is_separator(c)) {
+            if (!out.empty() && out.back() != '_') out += '_';
+        }
+        // else: drop silently
+    }
+    while (!out.empty() && out.back() == '_') out.pop_back();
+    if (out.size() > max_len) {
+        out.resize(max_len);
+        while (!out.empty() && out.back() == '_') out.pop_back();
+    }
+    return out;
+}
+
+// normalize_title — normalize_id + extra FS-safety constraints:
+// strip leading dots (dotfiles), reject pure-symbol results, reject
+// the path aliases "." and "..". Empty return means "could not
+// produce a usable title" — caller emits an error to the model.
+std::string normalize_title(const std::string & s, std::size_t max_len) {
+    std::string n = normalize_id(s, max_len);
+    while (!n.empty() && n.front() == '.') n.erase(n.begin());
+    if (n == "." || n == "..") return {};
+    bool has_alnum = false;
+    for (char c : n) {
+        if ((c >= 'a' && c <= 'z') ||
+            (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9')) {
+            has_alnum = true;
+            break;
+        }
+    }
+    return has_alnum ? n : std::string();
 }
 
 // ---------------------------------------------------------------------------
@@ -693,9 +763,22 @@ std::string make_preview(const std::string & content, std::size_t max_bytes) {
 
 ToolHandler make_save_handler(std::shared_ptr<RagStore> store) {
     return [store](const ToolCall & c) -> ToolResult {
-        std::string title;
-        if (!args::get_string(c.arguments_json, "title", title) || title.empty()) {
+        std::string title_raw;
+        if (!args::get_string(c.arguments_json, "title", title_raw) || title_raw.empty()) {
             return ToolResult::error("missing required argument: title");
+        }
+
+        // Normalize first so the model can pass natural strings
+        // ("BitNet ternary research") without bouncing on regex.
+        // The normalised form is what lives on disk; we report any
+        // change back in the success message so the model knows the
+        // canonical key for a later append / search / load.
+        std::string title = normalize_title(title_raw, kMaxTitleBytes);
+        if (title.empty()) {
+            return ToolResult::error(
+                "title \"" + title_raw + "\" could not be normalised to a "
+                "valid identifier (alphanumerics + .-_+ only). Try a title "
+                "with at least one letter or digit.");
         }
 
         // `fix=true` promotes the memory to immutable. Two ways to ask
@@ -710,22 +793,18 @@ ToolHandler make_save_handler(std::shared_ptr<RagStore> store) {
         args::get_bool(c.arguments_json, "fix", fix);
         if (fix && !title_is_fixed(title)) {
             title = std::string(kFixedTitlePrefix) + title;
+            if (title.size() > kMaxTitleBytes) {
+                title.resize(kMaxTitleBytes);
+                while (!title.empty() && title.back() == '_') title.pop_back();
+            }
         }
 
-        if (!is_valid_title(title, kMaxTitleBytes)) {
-            return ToolResult::error(
-                "title \"" + title + "\" is invalid; must match "
-                "[A-Za-z0-9._+-]{1," + std::to_string(kMaxTitleBytes) + "} "
-                "(fix=true auto-prepends \"" + std::string(kFixedTitlePrefix)
-                + "\" — keep the rest under the title length cap)");
-        }
-
-        std::vector<std::string> keywords;
+        std::vector<std::string> keywords_raw;
         std::string err;
-        if (!parse_string_array(c.arguments_json, "keywords", keywords, err)) {
+        if (!parse_string_array(c.arguments_json, "keywords", keywords_raw, err)) {
             return ToolResult::error(err);
         }
-        if (keywords.empty()) {
+        if (keywords_raw.empty()) {
             return ToolResult::error(
                 "keywords must be a non-empty array (1.."
                 + std::to_string(kMaxKeywordsPerEntry)
@@ -733,16 +812,32 @@ ToolHandler make_save_handler(std::shared_ptr<RagStore> store) {
                   "memory later — a memory with no keywords is unreachable by "
                   "keyword search (only rag_list can find it).");
         }
-        if (keywords.size() > kMaxKeywordsPerEntry) {
-            return ToolResult::error(
-                "too many keywords (max " + std::to_string(kMaxKeywordsPerEntry) + ")");
-        }
-        for (const auto & t : keywords) {
-            if (!is_valid_id(t, kMaxKeywordBytes)) {
-                return ToolResult::error(
-                    "keyword \"" + t + "\" is invalid; must match "
-                    "[A-Za-z0-9._+-]{1," + std::to_string(kMaxKeywordBytes) + "}");
+        // Normalize each keyword. Drop empties (e.g. "???" → ""),
+        // dedup after normalisation, cap at kMaxKeywordsPerEntry.
+        std::vector<std::string> keywords;
+        std::vector<std::pair<std::string,std::string>> kw_changes;  // (orig → norm)
+        std::vector<std::string>                         kw_dropped;
+        keywords.reserve(keywords_raw.size());
+        for (const auto & raw : keywords_raw) {
+            std::string n = normalize_id(raw, kMaxKeywordBytes);
+            if (n.empty()) {
+                kw_dropped.push_back(raw);
+                continue;
             }
+            if (std::find(keywords.begin(), keywords.end(), n) != keywords.end()) {
+                // already present (post-normalisation duplicate)
+                if (raw != n) kw_changes.emplace_back(raw, n);
+                continue;
+            }
+            if (raw != n) kw_changes.emplace_back(raw, n);
+            keywords.push_back(std::move(n));
+            if (keywords.size() >= kMaxKeywordsPerEntry) break;
+        }
+        if (keywords.empty()) {
+            return ToolResult::error(
+                "no usable keywords after normalisation (every one was empty "
+                "or pure punctuation). Try keywords like \"bitnet\", "
+                "\"ternary\", \"quantization\" — alphanumerics plus .-_+.");
         }
 
         std::string content;
@@ -783,6 +878,24 @@ ToolHandler make_save_handler(std::shared_ptr<RagStore> store) {
           << keywords.size() << " keyword" << (keywords.size() == 1 ? "" : "s")
           << (title_is_fixed(title) ? ", FIXED — immutable from now on" : "")
           << ")";
+        // Surface what we changed so the model can address the entry
+        // by its canonical key later. Silent normalisation is friendly
+        // for the first hop but invisible drift is bad over a session.
+        const bool title_changed = (title_raw != title)
+            && (std::string(kFixedTitlePrefix) + title_raw != title);
+        if (title_changed || !kw_changes.empty() || !kw_dropped.empty()) {
+            o << "\nnormalised:";
+            if (title_changed) {
+                o << "\n  title \"" << title_raw << "\" -> \"" << title << "\"";
+            }
+            for (const auto & ch : kw_changes) {
+                o << "\n  keyword \"" << ch.first << "\" -> \"" << ch.second << "\"";
+            }
+            if (!kw_dropped.empty()) {
+                o << "\n  dropped (empty after normalising):";
+                for (const auto & d : kw_dropped) o << " \"" << d << "\"";
+            }
+        }
         return ToolResult::ok(o.str());
     };
 }
@@ -817,14 +930,17 @@ ToolHandler make_save_handler(std::shared_ptr<RagStore> store) {
 //     is no upgrade dance and no risk of self-deadlock.
 ToolHandler make_append_handler(std::shared_ptr<RagStore> store) {
     return [store](const ToolCall & c) -> ToolResult {
-        std::string title;
-        if (!args::get_string(c.arguments_json, "title", title) || title.empty()) {
+        std::string title_raw;
+        if (!args::get_string(c.arguments_json, "title", title_raw) || title_raw.empty()) {
             return ToolResult::error("missing required argument: title");
         }
-        if (!is_valid_title(title, kMaxTitleBytes)) {
+        // Apply the same normalisation as rag_save so the model can
+        // reach the existing entry without exact-match anxiety.
+        std::string title = normalize_title(title_raw, kMaxTitleBytes);
+        if (title.empty()) {
             return ToolResult::error(
-                "title \"" + title + "\" is invalid; must match "
-                "[A-Za-z0-9._+-]{1," + std::to_string(kMaxTitleBytes) + "}");
+                "title \"" + title_raw + "\" could not be normalised to a "
+                "valid identifier.");
         }
 
         std::string suffix;
@@ -838,21 +954,27 @@ ToolHandler make_append_handler(std::shared_ptr<RagStore> store) {
         }
 
         // Optional: extra keywords to merge into the existing list.
-        // Validated up-front (before we hold the lock) so a malformed
-        // call returns a clean error without churning state.
-        std::vector<std::string> extra_keywords;
+        // Normalised + deduped the same way rag_save does.
+        std::vector<std::string> extra_raw;
         std::string err;
         if (args::has(c.arguments_json, "keywords")
                 && !parse_string_array(c.arguments_json, "keywords",
-                                       extra_keywords, err)) {
+                                       extra_raw, err)) {
             return ToolResult::error(err);
         }
-        for (const auto & k : extra_keywords) {
-            if (!is_valid_id(k, kMaxKeywordBytes)) {
-                return ToolResult::error(
-                    "keyword \"" + k + "\" is invalid; must match "
-                    "[A-Za-z0-9._+-]{1," + std::to_string(kMaxKeywordBytes) + "}");
+        std::vector<std::string> extra_keywords;
+        std::vector<std::pair<std::string,std::string>> kw_changes;
+        std::vector<std::string>                         kw_dropped;
+        for (const auto & raw : extra_raw) {
+            std::string n = normalize_id(raw, kMaxKeywordBytes);
+            if (n.empty()) { kw_dropped.push_back(raw); continue; }
+            if (std::find(extra_keywords.begin(), extra_keywords.end(), n)
+                    != extra_keywords.end()) {
+                if (raw != n) kw_changes.emplace_back(raw, n);
+                continue;
             }
+            if (raw != n) kw_changes.emplace_back(raw, n);
+            extra_keywords.push_back(std::move(n));
         }
 
         // WRITE: unique_lock for the whole RMW so a concurrent
@@ -949,6 +1071,20 @@ ToolHandler make_append_handler(std::shared_ptr<RagStore> store) {
           << "+" << suffix.size() << " B → " << merged.size() << " B total, "
           << merged_keywords.size() << " keyword"
           << (merged_keywords.size() == 1 ? "" : "s") << ")";
+        const bool title_changed = (title_raw != title);
+        if (title_changed || !kw_changes.empty() || !kw_dropped.empty()) {
+            o << "\nnormalised:";
+            if (title_changed) {
+                o << "\n  title \"" << title_raw << "\" -> \"" << title << "\"";
+            }
+            for (const auto & ch : kw_changes) {
+                o << "\n  keyword \"" << ch.first << "\" -> \"" << ch.second << "\"";
+            }
+            if (!kw_dropped.empty()) {
+                o << "\n  dropped (empty after normalising):";
+                for (const auto & d : kw_dropped) o << " \"" << d << "\"";
+            }
+        }
         return ToolResult::ok(o.str());
     };
 }
@@ -966,40 +1102,37 @@ ToolHandler make_search_handler(std::shared_ptr<RagStore> store) {
         // queried keywords it matched (`[matched N/M]`) so the model
         // can see the overlap and pick. A single-keyword query is the
         // degenerate case — that one keyword is the required one.
-        std::vector<std::string> keywords;
+        std::vector<std::string> keywords_raw;
         std::string err;
-        if (!parse_string_array(c.arguments_json, "keywords", keywords, err)) {
+        if (!parse_string_array(c.arguments_json, "keywords", keywords_raw, err)) {
             return ToolResult::error(err);
         }
-        if (keywords.empty()) {
+        if (keywords_raw.empty()) {
             return ToolResult::error(
                 "missing required argument: keywords (non-empty array)");
         }
-        if (keywords.size() > kMaxKeywordsPerEntry) {
+        if (keywords_raw.size() > kMaxKeywordsPerEntry) {
             return ToolResult::error(
                 "too many keywords (max "
                 + std::to_string(kMaxKeywordsPerEntry) + " per query)");
         }
-        for (const auto & k : keywords) {
-            if (!is_valid_id(k, kMaxKeywordBytes)) {
-                return ToolResult::error(
-                    "keyword \"" + k + "\" is invalid; must match "
-                    "[A-Za-z0-9._+-]{1," + std::to_string(kMaxKeywordBytes) + "}");
+        // Normalise the query keywords with the same rules rag_save
+        // uses, so "neural network" finds entries indexed under
+        // "neural_network". Order-preserving dedup — keywords[0] is
+        // the required keyword and must keep its slot.
+        std::vector<std::string> keywords;
+        keywords.reserve(keywords_raw.size());
+        for (const auto & raw : keywords_raw) {
+            std::string n = normalize_id(raw, kMaxKeywordBytes);
+            if (n.empty()) continue;
+            if (std::find(keywords.begin(), keywords.end(), n) == keywords.end()) {
+                keywords.push_back(std::move(n));
             }
         }
-        // Deduplicate the query — repeated keywords would otherwise
-        // distort the match count. Order-preserving: keywords[0] is the
-        // required keyword, so its position must not drift (a plain
-        // sort+unique would reorder it).
-        {
-            std::vector<std::string> deduped;
-            for (const auto & k : keywords) {
-                if (std::find(deduped.begin(), deduped.end(), k)
-                        == deduped.end()) {
-                    deduped.push_back(k);
-                }
-            }
-            keywords = std::move(deduped);
+        if (keywords.empty()) {
+            return ToolResult::error(
+                "no usable keywords after normalisation — try alphanumerics "
+                "plus .-_+ (e.g. \"bitnet\", \"ternary\").");
         }
         const std::string & required_kw = keywords.front();
 
@@ -1198,13 +1331,19 @@ ToolHandler make_load_handler(std::shared_ptr<RagStore> store) {
                 + std::to_string(kMaxLoadAtOnce)
                 + " per call); narrow your rag_search first");
         }
-        for (const auto & t : titles) {
-            if (!is_valid_title(t, kMaxTitleBytes)) {
+        // Normalise titles silently so the model can ask for
+        // "BitNet ternary research" and reach the on-disk
+        // "BitNet_ternary_research". A title that can't normalise
+        // (pure punctuation, "..") errors out — that's a real
+        // mistake, not just a formatting nit.
+        for (auto & t : titles) {
+            std::string n = normalize_title(t, kMaxTitleBytes);
+            if (n.empty()) {
                 return ToolResult::error(
-                    "title \"" + t + "\" is invalid; must match "
-                    "[A-Za-z0-9._+-]{1," + std::to_string(kMaxTitleBytes) + "} "
-                    "(no leading dot, not '.' or '..', must contain alnum)");
+                    "title \"" + t + "\" could not be normalised to a valid "
+                    "identifier (alphanumerics + .-_+; not '.' / '..').");
             }
+            t = std::move(n);
         }
 
         std::ostringstream o;
@@ -1248,12 +1387,16 @@ ToolHandler make_load_handler(std::shared_ptr<RagStore> store) {
 
 ToolHandler make_list_handler(std::shared_ptr<RagStore> store) {
     return [store](const ToolCall & c) -> ToolResult {
+        std::string prefix_raw;
+        args::get_string(c.arguments_json, "prefix", prefix_raw);
         std::string prefix;
-        args::get_string(c.arguments_json, "prefix", prefix);
-        if (!prefix.empty() && !is_valid_title(prefix, kMaxTitleBytes)) {
-            return ToolResult::error(
-                "prefix \"" + prefix + "\" is invalid; must match "
-                "[A-Za-z0-9._+-]{1," + std::to_string(kMaxTitleBytes) + "}");
+        if (!prefix_raw.empty()) {
+            // normalize_id (not normalize_title) — a prefix may end
+            // partway through a title and the FS-safety rules
+            // (no leading dot, must contain alnum) don't apply to
+            // a partial match. Empty after normalisation = ignore
+            // the filter entirely.
+            prefix = normalize_id(prefix_raw, kMaxTitleBytes);
         }
         long long max = (long long) kListResultsDflt;
         args::get_int(c.arguments_json, "max", max);
@@ -1309,14 +1452,15 @@ ToolHandler make_list_handler(std::shared_ptr<RagStore> store) {
 
 ToolHandler make_delete_handler(std::shared_ptr<RagStore> store) {
     return [store](const ToolCall & c) -> ToolResult {
-        std::string title;
-        if (!args::get_string(c.arguments_json, "title", title) || title.empty()) {
+        std::string title_raw;
+        if (!args::get_string(c.arguments_json, "title", title_raw) || title_raw.empty()) {
             return ToolResult::error("missing required argument: title");
         }
-        if (!is_valid_title(title, kMaxTitleBytes)) {
+        std::string title = normalize_title(title_raw, kMaxTitleBytes);
+        if (title.empty()) {
             return ToolResult::error(
-                "title \"" + title + "\" is invalid; must match "
-                "[A-Za-z0-9._+-]{1," + std::to_string(kMaxTitleBytes) + "}");
+                "title \"" + title_raw + "\" could not be normalised to a "
+                "valid identifier.");
         }
         // Fixed memories are immutable by design — refuse the delete
         // before we even take the write lock. The operator can still

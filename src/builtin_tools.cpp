@@ -1260,15 +1260,40 @@ constexpr const char * kGlobRegexMetachars = ".+()|^$\\{}[]";
 // whole-string predicate — same semantics as ::fnmatch(3) without the
 // platform's globbing edge cases.
 inline std::string glob_to_regex(const std::string & pattern) {
+    // If the pattern has no '/' at all, the model is naming a file
+    // by basename only ("*.c", "ADELIDE*") — match it anywhere in the
+    // tree, the same way `find -name PAT` does. Without this, a
+    // top-level file in the sandbox root never matches because the
+    // pattern implies a path component but the rel-path has none.
+    const bool implicit_recursive =
+        pattern.find('/') == std::string::npos;
+
     std::string re = "^";
-    re.reserve(pattern.size() * 2 + 2);
+    re.reserve(pattern.size() * 2 + 4);
+    if (implicit_recursive) re += "(?:.*/)?";
+
     for (std::size_t i = 0; i < pattern.size(); ++i) {
         const char ch = pattern[i];
         if (ch == '*') {
             const bool is_double_star =
                 (i + 1 < pattern.size() && pattern[i + 1] == '*');
-            if (is_double_star) { re += ".*"; ++i; }
-            else                { re += "[^/]*"; }
+            if (is_double_star) {
+                // `**/` should match zero-or-more path segments
+                // (including none), so `**/foo` matches both
+                // `foo` and `a/b/foo`. The previous translation
+                // (`.*/`) required at least one slash and missed
+                // top-level matches.
+                const bool has_trailing_slash =
+                    (i + 2 < pattern.size() && pattern[i + 2] == '/');
+                if (has_trailing_slash) {
+                    re += "(?:.*/)?";
+                    i += 2;          // consume '*' + '/'
+                } else {
+                    re += ".*"; ++i; // bare `**` — match any chars
+                }
+            } else {
+                re += "[^/]*";
+            }
         } else if (ch == '?') {
             re += "[^/]";
         } else if (std::strchr(kGlobRegexMetachars, ch)) {
