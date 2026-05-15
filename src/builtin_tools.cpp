@@ -1757,6 +1757,84 @@ ToolHandler make_fs_edit_handler(std::shared_ptr<Sandbox> sb) {
             o << "replaced lines " << start_line << "-" << end_line
               << " (" << deleted << " deleted, " << inserted << " inserted)";
         }
+
+        // Post-edit window so the model can re-orient WITHOUT spending
+        // another hop on fs(action="read"). The classic failure mode
+        // is a sequence of edits with stale 1-based line numbers — the
+        // tool did exactly what was asked, but the model believed the
+        // file looked different than it now does. Showing the lines
+        // that surround the edit (with insertion markers) anchors the
+        // model in the actual post-state.
+        std::vector<std::string_view> new_lines;
+        {
+            size_t ls = 0;
+            for (size_t i = 0; i < new_body.size(); ++i) {
+                if (new_body[i] == '\n') {
+                    new_lines.emplace_back(new_body.data() + ls,
+                                            i - ls + 1);
+                    ls = i + 1;
+                }
+            }
+            if (ls < new_body.size()) {
+                new_lines.emplace_back(new_body.data() + ls,
+                                        new_body.size() - ls);
+            }
+        }
+        const long long new_line_count = (long long) new_lines.size();
+
+        constexpr int kCtxLines        = 3;
+        constexpr int kPerLineCap      = 200;
+
+        long long win_start = std::max<long long>(1, start_line - kCtxLines);
+        long long win_end;
+        if (inserted > 0) {
+            win_end = std::min<long long>(
+                new_line_count, start_line + inserted - 1 + kCtxLines);
+        } else {
+            // Pure delete — show the seam where the deletion landed.
+            win_end = std::min<long long>(
+                new_line_count, start_line + kCtxLines);
+            // If the delete consumed the tail, start_line may now be
+            // past EOF; pull the window back so it still shows context.
+            if (start_line > new_line_count) {
+                win_start = std::max<long long>(
+                    1, new_line_count - 2 * kCtxLines);
+                win_end = new_line_count;
+            }
+        }
+
+        o << "; file now has " << new_line_count << " line"
+          << (new_line_count == 1 ? "" : "s")
+          << " (was " << line_count << ")";
+
+        if (new_line_count > 0 && win_end >= win_start) {
+            o << "; window [" << win_start << ".." << win_end << "]:\n";
+            const long long inserted_first = start_line;
+            const long long inserted_last  = start_line + inserted - 1;
+            for (long long ln = win_start; ln <= win_end; ++ln) {
+                std::string_view sv = new_lines[(size_t)(ln - 1)];
+                while (!sv.empty()
+                        && (sv.back() == '\n' || sv.back() == '\r')) {
+                    sv.remove_suffix(1);
+                }
+                const bool is_inserted =
+                    (inserted > 0
+                     && ln >= inserted_first
+                     && ln <= inserted_last);
+                o << (is_inserted ? "> " : "  ")
+                  << std::setw(5) << ln << ": ";
+                if ((long long) sv.size() > kPerLineCap) {
+                    o.write(sv.data(), kPerLineCap);
+                    o << "...[truncated]";
+                } else {
+                    o.write(sv.data(), (std::streamsize) sv.size());
+                }
+                o << "\n";
+            }
+        } else if (new_line_count == 0) {
+            o << "; file is now empty";
+        }
+
         return ToolResult::ok(o.str());
     };
 }
