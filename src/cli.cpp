@@ -13,6 +13,7 @@
 #include <ctime>
 #include <fcntl.h>    // open, O_*
 #include <filesystem>
+#include <iterator>   // make_move_iterator
 #include <sys/stat.h> // mode_t
 #include <unistd.h>   // getpid
 
@@ -33,6 +34,7 @@ Toolbelt & Toolbelt::with_plan   (Plan & plan)     { plan_         = &plan;     
 Toolbelt & Toolbelt::no_web      (bool on)         { no_web_       = on;             return *this; }
 Toolbelt & Toolbelt::no_datetime (bool on)         { no_datetime_  = on;             return *this; }
 Toolbelt & Toolbelt::use_google  (bool on)         { use_google_   = on;             return *this; }
+Toolbelt & Toolbelt::tool_mode   (ToolMode m)      { tool_mode_    = m;              return *this; }
 
 std::vector<Tool> Toolbelt::tools() const {
     std::vector<Tool> out;
@@ -51,7 +53,15 @@ std::vector<Tool> Toolbelt::tools() const {
             const char * gx = std::getenv("GOOGLE_CSE_ID");
             google = (gk && *gk && gx && *gx);
         }
-        out.push_back(easyai::tools::web(google));
+        if (tool_mode_ == ToolMode::Unified || tool_mode_ == ToolMode::Both) {
+            out.push_back(easyai::tools::web(google));
+        }
+        if (tool_mode_ == ToolMode::Split   || tool_mode_ == ToolMode::Both) {
+            auto v = easyai::tools::web_split(google);
+            out.insert(out.end(),
+                       std::make_move_iterator(v.begin()),
+                       std::make_move_iterator(v.end()));
+        }
     }
     // fs / bash / python3 share a working root: the configured sandbox
     // if set, otherwise ".". The unified `fs` and `python3` are
@@ -67,11 +77,18 @@ std::vector<Tool> Toolbelt::tools() const {
     const bool fs_on     = allow_fs_     && (!sandbox_.empty() || bash_on || python_on);
     const std::string fs_root = sandbox_.empty() ? "." : sandbox_;
     if (fs_on) {
-        // Single unified `fs` tool. Eight actions: read, write, list,
-        // glob, grep, check_path, cwd, sandbox. The cwd / sandbox
-        // actions replace the old standalone get_current_dir /
-        // get_sandbox_path tools.
-        out.push_back(easyai::tools::fs(fs_root));
+        // The fs surface — Unified (single dispatcher with `action`),
+        // Split (one tool per action: fs_read, fs_edit, …), or Both
+        // (registers both surfaces so the model can pick).
+        if (tool_mode_ == ToolMode::Unified || tool_mode_ == ToolMode::Both) {
+            out.push_back(easyai::tools::fs(fs_root));
+        }
+        if (tool_mode_ == ToolMode::Split   || tool_mode_ == ToolMode::Both) {
+            auto v = easyai::tools::fs_split(fs_root);
+            out.insert(out.end(),
+                       std::make_move_iterator(v.begin()),
+                       std::make_move_iterator(v.end()));
+        }
     }
     if (bash_on) {
         out.push_back(easyai::tools::bash(fs_root, show_bash_));

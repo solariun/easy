@@ -43,6 +43,42 @@ A running log of user-facing changes. Latest first — keep this list
 current as features land so anyone returning to the repo (or
 landing on it for the first time) sees what shipped recently.
 
+### 2026-05-15 — `--tools-mode` lets small models work with one-verb-per-tool
+
+`fs`, `web`, and `memory` ship as **unified dispatchers** with an
+`action` parameter (e.g. `fs(action="read", ...)`).  That shape keeps
+the system prompt small and lets a large model batch many actions, but
+**smaller / quantised tool-callers** (Llama 3 8B, Qwen 2.5 7B, Phi-3.5,
+GPT-OSS-20B) gravitate toward one-purpose tools — `fs_read`, `fs_edit`,
+etc. — because the verb IS the tool name and the parameter schema is
+flat.
+
+Three modes, selected by the new flag:
+
+```
+easyai-cli --tools-mode unified     # default; one dispatcher per family
+easyai-cli --tools-mode split       # one focused tool per action
+easyai-cli --tools-mode both        # register both surfaces side-by-side
+```
+
+| Mode | Tools registered (with `--sandbox` + `--memory`) |
+| --- | --- |
+| `unified` (default) | `fs`, `web`, `memory` — 3 dispatchers |
+| `split` | `fs_read`, `fs_write`, `fs_append`, `fs_edit`, `fs_list`, `fs_glob`, `fs_grep`, `fs_check_path`, `fs_cwd`, `fs_sandbox`, `web_search`, `web_fetch`, `memory_save`, `memory_append`, `memory_search`, `memory_load`, `memory_list`, `memory_delete`, `memory_keywords` — 19 focused tools |
+| `both` | unified + split, same handlers under both names |
+
+Same handlers under the hood — behaviour is identical to the unified
+surface; only the registration shape changes.  Library API:
+
+```cpp
+easyai::cli::Toolbelt()
+    .sandbox("/srv/data")
+    .tool_mode(easyai::cli::ToolMode::Split)   // or Both
+    .apply(client);
+```
+
+INI: `[cli] tools_mode = unified|split|both`.
+
 ### 2026-05-13 — `easyai-cli` session resume flips back to opt-in
 
 Reverts the 2026-05-12 default flip: loading the existing
@@ -1153,6 +1189,7 @@ upstream `llama-server`, OpenAI itself, etc.).
 | `--use-google` | off | Enable engine=`"google"` inside the unified `web` tool. |
 | `--external-tools DIR` | — | Load `EASYAI-*.tools` manifests. |
 | `--memory DIR` | — | Enable persistent memory (one `memory(action=…)` tool; alias `--RAG`). |
+| `--tools-mode MODE` | `unified` | How `fs` / `web` / `memory` are exposed: `unified` (one dispatcher per family, `action=` param), `split` (one focused tool per action: `fs_read`, `fs_edit`, …, `memory_save`, …), or `both` (register both surfaces). Small / quantised tool-callers consistently work better with `split`. INI: `[cli] tools_mode`. |
 | `--no-plan` | off | Don't auto-register the planning tool. |
 | `-p, --prompt TEXT` | (REPL) | One-shot prompt; without it you get a REPL. |
 | `--no-reasoning` | shown | Hide `delta.reasoning_content`. |

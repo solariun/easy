@@ -35,6 +35,12 @@ Tool datetime();   // returns current UTC + local time in ISO-8601
 // from the catalog.
 Tool web(bool google_enabled = false);
 
+// Focused per-action variants of `web` (web_search, web_fetch). Same
+// handlers as the unified surface; smaller / quantised tool-callers
+// work better with one verb per tool than with a `web(action="...")`
+// dispatcher. The Toolbelt exposes this via tool_mode(Split | Both).
+std::vector<Tool> web_split(bool google_enabled = false);
+
 // ---------- filesystem --------------------------------------------------
 // fs: unified filesystem tool. Single dispatcher with eight actions:
 //
@@ -62,6 +68,14 @@ Tool web(bool google_enabled = false);
 // tool description tells the model to use relatives only — it makes
 // the boundary obvious and matches what bash with the pinned cwd sees.
 Tool fs(std::string root = ".");
+
+// Focused per-action variants of `fs` (fs_read, fs_write, fs_append,
+// fs_edit, fs_list, fs_glob, fs_grep, fs_check_path, fs_cwd,
+// fs_sandbox). Same handlers as the unified surface — see fs_split's
+// banner in builtin_tools.cpp for the rationale. Use the Toolbelt's
+// tool_mode(Split | Both) to register these alongside (or instead of)
+// the unified `fs`.
+std::vector<Tool> fs_split(std::string root = ".");
 
 // ---------- shell-class executors ---------------------------------------
 // Run a shell command via /bin/sh -c. Working directory is set to `root`.

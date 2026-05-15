@@ -56,6 +56,25 @@ namespace easyai::cli {
 //         .allow_bash()
 //         .with_plan(plan)
 //         .apply(client);
+// Tool surface mode — controls how the multi-action tools (fs, web,
+// and the externally-registered memory) are exposed to the model.
+//
+//   Unified  — single dispatcher tool with an `action` argument (e.g.
+//              `fs(action="read")`).  Smallest system-prompt footprint.
+//              Best for large models that can hold the discriminated
+//              union schema in their head.
+//
+//   Split    — one focused tool per action (`fs_read`, `fs_edit`, …).
+//              Flat schemas, name == semantic anchor, no "unknown
+//              action" failure mode.  Best for smaller / quantised
+//              tool-callers (7-8B and below) — they consistently work
+//              more reliably with one verb per tool.
+//
+//   Both     — both surfaces registered side-by-side.  Costs more
+//              system-prompt tokens but lets the model pick whichever
+//              shape it's more comfortable with on a per-call basis.
+enum class ToolMode { Unified, Split, Both };
+
 class Toolbelt {
 public:
     Toolbelt & sandbox      (std::string dir);   // "" stays the default (no fs)
@@ -84,6 +103,12 @@ public:
     // key rotation mid-session surfaces a clear error rather than
     // silent disappearance.
     Toolbelt & use_google   (bool on = true);
+
+    // How fs / web are exposed to the model (Unified | Split | Both).
+    // Default Unified preserves the legacy registration shape; switch
+    // to Split or Both via this knob, or via the CLI's --tools-mode
+    // flag / `[cli] tools_mode` INI key.
+    Toolbelt & tool_mode    (ToolMode m);
 
     // Materialise the configured tool list.  Order is the canonical
     // one shown above; callers can append their own tools after.
@@ -117,6 +142,7 @@ private:
     bool        no_web_       = false;
     bool        no_datetime_  = false;
     bool        use_google_   = false;
+    ToolMode    tool_mode_    = ToolMode::Unified;
     Plan *      plan_         = nullptr;
 };
 

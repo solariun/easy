@@ -1850,4 +1850,130 @@ Tool make_rag_tool(std::string root_dir) {
         .build();
 }
 
+// ----------------------------------------------------------------------------
+// memory_split_tools — focused alternative to the unified `memory` tool.
+// ----------------------------------------------------------------------------
+// Same per-action handlers, same on-disk store; the only difference is
+// surface. Smaller models avoid the "unknown action" / "wrong action for
+// these args" failure mode when the verb IS the tool name.
+std::vector<Tool> memory_split_tools(std::string root_dir) {
+    auto store = build_rag_store(std::move(root_dir));
+    auto h_save     = make_save_handler    (store);
+    auto h_append   = make_append_handler  (store);
+    auto h_search   = make_search_handler  (store);
+    auto h_load     = make_load_handler    (store);
+    auto h_list     = make_list_handler    (store);
+    auto h_delete   = make_delete_handler  (store);
+    auto h_keywords = make_keywords_handler(store);
+
+    std::vector<Tool> out;
+    out.reserve(7);
+
+    out.push_back(Tool::builder("memory_save")
+        .describe(
+            "Store a new memory (or overwrite an existing one). Same "
+            "handler as memory(action=\"save\"). Title and keywords are "
+            "normalised: spaces become `_`, other punctuation drops; the "
+            "result is reported back in the success message so you know "
+            "the canonical key for a later memory_append / memory_search.")
+        .param("title",    "string",
+               "1..64 chars after normalisation. Pass natural strings "
+               "(e.g. \"BitNet ternary research\") — they're normalised.", true)
+        .param("keywords", "array",
+               "1..24 short strings; normalised the same way as title. "
+               "Lead with the must-have term — memory_search treats "
+               "keywords[0] as required.", true)
+        .param("content",  "string",
+               "Full memory body. Free-form UTF-8; capped at 256 KB.", true)
+        .param("fix",      "boolean",
+               "If true, mark the memory immutable (prefix `fix-easyai-` "
+               "auto-added; future save/append/delete are refused). "
+               "Default false.", false)
+        .handle(h_save)
+        .build());
+
+    out.push_back(Tool::builder("memory_append")
+        .describe(
+            "Append to an EXISTING memory; a Markdown `---` rule "
+            "separates each addition from prior body. Same handler as "
+            "memory(action=\"append\"). Refused on fix-easyai-* "
+            "memories.")
+        .param("title",    "string",
+               "Existing memory's title (will be normalised).", true)
+        .param("content",  "string",
+               "Text added after the current body.", true)
+        .param("keywords", "array",
+               "Optional: extra keywords to merge into the existing "
+               "list (deduped, total still capped at 24).", false)
+        .handle(h_append)
+        .build());
+
+    out.push_back(Tool::builder("memory_search")
+        .describe(
+            "Find memories by keyword(s). Same handler as "
+            "memory(action=\"search\"). Results carry `[matched N/M]` "
+            "showing keyword overlap.")
+        .param("keywords",    "array",
+               "1..24 strings; normalised before matching. keywords[0] "
+               "is MANDATORY (every hit carries it); keywords[1..] "
+               "only rank (more overlap → higher).", true)
+        .param("max_results", "integer",
+               "Page size (default 10, max 20).", false)
+        .param("page",        "integer",
+               "1-based page (default 1). Use when a previous search "
+               "returned `has_more: true`.", false)
+        .handle(h_search)
+        .build());
+
+    out.push_back(Tool::builder("memory_load")
+        .describe(
+            "Read the full content of up to 4 memories by exact title. "
+            "Same handler as memory(action=\"load\"). Cap is 4 to keep "
+            "the prompt slim — narrow with memory_search if you need "
+            "more.")
+        .param("titles", "array",
+               "1..4 exact titles (will be normalised).", true)
+        .handle(h_load)
+        .build());
+
+    out.push_back(Tool::builder("memory_list")
+        .describe(
+            "Browse memory titles without bodies. Same handler as "
+            "memory(action=\"list\"). Pass prefix=\"fix-easyai-\" to "
+            "see every immutable memory.")
+        .param("prefix", "string",
+               "Filter titles starting with this prefix (normalised).", false)
+        .param("max",    "integer",
+               "Result cap (default 50, max 200).", false)
+        .handle(h_list)
+        .build());
+
+    out.push_back(Tool::builder("memory_delete")
+        .describe(
+            "Forget a memory. Same handler as memory(action=\"delete\"). "
+            "fix-easyai-* memories are immutable and cannot be deleted "
+            "through this tool.")
+        .param("title", "string",
+               "Exact title (will be normalised).", true)
+        .handle(h_delete)
+        .build());
+
+    out.push_back(Tool::builder("memory_keywords")
+        .describe(
+            "Vocabulary overview — every distinct keyword and how many "
+            "memories carry it. Same handler as "
+            "memory(action=\"keywords\"). CALL THIS before "
+            "memory_save / memory_search when unsure what vocabulary "
+            "you've already established.")
+        .param("min_count", "integer",
+               "Hide keywords used by fewer than N memories (default "
+               "1 = show all).", false)
+        .param("max",       "integer",
+               "Result cap (default 200, max 500).", false)
+        .handle(h_keywords)
+        .build());
+
+    return out;
+}
+
 }  // namespace easyai::tools

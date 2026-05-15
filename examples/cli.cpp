@@ -518,6 +518,8 @@ struct Options {
     std::set<std::string> tools_enabled;       // empty = all defaults
     std::string external_tools_dir;            // dir of EASYAI-*.tools files
     std::string rag_dir;                        // optional RAG persistent-registry dir
+    std::string tools_mode = "unified";        // "unified" | "split" | "both"
+    bool        tools_mode_cli_set = false;
     std::string prompt;                        // -p one-shot
     // Sampling / penalty knobs — -1 / -2 / empty == server default.
     float                    temperature       = -1.0f;
@@ -705,6 +707,21 @@ void usage(const char * argv0) {
 "                                 section: show_bash = false.\n"
 "    --no-show-python           same as --no-show-bash, but for `python3`.\n"
 "                                 INI: [cli] show_python = false.\n"
+"    --tools-mode MODE          how the multi-action tool families (fs, web,\n"
+"                                 memory) are exposed to the model:\n"
+"                                   \"unified\" — single dispatcher with an\n"
+"                                     `action` argument (e.g. fs(action=\"read\"));\n"
+"                                     smallest system-prompt footprint. Default.\n"
+"                                   \"split\" — one focused tool per action\n"
+"                                     (fs_read, fs_edit, fs_glob, …, web_search,\n"
+"                                     web_fetch, memory_save, …); flat schemas,\n"
+"                                     no \"unknown action\" failure mode. Best for\n"
+"                                     7-8B / quantised tool-callers.\n"
+"                                   \"both\"  — register both surfaces side by\n"
+"                                     side. Costs more system-prompt tokens but\n"
+"                                     lets the model pick whichever shape it's\n"
+"                                     more comfortable with on a per-call basis.\n"
+"                                 INI: [cli] tools_mode = unified|split|both.\n"
 "    --use-google               enable engine=\"google\" inside the `web`\n"
 "                                 tool (Google Custom Search JSON API).\n"
 "                                 Requires both GOOGLE_API_KEY and\n"
@@ -814,6 +831,8 @@ void usage(const char * argv0) {
 "                                                  at /tmp/easyai-client-*.log)\n"
 "                                  show_bash     = true|false  (default true)\n"
 "                                  show_python   = true|false  (default true)\n"
+"                                  tools_mode    = unified|split|both\n"
+"                                                  (default unified)\n"
 "                                CLI flags override INI; INI overrides hardcoded\n"
 "                                defaults.\n"
 "    --unattended               inject an [unattended] block into the system\n"
@@ -941,6 +960,19 @@ bool parse_args(int argc, char ** argv, Options & o) {
                 if (!tok.empty()) o.tools_enabled.insert(tok);
             }
         }
+        else if (a == "--tools-mode") {
+            std::string m = need(i, "--tools-mode");
+            if (m != "unified" && m != "split" && m != "both") {
+                std::fprintf(stderr,
+                    "invalid --tools-mode \"%s\" — valid: \"unified\" "
+                    "(single dispatcher per family), \"split\" (one tool "
+                    "per action), or \"both\" (register both surfaces)\n",
+                    m.c_str());
+                return false;
+            }
+            o.tools_mode         = m;
+            o.tools_mode_cli_set = true;
+        }
         else if (a == "--no-plan")        o.no_plan = true;
         else if (a == "--show-reasoning") o.show_reasoning = true;   // no-op now (kept for compat)
         else if (a == "--no-reasoning"
@@ -1064,6 +1096,24 @@ bool parse_args(int argc, char ** argv, Options & o) {
         load_bool_flag("auto_compress", o.auto_compress, o.auto_compress_cli_set);
         load_bool_flag("auto_log",      o.auto_log,      /*cli_set=*/false);
         load_str_flag ("log_file",      o.log_file_path, o.log_file_path_cli_set);
+        // tools_mode also has a closed value set; validate the INI
+        // value the same way the CLI parser does instead of letting an
+        // unknown string slip through to registration time.
+        if (!o.tools_mode_cli_set) {
+            const std::string v = ini.get("cli", "tools_mode");
+            if (!v.empty()) {
+                if (v == "unified" || v == "split" || v == "both") {
+                    o.tools_mode = v;
+                } else {
+                    std::fprintf(stderr,
+                        "%s: [cli] tools_mode = \"%s\" is invalid — "
+                        "valid: \"unified\" / \"split\" / \"both\". "
+                        "Keeping default \"%s\".\n",
+                        o.config_path.c_str(), v.c_str(),
+                        o.tools_mode.c_str());
+                }
+            }
+        }
     }
     return true;
 }
@@ -1119,6 +1169,13 @@ void register_tools(easyai::Client & cli,
     // both env vars present at registration time; the tool itself
     // re-reads the env at call time so a key rotation surfaces a clear
     // error rather than silent disappearance.
+    // Tool surface — unified (single dispatcher) / split (one tool per
+    // action) / both. Smaller / quantised tool-callers consistently work
+    // better with split surfaces; large models handle either. See
+    // --tools-mode below and the README "tools mode" section.
+    const bool tm_unified = (o.tools_mode == "unified" || o.tools_mode == "both");
+    const bool tm_split   = (o.tools_mode == "split"   || o.tools_mode == "both");
+
     if (wants("web")) {
         bool google = false;
         if (o.use_google) {
@@ -1126,14 +1183,26 @@ void register_tools(easyai::Client & cli,
             const char * gx = std::getenv("GOOGLE_CSE_ID");
             google = (gk && *gk && gx && *gx);
         }
-        cli.add_tool(easyai::tools::web(google));
+        if (tm_unified) cli.add_tool(easyai::tools::web(google));
+        if (tm_split) {
+            for (auto & t : easyai::tools::web_split(google)) {
+                cli.add_tool(std::move(t));
+            }
+        }
     }
 
-    // Unified `fs` tool — scoped to --sandbox if given, otherwise CWD.
-    // Eight actions: read / write / list / glob / grep / check_path /
-    // cwd / sandbox.
+    // fs — scoped to --sandbox if given, otherwise CWD. Unified
+    // dispatcher (`fs(action="...")`) and/or focused per-action tools
+    // (`fs_read`, `fs_edit`, …) per --tools-mode.
     const std::string root = o.sandbox.empty() ? "." : o.sandbox;
-    if (wants("fs")) cli.add_tool(easyai::tools::fs(root));
+    if (wants("fs")) {
+        if (tm_unified) cli.add_tool(easyai::tools::fs(root));
+        if (tm_split) {
+            for (auto & t : easyai::tools::fs_split(root)) {
+                cli.add_tool(std::move(t));
+            }
+        }
+    }
 
     // bash — same root as fs; opt-in via --allow-bash or --tools bash.
     if (wants("bash")) {
@@ -1175,7 +1244,12 @@ void register_tools(easyai::Client & cli,
     // first save. See RAG.md.
     if (!o.rag_dir.empty()) {
         if (o.tools_enabled.empty() || o.tools_enabled.count("memory")) {
-            cli.add_tool(easyai::tools::make_rag_tool(o.rag_dir));
+            if (tm_unified) cli.add_tool(easyai::tools::make_rag_tool(o.rag_dir));
+            if (tm_split) {
+                for (auto & t : easyai::tools::memory_split_tools(o.rag_dir)) {
+                    cli.add_tool(std::move(t));
+                }
+            }
         }
     }
 

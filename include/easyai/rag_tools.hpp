@@ -79,4 +79,12 @@ namespace easyai::tools {
 // entries.
 Tool make_rag_tool(std::string root_dir);
 
+// Focused per-action variants of the `memory` tool: memory_save,
+// memory_append, memory_search, memory_load, memory_list,
+// memory_delete, memory_keywords. Same on-disk store and handlers as
+// the unified surface; for smaller tool-callers that handle
+// one-verb-per-tool more reliably than a discriminated `action`
+// string. The Toolbelt exposes this via tool_mode(Split | Both).
+std::vector<Tool> memory_split_tools(std::string root_dir);
+
 }  // namespace easyai::tools

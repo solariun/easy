@@ -1038,6 +1038,59 @@ ToolResult web_handle_fetch(const ToolCall & c) {
 
 }  // namespace
 
+// Focused per-action variants of the `web` tool. Same handlers as the
+// unified surface — smaller models perform notably better with a
+// single verb per tool rather than a discriminated `action`-string.
+std::vector<Tool> web_split(bool google_enabled) {
+    std::vector<Tool> out;
+    out.reserve(2);
+
+    out.push_back(Tool::builder("web_search")
+        .describe(
+            "Search the web for current information. Same handler as "
+            "web(action=\"search\"). Returns a numbered list of "
+            "title / URL / snippet entries you can then web_fetch.")
+        .param("query",       "string",
+               "Free-form query (e.g. \"BitNet ternary quantization\").", true)
+        .param("max_results", "integer",
+               "How many results to return (default 5, max 20).", false)
+        .param("page",        "integer",
+               "1-based page over the engine's own ordering "
+               "(default 1).", false)
+        .param("engine",      "string",
+               "\"ddg\" (default, DuckDuckGo, no key) or \"google\" "
+               "(Google Custom Search; needs GOOGLE_API_KEY + "
+               "GOOGLE_CSE_ID env vars AND the operator opt-in).", false)
+        .handle([google_enabled](const ToolCall & c) -> ToolResult {
+            return web_handle_search(c, google_enabled);
+        })
+        .build());
+
+    out.push_back(Tool::builder("web_fetch")
+        .describe(
+            "Fetch a URL and return its text (HTML stripped, or raw "
+            "with as_html=true). Page through long bodies with "
+            "start/limit. Same handler as web(action=\"fetch\").")
+        .param("url",     "string",
+               "Absolute URL to fetch.", true)
+        .param("as_html", "boolean",
+               "If true, return raw HTML instead of stripped text "
+               "(default false).", false)
+        .param("start",   "integer",
+               "Byte offset to start from (default 0). Use the "
+               "previous call's `start=` cursor in the truncation "
+               "marker to continue.", false)
+        .param("limit",   "integer",
+               "Window size in bytes (default 8192, min 256, max "
+               "65536).", false)
+        .handle([](const ToolCall & c) -> ToolResult {
+            return web_handle_fetch(c);
+        })
+        .build());
+
+    return out;
+}
+
 Tool web(bool google_enabled) {
     return Tool::builder("web")
         .describe(
@@ -2728,6 +2781,176 @@ Tool fs(std::string root) {
             return ToolResult::ok(out.str());
         })
         .build();
+}
+
+// ----------------------------------------------------------------------------
+// fs_split — one focused tool per fs action.
+// ----------------------------------------------------------------------------
+// Smaller / quantised tool-callers consistently work better with
+// one-purpose tools than with a `fs(action="x")` dispatcher: every name
+// is its own semantic anchor, the params schema is flat (no
+// discriminated union), and there is no "unknown action" failure mode.
+// The handlers are reused verbatim, so behaviour is identical to the
+// unified `fs` — the only difference is surface.
+//
+// Same Sandbox instance shared across the bundle so the tools observe
+// a consistent root (and the operator pays the inode probe once).
+std::vector<Tool> fs_split(std::string root) {
+    auto sb = std::make_shared<Sandbox>(root);
+    std::vector<Tool> out;
+    out.reserve(10);
+
+    out.push_back(Tool::builder("fs_read")
+        .describe(
+            "Read a UTF-8 text file from the sandbox. Same handler as "
+            "fs(action=\"read\"); this is the focused surface for one-"
+            "verb-per-tool callers. PATHS ARE RELATIVE to the sandbox "
+            "root (no leading `/`, no `..`).")
+        .param("path",         "string",
+               "Relative path under the sandbox root.", true)
+        .param("offset",       "integer",
+               "Skip N bytes from start (default 0). Page large files "
+               "by passing the previous (offset + bytes_returned).", false)
+        .param("limit",        "integer",
+               "Max bytes to return. Default 65536, max 1048576.", false)
+        .param("line_numbers", "boolean",
+               "If true, prefix each line with `<n>| ` so fs_edit can "
+               "target line ranges without manual counting.", false)
+        .handle(make_fs_read_handler(sb))
+        .build());
+
+    out.push_back(Tool::builder("fs_write")
+        .describe(
+            "Write UTF-8 text to a file (OVERWRITES existing content; "
+            "pass append=true to extend). Missing parent dirs are "
+            "created. Same handler as fs(action=\"write\").")
+        .param("path",    "string",
+               "Relative path under the sandbox root.", true)
+        .param("content", "string",
+               "Full file content (or appendix when append=true). Use "
+               "`\\n` for newlines.", true)
+        .param("append",  "boolean",
+               "If true, append to the file instead of overwriting "
+               "(creates if missing). Default false.", false)
+        .handle(make_fs_write_handler(sb))
+        .build());
+
+    out.push_back(Tool::builder("fs_append")
+        .describe(
+            "Append UTF-8 text to the END of a file (creates the file "
+            "and parent dirs if missing). Same handler as "
+            "fs(action=\"append\").")
+        .param("path",    "string",
+               "Relative path under the sandbox root.", true)
+        .param("content", "string",
+               "Text to append. Use `\\n` for newlines.", true)
+        .handle(make_fs_append_handler(sb))
+        .build());
+
+    out.push_back(Tool::builder("fs_edit")
+        .describe(
+            "Replace lines [start_line..end_line] (1-based, inclusive) "
+            "in an existing file with `content`. content=\"\" is a pure "
+            "delete; end_line = start_line - 1 is a pure insert before "
+            "start_line; start_line = line_count+1 appends at EOF. "
+            "Output includes a post-edit window so the model can re-"
+            "orient without another fs_read. Same handler as "
+            "fs(action=\"edit\"). Workflow: fs_read with "
+            "line_numbers=true to plan the edit.")
+        .param("path",       "string",
+               "Relative path under the sandbox root.", true)
+        .param("start_line", "integer",
+               "1-based first line of the range. line_count+1 appends "
+               "at EOF.", true)
+        .param("end_line",   "integer",
+               "1-based last line of the range. Pass start_line-1 for "
+               "a pure insert (zero-width range).", true)
+        .param("content",    "string",
+               "Replacement text. Pass \"\" for a pure delete.", true)
+        .handle(make_fs_edit_handler(sb))
+        .build());
+
+    out.push_back(Tool::builder("fs_list")
+        .describe(
+            "Non-recursive directory listing. Same handler as "
+            "fs(action=\"list\").")
+        .param("path", "string",
+               "Relative path; defaults to the sandbox root.", false)
+        .handle(make_fs_list_handler(sb))
+        .build());
+
+    out.push_back(Tool::builder("fs_glob")
+        .describe(
+            "Recursive wildcard file search. Patterns: `*`, `?`, "
+            "`**/`. A pattern without `/` matches anywhere in the tree "
+            "(e.g. `*.c` finds C files at any depth — like `find -name "
+            "*.c`). Same handler as fs(action=\"glob\").")
+        .param("pattern", "string",
+               "Wildcard pattern (e.g. `*.cpp`, `**/test_*.py`, "
+               "`src/*.h`).", true)
+        .param("path",    "string",
+               "Start directory; defaults to the sandbox root.", false)
+        .handle(make_fs_glob_handler(sb))
+        .build());
+
+    out.push_back(Tool::builder("fs_grep")
+        .describe(
+            "Recursive regex content search. Same handler as "
+            "fs(action=\"grep\").")
+        .param("pattern",          "string",
+               "ECMAScript regex; each line matched independently with "
+               "regex_search. Anchor with `^`/`$` for full-line "
+               "matches.", true)
+        .param("path",             "string",
+               "Start file or directory; defaults to the sandbox root. "
+               "A regular file is searched as one file.", false)
+        .param("file_glob",        "string",
+               "Wildcard pattern restricting which filenames are "
+               "searched (matched against basename), e.g. `*.cpp`.", false)
+        .param("max_matches",      "integer",
+               "Stop after this many matching lines (default 100).", false)
+        .param("case_insensitive", "boolean",
+               "Match the regex case-insensitively (default false).", false)
+        .handle(make_fs_grep_handler(sb))
+        .build());
+
+    out.push_back(Tool::builder("fs_check_path")
+        .describe(
+            "Pre-flight stat + r/w/x probe for a path. THE \"look "
+            "before you leap\" call — run this before fs_read / "
+            "fs_write / fs_edit on any path you haven't already "
+            "confirmed in this session. Same handler as "
+            "fs(action=\"check_path\").")
+        .param("path",  "string",
+               "Relative path to probe.", true)
+        .param("touch", "boolean",
+               "If true and the path doesn't exist, create an empty "
+               "file there (mode 0600, parent dirs auto-created). Lets "
+               "you probe write rights without writing real content. "
+               "Default false.", false)
+        .handle(make_fs_check_path_handler(sb))
+        .build());
+
+    out.push_back(Tool::builder("fs_cwd")
+        .describe(
+            "The process's current working directory at call time "
+            "(getcwd). For day-to-day work use fs_sandbox — fs_cwd is "
+            "only useful when you need to report the host's literal cwd "
+            "in user-facing output. No parameters.")
+        .handle(make_fs_cwd_handler())
+        .build());
+
+    out.push_back(Tool::builder("fs_sandbox")
+        .describe(
+            "The sandbox root, pinned at registration — the "
+            "authoritative on-disk anchor every fs_* and bash command "
+            "resolves RELATIVE paths against. Run this once at the "
+            "start of any filesystem task so you know where you really "
+            "are. No parameters.")
+        .handle(make_fs_sandbox_handler(root))
+        .build());
+
+    return out;
 }
 
 // ============================================================================
