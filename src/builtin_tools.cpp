@@ -305,13 +305,33 @@ static const char * const kEdgeUserAgent =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0";
 
-// Google Chrome on Windows 11 — current-stable User-Agent.  Used by the
-// DDG search POST (append_chrome_xhr_headers below), which impersonates
-// a JS fetch() rather than a page navigation.  Bump manually as Chrome
-// releases; keep the version in sync with the sec-ch-ua line.
+// Google Chrome on Windows 11 — current-stable User-Agent.  Kept for
+// reference; current search code prefers kNetscapeUserAgent (see below)
+// because the modern Chrome persona triggers DDG/Bing/Brave anti-bot
+// gating from server IPs while a vintage Netscape UA gets the lo-fi
+// HTML / no-JS path the search engines maintain for legacy clients.
 static const char * const kChromeUserAgent =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36";
+
+// Netscape Communicator 4.79 on Windows 2000 — the persona used for ALL
+// search backends (web_search_ddg, web_search_ddg_lite, web_search_bing,
+// web_search_brave). The reasoning: every keyless search endpoint we
+// scrape now treats a contemporary Chrome/Edge UA as suspect (DDG
+// returns its "anomaly" page, Brave throttles harder, Bing degrades the
+// HTML) but maintains a no-JS / accessibility path for clients that
+// obviously can't run a JS challenge. Posing as a 2001-era browser
+// trips that path: the search engines serve the simple table-based
+// results without a captcha challenge. Verified bypassing the DDG
+// "anomaly" wall on html.duckduckgo.com from server IPs that get
+// blocked under the modern UA.
+//
+// NOT used by web_handle_fetch — that path keeps kEdgeUserAgent because
+// (a) the model usually wants the modern version of a fetched page,
+// (b) some sites refuse to serve content at all to a Netscape UA, and
+// (c) fetch isn't the surface bot-gating us.
+static const char * const kNetscapeUserAgent =
+    "Mozilla/4.79 [en] (Windows NT 5.0; U)";
 
 // Companion headers Edge always sends.  Appended to whatever header list
 // the caller is already building so we don't clobber Content-Type for
@@ -335,29 +355,25 @@ static curl_slist * append_edge_browser_headers(curl_slist * headers) {
     return headers;
 }
 
-// Chrome XHR/fetch persona — the header set a real Chrome attaches when
-// page JavaScript issues a cross-site `fetch()` to html.duckduckgo.com:
-// `*/*` Accept, the client-hint trio, an Origin/Referer pointing back at
-// duckduckgo.com, X-Requested-With, and Sec-Fetch-* describing a fetch
-// (mode=cors, dest=empty, site=same-site) rather than a navigation.
-// Used only by the search POST; http_get / web-fetch keeps the
-// navigation-style append_edge_browser_headers (correct for whole-page
-// loads). Pair with kChromeUserAgent so UA and sec-ch-ua agree.
-static curl_slist * append_chrome_xhr_headers(curl_slist * headers) {
-    headers = curl_slist_append(headers, "Accept: */*");
-    headers = curl_slist_append(headers, "Accept-Language: en-US,en;q=0.9");
-    headers = curl_slist_append(headers,
-        "sec-ch-ua: \"Chromium\";v=\"133\", \"Google Chrome\";v=\"133\", "
-        "\"Not(A:Brand\";v=\"99\"");
-    headers = curl_slist_append(headers, "sec-ch-ua-mobile: ?0");
-    headers = curl_slist_append(headers, "sec-ch-ua-platform: \"Windows\"");
-    headers = curl_slist_append(headers, "Origin: https://duckduckgo.com");
-    headers = curl_slist_append(headers, "Referer: https://duckduckgo.com/");
-    headers = curl_slist_append(headers, "X-Requested-With: XMLHttpRequest");
-    headers = curl_slist_append(headers, "Sec-Fetch-Dest: empty");
-    headers = curl_slist_append(headers, "Sec-Fetch-Mode: cors");
-    headers = curl_slist_append(headers, "Sec-Fetch-Site: same-site");
-    return headers;
+// Netscape-era request headers for ALL search backends. Returned as a
+// std::vector<std::string> rather than a curl_slist so it composes
+// cleanly with both http_get's extra_headers parameter (slist built
+// internally) and the manual slist construction in http_post_form.
+//
+// What we DON'T send: sec-ch-ua client-hint trio, Sec-Fetch-* metadata,
+// Origin/Referer, X-Requested-With, Upgrade-Insecure-Requests. A real
+// Netscape 4.79 from 2001 didn't have any of those; sending them would
+// give DDG/Bing/Brave a contradictory fingerprint (vintage UA + modern
+// metadata) and they'd likely gate us anyway. The whole point of the
+// Netscape persona is to look like a browser that genuinely can't run
+// modern JS, so sending only the headers that browser would have sent
+// is part of the deception.
+static std::vector<std::string> netscape_search_headers() {
+    return {
+        std::string("User-Agent: ") + kNetscapeUserAgent,
+        "Accept: text/html, */*",
+        "Accept-Language: en-US,en;q=0.9",
+    };
 }
 
 // SECURITY: refuse non-http(s) URLs at the top of every fetch.  Without
@@ -535,9 +551,14 @@ static bool http_post_form(const std::string & url,
                      (long) (CURLPROTO_HTTP | CURLPROTO_HTTPS));
 #endif
     curl_easy_setopt(c, CURLOPT_TIMEOUT,         timeout_s);
-    // Impersonate Chrome issuing a JS fetch() — html.duckduckgo.com
-    // (and most search backends) reject or degrade non-browser UAs.
-    curl_easy_setopt(c, CURLOPT_USERAGENT,        kChromeUserAgent);
+    // Pose as Netscape 4.79 — html.duckduckgo.com gates the modern
+    // Chrome/Edge persona with its anti-bot "anomaly" page from
+    // server IPs, but the same query with a vintage UA gets the lo-fi
+    // HTML response without challenge. The User-Agent header in the
+    // slist below overrides this CURLOPT_USERAGENT setting (libcurl
+    // prefers the slist entry); the setopt is here so a default UA
+    // is in place even if the slist construction is later changed.
+    curl_easy_setopt(c, CURLOPT_USERAGENT,       kNetscapeUserAgent);
     curl_easy_setopt(c, CURLOPT_WRITEFUNCTION,   curl_write_cb);
     curl_easy_setopt(c, CURLOPT_WRITEDATA,       &sink);
     curl_easy_setopt(c, CURLOPT_NOSIGNAL,        1L);
@@ -546,14 +567,15 @@ static bool http_post_form(const std::string & url,
     curl_easy_setopt(c, CURLOPT_POSTFIELDS,      form_body.c_str());
     curl_easy_setopt(c, CURLOPT_POSTFIELDSIZE,   (long) form_body.size());
 
-    // Form POST + Chrome XHR persona.  append_chrome_xhr_headers()
-    // sends the Sec-Fetch-* / client-hint / Origin / Referer set a real
-    // Chrome attaches to a cross-site fetch(); we add Content-Type for
-    // the form payload.
+    // Form POST + Netscape persona (no Sec-Fetch / client-hint / Origin
+    // headers — a real Netscape 4.79 wouldn't have sent them, and the
+    // contradictory fingerprint would defeat the point of the vintage UA).
     curl_slist * headers = nullptr;
     headers = curl_slist_append(headers,
         "Content-Type: application/x-www-form-urlencoded");
-    headers = append_chrome_xhr_headers(headers);
+    for (const auto & h : netscape_search_headers()) {
+        headers = curl_slist_append(headers, h.c_str());
+    }
     curl_easy_setopt(c, CURLOPT_HTTPHEADER, headers);
 
     const int max_attempts = (retries < 0 ? 0 : retries) + 1;
@@ -731,10 +753,16 @@ WebFetchCache & web_fetch_cache() {
 namespace {
 
 // ---------- search: DuckDuckGo HTML scraper ----------
-// POST html.duckduckgo.com/html/ (DDG is much more aggressive about CAPTCHA
-// on GETs from scripted clients). DDG wraps result URLs in a tracking
-// redirect (`//duckduckgo.com/l/?uddg=ENCODED_URL&rut=...`); we unwrap
-// via decode_ddg_redirect() before handing them back so the model gets
+// POST html.duckduckgo.com/html/ as Netscape 4.79. The modern Chrome
+// XHR persona we used to send was reliably gated to DDG's anti-bot
+// "anomaly" page from server IPs; switching to the vintage Netscape
+// UA + a stripped-down request (no Sec-Fetch / client-hints / Origin)
+// gets the lo-fi HTML response instead. Same trick that powers the
+// ddg-lite engine — see kNetscapeUserAgent and http_post_form.
+//
+// DDG wraps result URLs in a tracking redirect
+// (`//duckduckgo.com/l/?uddg=ENCODED_URL&rut=...`); we unwrap via
+// decode_ddg_redirect() before handing them back so the model gets
 // real fetchable URLs.
 ToolResult web_search_ddg(const std::string & query, long long page,
                           long long max_results) {
@@ -790,32 +818,30 @@ ToolResult web_search_ddg(const std::string & query, long long page,
     }
 
     if (hits.empty()) {
-        // DDG's anti-bot "anomaly" page comes back HTTP 202 with a
-        // non-empty body that carries zero result__a anchors — the
-        // regex parse above yields nothing. Distinguish that hard
-        // block from a genuine empty result set / markup drift so the
-        // operator gets an honest, actionable error: an anomaly block
-        // is IP/client-level, NOT a transient rate-limit, so "try
-        // again in a minute" is misleading — the real fix is a
-        // different egress IP or the Google engine.
+        // The Netscape UA usually bypasses DDG's anti-bot "anomaly"
+        // page, but if DDG ever closes that loophole it would come
+        // back here — HTTP 202 with a non-empty body that carries
+        // zero result__a anchors. Detect that explicitly so the
+        // error is actionable: anomaly = IP/client-level block (a
+        // different egress IP is the real fix, not a retry).
         if (body.find("anomaly") != std::string::npos) {
             return ToolResult::error(
                 "DuckDuckGo blocked this request — it returned its "
-                "anti-bot \"anomaly\" page instead of results. This is "
-                "an IP/client-level block, not a transient rate-limit, "
-                "so retrying soon usually won't help. The default "
-                "engine=\"auto\" already cascades through bing and "
-                "google before falling here; if you reached this error "
-                "via an explicit engine=\"ddg\", drop the override and "
-                "let auto pick.");
+                "anti-bot \"anomaly\" page instead of results, even "
+                "with the Netscape UA bypass. This is an IP/client-"
+                "level block, not a transient rate-limit, so retrying "
+                "soon won't help. The default engine=\"auto\" already "
+                "cascades through brave / ddg-lite / bing before "
+                "falling here; if you reached this via explicit "
+                "engine=\"ddg\", switch to auto or another engine.");
         }
         return ToolResult::error(
             "no results parsed — DuckDuckGo returned a page with no "
             "recognisable result entries (possible HTML markup change, "
             "or a genuinely empty result set for this query). The "
-            "default engine=\"auto\" already tries bing before this; "
-            "if you reached this via explicit engine=\"ddg\", switch to "
-            "auto or engine=\"bing\".");
+            "default engine=\"auto\" already tries brave / ddg-lite / "
+            "bing before this; if you reached this via explicit "
+            "engine=\"ddg\", switch engines.");
     }
 
     const long long total = (long long) hits.size();
@@ -894,18 +920,11 @@ ToolResult web_search_ddg_lite(const std::string & query, long long page,
     const std::string url = "https://lite.duckduckgo.com/lite/?q="
         + url_encode(query);
 
-    // Netscape Communicator 4.79 on Windows 2000. The User-Agent
-    // header in extra_headers overrides the kEdgeUserAgent that
-    // http_get sets via CURLOPT_USERAGENT — libcurl prefers the
-    // slist entry when both are present.
-    const std::vector<std::string> hdrs = {
-        "User-Agent: Mozilla/4.79 [en] (Windows NT 5.0; U)",
-        "Accept: text/html, */*",
-        "Accept-Language: en-US,en;q=0.9",
-    };
-
+    // Netscape persona — see netscape_search_headers() for the why
+    // (same persona is shared across all search backends now).
     std::string body, err;
-    if (!http_get(url, hdrs, body, err, 20, 1024 * 1024)) {
+    if (!http_get(url, netscape_search_headers(), body, err,
+                  20, 1024 * 1024)) {
         return ToolResult::error("ddg-lite search failed: " + err);
     }
     if (body.empty()) {
@@ -1022,7 +1041,8 @@ ToolResult web_search_brave(const std::string & query, long long page,
         + url_encode(query);
 
     std::string body, err;
-    if (!http_get(url, {}, body, err, 20, 4 * 1024 * 1024)) {
+    if (!http_get(url, netscape_search_headers(), body, err,
+                  20, 4 * 1024 * 1024)) {
         return ToolResult::error("brave search failed: " + err);
     }
     if (body.empty()) {
@@ -1141,7 +1161,7 @@ ToolResult web_search_bing(const std::string & query, long long page,
         + url_encode(query) + "&format=rss";
 
     std::string body, err;
-    if (!http_get(url, {}, body, err)) {
+    if (!http_get(url, netscape_search_headers(), body, err)) {
         return ToolResult::error("bing search failed: " + err);
     }
     if (body.empty()) {
