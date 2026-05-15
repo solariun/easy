@@ -17,18 +17,25 @@ Tool datetime();   // returns current UTC + local time in ISO-8601
 //
 //   action="search"  query → numbered title/url/snippet results
 //                    engine: "auto" (default) cascades through
-//                    google → brave → bing → ddg and returns the
-//                    first that succeeds. Explicit picks:
+//                    google → brave → ddg-lite → bing → ddg and
+//                    returns the first that succeeds. Explicit picks:
 //                    "google" (Google Custom Search JSON API; needs
 //                    GOOGLE_API_KEY + GOOGLE_CSE_ID env vars at call
 //                    time AND `google_enabled=true` at registration —
 //                    the operator-opt-in gate that keeps a billed
 //                    third-party API off by default), "brave" (Brave
 //                    HTML scrape; keyless, ~20 results per query, the
-//                    keyless engine that actually understands the
-//                    full query — Bing RSS, by contrast, ignores
-//                    quoted phrases and rare named entities; downside
-//                    is Brave throttles single IPs aggressively),
+//                    keyless engine that best understands the full
+//                    query — Bing RSS, by contrast, ignores quoted
+//                    phrases and rare named entities; downside is
+//                    Brave throttles single IPs aggressively),
+//                    "ddg-lite" (DuckDuckGo's no-JS Lite endpoint
+//                    `lite.duckduckgo.com/lite/` accessed with a
+//                    Netscape Communicator 4.79 User-Agent; keyless,
+//                    ~10 results, page 1 only — the Netscape UA
+//                    bypasses the anti-bot wall the main DDG endpoint
+//                    applies to scripted clients, and the result
+//                    ranking is good for niche entity queries),
 //                    "bing" (Bing RSS feed; keyless, captcha-free,
 //                    ~10 results, no real pagination, weak query
 //                    understanding for niche terms but stable),

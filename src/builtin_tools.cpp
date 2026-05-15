@@ -846,6 +846,144 @@ ToolResult web_search_ddg(const std::string & query, long long page,
 #endif
 }
 
+// ---------- search: DuckDuckGo Lite ----------
+// GET lite.duckduckgo.com/lite/?q=… while posing as Netscape
+// Communicator 4.79 on Windows 2000. DDG Lite is the no-JS,
+// accessibility-friendly variant DDG maintains for old browsers and
+// screen readers — it bypasses the anti-bot "anomaly" gate the main
+// html.duckduckgo.com endpoint applies to scripted clients, because
+// an old browser legitimately can't run a JS challenge. The signal
+// is the User-Agent: a contemporary Chrome UA gets gated; an obvious
+// pre-2002 browser UA gets the simple table-based HTML.
+//
+// FIRST PAGE ONLY
+//   The Lite endpoint accepts an `s=` offset parameter for deeper
+//   pages, but this wrapper deliberately doesn't expose it — the
+//   user-facing contract is "first page, no pagination." `page > 1`
+//   returns a past-end marker so the model knows to switch engine
+//   instead of looping uselessly. For deeper pagination use
+//   engine="google".
+//
+// FORMAT QUIRKS
+//   - URLs are wrapped in DDG's `/l/?uddg=ENCODED_URL` redirects;
+//     decode_ddg_redirect() unwraps them so the model gets real URLs.
+//   - DDG randomly mixes single and double quotes on HTML attributes
+//     — the regex's [\"'] character class accepts either.
+//   - First "result" is often a Microsoft sponsored ad (URL contains
+//     `ad_provider=` / `bingv7aa` / `y.js?`); we drop those.
+ToolResult web_search_ddg_lite(const std::string & query, long long page,
+                               long long max_results) {
+#if !defined(EASYAI_HAVE_CURL)
+    (void) query; (void) page; (void) max_results;
+    return ToolResult::error(
+        "web search unavailable: easyai built without libcurl");
+#else
+    if (max_results < 1)  max_results = 1;
+    if (max_results > 10) max_results = 10;
+    if (page < 1)         page = 1;
+
+    // Page 1 only — refuse pagination requests cleanly.
+    if (page > 1) {
+        std::ostringstream o;
+        o << "[page " << page << " is past last page (1); ddg-lite "
+             "returns first-page results only — for deeper pagination "
+             "use engine=\"google\"]";
+        return ToolResult::ok(o.str());
+    }
+
+    const std::string url = "https://lite.duckduckgo.com/lite/?q="
+        + url_encode(query);
+
+    // Netscape Communicator 4.79 on Windows 2000. The User-Agent
+    // header in extra_headers overrides the kEdgeUserAgent that
+    // http_get sets via CURLOPT_USERAGENT — libcurl prefers the
+    // slist entry when both are present.
+    const std::vector<std::string> hdrs = {
+        "User-Agent: Mozilla/4.79 [en] (Windows NT 5.0; U)",
+        "Accept: text/html, */*",
+        "Accept-Language: en-US,en;q=0.9",
+    };
+
+    std::string body, err;
+    if (!http_get(url, hdrs, body, err, 20, 1024 * 1024)) {
+        return ToolResult::error("ddg-lite search failed: " + err);
+    }
+    if (body.empty()) {
+        return ToolResult::error("ddg-lite search failed: empty response");
+    }
+
+    static const std::regex re_link(
+        R"DDG(<a rel=["']nofollow["'] href=["']([^"']+)["'] class=["']result-link["']>([^<]+)</a>)DDG",
+        std::regex::icase);
+    static const std::regex re_snip(
+        R"DDG(<td class=["']result-snippet["'][^>]*>([\s\S]*?)</td>)DDG",
+        std::regex::icase);
+
+    struct Hit { std::string title, url, snippet; };
+    std::vector<Hit> hits;
+    hits.reserve(16);
+
+    auto t_end = std::sregex_iterator();
+    for (auto it = std::sregex_iterator(body.begin(), body.end(), re_link);
+         it != t_end; ++it) {
+        std::string href  = (*it)[1].str();
+        std::string title = strip_html((*it)[2].str());
+        if (href.empty() || title.empty()) continue;
+        // Skip the "more info" footer anchors on sponsored links —
+        // they reuse class="result-link" but point at DDG's help page.
+        if (title == "more info") continue;
+        std::string real = decode_ddg_redirect(href);
+        if (real.empty()) continue;
+        // Drop Microsoft sponsored ad results — their wrapped URL
+        // contains the ad-provider sentinel.
+        if (real.find("ad_provider=") != std::string::npos ||
+            real.find("bingv7aa")     != std::string::npos ||
+            real.find("y.js?")        != std::string::npos) {
+            continue;
+        }
+        // Snippet is in the next few rows; same look-ahead window
+        // shape as web_search_ddg.
+        size_t after = it->position(0) + it->length(0);
+        std::string tail = body.substr(after,
+            std::min<size_t>(2048, body.size() - after));
+        std::string snippet;
+        std::smatch sm;
+        if (std::regex_search(tail, sm, re_snip)) {
+            snippet = strip_html(sm[1].str());
+        }
+        hits.push_back({std::move(title), std::move(real), std::move(snippet)});
+        if ((long long) hits.size() >= 12) break;
+    }
+
+    if (hits.empty()) {
+        return ToolResult::error(
+            "no results parsed — DDG Lite returned a page with no "
+            "`class=\"result-link\"` organic anchors. Likely causes: "
+            "the Netscape UA loophole was closed (DDG started gating "
+            "Lite the same way as the main HTML endpoint), or "
+            "genuinely empty result set. Auto cascade falls to bing "
+            "next; if you reached this via explicit engine=\"ddg-lite\", "
+            "switch engines.");
+    }
+
+    const long long total = (long long) hits.size();
+    const long long emit  = std::min(total, max_results);
+
+    std::ostringstream out;
+    out << "total_entries: " << total << "\n";
+    out << "page: 1 of 1\n";
+    out << "has_more: no\n";
+    out << "engine: ddg-lite\n";
+    out << "Top web results for: " << query << "\n";
+    for (long long i = 0; i < emit; ++i) {
+        out << "\n" << (i + 1) << ". " << hits[i].title
+            << "\n   " << hits[i].url
+            << "\n   " << clip(hits[i].snippet, 300) << "\n";
+    }
+    return ToolResult::ok(clip(out.str(), 8 * 1024));
+#endif
+}
+
 // ---------- search: Brave Search HTML scrape ----------
 // GET search.brave.com/search?q=… — Brave SSRs ~20 result blocks per
 // page wrapped in `data-type="web"`. Unlike Bing's RSS endpoint
@@ -1193,10 +1331,10 @@ ToolResult web_search_google(const std::string & query, long long page,
 }
 
 // ---------- search: dispatch ----------
-// Default engine is "auto" — a fixed-order cascade through four
+// Default engine is "auto" — a fixed-order cascade through five
 // backends, picking the first that returns a non-error response:
 //
-//     google  →  brave  →  bing  →  ddg
+//     google  →  brave  →  ddg-lite  →  bing  →  ddg
 //
 // Why this order:
 //   - Google CSE is the highest-quality result set, but it's billed
@@ -1206,25 +1344,36 @@ ToolResult web_search_google(const std::string & query, long long page,
 //     missing we SKIP — not error — and move on, so a deployment
 //     without Google credentials silently falls through.
 //   - Brave HTML (`search.brave.com/search?q=…`) is the keyless
-//     engine that actually understands the full query. Bing RSS, by
+//     engine that best understands the full query. Bing RSS, by
 //     contrast, runs a stripped-down ranking that ignores quoted
 //     phrases and rare named entities — it returns Wikipedia about
 //     Santiago de Compostela for `"Santiago Cavalcante" PNUD`. So we
-//     try Brave FIRST among the keyless engines whenever the query
+//     try Brave first among the keyless engines whenever the query
 //     might contain a niche term. The downside: Brave throttles
-//     single IPs aggressively and its Svelte classes rotate between
-//     deploys, so it can fail in batches.
+//     single IPs aggressively (HTTP 429 after a small burst) and its
+//     Svelte classes rotate between deploys.
+//   - DDG Lite (`lite.duckduckgo.com/lite/`) with a Netscape 4.79 UA
+//     is the second keyless engine. It's also good at niche entity
+//     queries (returns the LinkedIn / Google Scholar / Brazilian
+//     profile hits for "Santiago Cavalcante" PNUD) and isn't rate-
+//     limited the way Brave is — so it carries the keyless workhorse
+//     case whenever Brave's burst budget is gone. The Netscape UA
+//     matters: a contemporary UA gets gated by the same anti-bot
+//     wall the main html.duckduckgo.com endpoint applies, but the
+//     Lite endpoint serves no-JS HTML to clients that obviously
+//     can't run JS. Page 1 only.
 //   - Bing RSS (`/search?q=…&format=rss`) is keyless, captcha-free,
 //     and stable — Microsoft maintains it for legitimate feed
-//     consumers. Caps at ~10 results per query and ignores
-//     pagination. Better than Brave for queries where Brave is rate-
-//     limited or where simple keyword matching is enough.
-//   - DDG HTML scrape is the historical default. Kept as the last
-//     fallback because (a) no key, (b) different result distribution,
-//     but increasingly serves the anti-bot "anomaly" page from
-//     server IPs, which is why it's no longer earlier in the chain.
+//     consumers. Caps at ~10 results, no pagination, weak query
+//     understanding for niche entities — useful as a fallback for
+//     ordinary keyword queries.
+//   - DDG HTML scrape is the last fallback — same backend as DDG Lite
+//     but the modern endpoint (html.duckduckgo.com), which DDG now
+//     gates aggressively from server IPs with the "anomaly" page.
+//     Kept because (a) no key, (b) occasionally still works even
+//     when ddg-lite doesn't (different rate-limit / IP-block paths).
 //
-// If all four fail, the error aggregates each engine's reason, so the
+// If all five fail, the error aggregates each engine's reason, so the
 // operator can tell at a glance whether it's a credential issue, a
 // network issue, or genuinely no results for the query.
 //
@@ -1246,28 +1395,30 @@ ToolResult web_handle_search(const ToolCall & c, bool google_enabled) {
     args::get_string(c.arguments_json, "engine", engine);
 
     // Explicit engine — run only that engine, no fallback.
-    if (engine == "ddg")   return web_search_ddg(query, page, max_results);
-    if (engine == "bing")  return web_search_bing(query, page, max_results);
-    if (engine == "brave") return web_search_brave(query, page, max_results);
+    if (engine == "ddg")      return web_search_ddg(query, page, max_results);
+    if (engine == "ddg-lite") return web_search_ddg_lite(query, page, max_results);
+    if (engine == "bing")     return web_search_bing(query, page, max_results);
+    if (engine == "brave")    return web_search_brave(query, page, max_results);
     if (engine == "google") {
         if (!google_enabled) {
             return ToolResult::error(
                 "engine=\"google\" not enabled on this server — operator "
                 "must pass --use-google (or Toolbelt::use_google()) to "
                 "allow Google CSE. Default engine \"auto\" cascades "
-                "google → brave → bing → ddg and works without any "
-                "opt-in.");
+                "google → brave → ddg-lite → bing → ddg and works "
+                "without any opt-in.");
         }
         return web_search_google(query, page, max_results);
     }
     if (!engine.empty() && engine != "auto") {
         return ToolResult::error(
             "unknown engine \"" + engine + "\" — valid: \"auto\" "
-            "(default; cascades google → brave → bing → ddg), "
-            "\"google\" (needs GOOGLE_API_KEY + GOOGLE_CSE_ID env "
-            "vars and operator opt-in), \"brave\" (HTML scrape, "
-            "keyless, best query understanding), \"bing\" (RSS, "
-            "keyless), \"ddg\" (HTML scrape, keyless).");
+            "(default; cascades google → brave → ddg-lite → bing → "
+            "ddg), \"google\" (needs GOOGLE_API_KEY + GOOGLE_CSE_ID "
+            "env vars and operator opt-in), \"brave\" (HTML scrape, "
+            "keyless, best query understanding), \"ddg-lite\" "
+            "(no-JS DDG with Netscape UA, keyless, page 1 only), "
+            "\"bing\" (RSS, keyless), \"ddg\" (HTML scrape, keyless).");
     }
 
     // Auto cascade.
@@ -1293,22 +1444,29 @@ ToolResult web_handle_search(const ToolCall & c, bool google_enabled) {
             "at registration)");
     }
 
-    // 2. Brave HTML — keyless and understands the full query.
+    // 2. Brave HTML — keyless, best query understanding when not 429ed.
     {
         ToolResult r = web_search_brave(query, page, max_results);
         if (!r.is_error) return r;
         tried.push_back("brave: " + r.content);
     }
 
-    // 3. Bing RSS — keyless, captcha-free, but weaker query
-    //    understanding for niche entities.
+    // 3. DDG Lite (Netscape UA) — keyless workhorse, also good at
+    //    niche entity queries, page-1-only.
+    {
+        ToolResult r = web_search_ddg_lite(query, page, max_results);
+        if (!r.is_error) return r;
+        tried.push_back("ddg-lite: " + r.content);
+    }
+
+    // 4. Bing RSS — keyless, captcha-free, weak entity ranking.
     {
         ToolResult r = web_search_bing(query, page, max_results);
         if (!r.is_error) return r;
         tried.push_back("bing: " + r.content);
     }
 
-    // 4. DDG HTML — last resort, often blocked from server IPs.
+    // 5. DDG HTML — last resort, often blocked from server IPs.
     {
         ToolResult r = web_search_ddg(query, page, max_results);
         if (!r.is_error) return r;
@@ -1396,12 +1554,17 @@ std::vector<Tool> web_split(bool google_enabled) {
                "(default 1).", false)
         .param("engine",      "string",
                "Which backend to use. \"auto\" (default) cascades "
-               "google → brave → bing → ddg and returns the first "
-               "that succeeds. Explicit picks: \"google\" (Google "
-               "Custom Search; needs GOOGLE_API_KEY + GOOGLE_CSE_ID "
-               "env vars AND operator opt-in), \"brave\" (Brave HTML "
-               "scrape; keyless, ~20 results, best query understanding "
-               "for niche named entities), \"bing\" (Bing RSS; "
+               "google → brave → ddg-lite → bing → ddg and returns "
+               "the first that succeeds. Explicit picks: \"google\" "
+               "(Google Custom Search; needs GOOGLE_API_KEY + "
+               "GOOGLE_CSE_ID env vars AND operator opt-in), "
+               "\"brave\" (Brave HTML scrape; keyless, ~20 results, "
+               "best query understanding for niche named entities), "
+               "\"ddg-lite\" (DuckDuckGo Lite endpoint with a Netscape "
+               "4.79 User-Agent; keyless, ~10 results, page 1 only — "
+               "Lite serves no-JS HTML to UAs that obviously can't run "
+               "JS, bypassing the anti-bot wall the main DDG endpoint "
+               "applies to scripted clients), \"bing\" (Bing RSS; "
                "keyless, ~10 results, no real pagination, weak query "
                "understanding for rare terms), \"ddg\" (DuckDuckGo "
                "HTML scrape; keyless but often blocked from server "
@@ -1445,21 +1608,24 @@ Tool web(bool google_enabled) {
             "\n"
             "  action=\"search\"\n"
             "    Search the web. Required: query. Optional: max_results "
-            "(default 5; ddg max 20, brave max 20, bing max 10, google "
-            "max 10), page (1-based, default 1; pages slice the "
-            "engine's own ordering — note bing RSS only returns ~10 "
-            "results and ignores deeper pagination, brave caps at ~20 "
-            "for the same reason), engine (default \"auto\" cascades "
-            "google → brave → bing → ddg and returns the first that "
+            "(default 5; ddg max 20, brave max 20, ddg-lite max 10, "
+            "bing max 10, google max 10), page (1-based, default 1; "
+            "pages slice the engine's own ordering — note ddg-lite is "
+            "page-1-only by design, bing RSS only returns ~10 results "
+            "and ignores deeper pagination, brave caps at ~20 for the "
+            "same reason), engine (default \"auto\" cascades google → "
+            "brave → ddg-lite → bing → ddg and returns the first that "
             "works; explicit picks: \"google\" needs GOOGLE_API_KEY + "
             "GOOGLE_CSE_ID and operator opt-in, \"brave\" is keyless "
             "HTML scrape with the best understanding of niche named "
-            "entities, \"bing\" is keyless RSS but ignores rare "
-            "terms in the query, \"ddg\" is keyless HTML scrape — "
-            "pin one only for diagnosis). Returns a numbered title / "
-            "url / snippet list with `total_entries`, `page`, "
-            "`has_more`, `engine` header lines so you can page forward "
-            "without guessing and see which backend actually answered.\n"
+            "entities, \"ddg-lite\" is the keyless no-JS DDG endpoint "
+            "with a Netscape UA (great for entity queries when brave "
+            "is rate-limited), \"bing\" is keyless RSS but ignores "
+            "rare terms, \"ddg\" is keyless HTML scrape — pin one "
+            "only for diagnosis). Returns a numbered title / url / "
+            "snippet list with `total_entries`, `page`, `has_more`, "
+            "`engine` header lines so you can page forward without "
+            "guessing and see which backend actually answered.\n"
             "\n"
             "  action=\"fetch\"\n"
             "    Read a URL's actual content. Required: url. Optional: "
@@ -1497,10 +1663,11 @@ Tool web(bool google_enabled) {
                "Google CSE caps total pageable results at 100.", false)
         .param("engine",      "string",
                "Used by search. \"auto\" (default; cascades google → "
-               "brave → bing → ddg), \"google\" (needs env vars + "
-               "operator opt-in), \"brave\" (HTML, keyless, best "
-               "query understanding for niche entities), \"bing\" "
-               "(RSS, keyless), \"ddg\" (HTML, keyless).", false)
+               "brave → ddg-lite → bing → ddg), \"google\" (needs "
+               "env vars + operator opt-in), \"brave\" (HTML, keyless, "
+               "best query understanding), \"ddg-lite\" (DDG no-JS "
+               "endpoint with Netscape UA, keyless, page 1 only), "
+               "\"bing\" (RSS, keyless), \"ddg\" (HTML, keyless).", false)
         .param("start",       "integer",
                "Used by fetch. Byte offset into the stripped (or raw, "
                "if as_html=true) body for pagination. Default 0.", false)

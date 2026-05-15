@@ -285,7 +285,8 @@ installer leaves room for in `/etc/easyai/easyai.ini`:
   `GOOGLE_API_KEY` and `GOOGLE_CSE_ID` in `Environment=` lines of a
   drop-in. Counts against your Google quota (free tier: 100/day).
   Without it, the auto cascade falls through to brave (keyless HTML,
-  best understanding of niche named entities) → bing (keyless RSS)
+  best understanding of niche named entities) → ddg-lite (keyless
+  no-JS DDG with Netscape UA, page 1 only) → bing (keyless RSS)
   → ddg (keyless HTML scrape).
 - `[SERVER] local_tools = false` (or pass `--no-local-tools`).
   Skips the LOCAL built-in toolbelt — the model only sees the
