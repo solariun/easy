@@ -570,12 +570,13 @@ mirrors the rag dispatcher introduced 2026-05-04.
 * **`web` tool** — `web(action="search"|"fetch")`. Replaces the
   separate `web_search`, `web_fetch`, and `web_google` tools. Search
   takes an `engine` parameter (`"auto"` default — cascades through
-  google → bing → ddg, returning the first that succeeds; explicit
-  picks: `"google"` opt-in via `--use-google` plus the GOOGLE_API_KEY /
-  GOOGLE_CSE_ID env vars, `"bing"` keyless RSS feed, `"ddg"` keyless
-  HTML scrape but increasingly blocked from server IPs). Both actions
-  take `page` for pagination; `fetch` takes `start` + `limit` for
-  byte-window control.
+  google → brave → bing → ddg, returning the first that succeeds;
+  explicit picks: `"google"` opt-in via `--use-google` plus the
+  GOOGLE_API_KEY / GOOGLE_CSE_ID env vars, `"brave"` keyless HTML
+  scrape with the best understanding of niche named entities,
+  `"bing"` keyless RSS feed, `"ddg"` keyless HTML scrape but
+  increasingly blocked from server IPs). Both actions take `page` for
+  pagination; `fetch` takes `start` + `limit` for byte-window control.
 * **`fs` tool** — `fs(action="read"|"write"|"list"|"glob"|"grep"|"check_path"|"cwd"|"sandbox")`.
   Replaces seven separate factories plus `get_current_dir` and
   `get_sandbox_path`. `--allow-fs` now registers one tool, not seven.
@@ -1670,11 +1671,14 @@ engine.add_tool(
   * `datetime` (no deps)
   * `web` — unified search + fetch (`action="search"` / `"fetch"`).
     Search engine selectable: `"auto"` (default; cascades google →
-    bing → ddg, returning the first that succeeds — Bing carries the
-    keyless workhorse case since DDG started anti-bot blocking server
-    IPs), or pin one explicitly: `"google"` (Google Custom Search JSON
-    API, opt-in via the `google_enabled` ctor flag and the
-    GOOGLE_API_KEY + GOOGLE_CSE_ID env vars), `"bing"` (Bing RSS feed,
+    brave → bing → ddg, returning the first that succeeds — Brave
+    carries the keyless niche-query case since Bing RSS ignores
+    quoted phrases and rare named entities, and Bing carries the
+    keyless workhorse case for ordinary queries since DDG started
+    anti-bot blocking server IPs), or pin one explicitly: `"google"`
+    (Google Custom Search JSON API, opt-in via the `google_enabled`
+    ctor flag and the GOOGLE_API_KEY + GOOGLE_CSE_ID env vars),
+    `"brave"` (Brave HTML scrape, keyless), `"bing"` (Bing RSS feed,
     keyless), `"ddg"` (DuckDuckGo HTML scrape, keyless). Page-based
     pagination on search; byte-window pagination on fetch. libcurl
     required at build time.
@@ -1744,7 +1748,7 @@ no shell.
 | (no flag)             | `datetime` and the unified `web` tool (action=`search` / `fetch`) only. |
 | `--sandbox <dir>`     | The unified `fs` tool (action=`read` / `write` / `list` / `glob` / `grep` / `check_path` / `cwd` / `sandbox`), all scoped to `<dir>`. The CLIs `chdir` into `<dir>` so `fs(action="cwd")` reports the sandbox path back to the model. |
 | `--allow-bash`        | `bash` (run `/bin/sh -c`). cwd = `--sandbox <dir>` if given, otherwise the binary's CWD. NOT a hardened sandbox — runs with your user privileges. Also bumps the agentic-loop `max_tool_hops` to 99999 (bash flows naturally span many turns). |
-| `--use-google`        | Enables `engine="google"` inside the unified `web` tool (Google Custom Search JSON API), and lets the default `engine="auto"` cascade try google as its first hop. Requires `GOOGLE_API_KEY` and `GOOGLE_CSE_ID` env vars. Counts against your Google quota — free tier is 100 queries/day per key. Without this flag (or without the env vars), the auto cascade silently skips google and falls through to bing → ddg. |
+| `--use-google`        | Enables `engine="google"` inside the unified `web` tool (Google Custom Search JSON API), and lets the default `engine="auto"` cascade try google as its first hop. Requires `GOOGLE_API_KEY` and `GOOGLE_CSE_ID` env vars. Counts against your Google quota — free tier is 100 queries/day per key. Without this flag (or without the env vars), the auto cascade silently skips google and falls through to brave → bing → ddg. |
 | `--external-tools <dir>` | Load every `EASYAI-<name>.tools` file in `<dir>` as an operator-defined tool pack. Per-file fault isolation (a bad file is logged + skipped, the agent still starts). Spawns via `fork`+`execve` — never a shell. **This is the supported way to give the model focused powers without flipping `--allow-bash`.** See [`EXTERNAL_TOOLS.md`](EXTERNAL_TOOLS.md). |
 | `--memory <dir>`      | Enable the agent's persistent **memory** (search / store / append / recall / update / forget) — a passive RAG technique over keyword-indexed Markdown files. Registers ONE `memory(action=...)` tool with sub-actions `save`, `append` (grow an existing memory without losing its body), `search`, `load`, `list`, `delete`, `keywords` — each memory one Markdown file in `<dir>`. Memories whose title starts with `fix-easyai-` are immutable: pass `fix=true` (sub-action `save`) to mint one. `--RAG` is still accepted as a back-compat alias. The systemd-installed server passes this by default (`/var/lib/easyai/rag`). See [`RAG.md`](RAG.md). |
 | `--mcp <url>`         | Connect to a remote MCP server as a CLIENT (e.g. another `easyai-server` or `easyai-mcp-server`). The upstream's tool catalogue is fetched via `tools/list` and merged into the local one; each remote tool's handler proxies `tools/call` back to it. Local tool names win on collision (remote dup skipped with a warning). Pair with `--mcp-token <token>` when the upstream requires bearer auth. |
@@ -2094,24 +2098,33 @@ the other explicitly with `-DGGML_METAL=OFF` / `-DGGML_CUDA=OFF`.
 ### Web search
 
 `web(action="search")` with the default `engine="auto"` cascades through
-three backends and returns the first one that succeeds:
+four backends and returns the first one that succeeds:
 
 1. **Google CSE** — only if `--use-google` is passed AND `GOOGLE_API_KEY`
    + `GOOGLE_CSE_ID` are set; if any are missing this hop is silently
    skipped (not a failure).
-2. **Bing RSS** — `www.bing.com/search?q=…&format=rss`. Keyless,
+2. **Brave HTML** — `search.brave.com/search?q=…`. Keyless HTML SSR,
+   ~20 results per page. The keyless engine that actually understands
+   the full query — unlike Bing RSS (which strips quoted phrases and
+   rare named entities, returning Wikipedia about Santiago de
+   Compostela for `"Santiago Cavalcante" PNUD`), Brave honours the
+   whole query. Downside: throttles single IPs aggressively, and its
+   Svelte CSS classes rotate between deploys (the scraper anchors on
+   stable hooks, so hash rotation alone won't break it; a structural
+   markup rewrite will).
+3. **Bing RSS** — `www.bing.com/search?q=…&format=rss`. Keyless,
    captcha-free XML feed maintained for legitimate feed consumers.
-   Caps at ~10 results per query and ignores pagination, but for the
-   80% case that's enough. This is the keyless workhorse.
-3. **DuckDuckGo HTML scrape** — `html.duckduckgo.com/html/`. Keyless,
+   Caps at ~10 results per query and ignores pagination, but stable
+   and fast for ordinary queries.
+4. **DuckDuckGo HTML scrape** — `html.duckduckgo.com/html/`. Keyless,
    the historical default, kept as last resort because DDG's anti-bot
    heuristics now return an "anomaly" page (HTTP 202, no results) for
    most server IPs.
 
-Pin a specific backend with `engine="google"` / `"bing"` / `"ddg"`
-when you want to bypass the cascade (useful for diagnosis: "does ddg
-still work from this box?"). The output's `engine: <name>` header line
-tells the model which backend actually answered.
+Pin a specific backend with `engine="google"` / `"brave"` / `"bing"` /
+`"ddg"` when you want to bypass the cascade (useful for diagnosis:
+"does ddg still work from this box?"). The output's `engine: <name>`
+header line tells the model which backend actually answered.
 
 ---
 

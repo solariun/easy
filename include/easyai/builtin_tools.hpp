@@ -17,20 +17,27 @@ Tool datetime();   // returns current UTC + local time in ISO-8601
 //
 //   action="search"  query → numbered title/url/snippet results
 //                    engine: "auto" (default) cascades through
-//                    google → bing → ddg and returns the first one
-//                    that succeeds. Explicit picks: "google" (Google
-//                    Custom Search JSON API; needs GOOGLE_API_KEY +
-//                    GOOGLE_CSE_ID env vars at call time AND
-//                    `google_enabled=true` at registration — the
-//                    operator-opt-in gate that keeps a billed third-
-//                    party API off by default), "bing" (Bing RSS feed,
-//                    keyless and captcha-free, ~10 results per query
-//                    with no real pagination), "ddg" (DuckDuckGo HTML
-//                    scrape, keyless but increasingly blocked from
-//                    server IPs by anti-bot heuristics).
-//                    Page-based pagination over the engine's own
-//                    ordering. The output's `engine: <name>` header
-//                    tells the caller which backend actually answered.
+//                    google → brave → bing → ddg and returns the
+//                    first that succeeds. Explicit picks:
+//                    "google" (Google Custom Search JSON API; needs
+//                    GOOGLE_API_KEY + GOOGLE_CSE_ID env vars at call
+//                    time AND `google_enabled=true` at registration —
+//                    the operator-opt-in gate that keeps a billed
+//                    third-party API off by default), "brave" (Brave
+//                    HTML scrape; keyless, ~20 results per query, the
+//                    keyless engine that actually understands the
+//                    full query — Bing RSS, by contrast, ignores
+//                    quoted phrases and rare named entities; downside
+//                    is Brave throttles single IPs aggressively),
+//                    "bing" (Bing RSS feed; keyless, captcha-free,
+//                    ~10 results, no real pagination, weak query
+//                    understanding for niche terms but stable),
+//                    "ddg" (DuckDuckGo HTML scrape; keyless but
+//                    increasingly blocked from server IPs by anti-bot
+//                    heuristics). Page-based pagination over the
+//                    engine's own ordering. The output's `engine:
+//                    <name>` header tells the caller which backend
+//                    actually answered.
 //
 //   action="fetch"   url → text content (HTML stripped, or raw with
 //                    as_html=true). Pagination via start (byte offset)

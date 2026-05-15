@@ -846,6 +846,133 @@ ToolResult web_search_ddg(const std::string & query, long long page,
 #endif
 }
 
+// ---------- search: Brave Search HTML scrape ----------
+// GET search.brave.com/search?q=… — Brave SSRs ~20 result blocks per
+// page wrapped in `data-type="web"`. Unlike Bing's RSS endpoint
+// (which runs a stripped-down ranking that ignores quoted phrases and
+// rare named entities), Brave honours the full query — it'll find a
+// niche Brazilian person record for `"Santiago Cavalcante" PNUD` where
+// Bing RSS returns a Wikipedia page about Santiago de Compostela.
+//
+// LIMITS
+//   - Pagination via the `&offset=N` URL parameter is intentionally
+//     NOT used — instead we fetch page 1 once (~20 results) and
+//     page-slice locally, same shape as the Bing handler. This keeps
+//     the request count down (Brave throttles single IPs aggressively)
+//     and avoids ambiguity about whether `offset` is page-indexed or
+//     result-indexed (Brave's docs are inconsistent). For deeper
+//     pagination, use engine="google".
+//   - Brave's Svelte-generated CSS classes carry build hashes
+//     (`svelte-1cwdgg3` etc.) that rotate between deployments. The
+//     scraper anchors only on the stable substrings — `data-type="web"`
+//     and the literal class-name prefixes "title" / "content" — so a
+//     hash rotation alone won't break it. A structural rewrite of the
+//     SERP markup will, though, and at that point the auto cascade
+//     simply falls through to bing → ddg until this scraper is updated.
+ToolResult web_search_brave(const std::string & query, long long page,
+                            long long max_results) {
+#if !defined(EASYAI_HAVE_CURL)
+    (void) query; (void) page; (void) max_results;
+    return ToolResult::error(
+        "web search unavailable: easyai built without libcurl");
+#else
+    if (max_results < 1)  max_results = 1;
+    if (max_results > 20) max_results = 20;
+    if (page < 1)         page = 1;
+
+    const std::string url = "https://search.brave.com/search?q="
+        + url_encode(query);
+
+    std::string body, err;
+    if (!http_get(url, {}, body, err, 20, 4 * 1024 * 1024)) {
+        return ToolResult::error("brave search failed: " + err);
+    }
+    if (body.empty()) {
+        return ToolResult::error("brave search failed: empty response");
+    }
+
+    static const std::regex re_href(
+        R"BRV(<a[^>]+href="(https?://[^"]+)")BRV", std::regex::icase);
+    static const std::regex re_title(
+        R"BRV(class="title[^"]*"[^>]*>([\s\S]*?)<)BRV", std::regex::icase);
+    static const std::regex re_content(
+        R"BRV(class="content[^"]*"[^>]*>([\s\S]*?)</div>)BRV", std::regex::icase);
+
+    struct Hit { std::string title, url, snippet; };
+    std::vector<Hit> hits;
+    hits.reserve(24);
+
+    const std::string marker = "data-type=\"web\"";
+    size_t pos = 0;
+    while (true) {
+        size_t start = body.find(marker, pos);
+        if (start == std::string::npos) break;
+        size_t next = body.find(marker, start + marker.size());
+        size_t end = (next == std::string::npos)
+            ? std::min<size_t>(body.size(), start + 8000)
+            : next;
+        std::string block = body.substr(start, end - start);
+        pos = start + marker.size();
+
+        std::smatch m;
+        std::string url_, title_, snippet_;
+        if (std::regex_search(block, m, re_href))    url_     = m[1].str();
+        if (std::regex_search(block, m, re_title))   title_   = strip_html(m[1].str());
+        if (std::regex_search(block, m, re_content)) snippet_ = strip_html(m[1].str());
+
+        if (url_.empty() || title_.empty()) continue;
+        // Defensively skip Brave's own internal navigation links — should
+        // never appear inside a data-type="web" block, but rotating
+        // markup could theoretically slip one in.
+        if (url_.find("search.brave.com") != std::string::npos) continue;
+
+        hits.push_back({std::move(title_), std::move(url_), std::move(snippet_)});
+        if ((long long) hits.size() >= 24) break;
+    }
+
+    if (hits.empty()) {
+        return ToolResult::error(
+            "no results parsed — Brave returned a page with no "
+            "`data-type=\"web\"` result blocks. Likely causes: rate "
+            "limit (Brave throttles single IPs aggressively, often "
+            "after only a handful of queries in a short window), an "
+            "anti-bot challenge, or markup change (Brave's Svelte "
+            "classes rotate between deployments). The default "
+            "engine=\"auto\" already cascades to bing after this; "
+            "if you reached this via explicit engine=\"brave\", "
+            "switch to auto or another engine.");
+    }
+
+    const long long total = (long long) hits.size();
+    const long long total_pages =
+        (total + max_results - 1) / max_results;
+    if (page > total_pages) {
+        std::ostringstream o;
+        o << "[page " << page << " is past last page (" << total_pages
+          << "); total_entries: " << total
+          << "; brave caps at ~20 results per query without re-fetching "
+             "with &offset= — for deeper pagination use engine=\"google\"]";
+        return ToolResult::ok(o.str());
+    }
+
+    const long long start_idx = (page - 1) * max_results;
+    const long long end_idx   = std::min(total, start_idx + max_results);
+
+    std::ostringstream out;
+    out << "total_entries: " << total << "\n";
+    out << "page: "          << page << " of " << total_pages << "\n";
+    out << "has_more: "      << (page < total_pages ? "yes" : "no") << "\n";
+    out << "engine: brave\n";
+    out << "Top web results for: " << query << "\n";
+    for (long long i = start_idx; i < end_idx; ++i) {
+        out << "\n" << (i + 1) << ". " << hits[i].title
+            << "\n   " << hits[i].url
+            << "\n   " << clip(hits[i].snippet, 300) << "\n";
+    }
+    return ToolResult::ok(clip(out.str(), 8 * 1024));
+#endif
+}
+
 // ---------- search: Bing RSS feed ----------
 // GET www.bing.com/search?q=...&format=rss — Bing's RSS endpoint returns
 // a clean XML feed of ~10 results per query. Unlike the HTML page (which
@@ -1066,30 +1193,38 @@ ToolResult web_search_google(const std::string & query, long long page,
 }
 
 // ---------- search: dispatch ----------
-// Default engine is "auto" — a fixed-order cascade through the three
+// Default engine is "auto" — a fixed-order cascade through four
 // backends, picking the first that returns a non-error response:
 //
-//     google  →  bing  →  ddg
+//     google  →  brave  →  bing  →  ddg
 //
 // Why this order:
-//   - Google CSE is the highest-quality result set, but it's billed and
-//     requires both an operator opt-in (`use_google=true` at register
-//     time) and two env vars (GOOGLE_API_KEY, GOOGLE_CSE_ID). When all
-//     of those are in place we prefer it. When any are missing we
-//     SKIP — not error — and move on, so a deployment without Google
-//     credentials silently falls through to the keyless engines.
+//   - Google CSE is the highest-quality result set, but it's billed
+//     and requires both an operator opt-in (`use_google=true` at
+//     register time) and two env vars (GOOGLE_API_KEY, GOOGLE_CSE_ID).
+//     When all of those are in place we prefer it. When any are
+//     missing we SKIP — not error — and move on, so a deployment
+//     without Google credentials silently falls through.
+//   - Brave HTML (`search.brave.com/search?q=…`) is the keyless
+//     engine that actually understands the full query. Bing RSS, by
+//     contrast, runs a stripped-down ranking that ignores quoted
+//     phrases and rare named entities — it returns Wikipedia about
+//     Santiago de Compostela for `"Santiago Cavalcante" PNUD`. So we
+//     try Brave FIRST among the keyless engines whenever the query
+//     might contain a niche term. The downside: Brave throttles
+//     single IPs aggressively and its Svelte classes rotate between
+//     deploys, so it can fail in batches.
 //   - Bing RSS (`/search?q=…&format=rss`) is keyless, captcha-free,
-//     stable, and a strict superset of "the engine works for non-
-//     browser clients" (which DDG no longer is for many server IPs).
-//     It caps at ~10 results per query and ignores pagination, but for
-//     the 80% case that's enough.
+//     and stable — Microsoft maintains it for legitimate feed
+//     consumers. Caps at ~10 results per query and ignores
+//     pagination. Better than Brave for queries where Brave is rate-
+//     limited or where simple keyword matching is enough.
 //   - DDG HTML scrape is the historical default. Kept as the last
-//     fallback because (a) no key, (b) different result distribution
-//     from bing — sometimes it surfaces a hit the others miss — but
-//     it's the most likely to return the anti-bot "anomaly" page from
-//     a server IP, which is why it's no longer the default.
+//     fallback because (a) no key, (b) different result distribution,
+//     but increasingly serves the anti-bot "anomaly" page from
+//     server IPs, which is why it's no longer earlier in the chain.
 //
-// If all three fail, the error aggregates each engine's reason, so the
+// If all four fail, the error aggregates each engine's reason, so the
 // operator can tell at a glance whether it's a credential issue, a
 // network issue, or genuinely no results for the query.
 //
@@ -1111,25 +1246,28 @@ ToolResult web_handle_search(const ToolCall & c, bool google_enabled) {
     args::get_string(c.arguments_json, "engine", engine);
 
     // Explicit engine — run only that engine, no fallback.
-    if (engine == "ddg")  return web_search_ddg(query, page, max_results);
-    if (engine == "bing") return web_search_bing(query, page, max_results);
+    if (engine == "ddg")   return web_search_ddg(query, page, max_results);
+    if (engine == "bing")  return web_search_bing(query, page, max_results);
+    if (engine == "brave") return web_search_brave(query, page, max_results);
     if (engine == "google") {
         if (!google_enabled) {
             return ToolResult::error(
                 "engine=\"google\" not enabled on this server — operator "
                 "must pass --use-google (or Toolbelt::use_google()) to "
                 "allow Google CSE. Default engine \"auto\" cascades "
-                "google → bing → ddg and works without any opt-in.");
+                "google → brave → bing → ddg and works without any "
+                "opt-in.");
         }
         return web_search_google(query, page, max_results);
     }
     if (!engine.empty() && engine != "auto") {
         return ToolResult::error(
             "unknown engine \"" + engine + "\" — valid: \"auto\" "
-            "(default; cascades google → bing → ddg), \"google\" "
-            "(needs GOOGLE_API_KEY + GOOGLE_CSE_ID env vars and "
-            "operator opt-in), \"bing\" (RSS, keyless), \"ddg\" "
-            "(HTML scrape, keyless).");
+            "(default; cascades google → brave → bing → ddg), "
+            "\"google\" (needs GOOGLE_API_KEY + GOOGLE_CSE_ID env "
+            "vars and operator opt-in), \"brave\" (HTML scrape, "
+            "keyless, best query understanding), \"bing\" (RSS, "
+            "keyless), \"ddg\" (HTML scrape, keyless).");
     }
 
     // Auto cascade.
@@ -1155,14 +1293,22 @@ ToolResult web_handle_search(const ToolCall & c, bool google_enabled) {
             "at registration)");
     }
 
-    // 2. Bing RSS — keyless, the workhorse fallback.
+    // 2. Brave HTML — keyless and understands the full query.
+    {
+        ToolResult r = web_search_brave(query, page, max_results);
+        if (!r.is_error) return r;
+        tried.push_back("brave: " + r.content);
+    }
+
+    // 3. Bing RSS — keyless, captcha-free, but weaker query
+    //    understanding for niche entities.
     {
         ToolResult r = web_search_bing(query, page, max_results);
         if (!r.is_error) return r;
         tried.push_back("bing: " + r.content);
     }
 
-    // 3. DDG HTML — last resort, often blocked from server IPs.
+    // 4. DDG HTML — last resort, often blocked from server IPs.
     {
         ToolResult r = web_search_ddg(query, page, max_results);
         if (!r.is_error) return r;
@@ -1250,11 +1396,14 @@ std::vector<Tool> web_split(bool google_enabled) {
                "(default 1).", false)
         .param("engine",      "string",
                "Which backend to use. \"auto\" (default) cascades "
-               "google → bing → ddg and returns the first one that "
-               "succeeds. Explicit picks: \"google\" (Google Custom "
-               "Search; needs GOOGLE_API_KEY + GOOGLE_CSE_ID env vars "
-               "AND operator opt-in), \"bing\" (Bing RSS; keyless, "
-               "~10 results, no real pagination), \"ddg\" (DuckDuckGo "
+               "google → brave → bing → ddg and returns the first "
+               "that succeeds. Explicit picks: \"google\" (Google "
+               "Custom Search; needs GOOGLE_API_KEY + GOOGLE_CSE_ID "
+               "env vars AND operator opt-in), \"brave\" (Brave HTML "
+               "scrape; keyless, ~20 results, best query understanding "
+               "for niche named entities), \"bing\" (Bing RSS; "
+               "keyless, ~10 results, no real pagination, weak query "
+               "understanding for rare terms), \"ddg\" (DuckDuckGo "
                "HTML scrape; keyless but often blocked from server "
                "IPs). Pin a specific engine only for diagnosis.", false)
         .handle([google_enabled](const ToolCall & c) -> ToolResult {
@@ -1296,18 +1445,21 @@ Tool web(bool google_enabled) {
             "\n"
             "  action=\"search\"\n"
             "    Search the web. Required: query. Optional: max_results "
-            "(default 5; ddg max 20, bing max 10, google max 10), page "
-            "(1-based, default 1; pages slice the engine's own "
-            "ordering — note bing RSS only returns ~10 results and "
-            "ignores pagination), engine (default \"auto\" cascades "
-            "google → bing → ddg and returns the first that works; "
-            "explicit picks: \"google\" needs GOOGLE_API_KEY + "
-            "GOOGLE_CSE_ID and operator opt-in, \"bing\" is keyless "
-            "RSS, \"ddg\" is keyless HTML scrape — pin one only for "
-            "diagnosis). Returns a numbered title / url / snippet list "
-            "with `total_entries`, `page`, `has_more`, `engine` "
-            "header lines so you can page forward without guessing "
-            "and see which backend actually answered.\n"
+            "(default 5; ddg max 20, brave max 20, bing max 10, google "
+            "max 10), page (1-based, default 1; pages slice the "
+            "engine's own ordering — note bing RSS only returns ~10 "
+            "results and ignores deeper pagination, brave caps at ~20 "
+            "for the same reason), engine (default \"auto\" cascades "
+            "google → brave → bing → ddg and returns the first that "
+            "works; explicit picks: \"google\" needs GOOGLE_API_KEY + "
+            "GOOGLE_CSE_ID and operator opt-in, \"brave\" is keyless "
+            "HTML scrape with the best understanding of niche named "
+            "entities, \"bing\" is keyless RSS but ignores rare "
+            "terms in the query, \"ddg\" is keyless HTML scrape — "
+            "pin one only for diagnosis). Returns a numbered title / "
+            "url / snippet list with `total_entries`, `page`, "
+            "`has_more`, `engine` header lines so you can page forward "
+            "without guessing and see which backend actually answered.\n"
             "\n"
             "  action=\"fetch\"\n"
             "    Read a URL's actual content. Required: url. Optional: "
@@ -1345,9 +1497,10 @@ Tool web(bool google_enabled) {
                "Google CSE caps total pageable results at 100.", false)
         .param("engine",      "string",
                "Used by search. \"auto\" (default; cascades google → "
-               "bing → ddg), \"google\" (needs env vars + operator "
-               "opt-in), \"bing\" (RSS, keyless), \"ddg\" (HTML, "
-               "keyless).", false)
+               "brave → bing → ddg), \"google\" (needs env vars + "
+               "operator opt-in), \"brave\" (HTML, keyless, best "
+               "query understanding for niche entities), \"bing\" "
+               "(RSS, keyless), \"ddg\" (HTML, keyless).", false)
         .param("start",       "integer",
                "Used by fetch. Byte offset into the stripped (or raw, "
                "if as_html=true) body for pagination. Default 0.", false)
