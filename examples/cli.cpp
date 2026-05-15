@@ -518,7 +518,13 @@ struct Options {
     std::set<std::string> tools_enabled;       // empty = all defaults
     std::string external_tools_dir;            // dir of EASYAI-*.tools files
     std::string rag_dir;                        // optional RAG persistent-registry dir
-    std::string tools_mode = "unified";        // "unified" | "split" | "both"
+    // Default "split": focused one-verb-per-tool surfaces (fs_read,
+    // fs_edit, memory_save, …) instead of the legacy single dispatcher
+    // (fs(action="read"), …). Smaller / quantised tool-callers
+    // dispatch much more reliably against the split shape; large
+    // models handle either. Pass --tools-mode unified to opt back into
+    // the legacy single-dispatcher registration.
+    std::string tools_mode = "split";          // "unified" | "split" | "both"
     bool        tools_mode_cli_set = false;
     std::string prompt;                        // -p one-shot
     // Sampling / penalty knobs — -1 / -2 / empty == server default.
@@ -709,15 +715,19 @@ void usage(const char * argv0) {
 "                                 INI: [cli] show_python = false.\n"
 "    --tools-mode MODE          how the multi-action tool families (fs, web,\n"
 "                                 memory) are exposed to the model:\n"
-"                                   \"unified\" — single dispatcher with an\n"
-"                                     `action` argument (e.g. fs(action=\"read\"));\n"
-"                                     smallest system-prompt footprint. Default.\n"
-"                                   \"split\" — one focused tool per action\n"
+"                                   \"split\"  — one focused tool per action\n"
 "                                     (fs_read, fs_edit, fs_glob, …, web_search,\n"
 "                                     web_fetch, memory_save, …); flat schemas,\n"
-"                                     no \"unknown action\" failure mode. Best for\n"
-"                                     7-8B / quantised tool-callers.\n"
-"                                   \"both\"  — register both surfaces side by\n"
+"                                     no \"unknown action\" failure mode. DEFAULT\n"
+"                                     since 2026-05-15 — works reliably across\n"
+"                                     small / quantised callers and large ones.\n"
+"                                   \"unified\" — single dispatcher with an\n"
+"                                     `action` argument (e.g. fs(action=\"read\"));\n"
+"                                     smallest system-prompt footprint. Pick this\n"
+"                                     when you specifically want the legacy\n"
+"                                     surface (3 dispatchers instead of 19\n"
+"                                     focused tools).\n"
+"                                   \"both\"   — register both surfaces side by\n"
 "                                     side. Costs more system-prompt tokens but\n"
 "                                     lets the model pick whichever shape it's\n"
 "                                     more comfortable with on a per-call basis.\n"
@@ -832,7 +842,8 @@ void usage(const char * argv0) {
 "                                  show_bash     = true|false  (default true)\n"
 "                                  show_python   = true|false  (default true)\n"
 "                                  tools_mode    = unified|split|both\n"
-"                                                  (default unified)\n"
+"                                                  (default split — focused\n"
+"                                                  one-verb-per-tool surfaces)\n"
 "                                CLI flags override INI; INI overrides hardcoded\n"
 "                                defaults.\n"
 "    --unattended               inject an [unattended] block into the system\n"

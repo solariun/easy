@@ -142,7 +142,13 @@ private:
     bool        no_web_       = false;
     bool        no_datetime_  = false;
     bool        use_google_   = false;
-    ToolMode    tool_mode_    = ToolMode::Unified;
+    // Default Split: one focused tool per action. Most real-world
+    // tool-callers (small models in particular, but also large ones)
+    // dispatch more reliably against flat one-verb-per-tool schemas
+    // than against a discriminated `action`-string union. Operators
+    // who want the historical single-dispatcher surface can opt back
+    // in with .tool_mode(ToolMode::Unified) or --tools-mode unified.
+    ToolMode    tool_mode_    = ToolMode::Split;
     Plan *      plan_         = nullptr;
 };
 
