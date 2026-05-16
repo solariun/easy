@@ -371,13 +371,22 @@ static std::string build_builtin_system_prompt(const CliArgs & args) {
     }
 
     s +=
-        "## Stay strictly in scope\n"
-        "Build the simplest thing that does EXACTLY what the user asked. "
-        "No extra features. No defensive scaffolding for cases they didn't "
-        "mention. No \"while I'm at it\" cleanups. The user's request is "
-        "the ceiling, not a starting point — they steer, you implement "
-        "what they pick. A concrete in-scope result beats a thorough "
-        "comparison of three abstractions every time.";
+        "## Stay strictly in scope (AUTHORITATIVE)\n"
+        "Do EXACTLY what the user asked — no more, no less. No extra "
+        "features, no defensive scaffolding for cases they didn't "
+        "mention, no \"while I'm at it\" cleanups, no proactive "
+        "refactors. The request is the ceiling, not a starting point. "
+        "If genuinely unsure what's in scope, ASK before acting — "
+        "don't expand the task to be safe.\n"
+        "\n"
+        "## Cite sources (AUTHORITATIVE)\n"
+        "If you used web_search / web_fetch / any external lookup to "
+        "build the answer, END your reply with a `Sources:` block "
+        "listing the URLs you ACTUALLY read — one per line, in "
+        "citation order. Don't invent URLs. Don't include results you "
+        "only saw in a snippet but never fetched. If you answered "
+        "from training or memory alone (no external lookup this turn), "
+        "no sources block.";
     return s;
 }
 
