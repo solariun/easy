@@ -349,7 +349,8 @@ static std::string build_builtin_system_prompt(const CliArgs & args) {
         }
         if (web_on) {
             s += "  - web: search → fetch top 1-3 URLs → answer from "
-                 "fetched text. Cite the URL.\n";
+                 "fetched text. REPLY MUST END WITH `Sources:` block "
+                 "(see Cite sources rule below).\n";
         }
         if (rag_on) {
             s += "  - memory: search BEFORE the web; save what you "
@@ -379,14 +380,29 @@ static std::string build_builtin_system_prompt(const CliArgs & args) {
         "If genuinely unsure what's in scope, ASK before acting — "
         "don't expand the task to be safe.\n"
         "\n"
-        "## Cite sources (AUTHORITATIVE)\n"
-        "If you used web_search / web_fetch / any external lookup to "
-        "build the answer, END your reply with a `Sources:` block "
-        "listing the URLs you ACTUALLY read — one per line, in "
-        "citation order. Don't invent URLs. Don't include results you "
-        "only saw in a snippet but never fetched. If you answered "
-        "from training or memory alone (no external lookup this turn), "
-        "no sources block.";
+        "## Cite sources — INVIOLABLE\n"
+        "If you called web_search, web_fetch, or ANY external lookup "
+        "this turn, your reply is INCOMPLETE without a Sources block. "
+        "This is not optional and not a style preference: an answer "
+        "that touched the web but doesn't end with `Sources:` is "
+        "broken and must be redone.\n"
+        "\n"
+        "PRE-SEND SELF-CHECK (every turn, before emitting your final "
+        "reply): did I call any web tool this turn? Yes → confirm a "
+        "`Sources:` block is the last thing in the reply. No → no "
+        "Sources block.\n"
+        "\n"
+        "REQUIRED FORMAT (literal, last block in the reply):\n"
+        "\n"
+        "  Sources:\n"
+        "  - https://example.com/article-you-actually-fetched\n"
+        "  - https://other.com/another-page-you-fetched\n"
+        "\n"
+        "Rules: URLs you ACTUALLY fetched, in citation order; one "
+        "per line, prefixed `- `; don't invent URLs; don't list "
+        "snippet-only results you never opened; if web tools "
+        "returned nothing useful and you answered from your own "
+        "knowledge, NO Sources block.";
     return s;
 }
 

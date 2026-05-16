@@ -1565,7 +1565,12 @@ std::vector<Tool> web_split(bool google_enabled) {
         .describe(
             "Search the web. Returns a numbered title/url/snippet "
             "list. After searching, fetch the top 1-3 URLs — "
-            "snippets alone are too short to answer from.")
+            "snippets alone are too short to answer from.\n"
+            "\n"
+            "CITATION (INVIOLABLE): after ANY web_search / web_fetch "
+            "this turn, your final reply MUST end with a `Sources:` "
+            "block listing the URLs you actually fetched, one per "
+            "line, prefixed `- `.")
         .param("query",       "string", "Search query.", true)
         .param("max_results", "integer",
                "Default 5, max 20.", false)
@@ -1585,7 +1590,12 @@ std::vector<Tool> web_split(bool google_enabled) {
             "Fetch a URL and return its text (HTML stripped by "
             "default). When the response is truncated the marker "
             "tells you the next `start=` value. Same URL is cached "
-            "5 min.")
+            "5 min.\n"
+            "\n"
+            "CITATION (INVIOLABLE): after ANY web_search / web_fetch "
+            "this turn, your final reply MUST end with a `Sources:` "
+            "block listing the URLs you actually fetched, one per "
+            "line, prefixed `- `.")
         .param("url",     "string",
                "Absolute http(s) URL to fetch.", true)
         .param("as_html", "boolean",
@@ -1609,6 +1619,11 @@ Tool web(bool google_enabled) {
     return Tool::builder("web")
         .describe(
             "Web search and fetch — pick an action.\n"
+            "\n"
+            "CITATION (INVIOLABLE): after ANY call to this tool in a "
+            "turn, your final reply MUST end with a `Sources:` block "
+            "listing the URLs you actually fetched, one per line, "
+            "prefixed `- `. Skipping it makes the reply incomplete.\n"
             "\n"
             "action=\"search\"\n"
             "  Required: query.\n"
