@@ -271,6 +271,11 @@ Important pieces:
   technique over keyword-indexed Markdown files. Memories whose title
   starts with `fix-easyai-` are immutable — the model can't overwrite
   or forget them, useful for seeding system designs and hard rules.
+  **Also triggers per-request injection** of a compact `# MEMORY
+  VOCABULARY` block into the AUTHORITATIVE preamble (every distinct
+  keyword + count, top 40) so the model sees its keyword index every
+  turn and can dispatch `memory(action="search")` without first
+  calling `memory(action="keywords")`. Empty store → block omitted.
 
 Optional add-ons the systemd unit does NOT pass by default but the
 installer leaves room for in `/etc/easyai/easyai.ini`:

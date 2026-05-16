@@ -853,18 +853,43 @@ until the user opts in via `.sandbox(...)` / `.allow_bash()`.  Remote mode
 enables `with_tools = true` automatically so the model running on
 the server side can call tools dispatched in the client process.
 
-## 5c. Authoritative datetime / knowledge-cutoff injection
+## 5c. AUTHORITATIVE preamble (datetime / knowledge-cutoff / memory vocabulary)
 
 A real production hazard: every chat-template-friendly model has a
 training cutoff.  Without a fresh wall-clock signal each turn, the
 model will happily insist that "this year" is the year it was
 trained, and confidently misreport leaders, prices, scores, and
-weather.  The fix is well known but worth describing as it lives in
-this codebase, because it interacts subtly with client-supplied
-system prompts.
+weather.  And without a hint of what's in its persistent memory,
+the model either burns a `memory(action="keywords")` hop on every
+question or skips memory entirely and goes to the web.  The fix
+is well known but worth describing as it lives in this codebase,
+because it interacts subtly with client-supplied system prompts.
 
-**What gets injected.** `build_authoritative_preamble(ctx)` produces
-a small system-prompt suffix on every request, freshly stamped:
+**One builder, three binaries.** The preamble used to live as
+`build_authoritative_preamble` inside `examples/server.cpp`, with
+parallel partial copies in `local.cpp` and nothing in `cli.cpp`.
+That drift was a smell — change the format and you'd silently miss
+the others.  Since 2026-05-16 the builder lives in libeasyai:
+
+```cpp
+// include/easyai/preamble.hpp
+namespace easyai::preamble {
+    struct Options {
+        bool        inject_datetime  = true;
+        std::string knowledge_cutoff = "2024-10";
+        std::string memory_root;        // empty → vocab block omitted
+    };
+    std::string build(const Options & opt);
+}
+```
+
+`easyai-server`, `easyai-local`, and `easyai-cli` all call the same
+function; the binary picks which blocks make sense for its
+deployment by toggling the option fields.
+
+**What gets injected.** `easyai::preamble::build()` produces a
+system-prompt suffix with up to three blocks, freshly stamped on
+each call:
 
 ```
 # AUTHORITATIVE DATE/TIME (do not ignore, do not second-guess)
@@ -880,13 +905,36 @@ either:
   1. Call a tool (web action=search/fetch, datetime, …) to verify, OR
   2. Explicitly state that you are not certain.
 Never present a post-cutoff fact as known.
+
+# MEMORY VOCABULARY (the keywords your private memory currently
+has tagged — the FIRST place to look for anything you might
+already know)
+12 entries (most-common first; call memory(action="search",
+keywords=["<name>", ...]) to recall):
+easyai(8) claude(5) bitnet(3) build(3) iteration(2) …
 ```
+
+Each block is conditional:
+* Date/time + cutoff render only when `inject_datetime=true`.
+* Memory vocabulary renders only when `memory_root` is set AND the
+  store has at least one tagged entry. Empty store → no block, no
+  wasted tokens.
 
 Cutoff date comes from `--knowledge-cutoff YYYY-MM` (default
 `2024-10`); date format is `strftime("%Y-%m-%d %H:%M:%S %z (%Z)")`.
+The vocabulary block is capped at the top 40 keywords (sorted count
+desc, name asc) to bound token cost on large stores.
+
+**Per-binary wire-up.**
+
+| Binary | When called | inject_datetime | memory_root |
+|---|---|---|---|
+| `easyai-server` | per request | `true` | from `ctx.memory_root` (set by `--memory`) |
+| `easyai-local`  | once at startup | `false` (would freeze "today") | from `args.rag_dir` (set by `--memory`) |
+| `easyai-cli`    | when building the system prefix | `false` (remote server handles date/time) | from `args.rag_dir` (set by `--memory`) |
 
 **Where it lands in the prompt.** Two cases, controlled by
-`prepare_engine_for_request`:
+`prepare_engine_for_request` in the server:
 
 1. *Client supplied its own `system` message* (the opencode /
    Claude-Code / OpenAI-SDK pattern).  We walk the request's history
@@ -898,8 +946,8 @@ Cutoff date comes from `--knowledge-cutoff YYYY-MM` (default
    its lone system message.
 
 Either way exactly one system block reaches the chat template,
-the preamble is in it, and the freshly-rendered timestamp goes
-through the standard chat-templates path (Qwen / Llama / Gemma /
+the preamble is in it, and the freshly-rendered timestamp + vocab
+go through the standard chat-templates path (Qwen / Llama / Gemma /
 DeepSeek all preserve system content verbatim).
 
 **Per-request override.** `X-Easyai-Inject: on|off` HTTP header lets
@@ -909,6 +957,14 @@ pre-injection behaviour.  We deliberately did NOT make this a body
 field — keeping it in the headers means OpenAI-compat client SDKs
 that don't know about easyai pass through cleanly without trying to
 forward the field to the model.
+
+**Memory vocabulary cost.** The vocab renderer
+(`easyai::tools::render_memory_vocabulary`) does a fresh disk scan
+on every call (~10-50ms for typical stores, up to ~200ms for very
+large ones). No persistent state — safe to call concurrently with
+memory-tool writes (the underlying `RagStore` uses `shared_mutex`).
+Scan cost is rounding error against inference latency, so the
+server pays it per request; `local` and `cli` pay it once.
 
 ## 5f. External tools — operator-defined commands via JSON manifests
 

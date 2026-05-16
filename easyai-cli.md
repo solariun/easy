@@ -183,7 +183,7 @@ prepended (see [§6](#6-system-prompt--injected-blocks)).
 | `--allow-bash` | Register `bash`. **Implies `fs`** (bash subsumes it). cwd = `--sandbox` if given, else the binary's CWD. WARNING: not a hardened sandbox. |
 | `--no-python` | Drop the auto-registered `python3` tool. By default `python3` is **ON** whenever `--sandbox` or `--allow-bash` is set. Stdlib-only interpreter (no PYTHON* env, no site-packages, no cwd on `sys.path`); disk access auto-restricted to the sandbox root via a Python preamble. WARNING: defense-in-depth, not a hardened sandbox — `import os` / `import socket` / `import subprocess` still work. |
 | `--use-google` | Enable `engine="google"` inside the unified `web` tool (Google Custom Search JSON API), and let the default `engine="auto"` cascade try google as its first hop. Requires `GOOGLE_API_KEY` and `GOOGLE_CSE_ID` env vars. Without this flag (or env vars), the auto cascade silently falls through to brave → ddg-lite → bing → ddg. |
-| `--memory DIR` | Enable persistent memory rooted at DIR — a passive RAG technique. Registers ONE `memory(action=...)` tool. `--RAG` is still accepted as a back-compat alias. |
+| `--memory DIR` | Enable persistent memory rooted at DIR — a passive RAG technique. Registers ONE `memory(action=...)` tool, AND appends a compact `# MEMORY VOCABULARY` block to the system prompt prefix so the remote model sees the current keyword index without having to call `memory(action="keywords")`. `--RAG` is still accepted as a back-compat alias. See `RAG.md` §5 "Automatic vocabulary injection". |
 | `--external-tools DIR` | Load every `EASYAI-*.tools` manifest in DIR. See `EXTERNAL_TOOLS.md`. |
 | `--no-plan` | Don't auto-register the `plan` tool. |
 
@@ -578,11 +578,26 @@ passive RAG technique — each memory is a single keyword-indexed
 Markdown file in `<dir>` that the operator can hand-edit. The legacy
 flag `--RAG` is still accepted as a back-compat alias.
 
+**Vocabulary auto-injection.** `--memory` also appends a compact
+`# MEMORY VOCABULARY` block to the system prompt prefix (the same
+prefix that already carries `[tool-discipline]`, `[environment]`,
+`[guidance]`, `[tools]`). The block lists every distinct keyword
+in the store + its count, sorted count desc / name asc, capped at
+top 40. The remote model now sees what it has tagged on every
+turn — `memory(action="search", keywords=[...])` becomes
+actionable without first calling `memory(action="keywords")`.
+Empty store → block omitted, no wasted tokens.
+
+The builder is shared with `easyai-server` and `easyai-local`
+(see `easyai::preamble::build` in `include/easyai/preamble.hpp`);
+change the renderer once and every binary updates.
+
 Memories whose title starts with `fix-easyai-` are immutable: save /
 append / delete refuse them. Pass `fix=true` (sub-action `save`) to
 mint one.
 
-See [`RAG.md`](RAG.md) for the full guide.
+See [`RAG.md`](RAG.md) for the full guide, including §5 "Automatic
+vocabulary injection".
 
 ---
 

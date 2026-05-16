@@ -99,7 +99,7 @@ The HTTP layer, paths, tool gating, MCP auth.
 | `system_file` | path | `-s`, `--system-file` | (none — uses built-in default) | File containing the server-default system prompt. |
 | `system_inline` | string | `--system` | (none) | Inline system prompt. Beats `system_file` if both are set. |
 | `external_tools` | path | `--external-tools` | (none — feature off) | Directory of `EASYAI-*.tools` manifests. See `EXTERNAL_TOOLS.md`. |
-| `memory` | path | `--memory` | (none — feature off) | Directory of `memory`-tool entries. The legacy key `rag` (CLI `--RAG`) is still read for back-compat. See `RAG.md`. |
+| `memory` | path | `--memory` | (none — feature off) | Directory of `memory`-tool entries. Also triggers per-request injection of a compact `# MEMORY VOCABULARY` block into the AUTHORITATIVE preamble so the model sees its current keyword index without having to call `memory(action="keywords")`. The legacy key `rag` (CLI `--RAG`) is still read for back-compat. See `RAG.md` §5 "Automatic vocabulary injection" and `design.md` §5c. |
 | `webui_title` | string | `--webui-title` | `Deep` | Document title pinned in the embedded webui. |
 | `webui_icon` | path | `--webui-icon` | (none) | `.ico` / `.png` / `.svg` / `.gif` / `.jpg` / `.webp`. |
 | `webui_mode` | enum | `--webui` | `modern` | `modern` (embedded llama-server bundle) or `minimal` (inline). |
@@ -398,7 +398,7 @@ opt-in is logged at startup with sanity warnings.
 | `--no-python` / `[SERVER] allow_python = off` | Drop the `python3` tool. `python3` defaults ON and auto-registers whenever `--sandbox` is set or `--allow-bash` is on. Isolated stdlib-only interpreter (no PYTHON* env, no site-packages, no cwd on `sys.path`); third-party imports fail with ModuleNotFoundError. Disk access auto-restricted to the sandbox root via a Python preamble — `open("/etc/passwd")` raises `PermissionError`. Defense-in-depth, NOT a hardened sandbox: `import os` / `import socket` / `import subprocess` / `import ctypes` all still work. Bumps `max_tool_hops` to 99999, same as `--allow-bash`. |
 | `--use-google` (`[SERVER] use_google`) | Enables `engine="google"` inside the unified `web` tool (Google Custom Search JSON API), and lets the default `engine="auto"` cascade try google as its first hop. Requires `GOOGLE_API_KEY` and `GOOGLE_CSE_ID` env vars; the auto cascade silently skips google if either is missing (a key rotation that briefly drops the env doesn't take down the server). Counts against your Google quota (free tier: 100 queries/day per key). Without `--use-google`, the auto cascade starts at brave (keyless HTML, best query understanding for niche entities) and falls through to ddg-lite (keyless no-JS DDG with Netscape UA, page 1 only) → bing (keyless RSS) → ddg (keyless HTML scrape, often blocked from server IPs). |
 | `--external-tools <dir>` (`[SERVER] external_tools`) | Load every `EASYAI-<name>.tools` file in `<dir>` as an operator-defined tool pack. Per-file fault isolation. Spawns via `fork`+`execve` — never a shell. **The supported way to give the model focused powers without flipping `--allow-bash`.** See [`EXTERNAL_TOOLS.md`](EXTERNAL_TOOLS.md). |
-| `--memory <dir>` (`[SERVER] memory`) | Enable the agent's persistent **memory** (search / store / append / recall / update / forget) — a passive RAG technique over keyword-indexed Markdown files. Registers ONE `memory(action=...)` tool with sub-actions `save`, `append` (grow an existing memory without losing its body), `search`, `load`, `list`, `delete`, `keywords` — each entry one Markdown file in `<dir>`, operator-readable and hand-editable. Memories whose title starts with `fix-easyai-` are immutable: save/append/delete refuse them. Pass `fix=true` (sub-action `save`) to mint one. The legacy flag `--RAG` (INI key `rag`) is still accepted as an alias. The systemd-installed server passes this by default (`/var/lib/easyai/rag`). See [`RAG.md`](RAG.md). |
+| `--memory <dir>` (`[SERVER] memory`) | Enable the agent's persistent **memory** (search / store / append / recall / update / forget) — a passive RAG technique over keyword-indexed Markdown files. Registers ONE `memory(action=...)` tool with sub-actions `save`, `append` (grow an existing memory without losing its body), `search`, `load`, `list`, `delete`, `keywords` — each entry one Markdown file in `<dir>`, operator-readable and hand-editable. Memories whose title starts with `fix-easyai-` are immutable: save/append/delete refuse them. Pass `fix=true` (sub-action `save`) to mint one. **Also triggers per-request injection** of a compact `# MEMORY VOCABULARY` block into the AUTHORITATIVE preamble (every distinct keyword + count, sorted by count desc / name asc, top 40) so the model can dispatch the right `memory(action="search")` without first calling `memory(action="keywords")`. Empty store → block omitted, no wasted tokens. The legacy flag `--RAG` (INI key `rag`) is still accepted as an alias. The systemd-installed server passes this by default (`/var/lib/easyai/rag`). See [`RAG.md`](RAG.md). |
 | `--mcp <url>` (`[SERVER] mcp`) | Connect to a remote MCP server as a CLIENT. The upstream's tool catalogue is merged into ours via `tools/list` at startup; each remote tool's handler proxies `tools/call` over HTTP. Local-tool names take precedence on collision (warning logged, remote dup skipped). Pair with `--mcp-token` for bearer-auth servers. Transient failures (connect refused, read timeout, 5xx) retry per `--http-retries`; each retry is logged. Connect failure after the retry budget logs a warning and continues with whatever local / `memory` tools were registered. |
 | `--mcp-token <token>` (`[SERVER] mcp_token`) | Bearer token attached to every `--mcp` request. Empty = no auth header. |
 | `--http-retries N` (`[SERVER] http_retries`) | Default `5`. Extra attempts on transient HTTP failures, applied to the `--mcp` upstream calls AND to the unified `web` tool's libcurl calls. 4xx never retries; 5xx + connect/read/write errors retry with exponential backoff (250 ms → 500 ms → 1 s → 2 s → 4 s, capped). Set 0 to disable. Every retry logs to stderr (visible in journalctl without `--verbose`). |
@@ -736,11 +736,17 @@ Highlights of the work documented in [`SECURITY_AUDIT.md`](SECURITY_AUDIT.md):
   so a TOCTOU race can't follow a last-second symlink.
 - **`memory` entries written mode 0600** so the OS-level ACL is
   owner-only even if the operator's umask leaves a wider default.
-- **Authoritative date/time preamble** appended to whichever system
-  message reaches the model (server's default OR client-supplied).
-  Suppresses post-cutoff hallucination by anchoring "today" to the
-  real wall clock and explicitly telling the model to call a tool or
-  state uncertainty for facts beyond `--knowledge-cutoff`.
+- **AUTHORITATIVE preamble** appended to whichever system message
+  reaches the model (server's default OR client-supplied). Up to
+  three blocks: `# AUTHORITATIVE DATE/TIME` (anchors "today" to the
+  real wall clock, suppresses post-cutoff hallucination), `# KNOWLEDGE
+  CUTOFF` (explicit rule to verify with a tool or state uncertainty
+  for facts beyond `--knowledge-cutoff`), and `# MEMORY VOCABULARY`
+  (top-40 keyword index when `--memory` is set, so the model can
+  dispatch `memory(action="search")` without first calling
+  `memory(action="keywords")`). Builder lives in libeasyai
+  (`easyai::preamble::build`) and is shared with `easyai-local` and
+  `easyai-cli`.
 - **Auto-generated transaction logs at `/tmp/easyai-<pid>-<epoch>.log`
   are created with `O_EXCL | O_NOFOLLOW | O_CLOEXEC` and mode `0600`.**
   `O_EXCL` makes the create atomic-or-fail so a local attacker can't

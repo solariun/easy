@@ -630,9 +630,45 @@ The `memory` tool's descriptions push three behaviours:
    sharper."
 
 The more often the model exercises these, the more useful the
-`memory` tool becomes. Future versions can add automatic injection of
-high-relevance entries into the system prompt, but the manual loop
-already works.
+`memory` tool becomes.
+
+### Automatic vocabulary injection (since 2026-05-16)
+
+The "search before assuming" rule only works if the model knows
+WHAT keywords to search for. To close that gap, every binary that
+loads memory (`easyai-server`, `easyai-local`, `easyai-cli`) now
+auto-injects a compact vocabulary snapshot into the system prompt:
+
+```
+# MEMORY VOCABULARY (the keywords your private memory currently
+has tagged — the FIRST place to look for anything you might
+already know)
+12 entries (most-common first; call memory(action="search",
+keywords=["<name>", ...]) to recall):
+easyai(8) claude(5) bitnet(3) build(3) iteration(2) …
+```
+
+* Sorted count desc, name asc; capped at top 40 keywords.
+* Empty memory store → no block, no wasted tokens.
+* **server** refreshes the snapshot every request (fresh disk
+  scan, ~10-50ms — rounding error vs. inference).
+* **local** computes it once at startup and appends to the
+  system prompt; long-running chats won't see new keywords until
+  restart (acceptable for the one-shot / single-chat local
+  pattern).
+* **cli** computes it once when building the system prefix to
+  send to the remote server.
+
+The model no longer has to call `memory(action="keywords")` to
+discover its own vocabulary — it sees the list every turn and
+can dispatch the right `memory(action="search")` directly. The
+manual `keywords` action is still available when the model wants
+fresh counts mid-task or needs the full list past the top-40 cap.
+
+The block is built by `easyai::preamble::build()` (see
+`include/easyai/preamble.hpp`); the renderer is
+`easyai::tools::render_memory_vocabulary()`. Both are public APIs
+so third-party hosts of libeasyai get the same behaviour.
 
 ---
 

@@ -43,6 +43,55 @@ A running log of user-facing changes. Latest first — keep this list
 current as features land so anyone returning to the repo (or
 landing on it for the first time) sees what shipped recently.
 
+### 2026-05-16 — Memory vocabulary auto-injection + shared `easyai::preamble::build()`
+
+Every binary that loads `--memory <dir>` now auto-injects a compact
+keyword-vocabulary block into the system prompt so the model knows
+what it has tagged without having to call `memory(action="keywords")`
+first. The block looks like:
+
+```
+# MEMORY VOCABULARY (the keywords your private memory currently
+has tagged — the FIRST place to look for anything you might
+already know)
+12 entries (most-common first; call memory(action="search",
+keywords=["<name>", ...]) to recall):
+easyai(8) claude(5) bitnet(3) build(3) iteration(2) …
+```
+
+Sorted count desc / name asc, capped at top 40. Empty store →
+block omitted, no wasted tokens.
+
+| Binary | When the vocab is computed |
+| --- | --- |
+| `easyai-server` | Every request (fresh disk scan, ~10-50ms — rounding error vs. inference). New saves visible on the next request. |
+| `easyai-local`  | Once at startup, appended to the system prompt. New saves visible after restart. |
+| `easyai-cli`    | Once when building the system prefix sent to the remote server. |
+
+The AUTHORITATIVE preamble used to live as a `build_authoritative_
+preamble` inside `examples/server.cpp` with parallel partial
+copies in `local.cpp` and nothing in `cli.cpp`. That drift is gone:
+the builder is now public in libeasyai —
+
+```cpp
+// include/easyai/preamble.hpp
+namespace easyai::preamble {
+    struct Options {
+        bool        inject_datetime  = true;
+        std::string knowledge_cutoff = "2024-10";
+        std::string memory_root;        // empty → vocab block omitted
+    };
+    std::string build(const Options & opt);
+}
+```
+
+— and all three binaries call it. Change the renderer once, every
+binary updates. Third-party hosts of libeasyai get the same
+behaviour out of the box.
+
+See `RAG.md` §5 "Automatic vocabulary injection" and `design.md`
+§5c for the full design.
+
 ### 2026-05-15 — `split` is the new tools-mode default
 
 Same-day follow-up to the morning's `--tools-mode` landing: **`split`

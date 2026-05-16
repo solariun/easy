@@ -3134,12 +3134,21 @@ It's actually fine — the printed line "stopped cleanly" tells the truth.
 Some shells/wrappers report a non-zero code because of the signal, but
 `main()` returned 0.
 
-### Forcing the model to ignore the server-injected datetime (QA only)
+### Forcing the model to ignore the server-injected AUTHORITATIVE preamble (QA only)
 
-The server appends an authoritative date/time + knowledge-cutoff
-preamble to whichever system message reaches the model
-(`--inject-datetime on` is the default).  For regression testing the
-preamble can be disabled per-request without restarting the server:
+The server appends an AUTHORITATIVE preamble to whichever system
+message reaches the model (`--inject-datetime on` is the default).
+The preamble has up to three blocks:
+
+* `# AUTHORITATIVE DATE/TIME` — current wall-clock + timezone.
+* `# KNOWLEDGE CUTOFF` — training-cutoff hint + rule to verify
+  post-cutoff facts.
+* `# MEMORY VOCABULARY` — top-40 keyword index when `--memory`
+  is set (so the model can dispatch `memory(action="search")`
+  without first calling `memory(action="keywords")`).
+
+For regression testing the preamble can be disabled per-request
+without restarting the server:
 
 ```bash
 curl http://ai.local:8080/v1/chat/completions \
@@ -3155,9 +3164,35 @@ Header values:
 * (anything else, or absent header) — defer to the server flag.
 
 WHY DEFAULT ON: most production deployments want the model to trust
-the server clock and to flag post-cutoff facts as uncertain.  Turning
-the preamble off removes a real safety net — only do it for A/B QA
-runs where you're explicitly comparing pre-injection behaviour.
+the server clock, flag post-cutoff facts as uncertain, and know
+what's in its persistent memory. Turning the preamble off removes a
+real safety net — only do it for A/B QA runs where you're explicitly
+comparing pre-injection behaviour.
+
+### Calling the preamble builder from your own code
+
+The same builder is exposed as a library API (since 2026-05-16) so
+third-party hosts of libeasyai get the same behaviour without
+copying the format:
+
+```cpp
+#include "easyai/preamble.hpp"
+
+std::string preamble = easyai::preamble::build({
+    /* inject_datetime  = */ true,
+    /* knowledge_cutoff = */ "2024-10",
+    /* memory_root      = */ "/var/lib/myapp/rag",
+});
+
+engine.system(default_system + preamble);
+```
+
+Each block is conditional: pass `inject_datetime=false` to skip the
+date/time + cutoff blocks (useful when the remote server already
+handles them), pass `memory_root=""` to skip the memory vocabulary
+block. The function is stateless — recomputes every call (fresh
+date, fresh directory scan for the memory index). Safe to call on
+the hot path; the directory scan is ~10-50ms for typical stores.
 
 ### `easyai::Client` — "HTTPS endpoint requires OpenSSL"
 

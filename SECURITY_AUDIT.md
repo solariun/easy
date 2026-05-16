@@ -343,9 +343,11 @@ that enforces destination policy (recommendation §14).
   We cannot programmatically force admins not to use it; document it
   loudly.
 * **Prompt injection is out of scope of this audit.**  The
-  authoritative-datetime preamble (`build_authoritative_preamble`)
-  does try to harden against post-cutoff hallucination, but a
-  determined prompt injector can still steer the model.  This is a
+  AUTHORITATIVE preamble (`easyai::preamble::build` in libeasyai,
+  shared by `easyai-server` / `easyai-local` / `easyai-cli`) does
+  try to harden against post-cutoff hallucination and points the
+  model at its persistent-memory vocabulary, but a determined
+  prompt injector can still steer the model.  This is a
   model-layer concern.
 * **Worst-case regex behaviour on user-controlled patterns** —
   fs_grep + fs_glob accept arbitrary regex from the model.  Even
