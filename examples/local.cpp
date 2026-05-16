@@ -353,8 +353,10 @@ static std::string build_builtin_system_prompt(const CliArgs & args) {
                  "(see Cite sources rule below).\n";
         }
         if (rag_on) {
-            s += "  - memory: search BEFORE the web; save what you "
-                 "learn before the turn ends.\n";
+            s += "  - memory: search BEFORE the web (your current "
+                 "keyword vocabulary is appended at end of system "
+                 "prompt — look there first); save what you learn "
+                 "before the turn ends.\n";
         }
         if (fs_on) {
             s += "  - fs: sandbox + check_path before any file work. "
@@ -443,6 +445,26 @@ int main(int argc, char ** argv) {
     }
     if (system_prompt.empty() && args.load_tools) {
         system_prompt = build_builtin_system_prompt(args);
+    }
+
+    // Memory vocabulary snapshot — appended once at startup when
+    // --memory is enabled. Local mode rebuilds the prompt only at
+    // process start, so the model sees the keyword index as it stood
+    // when the binary launched; new memories saved mid-session are
+    // visible to memory(action="search") but won't update the
+    // injected vocabulary until the next run. Acceptable for the
+    // one-shot / single-chat local pattern; the server gets a fresh
+    // snapshot per request.
+    if (!system_prompt.empty() && !args.rag_dir.empty()) {
+        std::string vocab = easyai::tools::render_memory_vocabulary(args.rag_dir);
+        if (!vocab.empty()) {
+            system_prompt +=
+                "\n\n# MEMORY VOCABULARY (the keywords your private "
+                "memory currently has tagged — the FIRST place to look "
+                "for anything you might already know)\n";
+            system_prompt += vocab;
+            system_prompt += "\n";
+        }
     }
 
     // --show-system-prompt: dump the resolved prompt to stdout and exit

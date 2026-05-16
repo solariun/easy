@@ -1421,6 +1421,7 @@ struct ServerCtx {
     std::string                default_system;
     bool                       inject_datetime    = true;        // server-side authoritative date/time injection
     std::string                knowledge_cutoff   = "2024-10";   // model training-data cutoff hint
+    std::string                memory_root;     // --memory dir; empty if no memory tool; used to render the per-request vocabulary
     bool                       verbose            = false;       // mirror of args.verbose for HTTP-layer logs
     easyai::Preset             default_preset;  // current "ambient" preset
     std::string                model_id;        // basename of model file
@@ -1737,6 +1738,21 @@ static std::string build_authoritative_preamble(const ServerCtx & ctx) {
         << "  2. Explicitly state that you are not certain.\n"
         << "Never present a post-cutoff fact as known.  Hallucination is\n"
         << "considered a critical failure for this assistant.\n";
+
+    // Memory vocabulary snapshot — appended only when --memory is enabled
+    // AND the store currently has at least one tagged entry. Empty string
+    // means "nothing to inject" (fresh store, or no --memory) — don't
+    // burn tokens on a "nothing here" header.
+    if (!ctx.memory_root.empty()) {
+        std::string vocab = easyai::tools::render_memory_vocabulary(
+            ctx.memory_root);
+        if (!vocab.empty()) {
+            out << "\n# MEMORY VOCABULARY (the keywords your private "
+                << "memory currently has tagged — the FIRST place to look "
+                << "for anything you might already know)\n"
+                << vocab << "\n";
+        }
+    }
     return out.str();
 }
 
@@ -4095,8 +4111,10 @@ static std::string build_builtin_system_prompt(const ServerArgs & args) {
                  "(see Cite sources rule below).\n";
         }
         if (rag_on) {
-            s += "  - memory: search BEFORE the web; save what you "
-                 "learn before the turn ends.\n";
+            s += "  - memory: search BEFORE the web (your current "
+                 "keyword vocabulary is appended at end of system "
+                 "prompt — look there first); save what you learn "
+                 "before the turn ends.\n";
         }
         if (fs_on) {
             s += "  - fs: sandbox + check_path before any file work. "
@@ -4204,6 +4222,23 @@ int main(int argc, char ** argv) {
     // service.
     if (args.show_system_prompt) {
         std::fputs(default_system.c_str(), stdout);
+        // Preview the memory-vocab block that would be appended per
+        // request when --memory is set — so the operator can verify
+        // the keyword index without bouncing the service. The
+        // date/time half of the AUTHORITATIVE preamble is dynamic
+        // (changes every request) and intentionally omitted here.
+        if (!args.rag_dir.empty()) {
+            std::string vocab = easyai::tools::render_memory_vocabulary(
+                args.rag_dir);
+            if (!vocab.empty()) {
+                std::fprintf(stdout,
+                    "\n\n# MEMORY VOCABULARY (the keywords your "
+                    "private memory currently has tagged — the FIRST "
+                    "place to look for anything you might already "
+                    "know)\n%s\n",
+                    vocab.c_str());
+            }
+        }
         std::fputc('\n', stdout);
         return 0;
     }
@@ -4294,6 +4329,11 @@ int main(int argc, char ** argv) {
     if (!args.rag_dir.empty()) {
         ctx->default_tools.push_back(
             easyai::tools::make_rag_tool(args.rag_dir));
+        // Remember the root so build_authoritative_preamble can render
+        // the current keyword vocabulary into every request — the model
+        // sees what keywords it has tagged without having to call
+        // memory(action="keywords") itself.
+        ctx->memory_root = args.rag_dir;
         std::fprintf(stderr,
             "easyai-server: memory enabled (single memory tool), "
             "root = %s\n",

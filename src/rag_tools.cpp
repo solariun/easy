@@ -1904,4 +1904,67 @@ std::vector<Tool> memory_split_tools(std::string root_dir) {
     return out;
 }
 
+// ---------------------------------------------------------------------------
+// Compact vocabulary snapshot for per-prompt injection.
+//
+// Reuses build_rag_store to load the keyword index off disk on every
+// call (no persistent state held by this function — callers that
+// already have a live RagStore via make_rag_tool pay the duplication
+// in exchange for the simpler API). Fine for the hot path since the
+// directory scan is O(N files) at ~10-50ms for typical stores, while
+// the inference that follows takes seconds.
+//
+// Empty store → empty string; the caller decides whether to inject.
+// Caps at the top kCap keywords (currently 40) so token cost stays
+// bounded even for very large memories. The sort key is
+// (count desc, name asc) — same order memory(action="keywords") uses,
+// so the model sees a familiar ranking.
+std::string render_memory_vocabulary(const std::string & root_dir) {
+    if (root_dir.empty()) return std::string();
+
+    auto store = build_rag_store(root_dir);
+
+    std::map<std::string, std::size_t> counts;
+    std::size_t total_entries = 0;
+    {
+        std::shared_lock<std::shared_mutex> lock(store->mu);
+        total_entries = store->index.size();
+        for (const auto & [_, m] : store->index) {
+            for (const auto & k : m.keywords) {
+                counts[k] += 1;
+            }
+        }
+    }
+    if (counts.empty()) return std::string();
+
+    struct Row { std::string keyword; std::size_t count; };
+    std::vector<Row> rows;
+    rows.reserve(counts.size());
+    for (const auto & [k, n] : counts) rows.push_back({k, n});
+    std::sort(rows.begin(), rows.end(), [](const Row & a, const Row & b) {
+        if (a.count != b.count) return a.count > b.count;
+        return a.keyword < b.keyword;
+    });
+
+    constexpr std::size_t kCap = 40;
+    const std::size_t total_kw = rows.size();
+    const bool truncated = total_kw > kCap;
+    if (truncated) rows.resize(kCap);
+
+    std::ostringstream o;
+    o << total_entries << " entr"
+      << (total_entries == 1 ? "y" : "ies")
+      << " (most-common first; call memory(action=\"search\", "
+      << "keywords=[\"<name>\", ...]) to recall):\n";
+    for (std::size_t i = 0; i < rows.size(); ++i) {
+        if (i) o << ' ';
+        o << rows[i].keyword << '(' << rows[i].count << ')';
+    }
+    if (truncated) {
+        o << " …(+" << (total_kw - kCap) << " more; call "
+          << "memory(action=\"keywords\") for the full list)";
+    }
+    return o.str();
+}
+
 }  // namespace easyai::tools
