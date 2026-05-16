@@ -92,6 +92,7 @@ set(EASYAI_SOURCES
     src/config.cpp
     src/external_tools.cpp
     src/rag_tools.cpp
+    src/preamble.cpp
     src/mcp.cpp
     src/mcp_client.cpp
     src/presets.cpp

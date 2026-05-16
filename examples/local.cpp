@@ -455,16 +455,19 @@ int main(int argc, char ** argv) {
     // injected vocabulary until the next run. Acceptable for the
     // one-shot / single-chat local pattern; the server gets a fresh
     // snapshot per request.
+    //
+    // We pass inject_datetime=false because LocalBackend doesn't
+    // append a date/time block per turn; injecting it once at
+    // startup would freeze "today" at whatever date the binary
+    // launched, which is worse than no injection at all. Date is
+    // expected to come from the datetime tool when needed.
     if (!system_prompt.empty() && !args.rag_dir.empty()) {
-        std::string vocab = easyai::tools::render_memory_vocabulary(args.rag_dir);
-        if (!vocab.empty()) {
-            system_prompt +=
-                "\n\n# MEMORY VOCABULARY (the keywords your private "
-                "memory currently has tagged — the FIRST place to look "
-                "for anything you might already know)\n";
-            system_prompt += vocab;
-            system_prompt += "\n";
-        }
+        std::string vocab = easyai::preamble::build({
+            /* inject_datetime  = */ false,
+            /* knowledge_cutoff = */ std::string(),
+            /* memory_root      = */ args.rag_dir,
+        });
+        if (!vocab.empty()) system_prompt += vocab;
     }
 
     // --show-system-prompt: dump the resolved prompt to stdout and exit

@@ -50,6 +50,7 @@
 #include "easyai/external_tools.hpp"
 #include "easyai/log.hpp"
 #include "easyai/plan.hpp"
+#include "easyai/preamble.hpp"
 #include "easyai/rag_tools.hpp"
 #include "easyai/text.hpp"
 #include "easyai/tool.hpp"
@@ -2026,6 +2027,28 @@ int main(int argc, char ** argv) {
             o.system_prompt = o.system_prompt.empty()
                                   ? prefix
                                   : prefix + "\n" + o.system_prompt;
+        }
+    }
+
+    // Memory vocabulary snapshot — when --memory is in use, append
+    // the current keyword index so the model can see what it has
+    // tagged without burning a memory(action="keywords") hop. The
+    // remote server typically owns the date/time block, so we
+    // pass inject_datetime=false: only the MEMORY VOCABULARY block
+    // is rendered, and only when the store is non-empty.
+    //
+    // This is the same easyai::preamble::build() helper server.cpp
+    // and local.cpp use, so the format stays in sync across all
+    // three binaries — change the renderer once, every binary
+    // updates.
+    if (!o.rag_dir.empty()) {
+        std::string vocab = easyai::preamble::build({
+            /* inject_datetime  = */ false,
+            /* knowledge_cutoff = */ std::string(),
+            /* memory_root      = */ o.rag_dir,
+        });
+        if (!vocab.empty()) {
+            o.system_prompt += vocab;
         }
     }
 

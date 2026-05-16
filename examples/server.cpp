@@ -1711,49 +1711,15 @@ static bool parse_chat_request(const httplib::Request & req,
 //
 // We rebuild this per request so the timestamp is always fresh.
 static std::string build_authoritative_preamble(const ServerCtx & ctx) {
-    auto now    = std::chrono::system_clock::now();
-    auto tt     = std::chrono::system_clock::to_time_t(now);
-    std::tm lt{};
-#if defined(_WIN32)
-    localtime_s(&lt, &tt);
-#else
-    localtime_r(&tt, &lt);
-#endif
-    char ts[64]; char tz[32];
-    std::strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S %z", &lt);
-    std::strftime(tz, sizeof(tz), "%Z",                    &lt);
-
-    std::ostringstream out;
-    out << "\n\n# AUTHORITATIVE DATE/TIME (do not ignore, do not second-guess)\n"
-        << "Current date and time: " << ts << " (" << tz << ").\n"
-        << "Trust this over any training-data intuition about \"today\".\n"
-        << "If the user mentions \"today\", \"now\", \"this year\" etc., use the\n"
-        << "value above.  When unsure, call the `datetime` tool first.\n"
-        << "\n# KNOWLEDGE CUTOFF\n"
-        << "Your training data ends around " << ctx.knowledge_cutoff << ".\n"
-        << "For ANY claim about events, people, products, prices, releases,\n"
-        << "leaders, scores, weather, or facts after that cutoff you MUST\n"
-        << "either:\n"
-        << "  1. Call a tool (web action=search/fetch, datetime, …) to verify, OR\n"
-        << "  2. Explicitly state that you are not certain.\n"
-        << "Never present a post-cutoff fact as known.  Hallucination is\n"
-        << "considered a critical failure for this assistant.\n";
-
-    // Memory vocabulary snapshot — appended only when --memory is enabled
-    // AND the store currently has at least one tagged entry. Empty string
-    // means "nothing to inject" (fresh store, or no --memory) — don't
-    // burn tokens on a "nothing here" header.
-    if (!ctx.memory_root.empty()) {
-        std::string vocab = easyai::tools::render_memory_vocabulary(
-            ctx.memory_root);
-        if (!vocab.empty()) {
-            out << "\n# MEMORY VOCABULARY (the keywords your private "
-                << "memory currently has tagged — the FIRST place to look "
-                << "for anything you might already know)\n"
-                << vocab << "\n";
-        }
-    }
-    return out.str();
+    // The preamble builder lives in libeasyai now (preamble.hpp) so
+    // server, local, and cli all share one implementation. This thin
+    // wrapper just maps from ServerCtx into the library's Options
+    // struct.
+    return easyai::preamble::build({
+        /* inject_datetime  = */ true,
+        /* knowledge_cutoff = */ ctx.knowledge_cutoff,
+        /* memory_root      = */ ctx.memory_root,
+    });
 }
 
 static void prepare_engine_for_request(ServerCtx & ctx, const ChatRequest & req) {
@@ -4222,22 +4188,18 @@ int main(int argc, char ** argv) {
     // service.
     if (args.show_system_prompt) {
         std::fputs(default_system.c_str(), stdout);
-        // Preview the memory-vocab block that would be appended per
-        // request when --memory is set — so the operator can verify
-        // the keyword index without bouncing the service. The
-        // date/time half of the AUTHORITATIVE preamble is dynamic
-        // (changes every request) and intentionally omitted here.
+        // Preview the memory-vocab portion of the per-request
+        // preamble so the operator can verify the keyword index
+        // without bouncing the service. The date/time half is
+        // dynamic (changes every request); we render only the
+        // memory vocabulary by passing inject_datetime=false.
         if (!args.rag_dir.empty()) {
-            std::string vocab = easyai::tools::render_memory_vocabulary(
-                args.rag_dir);
-            if (!vocab.empty()) {
-                std::fprintf(stdout,
-                    "\n\n# MEMORY VOCABULARY (the keywords your "
-                    "private memory currently has tagged — the FIRST "
-                    "place to look for anything you might already "
-                    "know)\n%s\n",
-                    vocab.c_str());
-            }
+            std::string vocab = easyai::preamble::build({
+                /* inject_datetime  = */ false,
+                /* knowledge_cutoff = */ std::string(),
+                /* memory_root      = */ args.rag_dir,
+            });
+            if (!vocab.empty()) std::fputs(vocab.c_str(), stdout);
         }
         std::fputc('\n', stdout);
         return 0;

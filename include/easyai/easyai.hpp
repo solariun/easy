@@ -10,6 +10,7 @@
 #include "builtin_tools.hpp"
 #include "external_tools.hpp"
 #include "rag_tools.hpp"
+#include "preamble.hpp"
 #include "mcp.hpp"
 #include "mcp_client.hpp"
 #include "config.hpp"
