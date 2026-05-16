@@ -629,13 +629,14 @@ static bool http_post_form(const std::string & url,
 Tool datetime() {
     return Tool::builder("datetime")
         .describe(
-            "Return the current wall-clock time. Output is two lines: "
-            "`UTC:   YYYY-MM-DD HH:MM:SS` and `Local: YYYY-MM-DD HH:MM:SS "
-            "<TZ>` (server's local timezone). No parameters.\n"
+            "Current date and time. No parameters.\n"
             "\n"
-            "Use when the user asks for the time/date, when you need an "
-            "anchor for relative phrasing (\"yesterday\", \"in 3 days\"), "
-            "or before any date arithmetic. Example call: {}.")
+            "Returns JSON: "
+            "{\"utc\":\"YYYY-MM-DDTHH:MM:SSZ\","
+            "\"local\":\"YYYY-MM-DDTHH:MM:SS+HHMM\"}.\n"
+            "\n"
+            "Call before any date math, or when the user says "
+            "'now' / 'today' / 'latest'.")
         .handle([](const ToolCall &) {
             using namespace std::chrono;
             auto now = system_clock::now();
@@ -1562,33 +1563,18 @@ std::vector<Tool> web_split(bool google_enabled) {
 
     out.push_back(Tool::builder("web_search")
         .describe(
-            "Search the web for current information. Same handler as "
-            "web(action=\"search\"). Returns a numbered list of "
-            "title / URL / snippet entries you can then web_fetch.")
-        .param("query",       "string",
-               "Free-form query (e.g. \"BitNet ternary quantization\").", true)
+            "Search the web. Returns a numbered title/url/snippet "
+            "list. After searching, fetch the top 1-3 URLs — "
+            "snippets alone are too short to answer from.")
+        .param("query",       "string", "Search query.", true)
         .param("max_results", "integer",
-               "How many results to return (default 5, max 20).", false)
+               "Default 5, max 20.", false)
         .param("page",        "integer",
-               "1-based page over the engine's own ordering "
-               "(default 1).", false)
+               "1-based page index, default 1.", false)
         .param("engine",      "string",
-               "Which backend to use. \"auto\" (default) cascades "
-               "google → brave → ddg-lite → bing → ddg and returns "
-               "the first that succeeds. Explicit picks: \"google\" "
-               "(Google Custom Search; needs GOOGLE_API_KEY + "
-               "GOOGLE_CSE_ID env vars AND operator opt-in), "
-               "\"brave\" (Brave HTML scrape; keyless, ~20 results, "
-               "best query understanding for niche named entities), "
-               "\"ddg-lite\" (DuckDuckGo Lite endpoint with a Netscape "
-               "4.79 User-Agent; keyless, ~10 results, page 1 only — "
-               "Lite serves no-JS HTML to UAs that obviously can't run "
-               "JS, bypassing the anti-bot wall the main DDG endpoint "
-               "applies to scripted clients), \"bing\" (Bing RSS; "
-               "keyless, ~10 results, no real pagination, weak query "
-               "understanding for rare terms), \"ddg\" (DuckDuckGo "
-               "HTML scrape; keyless but often blocked from server "
-               "IPs). Pin a specific engine only for diagnosis.", false)
+               "Default \"auto\" cascades google → brave → ddg-lite "
+               "→ bing → ddg and returns the first that works. "
+               "Pin one only for diagnosis.", false)
         .handle([google_enabled](const ToolCall & c) -> ToolResult {
             return web_handle_search(c, google_enabled);
         })
@@ -1596,21 +1582,21 @@ std::vector<Tool> web_split(bool google_enabled) {
 
     out.push_back(Tool::builder("web_fetch")
         .describe(
-            "Fetch a URL and return its text (HTML stripped, or raw "
-            "with as_html=true). Page through long bodies with "
-            "start/limit. Same handler as web(action=\"fetch\").")
+            "Fetch a URL and return its text (HTML stripped by "
+            "default). When the response is truncated the marker "
+            "tells you the next `start=` value. Same URL is cached "
+            "5 min.")
         .param("url",     "string",
-               "Absolute URL to fetch.", true)
+               "Absolute http(s) URL to fetch.", true)
         .param("as_html", "boolean",
-               "If true, return raw HTML instead of stripped text "
-               "(default false).", false)
+               "Keep raw HTML instead of stripped text. Default "
+               "false.", false)
         .param("start",   "integer",
-               "Byte offset to start from (default 0). Use the "
-               "previous call's `start=` cursor in the truncation "
-               "marker to continue.", false)
+               "Byte offset, default 0. Use the previous call's "
+               "`start=` marker to continue.", false)
         .param("limit",   "integer",
-               "Window size in bytes (default 8192, min 256, max "
-               "65536).", false)
+               "Window size in bytes. Default 8192, min 256, max "
+               "65536.", false)
         .handle([](const ToolCall & c) -> ToolResult {
             return web_handle_fetch(c);
         })
@@ -1622,82 +1608,48 @@ std::vector<Tool> web_split(bool google_enabled) {
 Tool web(bool google_enabled) {
     return Tool::builder("web")
         .describe(
-            "The web, accessed through one tool. Pick an action; the "
-            "parameters needed depend on which action you choose. "
-            "Two actions are supported:\n"
+            "Web search and fetch — pick an action.\n"
             "\n"
-            "  action=\"search\"\n"
-            "    Search the web. Required: query. Optional: max_results "
-            "(default 5; ddg max 20, brave max 20, ddg-lite max 10, "
-            "bing max 10, google max 10), page (1-based, default 1; "
-            "pages slice the engine's own ordering — note ddg-lite is "
-            "page-1-only by design, bing RSS only returns ~10 results "
-            "and ignores deeper pagination, brave caps at ~20 for the "
-            "same reason), engine (default \"auto\" cascades google → "
-            "brave → ddg-lite → bing → ddg and returns the first that "
-            "works; explicit picks: \"google\" needs GOOGLE_API_KEY + "
-            "GOOGLE_CSE_ID and operator opt-in, \"brave\" is keyless "
-            "HTML scrape with the best understanding of niche named "
-            "entities, \"ddg-lite\" is the keyless no-JS DDG endpoint "
-            "with a Netscape UA (great for entity queries when brave "
-            "is rate-limited), \"bing\" is keyless RSS but ignores "
-            "rare terms, \"ddg\" is keyless HTML scrape — pin one "
-            "only for diagnosis). Returns a numbered title / url / "
-            "snippet list with `total_entries`, `page`, `has_more`, "
-            "`engine` header lines so you can page forward without "
-            "guessing and see which backend actually answered.\n"
+            "action=\"search\"\n"
+            "  Required: query.\n"
+            "  Optional: max_results (default 5, max 20), page "
+            "(default 1, 1-based), engine (default \"auto\" cascades "
+            "google → brave → ddg-lite → bing → ddg).\n"
+            "  Returns: numbered title/url/snippet list with "
+            "total_entries, page, has_more, engine header lines.\n"
             "\n"
-            "  action=\"fetch\"\n"
-            "    Read a URL's actual content. Required: url. Optional: "
-            "as_html (default false — strip HTML to plain text; pass "
-            "true to keep raw markup), start (byte offset into the "
-            "stripped body, default 0), limit (window size, default "
-            "8192, max 65536). When the response is truncated it ends "
-            "with `[truncated: N more bytes; pass start=N to continue]` "
-            "— call again with the suggested start to read the next "
-            "slice. Repeated fetches of the same URL within 5 minutes "
-            "are served from an in-process cache.\n"
+            "action=\"fetch\"\n"
+            "  Required: url.\n"
+            "  Optional: as_html (default false; true keeps raw HTML), "
+            "start (default 0, byte offset), limit (default 8192, "
+            "max 65536).\n"
+            "  Returns: page text. When truncated, the marker tells "
+            "you the next `start=` value. Same URL cached 5 min.\n"
             "\n"
-            "WORKFLOW. Snippets in search results are 1-2 short "
-            "sentences; NEVER summarize a topic from them alone. After "
-            "every search, call action=\"fetch\" on the top 1-3 most "
-            "relevant URLs to read the actual page content, then base "
-            "your answer on the fetched text — not on the snippet list. "
-            "If the first page of results doesn't have what you need, "
-            "page forward (page=2, page=3, ...) BEFORE giving up; the "
-            "highest-quality result is often not in the first five.")
+            "After a search, ALWAYS fetch the top 1-3 URLs to "
+            "answer — snippets are too short. Cite the URL you "
+            "actually fetched.")
         .param("action",      "string",
-               "Required. One of: \"search\", \"fetch\". Each action "
-               "consumes a subset of the other parameters; see the tool "
-               "description for the per-action requirements.", true)
+               "\"search\" or \"fetch\".", true)
         .param("query",       "string",
-               "Used by search. The search query string.", false)
+               "Search query (with action=search).", false)
         .param("url",         "string",
-               "Used by fetch. Fully-qualified http(s) URL to read.", false)
+               "Absolute http(s) URL (with action=fetch).", false)
         .param("max_results", "integer",
-               "Used by search. Page size (default 5; ddg max 20, "
-               "google max 10).", false)
+               "Search page size. Default 5, max 20.", false)
         .param("page",        "integer",
-               "Used by search. 1-based page index (default 1). Use "
-               "when a previous search returned `has_more: yes`. "
-               "Google CSE caps total pageable results at 100.", false)
+               "Search page index, 1-based. Default 1.", false)
         .param("engine",      "string",
-               "Used by search. \"auto\" (default; cascades google → "
-               "brave → ddg-lite → bing → ddg), \"google\" (needs "
-               "env vars + operator opt-in), \"brave\" (HTML, keyless, "
-               "best query understanding), \"ddg-lite\" (DDG no-JS "
-               "endpoint with Netscape UA, keyless, page 1 only), "
-               "\"bing\" (RSS, keyless), \"ddg\" (HTML, keyless).", false)
+               "Search backend. Default \"auto\" cascades google → "
+               "brave → ddg-lite → bing → ddg. Pin one only for "
+               "diagnosis.", false)
         .param("start",       "integer",
-               "Used by fetch. Byte offset into the stripped (or raw, "
-               "if as_html=true) body for pagination. Default 0.", false)
+               "Fetch byte offset. Default 0.", false)
         .param("limit",       "integer",
-               "Used by fetch. Window size in bytes (default 8192, "
-               "max 65536). Larger windows mean fewer round-trips but "
-               "more tokens per call.", false)
+               "Fetch window size in bytes. Default 8192, max 65536.",
+               false)
         .param("as_html",     "boolean",
-               "Used by fetch. If true, return raw HTML instead of "
-               "stripped text. Default false.", false)
+               "Keep raw HTML in fetch. Default false.", false)
         .handle([google_enabled](const ToolCall & c) -> ToolResult {
             std::string action;
             if (!args::get_string(c.arguments_json, "action", action)
@@ -2902,203 +2854,112 @@ Tool fs(std::string root) {
 
     return Tool::builder("fs")
         .describe(
-            "The filesystem — one tool, ten actions selected by "
-            "`action`, plus a batch mode (`ops`) that runs up to 20 "
-            "operations in one call.\n"
+            "Filesystem — one tool, ten actions + batch mode.\n"
             "\n"
-            "AUTHORITATIVE SANDBOX RULE — at the start of every "
-            "filesystem or shell task, run action=\"sandbox\" once "
-            "(absolute on-disk root, pinned at registration — the "
-            "truth) then action=\"check_path\" on the file or "
-            "directory you intend to touch. Skipping this is the most "
-            "common cause of avoidable error loops. Don't guess paths "
-            "— probe.\n"
+            "PATHS are RELATIVE to the sandbox root (`report.md`, "
+            "`src/main.cpp`, `.` for root). Never prefix with `/`.\n"
             "\n"
-            "PATHS ARE RELATIVE to the sandbox root — `report.md`, "
-            "`src/main.cpp`, `.` for the root. NEVER prefix with `/`. "
-            "Absolute or `..`-bearing inputs are silently re-anchored "
-            "under the root, but always pass the relative form.\n"
+            "PRE-FLIGHT: at the start of any file work run "
+            "action=\"sandbox\" once (absolute root) then "
+            "action=\"check_path\" on the target. Skipping causes "
+            "guess-and-fail loops.\n"
             "\n"
-            "  action=\"read\" — read a UTF-8 text file. Required: "
-            "path. Optional: offset (skip N bytes, default 0), limit "
-            "(max bytes, default 65536, max 1048576), line_numbers "
-            "(default false; prefixes each line `<lineno>| ` so you "
-            "can plan an edit). Use offset to page through files "
-            "larger than the limit.\n"
+            "action=\"read\"        path → file content.\n"
+            "  Optional: offset (default 0), limit (default 65536, "
+            "max 1048576), line_numbers (prefix each line `<n>| `).\n"
             "\n"
-            "  action=\"write\" — write UTF-8 text to a file "
-            "(OVERWRITES existing content; pass append=true to extend, "
-            "or use action=\"append\"). Missing parent dirs are "
-            "created. Required: path, content. Optional: append "
-            "(default false). Don't use bash for `cat > file` / `echo "
-            "> file` / `cat <<EOF` — call this, no shell-quoting "
-            "minefield.\n"
+            "action=\"write\"       path, content → overwrites the "
+            "file. Creates parent dirs.\n"
+            "  Optional: append (true → append instead of overwrite).\n"
             "\n"
-            "  action=\"append\" — append UTF-8 text to the END of a "
-            "file (creates the file and parent dirs if needed). "
-            "Required: path, content. Equivalent to write with "
-            "append=true, but a first-class verb so an ops batch can "
-            "stack sequential appends in order. Use it to build up a "
-            "log / report incrementally; for a wholesale overwrite use "
-            "write.\n"
+            "action=\"append\"      path, content → adds to end of "
+            "file (creates if missing).\n"
             "\n"
-            "  action=\"edit\" — replace lines [start_line..end_line] "
-            "in an EXISTING file with `content`; atomic via tempfile + "
-            "rename. Required: path, start_line, end_line (both "
-            "1-based, inclusive), content. content=\"\" is a pure "
-            "delete; end_line=start_line-1 is a pure insert before "
-            "start_line; start_line=line_count+1 appends at EOF. The "
-            "file MUST exist — use write to create. Seam `\\n` "
-            "separators are inserted automatically as needed. "
-            "Workflow: read with line_numbers=true, plan the edit, "
-            "fire it. For multiple edits to one file use the ops batch "
-            "— it reorders same-path edits bottom-up so line numbers "
-            "stay consistent with the file's ORIGINAL state.\n"
+            "action=\"edit\"        path, start_line, end_line, "
+            "content → replaces lines [start..end] (1-based, "
+            "inclusive). Atomic.\n"
+            "  content=\"\" deletes the range; end_line=start-1 "
+            "inserts before start_line; start=line_count+1 appends "
+            "at EOF. File must exist — use write to create.\n"
             "\n"
-            "  action=\"list\" — list one directory, non-recursively. "
-            "Optional: path (default `.`, the sandbox root). One entry "
-            "per line with `d`/`f` prefix and sizes. If path is a "
-            "regular file the error suggests read. Use glob for "
-            "recursive / pattern matching.\n"
+            "action=\"list\"        path → entries one per line "
+            "(`d`/`f` prefix + size). Non-recursive.\n"
             "\n"
-            "  action=\"glob\" — find files by wildcard pattern, "
-            "recursive by default. Required: pattern (`*` = any run "
-            "except `/`, `**` crosses directories, `?` = one char, "
-            "`[abc]` = a set). Optional: path (starting DIRECTORY, "
-            "default `.`; pointing it at a file is an error).\n"
+            "action=\"glob\"        pattern → matching files, "
+            "recursive. `*` single segment, `**` crosses dirs, `?` "
+            "one char, `[abc]` a set.\n"
+            "  Optional: path (start directory, default sandbox root).\n"
             "\n"
-            "  action=\"grep\" — search file contents for an "
-            "ECMAScript regex. Required: pattern. Optional: path (a "
-            "directory to walk recursively OR a single file; default "
-            "`.`), file_glob (limit by basename, e.g. `*.cpp`), "
-            "max_matches (default 100), case_insensitive (default "
-            "false). Output: `<path>:<lineno>:<line>`, stopping after "
-            "max_matches.\n"
+            "action=\"grep\"        pattern → file contents matching "
+            "an ECMAScript regex.\n"
+            "  Optional: path, file_glob, max_matches (default 100), "
+            "case_insensitive.\n"
             "\n"
-            "  action=\"check_path\" — AUTHORITATIVE PRE-FLIGHT: "
-            "confirm a path's existence and your effective r/w/x "
-            "rights BEFORE touching it. Required: path. Optional: "
-            "touch (default false; when true and the path is missing, "
-            "an empty file is created so you can probe write access). "
-            "Output is multi-line key:value (path, absolute, exists, "
-            "type, size, mode, readable, writable, executable, mtime). "
-            "Run this once at the start of every fs / bash subtask.\n"
+            "action=\"check_path\"  path → existence, type, size, "
+            "r/w/x rights.\n"
+            "  Optional: touch (create empty file if missing — probes "
+            "write access).\n"
             "\n"
-            "  action=\"cwd\" — the process's current working "
-            "directory (getcwd at call time). Usually equals the "
-            "sandbox root since the process chdir's there at startup; "
-            "for the pinned sandbox boundary use action=\"sandbox\" "
-            "instead. No other parameters.\n"
+            "action=\"cwd\"         → current working directory.\n"
             "\n"
-            "  action=\"sandbox\" — the absolute filesystem path of "
-            "the sandbox root, pinned at registration. The single "
-            "source of truth for where the relative-path actions "
-            "resolve and where `bash` runs. Use it only to mention the "
-            "real on-disk path in user-facing output or in commands "
-            "handed to external tools — for day-to-day fs/bash work, "
-            "pass RELATIVE paths, not this. No other parameters.\n"
+            "action=\"sandbox\"     → absolute sandbox root. Use it "
+            "only for user-facing paths or external commands; for "
+            "fs/bash work pass RELATIVE paths.\n"
             "\n"
-            "BATCH MODE — pass `ops` (an array of up to 20 operation "
-            "objects) instead of `action` to run several operations in "
-            "one call. Each op is a self-contained object: `action` "
-            "plus that action's params. Set `action` OR `ops`, not "
-            "both.\n"
-            "    fs(ops=[\n"
-            "      {action:\"edit\", path:\"src/foo.cpp\", "
-            "start_line:42, end_line:58, content:\"...\"},\n"
-            "      {action:\"read\", path:\"src/main.cpp\", "
-            "line_numbers:true}\n"
-            "    ])\n"
-            "  Same-path edits are AUTO-REORDERED bottom-up so each "
-            "edit's line numbers stay consistent with the file's "
-            "ORIGINAL state — submit in any order. Ops run one at a "
-            "time; by default a failing op STOPS the batch (pass "
-            "continue_on_error=true to run all and report each). "
-            "Per-op atomicity only — no cross-op rollback. Output is a "
-            "`[i/N] action target: result` line per op.\n"
-            "\n"
-            "Errors return a single-line message starting with `error:`. "
-            "Reading a binary file returns the raw bytes — prefer the "
-            "shell's `file <path>` for those."
+            "BATCH: pass `ops` (array of 1..20 op objects, each with "
+            "`action` plus its params) instead of `action`. Same-path "
+            "edits auto-reorder bottom-up so line numbers stay "
+            "consistent. Pass continue_on_error=true to keep going "
+            "after a failed op."
         )
         .param("action",            "string",
-               "Required for single-op calls (mutually exclusive with "
-               "`ops`). One of: \"read\", \"write\", \"append\", "
-               "\"edit\", \"list\", \"glob\", \"grep\", \"check_path\", "
-               "\"cwd\", \"sandbox\". Each action consumes a subset of "
-               "the other parameters; see the tool description for "
-               "the per-action requirements.", false)
-        .param("ops",               "array",
-               "Required for batch calls (mutually exclusive with "
-               "`action`). Array of 1..20 operation objects. Each "
-               "object has `action` plus that action's per-action "
-               "params. Same-path edits are automatically reordered "
-               "bottom-up so line numbers stay consistent with the "
-               "file's original state.", false)
-        .param("continue_on_error", "boolean",
-               "Used by ops batch. If true, a failing op does NOT "
-               "abort the batch — the failure is reported and the "
-               "remaining ops still run. Default false (stop at "
-               "first error).", false)
-        .param("path",              "string",
-               "Used by read / write / append / edit / list / glob / "
-               "grep / check_path. RELATIVE path under the sandbox "
-               "root. No leading `/`. Use `.` for the root itself.",
+               "Required unless `ops` is set. One of: \"read\", "
+               "\"write\", \"append\", \"edit\", \"list\", \"glob\", "
+               "\"grep\", \"check_path\", \"cwd\", \"sandbox\".",
                false)
+        .param("ops",               "array",
+               "Batch mode: 1..20 op objects, each with `action` plus "
+               "its params. Set `ops` OR `action`, not both. Same-"
+               "path edits auto-reorder bottom-up.", false)
+        .param("continue_on_error", "boolean",
+               "Batch only. Keep running after a failed op. Default "
+               "false.", false)
+        .param("path",              "string",
+               "RELATIVE path under the sandbox root. `.` for root. "
+               "No leading `/`.", false)
         .param("content",           "string",
-               "Used by write / append / edit. UTF-8 text. For "
-               "write: full file content (or appendix when "
-               "append=true). For append: text added to the end of "
-               "the file. For edit: replacement for the line range; "
-               "pass \"\" for a pure delete. Use `\\n` for "
-               "newlines. Binary content is not supported — use "
-               "bash.", false)
+               "UTF-8 text for write/append/edit. Use `\\n` for "
+               "newlines. \"\" deletes the range for edit.", false)
         .param("append",            "boolean",
-               "Used by write. If true, append to the file instead of "
-               "overwriting (creates the file if missing). Default "
+               "write only. Append instead of overwrite. Default "
                "false.", false)
         .param("start_line",        "integer",
-               "Used by edit. 1-based, inclusive — the first line of "
-               "the range to replace. line_count+1 appends at EOF.",
-               false)
+               "edit only. 1-based, inclusive. line_count+1 appends "
+               "at EOF.", false)
         .param("end_line",          "integer",
-               "Used by edit. 1-based, inclusive — the last line of "
-               "the range to replace. Pass start_line-1 for a pure "
-               "insert (zero-width range) before start_line.",
-               false)
+               "edit only. 1-based, inclusive. start_line-1 inserts "
+               "before start_line.", false)
         .param("offset",            "integer",
-               "Used by read. Skip this many bytes from the start of "
-               "the file before reading. Default 0. Use the previous "
-               "read's (offset + bytes_returned) to page forward.",
-               false)
+               "read only. Byte offset, default 0.", false)
         .param("limit",             "integer",
-               "Used by read. Maximum bytes to return. Default 65536 "
-               "(64 KB), max 1048576 (1 MiB).", false)
+               "read only. Max bytes, default 65536, max 1048576.",
+               false)
         .param("line_numbers",      "boolean",
-               "Used by read. If true, prefix each returned line "
-               "with `<lineno>| ` so action=\"edit\" can target "
-               "specific lines without manual counting. Default "
-               "false.", false)
+               "read only. Prefix each line `<n>| `. Default false.",
+               false)
         .param("pattern",           "string",
-               "Used by glob / grep. For glob: wildcard pattern. For "
-               "grep: ECMAScript regex (each line matched independently "
-               "with regex_search; anchor with `^`/`$` for full-line "
-               "matches).", false)
+               "glob: wildcard. grep: ECMAScript regex (matched per "
+               "line; anchor with `^`/`$`).", false)
         .param("file_glob",         "string",
-               "Used by grep. Wildcard pattern restricting which "
-               "filenames are searched (matched against basename). "
-               "Examples: `*.cpp`, `*.{c,h}`, `test_*.py`.", false)
+               "grep only. Restrict filenames by basename pattern "
+               "(e.g. `*.cpp`).", false)
         .param("max_matches",       "integer",
-               "Used by grep. Stop after this many matching lines. "
-               "Default 100.", false)
+               "grep only. Stop after N matches. Default 100.", false)
         .param("case_insensitive",  "boolean",
-               "Used by grep. If true, the regex matches case-"
-               "insensitively. Default false.", false)
+               "grep only. Default false.", false)
         .param("touch",             "boolean",
-               "Used by check_path. If true and the path doesn't yet "
-               "exist, create an empty file there (parent dirs auto-"
-               "created, mode 0600). Lets you probe write rights "
-               "without writing real content. Default false.", false)
+               "check_path only. Create an empty file if missing "
+               "(probes write access). Default false.", false)
         .handle([dispatch_single]
                 (const ToolCall & c) -> ToolResult {
             // Detect the batch shape via raw nlohmann::json: an `ops`
@@ -3343,46 +3204,39 @@ std::vector<Tool> fs_split(std::string root) {
 
     out.push_back(Tool::builder("fs_read")
         .describe(
-            "Read a UTF-8 text file from the sandbox. Same handler as "
-            "fs(action=\"read\"); this is the focused surface for one-"
-            "verb-per-tool callers. PATHS ARE RELATIVE to the sandbox "
-            "root (no leading `/`, no `..`).")
+            "Read a UTF-8 text file. RELATIVE path under the sandbox "
+            "root.")
         .param("path",         "string",
-               "Relative path under the sandbox root.", true)
+               "Relative path. `.` for root.", true)
         .param("offset",       "integer",
-               "Skip N bytes from start (default 0). Page large files "
-               "by passing the previous (offset + bytes_returned).", false)
+               "Byte offset, default 0.", false)
         .param("limit",        "integer",
-               "Max bytes to return. Default 65536, max 1048576.", false)
+               "Max bytes, default 65536, max 1048576.", false)
         .param("line_numbers", "boolean",
-               "If true, prefix each line with `<n>| ` so fs_edit can "
-               "target line ranges without manual counting.", false)
+               "Prefix each line `<n>| ` (for fs_edit planning). "
+               "Default false.", false)
         .handle(make_fs_read_handler(sb))
         .build());
 
     out.push_back(Tool::builder("fs_write")
         .describe(
-            "Write UTF-8 text to a file (OVERWRITES existing content; "
-            "pass append=true to extend). Missing parent dirs are "
-            "created. Same handler as fs(action=\"write\").")
+            "Write UTF-8 text to a file (OVERWRITES existing "
+            "content). Creates parent dirs.")
         .param("path",    "string",
-               "Relative path under the sandbox root.", true)
+               "Relative path. `.` for root.", true)
         .param("content", "string",
-               "Full file content (or appendix when append=true). Use "
-               "`\\n` for newlines.", true)
+               "Full file content. Use `\\n` for newlines.", true)
         .param("append",  "boolean",
-               "If true, append to the file instead of overwriting "
-               "(creates if missing). Default false.", false)
+               "Append instead of overwrite. Default false.", false)
         .handle(make_fs_write_handler(sb))
         .build());
 
     out.push_back(Tool::builder("fs_append")
         .describe(
-            "Append UTF-8 text to the END of a file (creates the file "
-            "and parent dirs if missing). Same handler as "
-            "fs(action=\"append\").")
+            "Append UTF-8 text to the END of a file (creates if "
+            "missing).")
         .param("path",    "string",
-               "Relative path under the sandbox root.", true)
+               "Relative path. `.` for root.", true)
         .param("content", "string",
                "Text to append. Use `\\n` for newlines.", true)
         .handle(make_fs_append_handler(sb))
@@ -3390,104 +3244,91 @@ std::vector<Tool> fs_split(std::string root) {
 
     out.push_back(Tool::builder("fs_edit")
         .describe(
-            "Replace lines [start_line..end_line] (1-based, inclusive) "
-            "in an existing file with `content`. content=\"\" is a pure "
-            "delete; end_line = start_line - 1 is a pure insert before "
-            "start_line; start_line = line_count+1 appends at EOF. "
-            "Output includes a post-edit window so the model can re-"
-            "orient without another fs_read. Same handler as "
-            "fs(action=\"edit\"). Workflow: fs_read with "
-            "line_numbers=true to plan the edit.")
+            "Replace lines [start_line..end_line] (1-based, "
+            "inclusive) in an existing file. Atomic.\n"
+            "  content=\"\" deletes the range; end_line=start_line-1 "
+            "inserts before start_line; start_line=line_count+1 "
+            "appends at EOF.\n"
+            "  Plan with fs_read(line_numbers=true).")
         .param("path",       "string",
                "Relative path under the sandbox root.", true)
         .param("start_line", "integer",
-               "1-based first line of the range. line_count+1 appends "
-               "at EOF.", true)
+               "1-based, inclusive. line_count+1 appends at EOF.",
+               true)
         .param("end_line",   "integer",
-               "1-based last line of the range. Pass start_line-1 for "
-               "a pure insert (zero-width range).", true)
+               "1-based, inclusive. start_line-1 inserts before "
+               "start_line.", true)
         .param("content",    "string",
-               "Replacement text. Pass \"\" for a pure delete.", true)
+               "Replacement text. \"\" deletes.", true)
         .handle(make_fs_edit_handler(sb))
         .build());
 
     out.push_back(Tool::builder("fs_list")
         .describe(
-            "Non-recursive directory listing. Same handler as "
-            "fs(action=\"list\").")
+            "Non-recursive directory listing. One entry per line "
+            "(`d`/`f` prefix + size).")
         .param("path", "string",
-               "Relative path; defaults to the sandbox root.", false)
+               "Relative path; default sandbox root.", false)
         .handle(make_fs_list_handler(sb))
         .build());
 
     out.push_back(Tool::builder("fs_glob")
         .describe(
-            "Recursive wildcard file search. Patterns: `*`, `?`, "
-            "`**/`. A pattern without `/` matches anywhere in the tree "
-            "(e.g. `*.c` finds C files at any depth — like `find -name "
-            "*.c`). Same handler as fs(action=\"glob\").")
+            "Recursive wildcard file search. `*` single segment, "
+            "`**` crosses dirs, `?` one char, `[abc]` a set.")
         .param("pattern", "string",
-               "Wildcard pattern (e.g. `*.cpp`, `**/test_*.py`, "
-               "`src/*.h`).", true)
+               "Wildcard pattern (e.g. `*.cpp`, `**/test_*.py`).",
+               true)
         .param("path",    "string",
-               "Start directory; defaults to the sandbox root.", false)
+               "Start directory; default sandbox root.", false)
         .handle(make_fs_glob_handler(sb))
         .build());
 
     out.push_back(Tool::builder("fs_grep")
         .describe(
-            "Recursive regex content search. Same handler as "
-            "fs(action=\"grep\").")
+            "Recursive regex content search. Output is "
+            "`<path>:<lineno>:<line>`.")
         .param("pattern",          "string",
-               "ECMAScript regex; each line matched independently with "
-               "regex_search. Anchor with `^`/`$` for full-line "
-               "matches.", true)
+               "ECMAScript regex, matched per line. Anchor with "
+               "`^`/`$` for full-line matches.", true)
         .param("path",             "string",
-               "Start file or directory; defaults to the sandbox root. "
-               "A regular file is searched as one file.", false)
+               "Start file or directory; default sandbox root.",
+               false)
         .param("file_glob",        "string",
-               "Wildcard pattern restricting which filenames are "
-               "searched (matched against basename), e.g. `*.cpp`.", false)
+               "Restrict filenames by basename pattern (e.g. "
+               "`*.cpp`).", false)
         .param("max_matches",      "integer",
-               "Stop after this many matching lines (default 100).", false)
+               "Stop after N matches. Default 100.", false)
         .param("case_insensitive", "boolean",
-               "Match the regex case-insensitively (default false).", false)
+               "Default false.", false)
         .handle(make_fs_grep_handler(sb))
         .build());
 
     out.push_back(Tool::builder("fs_check_path")
         .describe(
-            "Pre-flight stat + r/w/x probe for a path. THE \"look "
-            "before you leap\" call — run this before fs_read / "
-            "fs_write / fs_edit on any path you haven't already "
-            "confirmed in this session. Same handler as "
-            "fs(action=\"check_path\").")
+            "Pre-flight: existence, type, size, r/w/x rights. Run "
+            "before reading/writing any unfamiliar path.")
         .param("path",  "string",
                "Relative path to probe.", true)
         .param("touch", "boolean",
-               "If true and the path doesn't exist, create an empty "
-               "file there (mode 0600, parent dirs auto-created). Lets "
-               "you probe write rights without writing real content. "
+               "Create empty file if missing (probes write access). "
                "Default false.", false)
         .handle(make_fs_check_path_handler(sb))
         .build());
 
     out.push_back(Tool::builder("fs_cwd")
         .describe(
-            "The process's current working directory at call time "
-            "(getcwd). For day-to-day work use fs_sandbox — fs_cwd is "
-            "only useful when you need to report the host's literal cwd "
-            "in user-facing output. No parameters.")
+            "Current working directory at call time (getcwd). For "
+            "day-to-day work use fs_sandbox. No parameters.")
         .handle(make_fs_cwd_handler())
         .build());
 
     out.push_back(Tool::builder("fs_sandbox")
         .describe(
-            "The sandbox root, pinned at registration — the "
-            "authoritative on-disk anchor every fs_* and bash command "
-            "resolves RELATIVE paths against. Run this once at the "
-            "start of any filesystem task so you know where you really "
-            "are. No parameters.")
+            "Absolute sandbox root, pinned at registration. The "
+            "anchor every fs_* / bash relative path resolves "
+            "against. Run once at the start of any filesystem task. "
+            "No parameters.")
         .handle(make_fs_sandbox_handler(root))
         .build());
 
@@ -3780,50 +3621,28 @@ Tool bash(std::string root, bool show_output) {
     auto sb = std::make_shared<Sandbox>(std::move(root));
     return Tool::builder("bash")
         .describe(
-            "Run a shell command via `/bin/sh -c`; stdout and stderr "
-            "are merged.\n"
+            "Run a shell command via `/bin/sh -c`. stdout and stderr "
+            "are merged. cwd is pinned to the sandbox root; use "
+            "RELATIVE paths.\n"
             "\n"
-            "SANDBOX PRE-FLIGHT — before your first fs / bash call in a "
-            "task, run fs(action=\"sandbox\") (absolute on-disk root, "
-            "pinned at registration) then fs(action=\"check_path\") on "
-            "any file the command touches. cwd is PINNED to the sandbox "
-            "root, so the probed path is what the shell sees. Skipping "
-            "this is the most common cause of avoidable error loops.\n"
+            "Use bash ONLY for shell features fs/python3 can't do:\n"
+            "  - pipelines (`grep | xargs`, `find -exec`)\n"
+            "  - build runners (make, cmake, cargo, npm)\n"
+            "  - git, package managers, sed/awk in-place edits\n"
             "\n"
-            "PATHS — cwd is the sandbox root; use RELATIVE paths (`ls`, "
-            "`cat report.md`, `./build/run`). Don't type absolute paths "
-            "for sandbox files. Need the absolute root for a log line "
-            "or external command? Fetch it once via "
-            "fs(action=\"sandbox\").\n"
+            "For file work use fs (no `cat > file`, `cat <<EOF`, "
+            "`echo >`, `mkdir`). For compute use python3.\n"
             "\n"
-            "PREFER OTHER TOOLS:\n"
-            "  - File work (read / write / list / find / search) → the "
-            "`fs` tool. Faster, no quoting foot-guns, structured "
-            "output. If your command is `cat > file` / `cat <<EOF` / "
-            "`echo > file` / `mkdir`, call fs(action=\"write\") "
-            "instead.\n"
-            "  - Data / compute (JSON, regex, arithmetic, stats, date "
-            "math) → the `python3` tool when available.\n"
-            "Reach for `bash` only for genuine shell needs: pipelines "
-            "(`grep | xargs`, `find -exec`), process orchestration "
-            "(builds, test suites), tooling with no fs/python "
-            "equivalent (git, package managers, make / cmake, diff, "
-            "file), and non-trivial in-place edits (sed/awk — "
-            "fs(action=\"write\") only overwrites or appends).\n"
-            "\n"
-            "WARNING: NOT a hardened sandbox — the command runs with the "
-            "caller's full uid/gid and can read/write files, hit the "
-            "network, spawn processes. Output is capped at 32 KB; a "
-            "SIGTERM/SIGKILL deadline (default 30s, max 300s) bounds "
-            "runtime."
+            "NOT a hardened sandbox — runs with caller's full uid/gid. "
+            "Output capped at 32 KB; SIGTERM/SIGKILL deadline "
+            "(default 30s, max 300s)."
         )
         .param("command", "string",
-               "Shell command line. Quoted, piped, redirected etc. as you "
-               "would type it in a terminal. Use RELATIVE paths under the "
-               "sandbox cwd. Example: `ls -la src | head -20`.", true)
+               "Shell command line, written as you'd type it in a "
+               "terminal. RELATIVE paths.", true)
         .param("timeout_sec", "integer",
-               "Max seconds to run before SIGTERM/SIGKILL. Default 30, max 300.",
-               false)
+               "Max seconds before SIGTERM/SIGKILL. Default 30, max "
+               "300.", false)
         .handle([sb, show_output](const ToolCall & c) {
             std::string cmd;
             long long timeout_sec = 30;
@@ -3922,90 +3741,44 @@ Tool python3(std::string root, bool show_output) {
     return Tool::builder("python3")
         .describe(
             "Run a Python 3 snippet via `python3 -I -S -E -c <code>`. "
-            "Output is stdout and stderr merged.\n"
+            "Captured stdout+stderr is the tool output.\n"
             "\n"
-            "USE THIS FOR — testing, calculation, data processing, "
-            "networking, information gathering. Concretely:\n"
-            "  - quick experiments / what-if computations / verifying "
-            "    an assumption\n"
-            "  - arithmetic and numerical work (Decimal math, statistics, "
-            "    date arithmetic, counting, hashing)\n"
-            "  - data wrangling — parse JSON / CSV, transform lists, "
-            "    regex over text, normalise records\n"
-            "  - networking — `urllib.request` HTTP fetches, JSON APIs, "
-            "    socket probes, DNS lookups\n"
-            "  - querying anything reachable over the network or "
-            "    derivable from a small in-memory dataset\n"
+            "STDLIB ONLY — no third-party packages, no PYTHON* env, "
+            "no cwd on sys.path. Available: json, re, statistics, "
+            "datetime, decimal, urllib.request, socket, hashlib, csv, "
+            "math, etc. `import numpy` / `import requests` will fail "
+            "with ModuleNotFoundError.\n"
             "\n"
-            "NEVER USE THIS FOR DISK. The python3 tool is NOT for file "
-            "reads or writes. Use fs(action=...) for every disk "
-            "operation:\n"
-            "  - reading a file → fs(action=\"read\", path=...)\n"
-            "  - writing a file → fs(action=\"write\", path=..., content=...)\n"
-            "  - listing a dir  → fs(action=\"list\", path=...)\n"
-            "  - finding files  → fs(action=\"glob\", pattern=...)\n"
-            "  - searching      → fs(action=\"grep\", pattern=...)\n"
-            "  - probing a path → fs(action=\"check_path\", path=...)\n"
+            "Use for: arithmetic, JSON/CSV wrangling, regex, date "
+            "math, hashing, HTTP fetches (urllib.request), socket "
+            "probes — anything painful in shell.\n"
             "\n"
-            "Disk access from python3 is mechanically restricted to the "
-            "sandbox root: `open()`, `io.open()`, and `os.open()` are "
-            "wrapped to reject any path that resolves outside the cwd. "
-            "Attempts to `open(\"/etc/passwd\")` or "
-            "`open(\"../foo\")` raise PermissionError. This is "
-            "defense-in-depth — the rule is about INTENT: the right "
-            "tool for disk is `fs`, not `python3`.\n"
+            "NOT for disk — use fs(action=...) instead. open() / "
+            "io.open() / os.open() are locked to the sandbox root and "
+            "raise PermissionError for paths outside it.\n"
             "\n"
-            "ISOLATED INTERPRETER — `-I -S -E` means: no PYTHON* "
-            "environment variables (-E), no `site.py` / no .pth files / "
-            "no site-packages auto-load (-S), no cwd on sys.path (-I). "
-            "The standard library is available; third-party packages "
-            "are NOT, so `import numpy` / `import requests` will fail "
-            "with ModuleNotFoundError. Stick to the stdlib: `json`, "
-            "`re`, `statistics`, `datetime`, `decimal`, `urllib.request`, "
-            "`socket`, `hashlib`, `csv`, `math`, etc.\n"
+            "ALWAYS print() what you want returned. Snippets that "
+            "don't print come back with just `exit=0`.\n"
             "\n"
-            "OUTPUT — print() what you want returned to the model. The "
-            "captured stdout+stderr (capped at 32 KB) is the tool "
-            "result. Snippets that don't print anything come back with "
-            "just the `exit=0` line — almost always you want a "
-            "`print(result)` at the end.\n"
-            "\n"
-            "The tool result is rendered as: a fenced ```python block "
-            "with the snippet you ran, then a `[python3 executed]` "
-            "notification line, then the exit code and captured "
-            "output. Chat UIs that render markdown will show the "
-            "code with syntax highlighting. You don't have to format "
-            "anything — the wrapper is added for you.\n"
-            "\n"
-            "EXAMPLES:\n"
+            "Examples:\n"
             "  {code: \"from decimal import Decimal as D; "
             "print(D('0.1')+D('0.2'))\"}\n"
             "  {code: \"import json, urllib.request; "
             "r=urllib.request.urlopen('https://api.github.com/repos/"
             "torvalds/linux'); print(json.load(r)['stargazers_count'])\"}\n"
-            "  {code: \"from datetime import date, timedelta; "
-            "print(date.today() + timedelta(days=42))\"}\n"
-            "  {code: \"import re, sys; data='abc 123 def 456'; "
-            "print(sum(int(x) for x in re.findall(r'\\\\d+', data)))\"}\n"
             "\n"
-            "WARNING: this is NOT a hardened sandbox — the interpreter "
-            "has the caller's full uid/gid and can `import os`, "
-            "`import socket`, `import subprocess` to do anything bash "
-            "can. The `-I -S -E` flags constrain *startup* and the "
-            "preamble constrains the common file-open path; neither "
-            "constrains *capabilities*. Output is capped at 32 KB and "
-            "a SIGTERM/SIGKILL deadline (default 30s, max 300s) bounds "
-            "runtime."
+            "NOT a hardened sandbox — has caller's full uid/gid; "
+            "`import os`/`socket`/`subprocess` still work. Output "
+            "capped at 32 KB; SIGTERM/SIGKILL deadline (default 30s, "
+            "max 300s)."
         )
         .param("code", "string",
-               "Python 3 source. Passed verbatim to `-c` (no shell layer; "
-               "no quoting concerns). Newlines and indentation are "
-               "preserved literally — write multi-line code with `\\n` in "
-               "the JSON string and the interpreter will see it as "
-               "ordinary Python source.", true)
+               "Python 3 source, passed verbatim to `-c` (no shell "
+               "layer). Use `\\n` in the JSON string for multi-line "
+               "code.", true)
         .param("timeout_sec", "integer",
-               "Max seconds to run before SIGTERM/SIGKILL. Default 30, max 300.",
-               false)
+               "Max seconds before SIGTERM/SIGKILL. Default 30, max "
+               "300.", false)
         .handle([sb, show_output](const ToolCall & c) {
             std::string code;
             long long timeout_sec = 30;
@@ -4100,65 +3873,27 @@ Tool tool_lookup(ToolListGetter get_tools) {
     }
     return Tool::builder("tool_lookup")
         .describe(
-            "AUTHORITATIVE registry of every tool wired up in THIS session. "
-            "This catalogue is the SINGLE SOURCE OF TRUTH for what you can "
-            "call. Your training data is NOT a source of truth for tool "
-            "availability — what you saw in pre-training does not exist "
-            "here unless it appears in this lookup's output.\n"
+            "List every tool wired up in THIS session. The single "
+            "source of truth for what you can call.\n"
             "\n"
-            "MANDATORY USE\n"
-            "Call tool_lookup BEFORE invoking any tool you have not seen "
-            "registered in this session. If you find yourself about to "
-            "emit a generic name (`write`, `read`, `ls`, `cat`, `curl`, "
-            "`python`, `sed`, `grep`, `find`, `mkdir`, etc.), STOP and "
-            "call tool_lookup first to confirm whether that exact name "
-            "is registered. Do NOT guess. Do NOT invent. Do NOT assume.\n"
+            "No arguments → full catalogue (numbered, one line each).\n"
+            "name=\"<substring>\" → filter by tool name "
+            "(case-insensitive, partial).\n"
             "\n"
-            "BINDING RULE\n"
-            "If a tool is NOT in this list, IT DOES NOT EXIST in this "
-            "session. Period. There is no fallback registry, no implicit "
-            "import, no \"the host probably has it.\" Calling a name "
-            "absent from this list will fail every time and waste a hop. "
-            "When the affordance you need is missing, say so in your "
-            "reply and propose a path forward (write code as text, ask "
-            "the operator to enable it, use a present tool differently). "
-            "Never retry an unknown-tool call hoping for a different "
-            "outcome — the registry will not change mid-turn.\n"
+            "If a name is NOT in this list, IT DOES NOT EXIST here — "
+            "no fallback, no implicit import. Calling an unlisted "
+            "name wastes a hop. When you reach for a generic name "
+            "(`write`, `ls`, `curl`, `python`, `sed`, etc.) and "
+            "haven't seen it registered, call this first instead of "
+            "guessing.\n"
             "\n"
-            "USAGE\n"
-            "  - {} (no arguments) → returns every registered tool as a "
-            "numbered list 1..N with each tool's one-line summary. Use "
-            "this when you need a complete \"what can I do here?\" view.\n"
-            "  - {\"name\":\"<substring>\"} → returns only tools whose "
-            "NAME contains that substring (case-insensitive, partial). "
-            "Use this when you have a specific name in mind and just "
-            "need to confirm it. Examples: name=\"fs\" finds the unified "
-            "filesystem tool; name=\"web\" finds the unified web tool; "
-            "name=\"memory\" finds the memory store tool.\n"
-            "\n"
-            "OUTPUT SHAPE (what you'll see)\n"
-            "  1. <tool_name>: <one-line summary>\n"
-            "  2. <tool_name>: <one-line summary>\n"
-            "  ...\n"
-            "Filters that match nothing return `(no tools match: \"…\")` "
-            "explicitly — that means the registry does NOT have that "
-            "tool, full stop, do not retry with variations.\n"
-            "\n"
-            "READ-ONLY. tool_lookup never spawns a process, never writes "
-            "a file, never hits the network. It is cheap; call it freely "
-            "whenever you're uncertain. Calling tool_lookup once at the "
-            "start of a non-trivial task and once whenever you reach for "
-            "a name you haven't dispatched in THIS session is correct "
-            "discipline."
+            "Read-only, never spawns a process. Cheap — call freely "
+            "when uncertain. A no-match result is authoritative; "
+            "don't retry variations."
         )
         .param("name", "string",
-               "Optional. Case-insensitive substring filter over tool NAMES "
-               "(not descriptions). Use when confirming whether a specific "
-               "name is registered — e.g. {\"name\":\"write\"} to check if "
-               "any write-style tool exists. Omit or pass \"\" to receive "
-               "the full catalogue. A non-empty filter that matches nothing "
-               "is an authoritative \"that name is not registered here\" — "
-               "do not retry with variations of the same name.",
+               "Substring filter over tool names (case-insensitive). "
+               "Omit or pass \"\" for the full catalogue.",
                false)
         .handle([get_tools](const ToolCall & c) -> ToolResult {
             std::string filter = args::get_string_or(c.arguments_json, "name", "");

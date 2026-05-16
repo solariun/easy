@@ -4075,90 +4075,39 @@ static std::string build_builtin_system_prompt(const ServerArgs & args) {
     const bool any_tool_note = datetime_on || web_on || fs_on || bash_on
                             || python_on || sandbox_path_on || rag_on;
     if (any_tool_note) {
-        s += "Tool notes:\n";
+        // One-line trigger index. Each tool's full rules live in its
+        // own description — these lines are just "when to reach for it".
+        s += "Active tools (one-line triggers — see each tool's "
+             "description for details):\n";
         if (datetime_on) {
             if (args.inject_datetime) {
-                // The AUTHORITATIVE DATE/TIME block is appended to this
-                // prompt at request time — point the model at it so it
-                // doesn't burn a tool call to learn what day it is.
-                s += "  - The current date/time is injected below in the\n"
-                     "    AUTHORITATIVE DATE/TIME block — USE that value for\n"
-                     "    'today' / 'now' / 'this year'. Call the datetime\n"
-                     "    tool ONLY for date arithmetic or a different\n"
-                     "    timezone, never just to learn today's date.\n";
+                s += "  - datetime: use the AUTHORITATIVE DATE/TIME "
+                     "below for 'today' / 'now'. Call the tool only "
+                     "for date math or other timezones.\n";
             } else {
-                s += "  - 'now' / 'today' / 'latest' → datetime first.\n";
+                s += "  - datetime: call for 'now' / 'today' / "
+                     "'latest'.\n";
             }
         }
         if (web_on) {
-            s +=
-                "  - web(action=\"search\") returns snippets only — after ONE\n"
-                "    search, web(action=\"fetch\") the top 1-3 URLs and answer\n"
-                "    from the body. Two searches in a row is wrong.\n";
-        }
-        if (fs_on && bash_on) {
-            s +=
-                "  - SANDBOX PRE-FLIGHT (authoritative): first turn that\n"
-                "    touches files, call fs(action=\"sandbox\") to anchor the\n"
-                "    absolute root, then fs(action=\"check_path\") on the\n"
-                "    target. Skipping this causes avoidable error loops.\n"
-                "  - Files: PREFER `fs` (action=read / write / list / glob /\n"
-                "    grep). RELATIVE paths under the sandbox root\n"
-                "    (`report.md`, `.` for root) — NEVER prefix `/`. Do NOT\n"
-                "    use bash for `cat > file`, heredocs, `echo >`, `mkdir`,\n"
-                "    or reading files — the `fs` actions do those without\n"
-                "    the shell-quoting minefield.\n"
-                "  - bash: cwd is the sandbox root; RELATIVE paths. Use it\n"
-                "    for shell features `fs` lacks — pipelines, `find |\n"
-                "    xargs`, build runners (make / cmake / cargo / npm),\n"
-                "    git, package managers, sed/awk in-place edits.\n";
-        } else if (fs_on) {
-            s +=
-                "  - SANDBOX PRE-FLIGHT (authoritative): first turn that\n"
-                "    touches files, call fs(action=\"sandbox\") to anchor the\n"
-                "    absolute root, then fs(action=\"check_path\") on the\n"
-                "    target before any read/write.\n"
-                "  - Files: use `fs` — action=read / list / glob / grep /\n"
-                "    write. RELATIVE paths under the sandbox root\n"
-                "    (`report.md`, `.` for root) — NEVER prefix `/`.\n";
-        } else if (bash_on) {
-            s +=
-                "  - bash: run shell commands. cwd is the sandbox root; use\n"
-                "    RELATIVE paths. `fs` is not registered, so bash is also\n"
-                "    the only path for file work — heredocs / cat / sed.\n";
-        }
-        if (python_on) {
-            s +=
-                "  - python3: run a snippet via `python3 -I -S -E -c <code>`\n"
-                "    (isolated stdlib-only — no third-party packages, no\n"
-                "    PYTHON* env, no site-packages, no cwd on sys.path).\n"
-                "    Reach for it for JSON wrangling, regex, arithmetic,\n"
-                "    date math, statistics — anything painful in shell.\n"
-                "    Always print() what you want returned.\n";
-        }
-        if (sandbox_path_on) {
-            s +=
-                "  - fs(action=\"sandbox\"): AUTHORITATIVE absolute root.\n"
-                "    Read it BEFORE any fs / bash work; other fs actions\n"
-                "    take RELATIVE paths anchored here. Paste the absolute\n"
-                "    root only into user-facing output or external commands.\n";
+            s += "  - web: search → fetch top 1-3 URLs → answer from "
+                 "fetched text. Cite the URL.\n";
         }
         if (rag_on) {
-            s +=
-                "  - Memory (AUTHORITATIVE — not optional): when\n"
-                "    memory(action=…) is in your tools it IS your long-term\n"
-                "    store and you MUST use it. BEFORE answering from\n"
-                "    guesswork or reaching for the web, memory(action=\n"
-                "    \"search\") it. The moment you learn something durable\n"
-                "    — a fact, a fix, a preference, a decision — \n"
-                "    memory(action=\"save\") it before the turn ends.\n"
-                "    Actions: save / append / search / load / list /\n"
-                "    delete / keywords.\n";
+            s += "  - memory: search BEFORE the web; save what you "
+                 "learn before the turn ends.\n";
         }
-        if (web_on) {
-            s +=
-                "  - Cite URLs you actually fetched; attach dates to dated\n"
-                "    facts (\"released April 2026\" beats \"recently released\").\n";
+        if (fs_on) {
+            s += "  - fs: sandbox + check_path before any file work. "
+                 "RELATIVE paths only.\n";
+        }
+        if (bash_on) {
+            s += "  - bash: only for shell features fs/python can't "
+                 "do (pipes, build runners, git, sed/awk).\n";
+        }
+        if (python_on) {
+            s += "  - python3: stdlib-only; print() what you want "
+                 "returned.\n";
         }
         s += "\n";
     }

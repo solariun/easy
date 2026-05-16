@@ -340,59 +340,32 @@ static std::string build_builtin_system_prompt(const CliArgs & args) {
     const bool any_tool_note = datetime_on || web_on || fs_on || bash_on
                             || python_on || rag_on;
     if (any_tool_note) {
-        s += "Tool notes:\n";
+        // One-line trigger index. Each tool's full rules live in its
+        // own description — these lines are just "when to reach for it".
+        s += "Active tools (one-line triggers — see each tool's "
+             "description for details):\n";
         if (datetime_on) {
-            s += "  - 'now' / 'today' / 'latest' → datetime first.\n";
+            s += "  - datetime: call for 'now' / 'today' / 'latest'.\n";
         }
         if (web_on) {
-            s += "  - web(action=\"search\") returns snippets only; after one "
-                 "search, call web(action=\"fetch\") on the top 1-3 URLs and "
-                 "answer from the fetched body. Two searches in a row is wrong.\n";
-        }
-        if (fs_on) {
-            s += "  - SANDBOX PRE-FLIGHT (authoritative): on the first turn "
-                 "that touches files, call `fs(action=\"sandbox\")` to anchor "
-                 "the absolute root, then `fs(action=\"check_path\")` against "
-                 "the file/dir you're about to read or write. Skipping this "
-                 "causes avoidable error loops.\n"
-                 "  - Files: PREFER the unified `fs` tool — action=read / "
-                 "write / list / glob / grep. Use RELATIVE paths "
-                 "(`report.md`, `src/main.cpp`, `.` for the root) — NEVER "
-                 "prefix with `/`.\n";
-        }
-        if (bash_on) {
-            s += "  - bash: cwd is the sandbox root; use RELATIVE paths. Do "
-                 "NOT use bash for `cat > file`, `cat <<EOF`, `echo > file`, "
-                 "`mkdir`, or for reading files — fs(action=\"write\") / "
-                 "fs(action=\"read\") do those without the shell-quoting "
-                 "minefield. Reach for bash for shell features `fs` doesn't "
-                 "have: pipelines, find | xargs, build runners (make / cmake "
-                 "/ cargo / npm), git, package managers, sed/awk for in-place "
-                 "edits.\n";
-        }
-        if (python_on) {
-            s += "  - python3: run a Python 3 snippet via "
-                 "`python3 -I -S -E -c <code>` (isolated stdlib-only "
-                 "interpreter — no third-party packages). Reach for it for "
-                 "JSON wrangling, regex, arithmetic, statistics, date math, "
-                 "and other small computations that would be painful in shell. "
-                 "ALWAYS print() what you want returned.\n";
-        }
-        if (!fs_on && !bash_on && !python_on) {
-            // No file affordance at all — leave the empty branch silent.
+            s += "  - web: search → fetch top 1-3 URLs → answer from "
+                 "fetched text. Cite the URL.\n";
         }
         if (rag_on) {
-            s += "  - Memory (AUTHORITATIVE — not optional): when "
-                 "memory(action=…) is in your tools it IS your long-term "
-                 "store and you MUST use it. BEFORE answering from guesswork "
-                 "or reaching for the web, memory(action=\"search\") it. The "
-                 "moment you learn something durable — a fact, a fix, a "
-                 "preference, a decision — memory(action=\"save\") it before "
-                 "the turn ends. Actions: save / append / search / load / "
-                 "list / delete / keywords.\n";
+            s += "  - memory: search BEFORE the web; save what you "
+                 "learn before the turn ends.\n";
         }
-        if (web_on) {
-            s += "  - Cite the URL you actually fetched.\n";
+        if (fs_on) {
+            s += "  - fs: sandbox + check_path before any file work. "
+                 "RELATIVE paths only.\n";
+        }
+        if (bash_on) {
+            s += "  - bash: only for shell features fs/python can't "
+                 "do (pipes, build runners, git, sed/awk).\n";
+        }
+        if (python_on) {
+            s += "  - python3: stdlib-only; print() what you want "
+                 "returned.\n";
         }
         s += "\n";
     }
