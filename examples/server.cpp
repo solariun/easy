@@ -4098,20 +4098,57 @@ static std::string build_builtin_system_prompt(const ServerArgs & args) {
     }
 
     s +=
-        "## Stop when you have enough (AUTHORITATIVE)\n"
-        "After EACH tool result, ask yourself: do I now have enough\n"
-        "to answer the user's question? Yes → answer immediately.\n"
-        "No → ONE more focused tool call, then re-check. Three or\n"
-        "more tool calls in a row without re-checking is a bug; it\n"
-        "means you're doing exploration instead of answering.\n"
+        "## Information pipeline (AUTHORITATIVE)\n"
+        "When the request needs facts you don't already know,\n"
+        "follow this order — strictly:\n"
+        "\n";
+    if (rag_on) {
+        s +=
+            "  1. MEMORY FIRST. memory(action=\"search\") with\n"
+            "     keywords from the vocabulary appended below. If\n"
+            "     memory returns enough to answer, SKIP the web\n"
+            "     and go straight to step 3.\n"
+            "  2. WEB only if memory had nothing or was insufficient.\n"
+            "     ONE web search, then web_fetch the top 1-3 URLs.\n"
+            "  3. ANSWER. As soon as steps 1-2 give you enough,\n"
+            "     answer the user. Don't re-search memory, don't\n"
+            "     re-search the web, don't save more memories first.\n";
+    } else {
+        s +=
+            "  1. WEB if you don't already know. ONE web search,\n"
+            "     then web_fetch the top 1-3 URLs.\n"
+            "  2. ANSWER. As soon as the fetched text gives you\n"
+            "     enough, answer. Don't re-search the same query.\n";
+    }
+    s +=
         "\n"
-        "Specifically: don't loop verify → save → re-verify. After\n"
-        "a memory load returns a stable fact (definition, syntax,\n"
-        "architecture), trust it without a web round-trip unless\n"
-        "the user explicitly asked for \"latest\" / \"current\".\n"
-        "After saving a memory, DON'T re-search the web on the same\n"
-        "topic in the same turn — the save means you already learned\n"
-        "what you needed.\n"
+        "STOP SIGNAL. After each tool result, ask: do I have enough\n"
+        "now? Yes → answer immediately. No → ONE more focused tool\n"
+        "call, then re-check. Three or more tool calls in a row\n"
+        "without re-checking is a bug — you're exploring instead of\n"
+        "answering.\n"
+        "\n"
+        "BUGS TO AVOID:\n";
+    if (rag_on) {
+        s +=
+            "  - Skipping memory and going straight to web when\n"
+            "    memory is enabled.\n"
+            "  - After a memory load returns a stable fact\n"
+            "    (definition, syntax, architecture), re-verifying\n"
+            "    with the web — only do this when the user asked\n"
+            "    for \"latest\" / \"current\" / dated info.\n"
+            "  - After saving a memory, re-searching the web on the\n"
+            "    same topic in the same turn — the save means you\n"
+            "    already learned what you needed.\n";
+    }
+    s +=
+        "  - Looping verify → save → re-verify.\n"
+        "  - Running the same web query twice in a row.\n"
+        "\n"
+        "Saving new memories (when the info is durable — see the\n"
+        "memory tool's GUIDELINES) happens AFTER your reply is\n"
+        "written, as a final tool call. It's not another\n"
+        "verification step.\n"
         "\n"
         "## Stay strictly in scope (AUTHORITATIVE)\n"
         "Do EXACTLY what the user asked — no more, no less. No extra\n"
