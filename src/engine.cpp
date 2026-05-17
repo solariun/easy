@@ -4,6 +4,7 @@
 
 #include "common.h"
 #include "sampling.h"
+#include "speculative.h"
 #include "chat.h"
 #include "llama.h"
 #include "ggml-backend.h"
@@ -702,6 +703,20 @@ struct Engine::Impl {
     common_chat_templates_ptr   templates;
     common_sampler            * sampler = nullptr;
 
+    // ------ speculative decoding (MTP path; see Engine::spec_type) -------
+    // For DRAFT_MTP, the "draft model" is the SAME as the target — we just
+    // open a second llama_context against `model_tgt` with
+    // LLAMA_CONTEXT_TYPE_MTP so the model's MTP heads run there. For
+    // non-MTP types (ngram-*, draft-simple, draft-eagle3) these stay
+    // null and the engine runs autoregressive.
+    common_speculative_ptr      spec;                  // null = no speculation
+    llama_context             * ctx_dft       = nullptr; // owned
+    bool                        spec_mtp      = false;   // true iff spec is DRAFT_MTP
+    bool                        spec_active   = false;   // true iff spec successfully initialised
+    // Per-generation stats (reset in chat_continue's outer loop).
+    uint64_t                    spec_drafted  = 0;
+    uint64_t                    spec_accepted = 0;
+
     std::vector<common_chat_msg> history;
     std::vector<Tool>            tools;
 
@@ -755,6 +770,14 @@ struct Engine::Impl {
         if (sampler) {
             common_sampler_free(sampler);
             sampler = nullptr;
+        }
+        // spec is unique_ptr; frees itself.
+        // ctx_dft is a raw llama_context owned by us — free explicitly
+        // BEFORE init (which owns the model) goes out of scope, so the
+        // model is still alive when the draft context unbinds from it.
+        if (ctx_dft) {
+            llama_free(ctx_dft);
+            ctx_dft = nullptr;
         }
         // common_init_result_ptr + common_chat_templates_ptr free themselves.
     }
@@ -820,14 +843,206 @@ struct Engine::Impl {
                 last_error = "llama_decode failed while feeding prompt";
                 return false;
             }
+            // For MTP: feed the same batch to the speculative pipeline so
+            // its internal state machine tracks the prompt evolution. The
+            // MTP impl uses this to keep its draft context aligned with
+            // the target's KV cache.
+            if (spec_active) {
+                common_speculative_process(spec.get(), b);
+            }
             n_past_inout += n;
+        }
+        // Tell the speculative pipeline this is the start of a new
+        // generation against this seq. MTP doesn't actually consume the
+        // prompt tokens (it reads them from the shared model state via
+        // the draft context), but the call wires up the per-seq state
+        // the next draft() invocation needs. Idempotent if called
+        // multiple times for the same generation.
+        if (spec_active) {
+            // Reset per-generation acceptance counters.
+            spec_drafted  = 0;
+            spec_accepted = 0;
+            common_speculative_begin(spec.get(), /*seq_id=*/0, toks);
         }
         return true;
     }
 
     // Generate tokens until EOG, tool-call grammar trigger, or max_new_tokens.
     // Returns the raw assistant text (may contain tool-call syntax).
+    // MTP-accelerated generation. The prompt has already been decoded into
+    // ctx() (target) and fed to the spec pipeline via feed_prompt's
+    // common_speculative_process / _begin calls. Each loop iteration:
+    //   1. Set draft params (n_past, id_last, ...) and ask MTP for drafts.
+    //   2. Build a batch with [last_id, draft0, ..., draftN-1], all with
+    //      logits=true so we can verify every position.
+    //   3. Decode on target; feed the same batch to the spec pipeline.
+    //   4. common_sampler_sample_and_accept_n verifies each draft against
+    //      the target's logits, returning the accepted-prefix tokens.
+    //   5. Tell spec how many drafts were accepted; the last accepted
+    //      token becomes the next last_id.
+    // Acceptance rate ~50-80% on MTP-trained models gives the 1.5-2x
+    // decode speedup; for non-MTP models drafts are usually rejected and
+    // this degrades to ~autoregressive (with a small overhead per turn).
+    std::string generate_until_done_mtp(int & n_past_inout) {
+        const llama_vocab * vocab = llama_model_get_vocab(model());
+
+        std::string raw;
+        int generated = 0;
+        const int budget = max_new_tokens > 0
+                               ? max_new_tokens
+                               : params.n_predict > 0 ? params.n_predict : -1;
+        const int n_ctx        = llama_n_ctx(ctx());
+        const int n_draft_max  = params.speculative.draft.n_max;
+
+        // Sample the FIRST token from the prompt's last-position logits.
+        // From here on, last_id becomes the token sitting at the end of
+        // the decoded sequence — we hand it to spec_draft as id_last.
+        llama_token last_id = common_sampler_sample(sampler, ctx(), -1);
+        common_sampler_accept(sampler, last_id, /*accept_grammar=*/true);
+
+        // Reusable scratch — recreated every iter because draft size
+        // varies (1..n_max+1 tokens).
+        llama_tokens draft;
+        std::vector<int> i_logits;        // batch positions to sample at
+
+        while (true) {
+            if (cancel_requested.load(std::memory_order_relaxed)) {
+                if (verbose) std::fprintf(stderr,
+                    "[easyai] generate cancelled (after %d tokens)\n", generated);
+                last_error = "cancelled";
+                break;
+            }
+
+            // EOG check on the most recent accepted token, mirroring the
+            // non-spec path's break point.
+            if (llama_vocab_is_eog(vocab, last_id)) break;
+
+            // Emit `last_id` to the caller. We do this BEFORE adding it
+            // to the next batch so streaming sees tokens as they're
+            // accepted, not buffered.
+            std::string piece = common_token_to_piece(ctx(), last_id, /*special=*/false);
+            raw += piece;
+            if (on_token) on_token(piece);
+            ++generated;
+            if (budget > 0 && generated >= budget) break;
+            if (n_past_inout + 1 >= n_ctx) {
+                if (verbose) std::fprintf(stderr, "[easyai] context full, stopping\n");
+                break;
+            }
+
+            // --- 1. Ask MTP for draft tokens following last_id ----------
+            draft.clear();
+            auto & dp = common_speculative_get_draft_params(spec.get(), /*seq=*/0);
+            dp.drafting = true;
+            dp.n_max    = std::min(n_draft_max,
+                                   std::max(0, n_ctx - n_past_inout - 1));
+            dp.n_past   = n_past_inout;
+            dp.id_last  = last_id;
+            dp.result   = &draft;
+            // The MTP impl doesn't actually read .prompt (it reuses the
+            // model's KV state via the draft context). Setting it to
+            // null is fine in the typical MTP path. Other speculative
+            // impls (ngram-*) WOULD read it — they aren't wired here.
+            dp.prompt   = nullptr;
+
+            common_speculative_draft(spec.get());
+            spec_drafted += draft.size();
+
+            // --- 2. Build target batch: [last_id, draft[0..N-1]] --------
+            // All positions need logits=true so sample_and_accept_n can
+            // verify each draft. We use llama_batch_init / common_batch_add
+            // (not llama_batch_get_one which doesn't expose per-token
+            // logits flags).
+            const int n_tokens = 1 + (int) draft.size();
+            llama_batch b = llama_batch_init(n_tokens, /*embd=*/0, /*n_seq_max=*/1);
+            common_batch_add(b, last_id, n_past_inout, {0}, /*logits=*/true);
+            i_logits.clear();
+            i_logits.push_back(0);  // position of last_id in batch
+            for (size_t k = 0; k < draft.size(); ++k) {
+                common_batch_add(b, draft[k],
+                                 n_past_inout + 1 + (int) k,
+                                 {0}, /*logits=*/true);
+                i_logits.push_back(1 + (int) k);
+            }
+
+            // --- 3. Decode on target + feed spec pipeline ----------------
+            if (llama_decode(ctx(), b) != 0) {
+                llama_batch_free(b);
+                last_error = "llama_decode failed during MTP generation";
+                break;
+            }
+            common_speculative_process(spec.get(), b);
+
+            // --- 4. Verify drafts + sample next continuation -----------
+            // Returns: vector of accepted tokens (size 1..draft.size()+1).
+            // The first element is the verified continuation of last_id
+            // (which always exists — equals draft[0] if accepted, the
+            // resampled token if not). Subsequent elements are accepted
+            // drafts. The last element is the new last_id.
+            auto accepted = common_sampler_sample_and_accept_n(
+                sampler, ctx(), i_logits, draft);
+            llama_batch_free(b);
+
+            if (accepted.empty()) {
+                // Defensive — should never happen per llama-server's
+                // GGML_ASSERT(accepted.size() >= 1).
+                last_error = "sample_and_accept_n returned no tokens";
+                break;
+            }
+
+            // --- 5. Tell spec how many DRAFTS were accepted ------------
+            // accepted.size() - 1 = drafts accepted (the +1 is the
+            // mandatory new sample at position 0).
+            const uint16_t n_draft_accepted = (uint16_t) (accepted.size() - 1);
+            common_speculative_accept(spec.get(), /*seq=*/0, n_draft_accepted);
+            spec_accepted += n_draft_accepted;
+
+            // The KV cache now holds [last_id, draft0, ..., draftN-1]
+            // (all n_tokens positions). But we only accepted
+            // accepted.size() = 1 + n_draft_accepted of them. Trim KV
+            // back to keep only the accepted positions.
+            const int n_evicted = (int) draft.size() - (int) n_draft_accepted;
+            if (n_evicted > 0) {
+                // Wipe positions [n_past_inout + accepted.size() .. n_past_inout + n_tokens)
+                llama_memory_seq_rm(
+                    llama_get_memory(ctx()), /*seq=*/0,
+                    n_past_inout + (int) accepted.size(),
+                    n_past_inout + n_tokens);
+            }
+            n_past_inout += (int) accepted.size();
+
+            // --- 6. Emit accepted draft tokens (skip index 0 which is
+            //         the new sample — we emit it next iter as last_id). --
+            // Actually, ALL accepted entries except the last need to be
+            // emitted now; the last becomes the next last_id (emitted at
+            // the top of the next iter).
+            for (size_t k = 0; k + 1 < accepted.size(); ++k) {
+                llama_token id = accepted[k];
+                if (llama_vocab_is_eog(vocab, id)) {
+                    // EOG mid-draft → emit nothing past it and stop.
+                    return raw;
+                }
+                std::string p = common_token_to_piece(ctx(), id, /*special=*/false);
+                raw += p;
+                if (on_token) on_token(p);
+                ++generated;
+                if (budget > 0 && generated >= budget) {
+                    last_id = id;
+                    return raw;
+                }
+            }
+            last_id = accepted.back();
+        }
+        return raw;
+    }
+
+    // Autoregressive generation — the path used when MTP isn't active.
+    // Generate tokens until EOG, tool-call grammar trigger, or max_new_tokens.
+    // Returns the raw assistant text (may contain tool-call syntax).
     std::string generate_until_done(int & n_past_inout) {
+        if (spec_active) {
+            return generate_until_done_mtp(n_past_inout);
+        }
         const llama_vocab * vocab = llama_model_get_vocab(model());
 
         std::string raw;
@@ -1330,6 +1545,61 @@ bool Engine::load() {
 
     if (!p_->system_prompt.empty()) {
         p_->history.push_back({ "system", p_->system_prompt, {}, {}, "", "", "" });
+    }
+
+    // ---- speculative decoding init ---------------------------------------
+    // Only MTP is wired through the decode loop today. ngram-* and
+    // draft-simple set their type in params but the engine still runs
+    // autoregressive — common_init_from_params allocates the per-type
+    // memory pre-emptively, so the cost is just a few extra MB.
+    if (!p_->params.speculative.types.empty()) {
+        const auto t0 = p_->params.speculative.types.front();
+        if (t0 == COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
+            // Build a SECOND llama_context against the SAME target model
+            // with ctx_type=MTP. The MTP heads in the model produce draft
+            // tokens here; the original context verifies them. This is
+            // structurally how llama-server does it (see
+            // tools/server/server-context.cpp ~line 800).
+            auto cparams_mtp = common_context_params_to_llama(p_->params);
+            cparams_mtp.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+            cparams_mtp.n_rs_seq = 0;
+            p_->ctx_dft = llama_init_from_model(p_->init->model(), cparams_mtp);
+            if (!p_->ctx_dft) {
+                p_->last_error =
+                    "spec_type=draft-mtp: failed to create MTP draft "
+                    "context — the model probably wasn't trained with "
+                    "MTP heads (try a Qwen3.5/3.6, DeepSeek V3, or "
+                    "MimoVL build, OR remove --spec-type to run "
+                    "autoregressive)";
+                easyai::log::error("[easyai] Engine::load: %s",
+                                   p_->last_error.c_str());
+                return false;
+            }
+            p_->spec.reset(common_speculative_init(p_->params.speculative,
+                                                   /*n_seq=*/1));
+            if (!p_->spec) {
+                p_->last_error =
+                    "spec_type=draft-mtp: common_speculative_init failed";
+                easyai::log::error("[easyai] Engine::load: %s",
+                                   p_->last_error.c_str());
+                return false;
+            }
+            p_->spec_mtp    = true;
+            p_->spec_active = true;
+            easyai::log::error(
+                "[easyai] speculative MTP enabled (n_max=%d)\n",
+                (int) p_->params.speculative.draft.n_max);
+        }
+        // else: type is set but we don't actively drive it — keep the
+        // log line so the operator knows their non-MTP request didn't
+        // wire a real decode path.
+        else if (t0 != COMMON_SPECULATIVE_TYPE_NONE) {
+            easyai::log::error(
+                "[easyai] spec_type=%s requested but only draft-mtp is "
+                "wired through the easyai decode loop today — running "
+                "autoregressive\n",
+                common_speculative_type_to_str(t0).c_str());
+        }
     }
 
     // ---- backend summary --------------------------------------------------
