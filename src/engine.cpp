@@ -930,6 +930,18 @@ struct Engine::Impl {
                 break;
             }
 
+            // --- 0. Align ctx_dft to target's CURRENT position ----------
+            // Previous iter's process() decoded the full verify batch
+            // (last_id + K drafts) into ctx_dft. After sample_and_accept_n
+            // accepted A tokens, target trimmed [n_past+A..n_past+K+1) but
+            // ctx_dft still has those rejected positions. Trim them here
+            // so ctx_dft is back in lockstep with target before draft()
+            // runs. For the very first iter (no leftover state from
+            // feed_prompt) this is a no-op.
+            llama_memory_seq_rm(
+                llama_get_memory(ctx_dft), /*seq=*/0,
+                n_past_inout, /*p1=*/-1);
+
             // --- 1. Ask MTP for draft tokens following last_id ----------
             draft.clear();
             auto & dp = common_speculative_get_draft_params(spec.get(), /*seq=*/0);
