@@ -8,21 +8,20 @@
 #
 # llama.cpp source — IMPORTANT
 # ----------------------------
-# This script does NOT clone llama.cpp. It links against whatever
-# checkout already exists at the sibling directory `../llama.cpp`.
-# The expected setup is that you ran
+# This script links against the sibling directory `../llama.cpp` and
+# auto-clones upstream (ggml-org/llama.cpp) there if it's missing.
+# Override the URL via $LLAMA_CPP_REPO if you need a different fork —
+# e.g. the PrismML fork shipped by ./scripts/install_easyai_macos.sh,
+# the only one with the Bonsai-8B-Q1_0 1.125-bit kernel.
 #
-#   ./scripts/install_easyai_macos.sh
-#
-# at least once: the installer drops PrismML's fork next to easyai
-# (the only fork with the Bonsai-8B-Q1_0 1.125-bit kernel), then
-# builds + installs. After that you can use this script for fast
-# rebuilds during development without re-cloning or re-installing.
-#
-# If the sibling is missing, this script bails with the exact clone
-# command — pick the fork that matches the GGUF you intend to load:
+# Fork compatibility:
 #   * PrismML fork  → Bonsai-8B-Q1_0 (Q1_0 kernel only lives there)
 #   * Upstream      → every other quant family
+#
+# Pass --upgrade to `git pull --ff-only` both this easyai checkout and
+# ../llama.cpp before configuring, then rebuild against the fresher
+# trees. Local commits/changes that don't fast-forward abort the pull
+# rather than auto-merging — resolve them by hand and rerun.
 #
 # By default this script ONLY configures + builds. Output lands under
 # ./build-macos/. Pass --install to ALSO run `sudo cmake --install`
@@ -38,6 +37,7 @@
 #   ./build_macos.sh --debug                  # Debug build
 #   ./build_macos.sh --jobs 6                 # explicit -j 6
 #   ./build_macos.sh --rebuild                # wipe build-macos/ first
+#   ./build_macos.sh --upgrade                # git pull easyai + ../llama.cpp, then rebuild
 #   ./build_macos.sh --build-dir build-foo
 #   ./build_macos.sh --install                # build then `sudo cmake --install` to /usr/local
 #   ./build_macos.sh --install --prefix /opt/easyai
@@ -52,12 +52,21 @@ BUILD_DIR="${BUILD_DIR:-$script_dir/build-macos}"
 BUILD_TYPE="${BUILD_TYPE:-Release}"
 JOBS="${JOBS:-$(sysctl -n hw.logicalcpu 2>/dev/null || echo 4)}"
 REBUILD=0
+UPGRADE=0
 DO_INSTALL=0
 INSTALL_PREFIX="${INSTALL_PREFIX:-/usr/local}"
+
+# llama.cpp source. Defaults to upstream so a from-scratch checkout
+# produces a working binary for every non-Bonsai GGUF. The installer
+# (scripts/install_easyai_macos.sh) overrides this to the PrismML fork
+# when it sets up Bonsai-8B-Q1_0 — we don't touch an existing sibling
+# checkout, so that setup is preserved.
+LLAMA_CPP_REPO="${LLAMA_CPP_REPO:-https://github.com/ggml-org/llama.cpp.git}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --rebuild)   REBUILD=1; shift ;;
+        --upgrade)   UPGRADE=1; shift ;;
         --debug)     BUILD_TYPE=Debug; shift ;;
         --jobs)      JOBS="$2"; shift 2 ;;
         --build-dir) BUILD_DIR="$2"; shift 2 ;;
@@ -75,25 +84,25 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
     exit 1
 fi
 
-# Sibling llama.cpp — must already be in place from
-# install_easyai_macos.sh (PrismML fork) or a manual clone.
+# Sibling llama.cpp — auto-cloned from $LLAMA_CPP_REPO (default upstream)
+# when missing. An existing checkout (e.g. the PrismML fork dropped by
+# install_easyai_macos.sh) is kept untouched.
 llama_dir="$(dirname "$script_dir")/llama.cpp"
 if [[ ! -d "$llama_dir/.git" ]]; then
-    cat >&2 <<EOF
-build_macos.sh: missing sibling checkout at
-   $llama_dir
+    echo "==> Cloning $LLAMA_CPP_REPO -> $llama_dir"
+    git clone "$LLAMA_CPP_REPO" "$llama_dir"
+fi
 
-easyai builds against ../llama.cpp. Two ways to populate it:
-
-   # Recommended (also installs deps + Bonsai-tuned defaults):
-   ./scripts/install_easyai_macos.sh
-
-   # Manual — pick the fork that matches your GGUF:
-   git clone https://github.com/PrismML-Eng/llama.cpp.git "$llama_dir"   # for Bonsai-8B-Q1_0
-   #   OR
-   git clone https://github.com/ggml-org/llama.cpp.git "$llama_dir"      # upstream, every other quant
-EOF
-    exit 1
+# --upgrade: fast-forward both checkouts before configuring. We pull
+# easyai first; if `git pull --ff-only` would clobber local commits or
+# uncommitted edits that conflict, it aborts and the build never starts.
+# llama.cpp pulls from whatever remote/branch is already configured —
+# upstream for fresh clones, PrismML for installer-seeded trees.
+if [[ "$UPGRADE" == "1" ]]; then
+    echo "==> --upgrade: pulling easyai ($script_dir)"
+    git -C "$script_dir" pull --ff-only
+    echo "==> --upgrade: pulling llama.cpp ($llama_dir)"
+    git -C "$llama_dir" pull --ff-only
 fi
 
 # Show what fork is actually wired in, so the operator can confirm
