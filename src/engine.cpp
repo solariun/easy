@@ -948,6 +948,21 @@ struct Engine::Impl {
             common_speculative_draft(spec.get());
             spec_drafted += draft.size();
 
+            // MTP's draft() decodes each drafted token into ctx_dft to
+            // chain predictions (see common_speculative_state_draft_mtp::
+            // draft in speculative.cpp). Those positions now sit in
+            // ctx_dft's KV at [n_past_inout .. n_past_inout + draft.size()).
+            // common_speculative_process() about to run NEXT also decodes
+            // the verify batch on ctx_dft at the SAME positions — a
+            // conflict that triggers M-RoPE's "X < Y" position check and
+            // fails. Trim ctx_dft back to (n_past_inout - 1) so process()
+            // starts from a clean slate. Mirrors llama-server's
+            // common_context_seq_rm(ctx_dft, ...) at
+            // tools/server/server-context.cpp:2352.
+            llama_memory_seq_rm(
+                llama_get_memory(ctx_dft), /*seq=*/0,
+                n_past_inout, /*p1=*/-1);
+
             // --- 2. Build target batch: [last_id, draft[0..N-1]] --------
             // All positions need logits=true so sample_and_accept_n can
             // verify each draft. We use llama_batch_init / common_batch_add
