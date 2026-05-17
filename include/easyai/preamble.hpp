@@ -65,6 +65,11 @@ struct Options {
     // MEMORY VOCABULARY block is appended. Empty string OR empty
     // store → block omitted, no tokens wasted on "(nothing here)".
     std::string memory_root;
+
+    // Append the CITE-SOURCES block (see cite_sources_block()).
+    // Default off so the historical "empty Options → empty preamble"
+    // contract still holds. Server, local, and cli all opt in.
+    bool cite_sources = false;
 };
 
 // Build the AUTHORITATIVE preamble. Returns a string that should
@@ -75,5 +80,19 @@ struct Options {
 // a non-empty string (the date/time + cutoff blocks). To get an
 // empty string, set inject_datetime=false AND memory_root="".
 std::string build(const Options & opt);
+
+// Return the canonical CITE-SOURCES instruction block — strengthened
+// and centralised so server/local/cli render the exact same text. The
+// returned string starts with the section header (no leading "\n\n"),
+// so callers control how it joins onto the surrounding prompt:
+//   * build() prepends "\n\n" when emitting it from the preamble path.
+//   * inline emitters (build_builtin_system_prompt, cli's prefix) just
+//     append it where their other sections live.
+//
+// Models — especially Qwen3.x reasoning fine-tunes — were ignoring the
+// previous, milder phrasing. The text below restates the rule, gives a
+// pre-send checklist, and frames omission as a turn failure rather
+// than a style preference.
+std::string cite_sources_block();
 
 }  // namespace easyai::preamble

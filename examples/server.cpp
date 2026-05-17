@@ -1719,6 +1719,7 @@ static std::string build_authoritative_preamble(const ServerCtx & ctx) {
         /* inject_datetime  = */ true,
         /* knowledge_cutoff = */ ctx.knowledge_cutoff,
         /* memory_root      = */ ctx.memory_root,
+        /* cite_sources     = */ true,
     });
 }
 
@@ -4176,33 +4177,13 @@ static std::string build_builtin_system_prompt(const ServerArgs & args) {
         "The request is the ceiling, not a starting point. If genuinely\n"
         "unsure what's in scope, ASK before acting — don't expand the\n"
         "task to be safe.\n"
-        "\n"
-        "## Cite sources — INVIOLABLE\n"
-        "If you called web_search, web_fetch, or ANY external lookup\n"
-        "this turn, your reply is INCOMPLETE without a Sources block.\n"
-        "This is not optional and not a style preference: an answer\n"
-        "that touched the web but doesn't end with `Sources:` is\n"
-        "broken and must be redone.\n"
-        "\n"
-        "PRE-SEND SELF-CHECK (every turn, before emitting your final\n"
-        "reply): did I call any web tool this turn? Yes → confirm a\n"
-        "`Sources:` block is the last thing in the reply. No → no\n"
-        "Sources block; say in prose where the answer came from if\n"
-        "the user asked.\n"
-        "\n"
-        "REQUIRED FORMAT (literal, last block in the reply):\n"
-        "\n"
-        "  Sources:\n"
-        "  - https://example.com/article-you-actually-fetched\n"
-        "  - https://other.com/another-page-you-fetched\n"
-        "\n"
-        "Rules:\n"
-        "  - URLs you ACTUALLY fetched, in citation order.\n"
-        "  - One per line, prefixed `- `.\n"
-        "  - Don't invent URLs. Don't list snippet-only results you\n"
-        "    never opened. Don't list memory/training facts.\n"
-        "  - If web tools returned nothing useful and you answered\n"
-        "    from your own knowledge, NO Sources block.\n"
+        "\n";
+    // Citation rule lives in libeasyai now (preamble.hpp) so server,
+    // local, and cli render the exact same text. The per-request
+    // preamble also re-emits this block at the END of the prompt for
+    // Qwen3.x-style models that drop sources after a long <think>.
+    s += easyai::preamble::cite_sources_block();
+    s +=
         "\n"
         "Be terse. Be honest about uncertainty: \"I'm not sure — let me\n"
         "check\"";

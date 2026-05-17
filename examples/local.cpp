@@ -435,29 +435,14 @@ static std::string build_builtin_system_prompt(const CliArgs & args) {
         "If genuinely unsure what's in scope, ASK before acting — "
         "don't expand the task to be safe.\n"
         "\n"
-        "## Cite sources — INVIOLABLE\n"
-        "If you called web_search, web_fetch, or ANY external lookup "
-        "this turn, your reply is INCOMPLETE without a Sources block. "
-        "This is not optional and not a style preference: an answer "
-        "that touched the web but doesn't end with `Sources:` is "
-        "broken and must be redone.\n"
-        "\n"
-        "PRE-SEND SELF-CHECK (every turn, before emitting your final "
-        "reply): did I call any web tool this turn? Yes → confirm a "
-        "`Sources:` block is the last thing in the reply. No → no "
-        "Sources block.\n"
-        "\n"
-        "REQUIRED FORMAT (literal, last block in the reply):\n"
-        "\n"
-        "  Sources:\n"
-        "  - https://example.com/article-you-actually-fetched\n"
-        "  - https://other.com/another-page-you-fetched\n"
-        "\n"
-        "Rules: URLs you ACTUALLY fetched, in citation order; one "
-        "per line, prefixed `- `; don't invent URLs; don't list "
-        "snippet-only results you never opened; if web tools "
-        "returned nothing useful and you answered from your own "
-        "knowledge, NO Sources block.";
+        "";
+    // Citation rule lives in libeasyai now (preamble.hpp) so server,
+    // local, and cli render the exact same text. easyai-local appends
+    // it once here; the preamble path adds a second copy at the end
+    // of the prompt when --memory is enabled, for models (notably
+    // Qwen3.x reasoning fine-tunes) that drop the Sources block
+    // after a long <think> trace.
+    s += easyai::preamble::cite_sources_block();
     return s;
 }
 
@@ -519,6 +504,7 @@ int main(int argc, char ** argv) {
             /* inject_datetime  = */ false,
             /* knowledge_cutoff = */ std::string(),
             /* memory_root      = */ args.rag_dir,
+            /* cite_sources     = */ true,
         });
         if (!vocab.empty()) system_prompt += vocab;
     }

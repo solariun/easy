@@ -2023,6 +2023,15 @@ int main(int argc, char ** argv) {
                 "instead of asking which next-step the user wants, list "
                 "any ideas in your final answer and stop.\n";
         }
+        // [cite-sources] — unconditional. The server's built-in prompt
+        // carries the same rule, but a CLI that passes --system to
+        // override the server default would otherwise lose it. Render
+        // the centralised text here so server + local + cli all agree
+        // verbatim. The memory-vocab preamble below ALSO re-emits the
+        // block at the prompt tail when --memory is on, for models
+        // that drop sources after a long reasoning trace.
+        if (!prefix.empty()) prefix += "\n";
+        prefix += easyai::preamble::cite_sources_block();
         if (!prefix.empty()) {
             o.system_prompt = o.system_prompt.empty()
                                   ? prefix
@@ -2046,6 +2055,7 @@ int main(int argc, char ** argv) {
             /* inject_datetime  = */ false,
             /* knowledge_cutoff = */ std::string(),
             /* memory_root      = */ o.rag_dir,
+            /* cite_sources     = */ true,
         });
         if (!vocab.empty()) {
             o.system_prompt += vocab;
