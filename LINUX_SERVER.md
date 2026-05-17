@@ -587,6 +587,43 @@ The installer sets these to `nproc`. For a single-user agent box
 that's right. For shared hardware, reduce so the agent doesn't
 starve the rest of the system.
 
+### MTP speculative decoding (`--mtp`)
+
+When the served model was trained with Multi-Token Prediction heads
+(DeepSeek V3 / V3.2, MimoVL, Qwen3-MTP, and similar), the installer's
+`--mtp` flag bakes speculative decoding into the systemd unit:
+
+```bash
+./install_easyai_server.sh --mtp                 # n_max=6 (default)
+./install_easyai_server.sh --mtp --mtp-n-max 8   # wider draft window
+```
+
+What ends up in `ExecStart`:
+
+```
+ExecStart=/bin/sh -c '... exec /usr/local/bin/easyai-server \
+  --config /etc/easyai/easyai.ini \
+  -m /var/lib/easyai/models/active.gguf \
+  --spec-type draft-mtp --spec-draft-n-max 6 ...'
+```
+
+**Why this is fast.** MTP heads ship inside the main GGUF — no second
+model loaded, no extra VRAM, no separate KV cache. The draft heads
+predict N tokens ahead each step; the main model verifies them in
+one forward pass. Typical decode-phase speedup with `n_max=6`: 1.5-2×
+tok/s on single-user latency.
+
+**When NOT to pass `--mtp`.** If the model isn't MTP-trained,
+llama.cpp will refuse to load with `--spec-type draft-mtp`. You'll
+see something like `error: model does not contain MTP weights` in the
+startup logs and the service will fail. Skip `--mtp` and run plain
+autoregressive; speculative decoding via n-grams or a classic draft
+model isn't wired through the installer yet.
+
+To remove MTP later: re-run the installer **without** `--mtp` (the
+unit gets rewritten with the new flag set), or `systemctl edit
+easyai-server` and strip the two flags from the `ExecStart` line.
+
 ---
 
 ## 8. Common gotchas

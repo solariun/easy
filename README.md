@@ -43,6 +43,49 @@ A running log of user-facing changes. Latest first — keep this list
 current as features land so anyone returning to the repo (or
 landing on it for the first time) sees what shipped recently.
 
+### 2026-05-17 — MTP speculative decoding (`--spec-type draft-mtp`) + installer `--mtp`
+
+llama.cpp's Multi-Token Prediction merged upstream on 2026-05-16; we
+bumped our vendored llama.cpp checkout to `39cf5d619` (same-day HEAD,
+all 262 commits since the previous pin) and wired the MTP path
+through the three layers in one go.
+
+**Library API** ([include/easyai/engine.hpp](include/easyai/engine.hpp)):
+```cpp
+engine.spec_type("draft-mtp")      // or: none (default), draft-simple,
+                                    //     draft-eagle3, ngram-simple,
+                                    //     ngram-map-k, ngram-map-k4v,
+                                    //     ngram-mod, ngram-cache
+       .spec_draft_n_max(6);        // max draft tokens per step
+```
+Unknown strings land in `Engine::last_error()` and leave speculation
+off (no silent default switch).
+
+**Server CLI**:
+```bash
+easyai-server -m /path/to/mtp-model.gguf \
+  --spec-type draft-mtp --spec-draft-n-max 6
+```
+INI keys: `[ENGINE] spec_type` and `[ENGINE] spec_draft_n_max`.
+
+**Installer shortcut**:
+```bash
+./install_easyai_server.sh --mtp                # n_max=6 (default)
+./install_easyai_server.sh --mtp --mtp-n-max 8  # override
+```
+The installer bakes the two flags into the systemd `ExecStart` so the
+service inherits MTP without `systemctl edit`.
+
+**Caveat**: MTP needs a model TRAINED with MTP heads (DeepSeek V3,
+MimoVL, and similar). Plain models will refuse to load with
+`--spec-type draft-mtp`. The installer's `--mtp` flag is the operator
+saying "I know what I'm doing"; there's no validation.
+
+Classic standalone-draft-model speculative decoding (the
+`--draft-model PATH` path) is not yet wired — only MTP, which doesn't
+need a separate model file. The old installer compat lines for
+`--draft-model` / `--draft-max` / `--draft-min` still warn and skip.
+
 ### 2026-05-16 — Memory vocabulary auto-injection + shared `easyai::preamble::build()`
 
 Every binary that loads `--memory <dir>` now auto-injects a compact

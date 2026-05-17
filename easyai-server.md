@@ -146,6 +146,8 @@ Model loading and inference tunables.
 | `cache_type_v` | enum | `-ctv`, `--cache-type-v` | `f16` | Same options as K. Quantising V saves a lot of VRAM. |
 | `numa` | string | `--numa` | (none) | Llama-server compat. |
 | `override_kv` | list | `--override-kv` (repeat) | (empty) | GGUF metadata overrides. Comma-separated list of `key=type:value` triples (e.g. `tokenizer.ggml.eos_token_id=int:151645`). On the CLI, repeat `--override-kv` per entry; in INI, comma-separate. |
+| `spec_type` | enum | `--spec-type` | `none` | Speculative decoding backend. `none` (off), `draft-mtp` (Multi-Token Prediction heads embedded in the main model — requires an MTP-trained model like DeepSeek V3 / MimoVL; NO separate draft model needed), `draft-simple` (classic draft model — needs `--draft-model PATH`, not yet wired up in easyai), `draft-eagle3` (Eagle3 draft model), `ngram-simple` / `ngram-map-k` / `ngram-map-k4v` / `ngram-mod` / `ngram-cache` (self-speculative via n-grams). Unknown strings are recorded in `Engine::last_error()` and leave speculation off. |
+| `spec_draft_n_max` | int | `--spec-draft-n-max` | (llama.cpp default: 16) | Max draft tokens per speculation step. Typical for MTP: `6`. Set to `0` to defer to llama.cpp's default; ignored when `spec_type=none`. |
 | `temperature` | float | `--temperature`, `--temp` | (preset) | Sampling override. |
 | `top_p` | float | `--top-p` | (preset) | Sampling override. |
 | `top_k` | int | `--top-k` | (preset) | Sampling override. |
@@ -626,6 +628,39 @@ an action ("Let me…", "I'll…") without actually emitting the
 tool_call. Bump to 15-20 for weak / 1-bit-quant models; set to 0 to
 disable retries entirely. Each retry surfaces in the webui Thinking
 panel as `↻ Retry N/max`.
+
+### Speculative decoding (`--spec-type` / `--spec-draft-n-max`)
+
+Off by default. Set `--spec-type` to enable; the most useful path is
+**MTP** (`--spec-type draft-mtp`), which uses Multi-Token Prediction
+heads baked into the main model — no separate draft model file,
+zero extra VRAM for a draft. Typical speedup with `--spec-draft-n-max
+6` on an MTP-trained model: 1.5-2× tok/s in the decode phase, more on
+small-batch single-user latency.
+
+```bash
+# MTP (recommended when the model supports it)
+easyai-server -m /models/deepseek-v3.gguf \
+  --spec-type draft-mtp --spec-draft-n-max 6
+
+# Self-speculative via n-grams (no extra model, no MTP heads needed)
+easyai-server -m /models/qwen3-7b.gguf --spec-type ngram-cache
+```
+
+**Caveat — MTP requires an MTP-trained model.** DeepSeek V3 / V3.2,
+MimoVL, and a handful of others ship with the MTP heads in the GGUF.
+Pass `--spec-type draft-mtp` against a model without them and llama.cpp
+will refuse to load (or fall back to autoregressive silently — check
+the startup banner).
+
+**Classic standalone-draft mode (`--spec-type draft-simple`) is not
+yet wired up** in easyai. llama.cpp supports it, but easyai-server
+doesn't expose a `--draft-model PATH` flag yet. If you need it, file
+an issue or use llama-server directly until the surface lands here.
+
+INI keys: `[ENGINE] spec_type` and `[ENGINE] spec_draft_n_max`. The
+systemd installer's `--mtp` flag bakes `--spec-type draft-mtp
+--spec-draft-n-max 6` into the unit's `ExecStart` (see `LINUX_SERVER.md`).
 
 ---
 
