@@ -37,18 +37,19 @@ std::string build(const Options & opt) {
             out << "\n# KNOWLEDGE CUTOFF\n"
                 << "Your training data ends around "
                 << opt.knowledge_cutoff << ".\n"
-                << "For ANY claim about events, people, products, "
-                   "prices, releases,\n"
-                << "leaders, scores, weather, or facts after that "
-                   "cutoff you MUST\n"
-                << "either:\n"
-                << "  1. Call a tool (web action=search/fetch, "
-                   "datetime, …) to verify, OR\n"
-                << "  2. Explicitly state that you are not certain.\n"
-                << "Never present a post-cutoff fact as known.  "
-                   "Hallucination is\n"
-                << "considered a critical failure for this "
-                   "assistant.\n";
+                << "For TIME-SENSITIVE claims after that cutoff —\n"
+                << "current events, prices, scores, weather, latest\n"
+                << "releases, who-holds-what-office — verify with a\n"
+                << "tool (web search/fetch, datetime) OR state\n"
+                << "uncertainty. Never present a post-cutoff\n"
+                << "time-sensitive fact as known.\n"
+                << "\n"
+                << "STABLE facts (definitions, syntax, architecture,\n"
+                << "math, algorithms) don't need verification just\n"
+                << "because the topic is recent — trust your\n"
+                << "knowledge unless the user asks for the latest\n"
+                << "state. One verification per topic is enough; don't\n"
+                << "re-verify after every fetch.\n";
         }
     }
 

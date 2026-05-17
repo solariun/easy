@@ -4077,10 +4077,10 @@ static std::string build_builtin_system_prompt(const ServerArgs & args) {
                  "(see Cite sources rule below).\n";
         }
         if (rag_on) {
-            s += "  - memory: search BEFORE the web (your current "
-                 "keyword vocabulary is appended at end of system "
-                 "prompt — look there first); save what you learn "
-                 "before the turn ends.\n";
+            s += "  - memory: search first for STABLE facts (vocab "
+                 "appended below); save only DURABLE info, one "
+                 "comprehensive entry per topic — see the tool's own "
+                 "description for the trust/verify policy.\n";
         }
         if (fs_on) {
             s += "  - fs: sandbox + check_path before any file work. "
@@ -4098,6 +4098,21 @@ static std::string build_builtin_system_prompt(const ServerArgs & args) {
     }
 
     s +=
+        "## Stop when you have enough (AUTHORITATIVE)\n"
+        "After EACH tool result, ask yourself: do I now have enough\n"
+        "to answer the user's question? Yes → answer immediately.\n"
+        "No → ONE more focused tool call, then re-check. Three or\n"
+        "more tool calls in a row without re-checking is a bug; it\n"
+        "means you're doing exploration instead of answering.\n"
+        "\n"
+        "Specifically: don't loop verify → save → re-verify. After\n"
+        "a memory load returns a stable fact (definition, syntax,\n"
+        "architecture), trust it without a web round-trip unless\n"
+        "the user explicitly asked for \"latest\" / \"current\".\n"
+        "After saving a memory, DON'T re-search the web on the same\n"
+        "topic in the same turn — the save means you already learned\n"
+        "what you needed.\n"
+        "\n"
         "## Stay strictly in scope (AUTHORITATIVE)\n"
         "Do EXACTLY what the user asked — no more, no less. No extra\n"
         "features, no defensive scaffolding for cases they didn't\n"
