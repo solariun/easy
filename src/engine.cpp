@@ -1575,6 +1575,15 @@ bool Engine::load() {
                                    p_->last_error.c_str());
                 return false;
             }
+            // common_speculative_init's MTP enable check is
+            //   has_mtp = (types & MTP) && params.draft.ctx_dft != nullptr
+            // — it REQUIRES both context pointers to be wired into
+            // params BEFORE the init call. Without this, init logs
+            // "no implementations specified" and returns null. See
+            // tools/server/server-context.cpp:799-800 for the same
+            // assignment in llama-server.
+            p_->params.speculative.draft.ctx_tgt = p_->init->context();
+            p_->params.speculative.draft.ctx_dft = p_->ctx_dft;
             p_->spec.reset(common_speculative_init(p_->params.speculative,
                                                    /*n_seq=*/1));
             if (!p_->spec) {
