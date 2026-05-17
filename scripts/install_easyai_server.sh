@@ -1126,6 +1126,30 @@ repeat_penalty   = $repeat_penalty
 presence_penalty = $presence_penalty
 max_tokens       = $max_tokens
 
+# ------------------------------------------------------------
+# Speculative decoding — off by default. Uncomment ONE of the
+# pairs below when the served model supports the backend.
+# ------------------------------------------------------------
+#
+# MTP — Multi-Token Prediction heads embedded in the main model.
+# Only works with MTP-trained models (Qwen3.5/3.6, DeepSeek V3,
+# MimoVL, etc.); plain models will refuse to load. Typical
+# decode speedup: 1.5-2x tok/s. No second model loaded, zero
+# extra VRAM. The installer's --mtp flag bakes the SAME pair
+# into the unit's ExecStart — use INI here if you'd rather edit
+# easyai.ini than re-run the installer.
+#spec_type        = draft-mtp
+#spec_draft_n_max = 6
+#
+# Self-speculative via n-grams — works with ANY model, no MTP
+# heads needed. Smaller speedup than MTP but free.
+#spec_type        = ngram-cache
+#
+# Classic standalone draft model — NOT yet wired in easyai-server.
+# (--draft-model PATH is accepted by llama.cpp but easyai doesn't
+# expose the path knob; leave commented until that lands.)
+#spec_type        = draft-simple
+
 # ============================================================
 # [MCP_USER] — Bearer-token auth for POST /mcp
 # ============================================================
