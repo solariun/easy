@@ -1083,7 +1083,7 @@ verbose         = $([[ "$enable_verbose" -eq 1 ]] && echo on || echo off)
 # "elevated" / "HIGH" / "CRITICAL" so socket exhaustion shows up before
 # connections start failing. 0 disables.
 #
-# ALWAYS ON regardless of `verbose` — operators need this telemetry in
+# ALWAYS ON regardless of \`verbose\` — operators need this telemetry in
 # journalctl whether or not they're chasing a debug session.
 #
 # Default 300 (5 minutes) — low-overhead enough to leave on permanently
@@ -1337,9 +1337,9 @@ Wants=network-online.target
 # bad config / missing GPU.  A long-running successful start that fails
 # 2+ minutes later is NOT counted against this burst because the look-
 # back window resets — only rapid back-to-back boot failures stop the
-# service.  Inspect the journal (`journalctl -u easyai-server`) to see
-# why the two attempts failed, then `sudo systemctl reset-failed` +
-# `sudo systemctl start easyai-server` to try again.
+# service.  Inspect the journal (journalctl -u easyai-server) to see
+# why the two attempts failed, then 'sudo systemctl reset-failed' +
+# 'sudo systemctl start easyai-server' to try again.
 StartLimitBurst=2
 StartLimitIntervalSec=60
 
