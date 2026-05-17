@@ -3295,6 +3295,15 @@ static bool require_auth(const ServerCtx & ctx, const httplib::Request & req,
         "      --kv-unified             Use a single unified KV buffer across sequences\n"
         "      --override-kv <k=t:v>    Override a GGUF metadata entry (repeatable)\n"
         "                                Types: int|float|bool|str\n"
+        "\nSpeculative decoding (all optional):\n"
+        "      --spec-type <type>       none (default; off), draft-mtp (MTP-trained\n"
+        "                                 model, no draft file needed), draft-simple,\n"
+        "                                 draft-eagle3, ngram-simple|map-k|map-k4v|\n"
+        "                                 mod|cache. INI key: [ENGINE] spec_type.\n"
+        "      --spec-draft-n-max <n>   Max draft tokens per speculation step. Typical\n"
+        "                                 MTP: 6. Default 16 when --spec-type is set,\n"
+        "                                 unused when --spec-type=none. INI key:\n"
+        "                                 [ENGINE] spec_draft_n_max.\n"
         "\nllama-server compatibility:\n"
         "  -a,  --alias <name>          Public model id reported by /v1/models\n"
         "       --api-key <key>         Require Bearer auth on every /v1 route\n"
@@ -3459,6 +3468,14 @@ struct ServerArgs {
     bool        no_kv_offload = false;
     bool        kv_unified    = false;
     std::vector<std::string> kv_overrides;
+
+    // Speculative decoding — see Engine::spec_type for the accepted
+    // string values. "none" (default) is autoregressive. The MTP path
+    // (--spec-type draft-mtp + --spec-draft-n-max 6) needs an MTP-
+    // trained model (DeepSeek V3, MimoVL, etc.); other models will
+    // refuse to load or run autoregressive anyway.
+    std::string spec_type;             // empty → leave Engine default ("none")
+    int         spec_draft_n_max = 0;  // 0 → leave Engine default (16)
 
     // llama-server compatibility / production knobs
     std::string alias;            // exposed as model id in /v1/models
@@ -3708,6 +3725,8 @@ static const std::vector<FlagDef> & kFlags() {
         { {"-ctv","--cache-type-v"},"ENGINE","cache_type_v",   "cache_type_v",   true,  SET_STR(&ServerArgs::cache_type_v) },
         { {"--numa"},              "ENGINE", "numa",           "numa",           true,  SET_STR(&ServerArgs::numa) },
         { {"--override-kv"},       "ENGINE", "override_kv",    "override_kv",    true,  SET_LIST_APPEND(&ServerArgs::kv_overrides) },
+        { {"--spec-type"},         "ENGINE", "spec_type",      "spec_type",      true,  SET_STR(&ServerArgs::spec_type) },
+        { {"--spec-draft-n-max"},  "ENGINE", "spec_draft_n_max","spec_draft_n_max",true, SET_INT(&ServerArgs::spec_draft_n_max) },
         // sampling
         { {"--temperature","--temp"},"ENGINE","temperature",   "temperature",    true,  SET_FLOAT(&ServerArgs::temperature) },
         { {"--top-p"},             "ENGINE", "top_p",          "top_p",          true,  SET_FLOAT(&ServerArgs::top_p) },
@@ -6256,6 +6275,8 @@ int main(int argc, char ** argv) {
     if (!args.cache_type_v.empty()) ctx->engine.cache_type_v(args.cache_type_v);
     if (args.no_kv_offload)  ctx->engine.no_kv_offload(true);
     if (args.kv_unified)     ctx->engine.kv_unified(true);
+    if (!args.spec_type.empty())   ctx->engine.spec_type(args.spec_type);
+    if (args.spec_draft_n_max > 0) ctx->engine.spec_draft_n_max(args.spec_draft_n_max);
     if (args.flash_attn)     ctx->engine.flash_attn(true);
     if (args.mlock)          ctx->engine.use_mlock(true);
     if (args.no_mmap)        ctx->engine.use_mmap(false);

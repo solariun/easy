@@ -1138,6 +1138,45 @@ Engine & Engine::cache_type_v(const std::string & name) {
     return *this;
 }
 
+// Map a CLI-friendly spec-type string to llama.cpp's enum. Names match
+// the `--spec-type` flag llama-server accepts (e.g. "draft-mtp"); the
+// underscore-cased enum variants are intentionally not exposed. Returns
+// COMMON_SPECULATIVE_TYPE_COUNT on miss.
+static common_speculative_type spec_type_from_name(const std::string & s) {
+    if (s == "none")          return COMMON_SPECULATIVE_TYPE_NONE;
+    if (s == "draft-simple")  return COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE;
+    if (s == "draft-eagle3")  return COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3;
+    if (s == "draft-mtp")     return COMMON_SPECULATIVE_TYPE_DRAFT_MTP;
+    if (s == "ngram-simple")  return COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE;
+    if (s == "ngram-map-k")   return COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K;
+    if (s == "ngram-map-k4v") return COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V;
+    if (s == "ngram-mod")     return COMMON_SPECULATIVE_TYPE_NGRAM_MOD;
+    if (s == "ngram-cache")   return COMMON_SPECULATIVE_TYPE_NGRAM_CACHE;
+    return COMMON_SPECULATIVE_TYPE_COUNT;
+}
+
+Engine & Engine::spec_type(const std::string & name) {
+    common_speculative_type t = spec_type_from_name(name);
+    if (t == COMMON_SPECULATIVE_TYPE_COUNT) {
+        p_->last_error = "spec_type: unknown speculative type '" + name
+            + "' (valid: none, draft-simple, draft-eagle3, draft-mtp, "
+              "ngram-simple, ngram-map-k, ngram-map-k4v, ngram-mod, "
+              "ngram-cache)";
+        return *this;
+    }
+    // llama.cpp keeps a vector to allow chained types; we expose only
+    // the single-type case from the easyai API since chained speculation
+    // is an exotic configuration nobody asked for yet.
+    p_->params.speculative.types = { t };
+    return *this;
+}
+
+Engine & Engine::spec_draft_n_max(int n) {
+    if (n < 0) n = 0;
+    p_->params.speculative.draft.n_max = (int32_t) n;
+    return *this;
+}
+
 Engine & Engine::no_kv_offload(bool on) { p_->params.no_kv_offload = on; return *this; }
 Engine & Engine::kv_unified  (bool on) { p_->params.kv_unified    = on; return *this; }
 

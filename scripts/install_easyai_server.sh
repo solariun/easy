@@ -66,6 +66,13 @@
 #                                                    # touch it.
 #   ./install_easyai_server.sh --enable-now          # systemctl start now
 #   ./install_easyai_server.sh --enable-verbose      # bake --verbose into ExecStart (noisy)
+#   ./install_easyai_server.sh --mtp                 # bake --spec-type draft-mtp
+#                                                    # --spec-draft-n-max 6 into
+#                                                    # ExecStart. Only for MTP-
+#                                                    # trained models (DeepSeek
+#                                                    # V3, MimoVL, etc.); plain
+#                                                    # models won't load.
+#   ./install_easyai_server.sh --mtp --mtp-n-max 8   # override the draft window
 #   ./install_easyai_server.sh --no-service          # build/install only
 #   ./install_easyai_server.sh -h                    # show this help
 # ============================================================================
@@ -186,6 +193,12 @@ enable_metrics=1
 enable_flash_attn=1
 enable_verbose=1                              # writes verbose=on into the INI;
                                               # operator's primary debug switch
+mtp=0                                         # --mtp: bake --spec-type draft-mtp
+                                              # --spec-draft-n-max 6 into ExecStart
+                                              # (only meaningful for MTP-trained
+                                              # models — DeepSeek V3, MimoVL, etc.)
+mtp_n_max=6                                   # --mtp-n-max <n>: override the draft
+                                              # window when --mtp is on
 cache_type_k="q8_0"                           # K cache: q8_0 — attention scores
                                               # need precision; quantizing K hurts
                                               # more than V
@@ -314,11 +327,24 @@ while [[ $# -gt 0 ]]; do
             warn "--thinking-budget: not yet supported in easyai (use --thinking on/off + --max-tokens at runtime)"
             shift 2 ;;
         --draft-model|--draft-max|--draft-min)
-            warn "$1: speculative decoding not yet wired up in easyai — flag ignored"
+            warn "$1: classic draft-model speculative decoding not wired up in easyai — flag ignored. For MTP-trained models, pass --mtp instead."
             shift 2 ;;
         --no-draft)
-            warn "--no-draft: ignored (speculative decoding not enabled by default in easyai)"
+            warn "--no-draft: ignored (speculative decoding is off by default in easyai; pass --mtp to enable MTP)"
             shift ;;
+        --mtp)
+            # Bake `--spec-type draft-mtp --spec-draft-n-max $mtp_n_max`
+            # into ExecStart. Only meaningful when the served model was
+            # trained with MTP heads (DeepSeek V3, MimoVL, etc.); other
+            # models will refuse to load or run plain autoregressive.
+            mtp=1
+            shift ;;
+        --mtp-n-max)
+            mtp_n_max="$2"
+            if [[ ! "$mtp_n_max" =~ ^[0-9]+$ ]] || (( mtp_n_max < 1 )); then
+                die "--mtp-n-max: expected positive integer, got: $(printf '%q' "$mtp_n_max")"
+            fi
+            shift 2 ;;
         --list-tags)
             # Mirror the original installer's behaviour: list recent tags of the
             # easyai repo instead of llama.cpp's.
@@ -331,7 +357,7 @@ while [[ $# -gt 0 ]]; do
             exit 0 ;;
         # -----------------------------------------------------------------
 
-        -h|--help)          sed -n '2,49p' "$0"; exit 0 ;;
+        -h|--help)          sed -n '2,77p' "$0"; exit 0 ;;
         *)
             echo "unknown arg: $1" >&2
             echo "run with --help for usage" >&2
@@ -1276,6 +1302,13 @@ if [[ $do_service -eq 1 ]]; then
     fi
     [[ -n "$webui_icon_dest" ]] && args+=( --webui-icon "$webui_icon_dest" )
     [[ "$thinking" == "off" ]]  && args+=( --reasoning off )
+    if (( mtp == 1 )); then
+        # MTP speculative decoding. Only meaningful when the served model
+        # was TRAINED with MTP heads (DeepSeek V3, MimoVL, etc.); for
+        # other models the load will fail. Operators who pass --mtp are
+        # taking that responsibility.
+        args+=( --spec-type draft-mtp --spec-draft-n-max "$mtp_n_max" )
+    fi
 
     # api-key file integration is wired upstream in the args[] block
     # above (`--api-key '${EASYAI_API_KEY}'` is appended only when the

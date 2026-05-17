@@ -205,6 +205,27 @@ class Engine {
     // Repeatable.  Useful for fixing tokenizer or rope parameters at load time.
     Engine & add_kv_override(const std::string & spec);
 
+    // ---------------- speculative decoding ----------------------------------
+    // Set the speculative-decoding backend. Pass one of:
+    //   "none"           — autoregressive (default; speculative off)
+    //   "draft-mtp"      — Multi-Token Prediction heads embedded in the main
+    //                      model. Requires a model TRAINED with MTP (e.g.
+    //                      DeepSeek V3, MimoVL). No separate draft model.
+    //   "draft-eagle3"   — Eagle3 draft model (needs a draft model file).
+    //   "draft-simple"   — Standalone draft model speculative decoding
+    //                      (classic; needs a draft model file).
+    //   "ngram-simple"   — Self-speculative via n-grams.
+    //   "ngram-map-k"    — n-gram keys only.
+    //   "ngram-map-k4v"  — n-gram keys + 4 m-gram values.
+    //   "ngram-mod"      — n-gram mod.
+    //   "ngram-cache"    — 3-level n-gram cache.
+    // Unrecognised strings record an error in last_error() and leave
+    // speculation off. Defaults to "none".
+    Engine & spec_type(const std::string & name);
+    // Max draft tokens per speculation step. 0 = disabled, ≥1 enables (with a
+    // sensible per-type ceiling enforced by llama.cpp). Typical for MTP: 6.
+    Engine & spec_draft_n_max(int n);
+
     // ---------------- compute / memory knobs --------------------------------
     // Flash attention — auto, on, off.  Default 'auto' lets llama.cpp decide
     // based on backend capability.  Pass true to force on.
