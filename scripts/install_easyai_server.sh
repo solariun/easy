@@ -53,17 +53,26 @@
 #   ./install_easyai_server.sh --webui-title "AI Box"
 #   ./install_easyai_server.sh --webui-icon /path/to/logo.svg   # ico|png|svg|gif|jpg|webp
 #   ./install_easyai_server.sh --upgrade             # git pull + rebuild
-#   ./install_easyai_server.sh --force               # also rewrite easyai.ini
-#                                                    # AND systemd unit (use
-#                                                    # after changing installer
-#                                                    # defaults to push them
-#                                                    # to the box).  Backs up
-#                                                    # easyai.ini → .bak first.
-#                                                    # Note: system.txt is no
-#                                                    # longer installed (only
-#                                                    # the template ships),
-#                                                    # so --force does not
-#                                                    # touch it.
+#   ./install_easyai_server.sh --force               # CLEAN-SLATE rewrite:
+#                                                    #   - easyai.ini backed up
+#                                                    #     to .bak then replaced
+#                                                    #   - systemd unit stopped,
+#                                                    #     disabled, removed
+#                                                    #   - ENTIRE drop-in dir
+#                                                    #     (.service.d/*) wiped
+#                                                    #     incl. operator-edited
+#                                                    #     override.conf
+#                                                    #   - systemctl reset-failed
+#                                                    #     so a fresh unit isn't
+#                                                    #     blocked by prior
+#                                                    #     StartLimitBurst gate
+#                                                    #   - new unit written
+#                                                    #   - daemon-reload
+#                                                    # Use this after changing
+#                                                    # installer defaults OR to
+#                                                    # recover a corrupted unit.
+#                                                    # system.txt is NOT touched
+#                                                    # (only the template ships).
 #   ./install_easyai_server.sh --enable-now          # systemctl start now
 #   ./install_easyai_server.sh --enable-verbose      # bake --verbose into ExecStart (noisy)
 #   ./install_easyai_server.sh --mtp                 # bake --spec-type draft-mtp
@@ -1110,6 +1119,43 @@ ngl              = $ngl
 threads          = $n_threads_default
 threads_batch    = $n_threads_batch_default
 
+# ------------------------------------------------------------
+# Sampling preset — five built-ins. LEFT COMMENTED so the engine
+# picks the preset name from --preset / its own default; uncomment
+# to PIN it in the INI. The webui exposes a "default" badge that
+# always reflects whichever preset name is active on the server,
+# so operators don't have to remember the specific numbers.
+#
+# Each preset sets temperature / top_p / top_k / min_p as a unit;
+# the explicit overrides further below WIN when both are set.
+#
+#   deterministic  temp=0.0  top_p=1.00  top_k=1   min_p=0.00
+#     Greedy. Same prompt → identical answer every time. For
+#     reproducibility, tests, anything piped into a parser.
+#
+#   precise        temp=0.2  top_p=0.95  top_k=40  min_p=0.10
+#     Default. Sticks to high-probability tokens. Best for code,
+#     math, factual Q&A, tool-calling agents, structured output.
+#
+#   balanced       temp=0.7  top_p=0.95  top_k=40  min_p=0.05
+#     General-purpose chat. Some phrasing variety, still focused.
+#
+#   creative       temp=1.0  top_p=0.95  top_k=40  min_p=0.05
+#     Higher entropy. Brainstorming, fiction, marketing copy.
+#     Code / math get notably worse.
+#
+#   wild           temp=1.4  top_p=0.98  top_k=60  min_p=0.00
+#     Maximum entropy. Frequent off-topic / hallucination.
+#     Pure exploration only.
+#
+# Where the preset name is also referenced:
+#   * CLI flag --preset <name>          (one-shot override per launch)
+#   * GET  /health  ".preset" field     (liveness probe reports active)
+#   * POST /v1/preset                   (live swap, no restart)
+#   * webui "default" badge             (reflects the server's preset;
+#                                        clicking it applies the same
+#                                        values, no need to remember
+#                                        the specific numbers)
 #preset          = $preset
 flash_attn       = $([[ "$enable_flash_attn" -eq 1 ]] && echo on || echo off)
 cache_type_k     = $cache_type_k
@@ -1301,10 +1347,21 @@ fi
 # ---------- systemd unit ----------------------------------------------------
 if [[ $do_service -eq 1 ]]; then
     if [[ $do_force_service -eq 1 ]]; then
-        log "stopping + removing existing $service_name (--force-service)"
+        # --force-service / --force: total clean-slate rewrite of the
+        # unit. Stops the service, disables auto-start, removes the
+        # main unit file AND any drop-in directory (operator-authored
+        # override.conf included — the assumption is that the operator
+        # asked for --force precisely to nuke any prior customisation
+        # and start over). reset-failed clears the systemd "failed"
+        # state so a freshly-written unit isn't blocked by the
+        # StartLimitBurst gate from a previous bad config.
+        log "stopping + removing existing $service_name + drop-ins (--force-service)"
         sudo systemctl stop    "$service_name" 2>/dev/null || true
         sudo systemctl disable "$service_name" 2>/dev/null || true
-        sudo rm -f "/etc/systemd/system/$service_name"
+        sudo systemctl reset-failed "$service_name" 2>/dev/null || true
+        sudo rm -f  "/etc/systemd/system/$service_name"
+        sudo rm -rf "/etc/systemd/system/$service_name.d"
+        sudo systemctl daemon-reload
     fi
 
     # ----- INI-FIRST: every flag below now lives in $ini_file by default.

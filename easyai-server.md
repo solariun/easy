@@ -136,7 +136,7 @@ Model loading and inference tunables.
 | `threads_batch` | int | `-tb`, `--threads-batch` | `0` (lib default) | CPU threads for batched inference. |
 | `batch` | int | `--batch` | `0` (follows ctx) | Logical batch size. |
 | `parallel` | int | `-np`, `--parallel` | `1` | Llama-server compat. |
-| `preset` | string | `--preset` | `precise` | `deterministic` / `precise` / `balanced` / `creative` / `wild`. See [`README.md` §Sampling presets](README.md#sampling-presets) for what each implies. The installer drops `preset = precise` in the generated INI. |
+| `preset` | string | `--preset` | `precise` | `deterministic` / `precise` / `balanced` / `creative` / `wild`. See the [Sampling presets table](#sampling-presets--the-five-built-ins) below for what each implies. The installer drops `#preset = <name>` (commented) in the generated INI so the engine picks the name from `--preset` instead. |
 | `flash_attn` | bool | `-fa`, `--flash-attn` | `off` | Free perf on every backend that supports it. |
 | `mlock` | bool | `--mlock` | `off` | Pin model weights in RAM. Needs `LimitMEMLOCK=infinity` on the unit. |
 | `no_mmap` | bool | `--no-mmap` | `off` | Required with `mlock` for portability. |
@@ -157,6 +157,50 @@ Model loading and inference tunables.
 | `max_tokens` | int | `--max-tokens` | `-1` (until EOS / ctx full) | Per-turn cap. |
 | `seed` | uint32 | `--seed` | `0` (random) | RNG seed. |
 | `max_incomplete_retries` | int | `--max-incomplete-retries` | `10` | How many times the engine discards + nudges + retries when the model finishes a turn with no tool_call and only an "announce" snippet ("Let me…", "I'll…"). `0` disables retries (equivalent to `retry_on_incomplete = off`). Bump to 15-20 for weak / 1-bit-quant models that keep announcing-without-acting. Each retry surfaces in the webui Thinking panel as `↻ Retry N/max`. |
+
+### Sampling presets — the five built-ins
+
+A **preset** is a named bundle of sampling parameters (`temperature`,
+`top_p`, `top_k`, `min_p`). Five ship with easyai; the one the server
+runs on comes from `--preset` / `[ENGINE] preset` and is exposed in
+the webui as a `default` badge so operators don't have to remember
+the specific numbers.
+
+| Preset | temp | top_p | top_k | min_p | Behaviour |
+|---|---|---|---|---|---|
+| **`deterministic`** | 0.0 | 1.00 | 1 | 0.00 | Greedy — same prompt → identical answer every time. Reproducibility, regression tests, anything piped into a parser. |
+| **`precise`** (default) | 0.2 | 0.95 | 40 | 0.10 | High-confidence tokens only. Best for code, math, factual Q&A, tool-calling agents, structured output. The installer's baseline. |
+| **`balanced`** | 0.7 | 0.95 | 40 | 0.05 | Some phrasing variety, still focused. General-purpose chat, summarisation. |
+| **`creative`** | 1.0 | 0.95 | 40 | 0.05 | Wider phrasing, surprising word choices. Brainstorming, fiction, marketing copy. Code/math get worse. |
+| **`wild`** | 1.4 | 0.98 | 60 | 0.00 | Maximum entropy. Frequent off-topic, contradictions, hallucinations. Pure exploration only. |
+
+Aliases (case-insensitive, recognised by `easyai::find_preset()`):
+`exact` → `precise`, `default` → `balanced` (library alias only —
+NOT the same as the webui's "default" badge, which resolves
+dynamically), `fun` → `creative`, `chaos` → `wild`, `greedy` →
+`deterministic`.
+
+Where the preset name shows up across the server:
+
+| Surface | What it does |
+|---|---|
+| `install_easyai_server.sh --preset NAME` | Bakes the chosen name into the INI template. The line itself stays commented (operator un-comments to pin); explicit `temperature`/`top_k`/... overrides below WIN when both are set. |
+| `/etc/easyai/easyai.ini` `[ENGINE] preset` | Server reads at startup. Survives restarts. |
+| `easyai-server --preset NAME` | Wins over INI for THIS launch. |
+| `GET /health` `.preset` field | Liveness probe reports the active preset name. |
+| `POST /v1/preset` body `{"preset":"NAME"}` | Live swap. Sets the server-wide ambient default for every subsequent request — no restart. |
+| Webui **`default` badge** | First button in the tone bar. Resolves to the server's currently-active preset (read at page-load from the values baked into the bundle's injected JS). New sessions start here when `localStorage` has no prior choice; existing sessions keep whatever the user last cycled to. |
+| Webui named badges | `deterministic` / `precise` / `balanced` / `creative` / `wild` — per-session client-side override. Affects only requests THIS browser tab sends; doesn't change the server's ambient default. Persists in `localStorage`. |
+| Inline preset command | First word in the user's message (`creative 0.9 …`, `precise …`). `parse_preset()` peels the prefix; the rest becomes the actual prompt. Per-turn override. |
+
+The explicit per-knob overrides (`temperature`, `top_p`, `top_k`,
+`min_p`, …) WIN over the preset's baseline values when both are set,
+so `preset = precise` + `temperature = 0.5` yields precise's
+top_p/top_k/min_p with temperature bumped to 0.5. That's how the
+installer's default config works — `preset` left commented, with
+explicit `temperature = 0.5` / `top_k = 64` / `presence_penalty =
+1.5` tuned for long agentic flows on the AI box (see
+[`design.md` §4b](design.md#4b-sampling-and-the-penalty-stack)).
 
 ### `[MCP_USER]`
 

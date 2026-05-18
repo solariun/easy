@@ -4796,13 +4796,28 @@ int main(int argc, char ** argv) {
                 "});"
                 "const reject=stub({error:{message:'not supported on easyai-server'}},501);"
                 "const TONES={"
+                  // "default" resolves to whichever preset the server
+                  // was launched with (--preset CLI / [ENGINE] preset
+                  // INI). Values baked at template-render time below
+                  // so the fetch-interceptor doesn't need a round-trip
+                  // to find them.
+                  "default:{t:"
+                  << ctx->default_preset.temperature
+                  << ",top_p:" << ctx->default_preset.top_p
+                  << ",top_k:" << ctx->default_preset.top_k
+                  << "},"
                   "deterministic:{t:0.0,top_p:1.0,top_k:1},"
                   "precise:{t:0.2,top_p:0.95,top_k:40},"
                   "balanced:{t:0.7,top_p:0.95,top_k:40},"
-                  "creative:{t:1.0,top_p:0.95,top_k:40}"
+                  "creative:{t:1.0,top_p:0.95,top_k:40},"
+                  "wild:{t:1.4,top_p:0.98,top_k:60}"
                 "};"
-                "try{window.__easyaiTone=localStorage.getItem('easyai-tone')||'balanced';}"
-                  "catch(e){window.__easyaiTone='balanced';}"
+                // Load the previous tone from localStorage; fall back to
+                // 'default' (= the server's configured preset) for fresh
+                // sessions / cleared storage. Existing choices persist
+                // across reloads — no force-overwrite.
+                "try{window.__easyaiTone=localStorage.getItem('easyai-tone')||'default';}"
+                  "catch(e){window.__easyaiTone='default';}"
                 "window.fetch=async(input,init)=>{"
                   "let url=typeof input==='string'?input:(input&&input.url)||'';"
                   "try{const u=new URL(url,location.origin);url=u.pathname;}catch(e){}"
@@ -5298,8 +5313,11 @@ int main(int argc, char ** argv) {
                   "[class*=\"rounded-sm\"][class*=\"px-1.5\"]';"
                 "const TONE_ID='__easyaiToneHost';"
                 "const TOOLS_ID='__easyaiToolsHost';"
+                // 'default' first (cycle starts on the operator's preset);
+                // 'wild' last (exploratory escape hatch — keep it out of
+                // the way during normal cycling).
                 "const TONE_ORDER="
-                  "['deterministic','precise','balanced','creative'];"
+                  "['default','deterministic','precise','balanced','creative','wild'];"
                 "let toneBtn=null,toolsBtn=null,toolsPop=null;"
                 // findPill MUST skip our own clones — `cloneNode(false)`
                 // copies the pill's class string, so toneBtn and toolsBtn
@@ -5318,7 +5336,7 @@ int main(int argc, char ** argv) {
                 "};"
                 "const setToneLabel=(b)=>{"
                   "const lbl=b.querySelector('[data-tone-current]');"
-                  "if(lbl)lbl.textContent=window.__easyaiTone||'balanced';"
+                  "if(lbl)lbl.textContent=window.__easyaiTone||'default';"
                 "};"
 
                 "const buildToneFromPill=(pill)=>{"
@@ -5347,7 +5365,7 @@ int main(int argc, char ** argv) {
                   "setToneLabel(b);"
                   "b.addEventListener('click',(e)=>{"
                     "e.preventDefault();e.stopPropagation();"
-                    "const cur=window.__easyaiTone||'balanced';"
+                    "const cur=window.__easyaiTone||'default';"
                     "const i=TONE_ORDER.indexOf(cur);"
                     "const next=TONE_ORDER[(i+1)%TONE_ORDER.length];"
                     "window.__easyaiTone=next;"
