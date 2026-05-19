@@ -119,10 +119,22 @@ inline void vlog(const char * fmt, ...) {
 // ===========================================================================
 constexpr const char * kSessionFileName = "easyai-session.json";
 
-// `.easyai_session` is the canonical name (hidden, dot-prefixed); the
-// non-hidden alias above is what the constant currently spells.  Keep
-// the dot-prefixed form as the literal on disk:
-inline std::filesystem::path session_file_path() {
+// Canonical default is `.easyai_session` (hidden, dot-prefixed) in
+// cwd. `--session-file <name>` overrides this:
+//   * absolute path → used as-is (e.g. `/var/lib/easyai/preset.json`)
+//   * relative path → resolved against cwd (e.g. `mysession.json`)
+//   * empty string  → fall back to `.easyai_session`
+// Lets operators keep backups of pre-baked sessions outside the
+// working directory and feed them as scheduled-job seed contexts.
+inline std::filesystem::path session_file_path(const std::string & override_name = "") {
+    if (!override_name.empty()) {
+        std::filesystem::path p(override_name);
+        if (p.is_absolute()) return p;
+        std::error_code ec;
+        auto cwd = std::filesystem::current_path(ec);
+        if (ec) cwd = std::filesystem::path(".");
+        return cwd / p;
+    }
     std::error_code ec;
     auto cwd = std::filesystem::current_path(ec);
     if (ec) cwd = std::filesystem::path(".");
@@ -133,9 +145,11 @@ inline std::filesystem::path session_file_path() {
 // at the session path doesn't redirect us out of cwd; mode 0600 because
 // the file echoes prompts, tool results, and reasoning content (which
 // can contain secrets, API keys mentioned in passing, or private notes).
-bool save_session(const easyai::Client & cli, std::string * err = nullptr) {
+bool save_session(const easyai::Client & cli,
+                  const std::string & override_name = "",
+                  std::string * err = nullptr) {
     const std::string body = cli.dump_history();
-    const auto target = session_file_path();
+    const auto target = session_file_path(override_name);
     const std::string tmp = target.string() + ".tmp";
 
     int fd = ::open(tmp.c_str(),
@@ -175,8 +189,10 @@ bool save_session(const easyai::Client & cli, std::string * err = nullptr) {
 // Returns true on success.  Sets `*err` on failure (and on the
 // "session file missing" case, which the caller treats as informational
 // when --continue was passed against an unprimed cwd).
-bool load_session(easyai::Client & cli, std::string * err = nullptr) {
-    const auto target = session_file_path();
+bool load_session(easyai::Client & cli,
+                  const std::string & override_name = "",
+                  std::string * err = nullptr) {
+    const auto target = session_file_path(override_name);
     std::ifstream f(target);
     if (!f) {
         if (err) *err = "no session file at " + target.string();
@@ -572,6 +588,18 @@ struct Options {
     bool        auto_continue_cli_set = false;  // CLI > INI > hardcoded default
     bool        auto_compress       = false;    // recap on every load when on
     bool        auto_compress_cli_set = false;
+    // --session-file <name>: override the default `.easyai_session`
+    // file name (or full path). Empty → use canonical default. When
+    // non-empty, implies --continue (load this file on startup) so
+    // the operator's "pre-baked session as scheduled-job input" use
+    // case works in one flag.
+    std::string session_file;
+    // --no-local-session: skip every save_session() call. The session
+    // file is read on load (if --continue / --session-file is set)
+    // but never written back. Designed for read-only pre-session
+    // seeding — the caller wants the prepared context as input but
+    // doesn't want this run mutating the file.
+    bool        no_local_session    = false;
     bool        log_file_path_cli_set = false;  // tracks --log-file vs INI log_file
     bool        auto_log            = false;    // legacy /tmp auto-log: opt-in via INI
     int         max_reasoning    = 0;      // 0 = unlimited (disable runaway abort)
@@ -829,6 +857,24 @@ void usage(const char * argv0) {
 "                                No-op without --continue (nothing in\n"
 "                                memory to recap on a fresh session).\n"
 "                                INI: [cli] auto_compress = true|false.\n"
+"    --session-file NAME        override the default `.easyai_session`\n"
+"                                file. Accepts a name (relative to cwd)\n"
+"                                or a full path. Implies --continue —\n"
+"                                the file is loaded before the first\n"
+"                                prompt. Use to feed a pre-baked\n"
+"                                session into a scheduled job or to\n"
+"                                keep multiple parallel sessions in\n"
+"                                one project directory.\n"
+"                                Examples:\n"
+"                                  --session-file mysession\n"
+"                                  --session-file /var/lib/easyai/seed.json\n"
+"    --no-local-session         read-only mode for the session file.\n"
+"                                --continue / --session-file still LOAD\n"
+"                                the file at startup, but no save is\n"
+"                                ever written back. Pair with\n"
+"                                --session-file to seed a scheduled job\n"
+"                                with a pre-structured pre-session\n"
+"                                without mutating the source file.\n"
 "    --config PATH              INI overlay (CLI > INI > hardcoded). Default\n"
 "                                /etc/easyai/easyai-cli.ini; missing file is\n"
 "                                NOT an error (just keeps hardcoded\n"
@@ -1016,6 +1062,24 @@ bool parse_args(int argc, char ** argv, Options & o) {
         else if (a == "--compress") {
             o.auto_compress         = true;
             o.auto_compress_cli_set = true;
+        }
+        else if (a == "--session-file") {
+            o.session_file = need(i, "--session-file");
+            // Auto-imply --continue: the operator passed an explicit
+            // path so they obviously want it loaded. Don't make them
+            // type both flags. They can still pass --no-continue
+            // AFTER --session-file on the same command line to
+            // override this (rare; --session-file without loading
+            // is essentially a useless write-only mode).
+            o.auto_continue         = true;
+            o.auto_continue_cli_set = true;
+        }
+        else if (a == "--no-local-session") {
+            // Read-only mode for session files. --continue / --session-
+            // file still LOAD the file at startup, but no save_session()
+            // call writes anything back. Designed for "feed a pre-baked
+            // session into a scheduled job without mutating the file".
+            o.no_local_session = true;
         }
         else if (a == "--insecure-tls")   o.tls_insecure = true;
         else if (a == "--ca-cert")        o.tls_ca_path  = need(i, "--ca-cert");
@@ -1534,15 +1598,16 @@ int run_one(easyai::Client & cli, easyai::Plan & plan,
     // single on_tool callback that streaming.attach(cli) just
     // installed — we keep its content/reasoning callbacks intact
     // because cli.on_tool() only touches the tool slot.
-    cli.on_tool([&streaming, &cli, &st]
+    cli.on_tool([&streaming, &cli, &st, &o]
                 (const easyai::ToolCall & call,
                  const easyai::ToolResult & result) {
         streaming.notify_tool(call, result);
+        if (o.no_local_session) return;
         std::string save_err;
-        if (!save_session(cli, &save_err)) {
+        if (!save_session(cli, o.session_file, &save_err)) {
             std::fprintf(stderr,
                 "%s[easyai-cli] warning:%s checkpoint "
-                ".easyai_session: %s\n",
+                "session file: %s\n",
                 st.yellow(), st.reset(), save_err.c_str());
         }
     });
@@ -1596,17 +1661,17 @@ int run_one(easyai::Client & cli, easyai::Plan & plan,
     spinner.finish();
     std::fputc('\n', stdout);
 
-    // Persist the post-turn state to .easyai_session.  Best-effort: a
+    // Persist the post-turn state to the session file.  Best-effort: a
     // disk failure here doesn't fail the turn (the model already
     // replied; the user already saw the answer), but the warning lets
     // the operator notice an out-of-space / permission issue.  Atomic
     // tempfile + rename — a partial write never replaces the prior
-    // session file.
-    {
+    // session file. Skipped entirely when --no-local-session is set.
+    if (!o.no_local_session) {
         std::string save_err;
-        if (!save_session(cli, &save_err)) {
+        if (!save_session(cli, o.session_file, &save_err)) {
             std::fprintf(stderr,
-                "%swarning:%s could not save .easyai_session: %s\n",
+                "%swarning:%s could not save session file: %s\n",
                 st.yellow(), st.reset(), save_err.c_str());
         }
     }
@@ -1712,13 +1777,15 @@ int run_repl(easyai::Client & cli, easyai::Plan & plan,
         if (line.empty()) continue;
 
         // Best-effort save after a history-mutating slash command so
-        // .easyai_session reflects the post-command state.  A disk
-        // failure here is a warning, not a fatal — the REPL keeps going.
+        // the session file reflects the post-command state. A disk
+        // failure here is a warning, not a fatal — the REPL keeps
+        // going. Skipped when --no-local-session is set.
         auto save_after_mutation = [&]() {
+            if (o.no_local_session) return;
             std::string save_err;
-            if (!save_session(cli, &save_err)) {
+            if (!save_session(cli, o.session_file, &save_err)) {
                 std::fprintf(stderr,
-                    "%swarning:%s could not save .easyai_session: %s\n",
+                    "%swarning:%s could not save session file: %s\n",
                     st.yellow(), st.reset(), save_err.c_str());
             }
         };
@@ -2120,13 +2187,15 @@ int main(int argc, char ** argv) {
     // is a no-op because there's no history in memory to recap.
     if (o.auto_continue && !any_management(o)) {
         std::string load_err;
-        if (load_session(cli, &load_err)) {
+        if (load_session(cli, o.session_file, &load_err)) {
+            const auto path = session_file_path(o.session_file);
             std::fprintf(stderr,
-                "%s[easyai-cli-remote]%s continued from "
-                "%s.easyai_session%s in %s\n",
+                "%s[easyai-cli-remote]%s continued from %s%s%s%s\n",
                 st.dim(),  st.reset(),
-                st.bold(), st.reset(),
-                session_file_path().parent_path().string().c_str());
+                st.bold(), path.filename().string().c_str(), st.reset(),
+                o.no_local_session
+                    ? " (read-only: --no-local-session is on)"
+                    : "");
         }
         // No session file is a normal first-run state — start fresh
         // silently.  (Earlier versions warned here because --continue
@@ -2136,12 +2205,14 @@ int main(int argc, char ** argv) {
 
         if (o.auto_compress) {
             if (do_compress(cli, st)) {
-                std::string save_err;
-                if (!save_session(cli, &save_err)) {
-                    std::fprintf(stderr,
-                        "%swarning:%s could not persist compressed "
-                        "session: %s\n",
-                        st.yellow(), st.reset(), save_err.c_str());
+                if (!o.no_local_session) {
+                    std::string save_err;
+                    if (!save_session(cli, o.session_file, &save_err)) {
+                        std::fprintf(stderr,
+                            "%swarning:%s could not persist compressed "
+                            "session: %s\n",
+                            st.yellow(), st.reset(), save_err.c_str());
+                    }
                 }
             }
         }
