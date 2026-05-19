@@ -1196,6 +1196,22 @@ max_tokens       = $max_tokens
 # expose the path knob; leave commented until that lands.)
 #spec_type        = draft-simple
 
+# --- Chat template / reasoning extraction (llama-server compat) ---
+# Override the GGUF's embedded chat template with a Jinja file on
+# disk. Mirrors llama-server's --chat-template-file. Leave empty to
+# use the model's template. Example: ship a tuned Qwen3 thinking
+# template alongside easyai.ini so you can tweak it without re-
+# quantising the GGUF.
+#chat_template_file = /etc/easyai/qwen3-think.jinja
+#
+# Reasoning-content extraction format. Accepts:
+#   none            — leave <think>…</think> inline in content
+#   auto            — default; currently behaves like deepseek
+#   deepseek        — split <think>…</think> into reasoning_content
+#                     (including in streaming deltas). Qwen3 / R1 default.
+#   deepseek-legacy — split for sync, leave inline for streaming.
+#reasoning_format  = deepseek
+
 # ============================================================
 # [MCP_USER] — Bearer-token auth for POST /mcp
 # ============================================================

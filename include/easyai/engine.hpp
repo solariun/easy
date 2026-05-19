@@ -247,6 +247,22 @@ class Engine {
     // <think> blocks. Pass false to ask the model not to think aloud.
     Engine & enable_thinking(bool on = true);
 
+    // Override the chat template embedded in the GGUF with a Jinja file on
+    // disk. The file is read at load() time and its contents are passed as
+    // the `chat_template_override` argument to common_chat_templates_init.
+    // Mirrors llama-server's --chat-template-file. Empty path = use the
+    // model's embedded template (the default). Read errors are recorded in
+    // last_error() and load() fails.
+    Engine & chat_template_file(const std::string & path);
+
+    // Pick the reasoning-content extraction format used when rendering the
+    // chat template. Accepts the same names as llama-server's
+    // --reasoning-format: "none", "auto", "deepseek", "deepseek-legacy".
+    // Default "auto" (which currently behaves like "deepseek"). Unknown
+    // names fall back to "none" — see common_reasoning_format_from_name in
+    // common/chat.h.
+    Engine & reasoning_format(const std::string & name);
+
     // ---------------- tools -------------------------------------------------
     Engine & add_tool   (Tool t);
     Engine & clear_tools();

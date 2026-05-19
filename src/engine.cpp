@@ -15,6 +15,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <random>
 #include <sstream>
 #include <string>
@@ -725,6 +726,13 @@ struct Engine::Impl {
     bool         loaded         = false;
     bool         verbose        = false;
     bool         enable_thinking = true;   // sent to chat templates that use it
+    // Optional path to a Jinja chat-template file. Empty = use the
+    // template embedded in the GGUF. Resolved (read into a string) by
+    // load() and passed as the override to common_chat_templates_init.
+    std::string  chat_template_file;
+    // Reasoning extraction format for render(). Default AUTO (≡ DEEPSEEK
+    // for templates that support it). Overridden by Engine::reasoning_format.
+    common_reasoning_format reasoning_format = COMMON_REASONING_FORMAT_AUTO;
     common_chat_tool_choice tool_choice = COMMON_CHAT_TOOL_CHOICE_AUTO;
     bool         parallel_tool_calls    = false;
     int          max_tool_hops          = 8;     // default agentic safety cap
@@ -810,10 +818,11 @@ struct Engine::Impl {
         // Tell the template builder to wire reasoning extraction into the
         // PEG parser it produces.  Without this the parser leaves <think>
         // content inside msg.content, so the streaming code can't split
-        // reasoning_content from content.  AUTO maps to DEEPSEEK (the
-        // canonical "extract <think>...</think> blocks") for every
-        // template that supports thinking.
-        in.reasoning_format      = COMMON_REASONING_FORMAT_AUTO;
+        // reasoning_content from content.  Default AUTO maps to DEEPSEEK
+        // (the canonical "extract <think>...</think> blocks") for every
+        // template that supports thinking; user can override via
+        // Engine::reasoning_format (--reasoning-format on the CLI).
+        in.reasoning_format      = reasoning_format;
         return common_chat_templates_apply(templates.get(), in);
     }
 
@@ -1504,6 +1513,26 @@ Engine & Engine::enable_thinking(bool on) {
     return *this;
 }
 
+Engine & Engine::chat_template_file(const std::string & path) {
+    p_->chat_template_file = path;
+    return *this;
+}
+
+Engine & Engine::reasoning_format(const std::string & name) {
+    // common_reasoning_format_from_name throws on unknown values
+    // (see llama.cpp/common/chat.cpp). We catch so a bad --reasoning-
+    // format value records a clean error instead of unwinding through
+    // the server's arg-apply path.
+    try {
+        p_->reasoning_format = common_reasoning_format_from_name(name);
+    } catch (const std::exception & e) {
+        p_->last_error = std::string("reasoning_format: ") + e.what();
+        easyai::log::error("[easyai] Engine::reasoning_format: %s",
+                           p_->last_error.c_str());
+    }
+    return *this;
+}
+
 Engine & Engine::add_tool(Tool t)               { p_->tools.push_back(std::move(t)); return *this; }
 Engine & Engine::clear_tools()                  { p_->tools.clear(); return *this; }
 Engine & Engine::on_token(TokenCallback cb)         { p_->on_token     = std::move(cb); return *this; }
@@ -1531,6 +1560,29 @@ bool Engine::load() {
         p_->last_error = "model path not set; call .model(\"path/to/file.gguf\") first";
         easyai::log::error("[easyai] Engine::load: %s", p_->last_error.c_str());
         return false;
+    }
+
+    // Pre-load the optional Jinja chat-template override (read once,
+    // cheap) so a typo'd path fails fast — before the multi-second
+    // GGUF load. Empty path keeps the model's embedded template.
+    std::string tmpl_override;
+    if (!p_->chat_template_file.empty()) {
+        std::ifstream f(p_->chat_template_file, std::ios::binary);
+        if (!f) {
+            p_->last_error = "failed to open chat template file: " +
+                             p_->chat_template_file;
+            easyai::log::error("[easyai] Engine::load: %s", p_->last_error.c_str());
+            return false;
+        }
+        std::ostringstream ss;
+        ss << f.rdbuf();
+        tmpl_override = ss.str();
+        if (tmpl_override.empty()) {
+            p_->last_error = "chat template file is empty: " +
+                             p_->chat_template_file;
+            easyai::log::error("[easyai] Engine::load: %s", p_->last_error.c_str());
+            return false;
+        }
     }
 
     // quiet logs unless verbose
@@ -1563,7 +1615,11 @@ bool Engine::load() {
         return false;
     }
 
-    p_->templates = common_chat_templates_init(p_->init->model(), /*override=*/"");
+    // tmpl_override was pre-loaded above (before common_init_from_params)
+    // so a typo'd --chat-template-file fails fast without paying the GGUF
+    // load cost. Empty when no override path was set; in that case we
+    // pass "" and common_chat_templates_init uses the embedded template.
+    p_->templates = common_chat_templates_init(p_->init->model(), tmpl_override);
     if (!p_->templates) {
         p_->last_error = "model has no usable chat template";
         easyai::log::error("[easyai] Engine::load: %s", p_->last_error.c_str());

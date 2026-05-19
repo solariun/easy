@@ -3305,6 +3305,17 @@ static bool require_auth(const ServerCtx & ctx, const httplib::Request & req,
         "                                 MTP: 6. Default 16 when --spec-type is set,\n"
         "                                 unused when --spec-type=none. INI key:\n"
         "                                 [ENGINE] spec_draft_n_max.\n"
+        "\nChat template / reasoning (llama-server compat):\n"
+        "      --chat-template-file <p> Override the GGUF's embedded chat template\n"
+        "                                 with a Jinja file on disk (e.g. qwen3-\n"
+        "                                 think.jinja). Empty = use the model's\n"
+        "                                 template. INI key: [ENGINE]\n"
+        "                                 chat_template_file.\n"
+        "      --reasoning-format <fmt> Reasoning-content extraction format:\n"
+        "                                 none|auto|deepseek|deepseek-legacy.\n"
+        "                                 Default auto (≡ deepseek for Qwen3 /\n"
+        "                                 R1 templates). INI key: [ENGINE]\n"
+        "                                 reasoning_format.\n"
         "\nllama-server compatibility:\n"
         "  -a,  --alias <name>          Public model id reported by /v1/models\n"
         "       --api-key <key>         Require Bearer auth on every /v1 route\n"
@@ -3477,6 +3488,15 @@ struct ServerArgs {
     // refuse to load or run autoregressive anyway.
     std::string spec_type;             // empty → leave Engine default ("none")
     int         spec_draft_n_max = 0;  // 0 → leave Engine default (16)
+
+    // Chat-template override (--chat-template-file). Empty = use the
+    // template embedded in the GGUF. Mirrors llama-server's flag of the
+    // same name; the file is loaded once at Engine::load() time.
+    std::string chat_template_file;
+    // Reasoning extraction format (--reasoning-format). Accepts
+    // "none" | "auto" | "deepseek" | "deepseek-legacy". Empty = keep the
+    // Engine default ("auto", which behaves like "deepseek").
+    std::string reasoning_format;
 
     // llama-server compatibility / production knobs
     std::string alias;            // exposed as model id in /v1/models
@@ -3728,6 +3748,11 @@ static const std::vector<FlagDef> & kFlags() {
         { {"--override-kv"},       "ENGINE", "override_kv",    "override_kv",    true,  SET_LIST_APPEND(&ServerArgs::kv_overrides) },
         { {"--spec-type"},         "ENGINE", "spec_type",      "spec_type",      true,  SET_STR(&ServerArgs::spec_type) },
         { {"--spec-draft-n-max"},  "ENGINE", "spec_draft_n_max","spec_draft_n_max",true, SET_INT(&ServerArgs::spec_draft_n_max) },
+        // --chat-template-file / --reasoning-format: mirror llama-server's
+        // flags. Both take effect at Engine::load() time. INI keys are the
+        // snake_case forms under [ENGINE].
+        { {"--chat-template-file"},"ENGINE", "chat_template_file","chat_template_file",true, SET_STR(&ServerArgs::chat_template_file) },
+        { {"--reasoning-format"},  "ENGINE", "reasoning_format","reasoning_format",true,  SET_STR(&ServerArgs::reasoning_format) },
         // sampling
         { {"--temperature","--temp"},"ENGINE","temperature",   "temperature",    true,  SET_FLOAT(&ServerArgs::temperature) },
         { {"--top-p"},             "ENGINE", "top_p",          "top_p",          true,  SET_FLOAT(&ServerArgs::top_p) },
@@ -6293,6 +6318,20 @@ int main(int argc, char ** argv) {
     if (args.kv_unified)     ctx->engine.kv_unified(true);
     if (!args.spec_type.empty())   ctx->engine.spec_type(args.spec_type);
     if (args.spec_draft_n_max > 0) ctx->engine.spec_draft_n_max(args.spec_draft_n_max);
+    if (!args.chat_template_file.empty()) ctx->engine.chat_template_file(args.chat_template_file);
+    if (!args.reasoning_format.empty()) {
+        ctx->engine.reasoning_format(args.reasoning_format);
+        // The setter catches the unknown-name throw from common_reasoning_
+        // format_from_name and records last_error. Surface it here so a typo
+        // like --reasoning-format deepseak aborts startup instead of
+        // silently falling back to the default.
+        if (!ctx->engine.last_error().empty()) {
+            std::fprintf(stderr, "[easyai-server] %s\n"
+                                 "                accepted values: none, auto, deepseek, deepseek-legacy\n",
+                         ctx->engine.last_error().c_str());
+            return 1;
+        }
+    }
     if (args.flash_attn)     ctx->engine.flash_attn(true);
     if (args.mlock)          ctx->engine.use_mlock(true);
     if (args.no_mmap)        ctx->engine.use_mmap(false);
