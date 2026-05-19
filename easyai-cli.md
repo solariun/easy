@@ -15,17 +15,18 @@
 2. [Connection — endpoint, model, auth](#2-connection--endpoint-model-auth)
 3. [Modes — REPL, one-shot, piped, management](#3-modes--repl-one-shot-piped-management)
 4. [Command-line flags](#4-command-line-flags)
-5. [Tool registration](#5-tool-registration)
-6. [System prompt + injected blocks](#6-system-prompt--injected-blocks)
-7. [Sampling and penalty knobs](#7-sampling-and-penalty-knobs)
-8. [Reasoning streams](#8-reasoning-streams)
-9. [The raw transaction log](#9-the-raw-transaction-log)
-10. [Session persistence](#10-session-persistence)
-11. [memory — persistent memory](#11-memory--persistent-memory)
-12. [External tools](#12-external-tools)
-13. [Management subcommands](#13-management-subcommands)
-14. [Worked examples](#14-worked-examples)
-15. [Cross-references](#15-cross-references)
+5. [Configuration file (`easyai-cli.ini`)](#5-configuration-file-easyai-cliini)
+6. [Tool registration](#6-tool-registration)
+7. [System prompt + injected blocks](#7-system-prompt--injected-blocks)
+8. [Sampling and penalty knobs](#8-sampling-and-penalty-knobs)
+9. [Reasoning streams](#9-reasoning-streams)
+10. [The raw transaction log](#10-the-raw-transaction-log)
+11. [Session persistence](#11-session-persistence)
+12. [memory — persistent memory](#12-memory--persistent-memory)
+13. [External tools](#13-external-tools)
+14. [Management subcommands](#14-management-subcommands)
+15. [Worked examples](#15-worked-examples)
+16. [Cross-references](#16-cross-references)
 
 ---
 
@@ -109,7 +110,7 @@ on the command line and stdin.
 | **REPL** | No `-p`, no positional prompt, stdin is a TTY | Interactive prompt loop. `Ctrl-D` to exit. History persists during the session. `Ctrl-C` during a turn → graceful exit (see below). |
 | **One-shot** | `-p <text>` OR a positional argument | Send the single prompt, stream the reply, exit. |
 | **Piped** | stdin is a pipe (anything redirected in) | Reads stdin into the prompt and runs once. Same as one-shot. |
-| **Management** | `--list-models`, `--list-tools`, `--list-remote-tools`, `--health`, `--props`, `--metrics`, `--set-preset`, `--show-system-prompt` | Hits the named endpoint (or, for `--show-system-prompt`, just resolves locally), prints the result, exits. No chat. See [§13](#13-management-subcommands). |
+| **Management** | `--list-models`, `--list-tools`, `--list-remote-tools`, `--health`, `--props`, `--metrics`, `--set-preset`, `--show-system-prompt` | Hits the named endpoint (or, for `--show-system-prompt`, just resolves locally), prints the result, exits. No chat. See [§14](#14-management-subcommands). |
 
 The four are mutually exclusive: passing `-p` AND a management flag is
 an error.
@@ -156,7 +157,7 @@ appear next to the matching flag.
 
 When neither is passed, the server's default persona handles the system
 message. Either flag still gets the [environment] + [guidance] injection
-prepended (see [§6](#6-system-prompt--injected-blocks)).
+prepended (see [§7](#7-system-prompt--injected-blocks)).
 
 ### Sampling and penalty (omit any to keep server default)
 
@@ -178,7 +179,7 @@ prepended (see [§6](#6-system-prompt--injected-blocks)).
 
 | Flag | Notes |
 | --- | --- |
-| `--tools LIST` | Comma list, overrides the default catalog. See [§5](#5-tool-registration) for valid names. |
+| `--tools LIST` | Comma list, overrides the default catalog. See [§6](#6-tool-registration) for valid names. |
 | `--sandbox DIR` | Working root for `fs` / `bash` / `python3`. **Auto-registers the unified `fs` tool** (action=read / write / list / glob / grep / check_path / cwd / sandbox). `bash` and `python3` still require their respective `--allow-*` flags. |
 | `--allow-bash` | Register `bash`. **Implies `fs`** (bash subsumes it). cwd = `--sandbox` if given, else the binary's CWD. WARNING: not a hardened sandbox. |
 | `--no-python` | Drop the auto-registered `python3` tool. By default `python3` is **ON** whenever `--sandbox` or `--allow-bash` is set. Stdlib-only interpreter (no PYTHON* env, no site-packages, no cwd on `sys.path`); disk access auto-restricted to the sandbox root via a Python preamble. WARNING: defense-in-depth, not a hardened sandbox — `import os` / `import socket` / `import subprocess` still work. |
@@ -200,13 +201,13 @@ prepended (see [§6](#6-system-prompt--injected-blocks)).
 | `-q`, `--quiet` | Disable the spinner glyph + context-fill gauge. Use for batch / scripted runs. **Also changes `Ctrl-C` / `SIGTERM` semantics** — see [§3 → Ctrl-C and SIGTERM](#ctrl-c-and-sigterm). |
 | `--log-file PATH` | Opt in to a raw transaction log at PATH (request body + every SSE chunk + every tool dispatch input/output, mode 0600). Default OFF — no log file is written without this flag. Implies `--verbose`. |
 | `--tools-mode MODE` | How `fs` / `web` / `memory` are exposed to the model. **MODE** is one of `split` (default since 2026-05-15 — one focused tool per action: `fs_read`, `fs_edit`, …, `memory_save`, …, `web_search`, `web_fetch`), `unified` (legacy single dispatcher per family with `action=`), or `both` (register both surfaces side-by-side). Same handlers under the hood; only the registration shape differs. INI: `[cli] tools_mode = unified\|split\|both`. |
-| `--continue` | Load `.easyai_session` from cwd before the first prompt. **Default OFF** (since 2026-05-13) — any existing session file is ignored and overwritten on the first turn unless this flag is set. INI: `[cli] auto_continue = true\|false`. See [§10](#10-session-persistence). |
+| `--continue` | Load `.easyai_session` from cwd before the first prompt. **Default OFF** (since 2026-05-13) — any existing session file is ignored and overwritten on the first turn unless this flag is set. INI: `[cli] auto_continue = true\|false`. See [§11](#11-session-persistence). |
 | `--no-continue` | Explicit form of the default — ignore any existing `.easyai_session` and overwrite on the first turn. Useful to override `[cli] auto_continue = on` set in INI. |
 | `--compress` | After loading, ask the model for one lossless recap of the conversation and replace the history with that recap. Also reachable mid-REPL via `/compress`. No-op without `--continue` (nothing in memory to recap). INI: `[cli] auto_compress = true\|false`. |
 
 ### Management subcommands (one only, no chat)
 
-See [§13](#13-management-subcommands) for the full picture.
+See [§14](#14-management-subcommands) for the full picture.
 
 | Flag | Result |
 | --- | --- |
@@ -227,7 +228,200 @@ See [§13](#13-management-subcommands) for the full picture.
 
 ---
 
-## 5. Tool registration
+## 5. Configuration file (`easyai-cli.ini`)
+
+Every command-line knob also has an INI equivalent so an operator can
+bake their connection details, sampling defaults, and tool catalog into
+a file once and stop typing flags. Precedence is:
+
+```
+command-line flag   >   INI value   >   hardcoded default
+```
+
+### Lookup order
+
+When `--config <path>` is **not** given, the CLI looks for an INI file
+in layers and uses the first one it finds:
+
+| Order | Path | Use case |
+| --- | --- | --- |
+| 1 | `$HOME/.easyai/easyai-cli.ini` | Per-user — the common case. The CLI runs as your user, not as a service, so this is where most settings belong. |
+| 2 | `/etc/easyai/easyai-cli.ini`   | System-wide fallback — useful for a shared box where every user should hit the same server with the same defaults. |
+| 3 | (none) | No INI loaded; the CLI runs on hardcoded defaults + env vars + whatever you pass on the command line. |
+
+`--config <path>` bypasses the layered lookup and pins one file. If the
+explicit path doesn't exist, the CLI prints a warning and falls through
+to defaults (it doesn't silently search elsewhere). A missing
+layered-default path is silent — it just means you haven't created a
+config yet.
+
+Run with `--verbose` (or `[cli] verbose = true`) to see which path the
+CLI resolved to at startup.
+
+### Quickstart
+
+A pristine reference file lives at
+[`resources/easyai-cli.ini.example`](resources/easyai-cli.ini.example) —
+every key documented, every line commented out. Activate by copying it
+to one of the lookup locations and uncommenting what you want:
+
+```bash
+mkdir -p ~/.easyai
+cp resources/easyai-cli.ini.example ~/.easyai/easyai-cli.ini
+$EDITOR ~/.easyai/easyai-cli.ini    # uncomment url, api_key, tools, …
+easyai-cli "what's new on hacker news today?"
+```
+
+Minimal `~/.easyai/easyai-cli.ini` for a workstation talking to a single
+AI box:
+
+```ini
+[cli]
+url           = http://ai.local:8080
+api_key       = REPLACE-WITH-OPENSSL-RAND-HEX-32
+model         = EasyAi
+verbose       = false
+quiet         = false
+tools         = datetime, plan, web
+tools_mode    = split
+auto_continue = false
+```
+
+### All `[cli]` keys
+
+Everything lives under a single `[cli]` section. Unknown keys are
+ignored silently; values that fail to parse fall back to the hardcoded
+default and print a one-line warning at startup. Booleans accept
+`true / false`, `on / off`, `yes / no`, `1 / 0`. List values are
+comma-separated.
+
+#### Connection
+
+| Key | Type | CLI flag | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `url`           | string | `--url`           | (env `EASYAI_URL`)   | Full URL of the OpenAI-compatible endpoint. |
+| `api_key`       | string | `--api-key`       | (env `EASYAI_API_KEY`)| Bearer token. |
+| `model`         | string | `--model`         | `EasyAi`             | Model id in the request body. |
+| `timeout`       | int    | `--timeout`       | `86400`              | Read/write timeout, seconds. SSE deltas reset the timer. |
+| `http_retries`  | int    | `--http-retries`  | `5`                  | Extra retries on transient HTTP failures. |
+| `max_tool_hops` | int    | `--max-tool-hops` | `99999` (unlimited)  | Per-turn ceiling on tool calls. |
+| `insecure_tls`  | bool   | `--insecure-tls`  | `false`              | Skip TLS peer-cert verification. https only. DEV ONLY. |
+| `ca_cert`       | path   | `--ca-cert`       | (system trust store) | PEM CA bundle to trust for https. |
+
+#### Conversation
+
+| Key | Type | CLI flag | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `system`        | string | `--system`        | (empty)              | Inline system prompt. |
+| `system_file`   | path   | `--system-file`   | (empty)              | System prompt from a file. Wins over `system` when both are set. |
+
+#### Sampling and penalties
+
+Unset / sentinel = the field is **omitted** from the request body, so
+the server's preset drives sampling. Set explicitly to override.
+
+| Key | Type | CLI flag | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `temperature`       | float | `--temperature`        | server default | |
+| `top_p`             | float | `--top-p`              | server default | |
+| `top_k`             | int   | `--top-k`              | server default | |
+| `min_p`             | float | `--min-p`              | server default | |
+| `repeat_penalty`    | float | `--repeat-penalty`     | `1.15`         | Anti-loop multiplicative penalty. Set `1.0` to disable. |
+| `frequency_penalty` | float | `--frequency-penalty`  | server default | OpenAI semantics. |
+| `presence_penalty`  | float | `--presence-penalty`   | server default | OpenAI semantics. |
+| `seed`              | int64 | `--seed`               | random         | -1 = random. |
+| `max_tokens`        | int   | `--max-tokens`         | `-1`           | -1 = unlimited until EOS / ctx full. |
+| `stop`              | list  | `--stop` (repeatable)  | (empty)        | Comma-separated stop sequences. |
+| `extra_json`        | json  | `--extra-json`         | (empty)        | Single-line JSON object literal merged into the request body. |
+
+#### Tools
+
+| Key | Type | CLI flag | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `tools`          | list   | `--tools`           | (built-in catalog) | Comma-separated tool names. Empty = default catalog. |
+| `tools_mode`     | enum   | `--tools-mode`      | `split`            | `unified` / `split` / `both`. |
+| `sandbox`        | path   | `--sandbox`         | (empty)            | Sandbox root for `fs` / `python3` / `bash`. |
+| `allow_bash`     | bool   | `--allow-bash`      | `false`            | Register the `bash` tool. NOT a hardened sandbox. |
+| `allow_python`   | bool   | `--no-python` (off) | `true`             | Register `python3`. Flip false to opt out. |
+| `use_google`     | bool   | `--use-google`      | `false`            | Enable engine="google" in the web tool. |
+| `external_tools` | path   | `--external-tools`  | (empty)            | Dir of `EASYAI-*.tools` manifests. |
+| `memory`         | path   | `--memory` / `--RAG`| (empty)            | RAG persistent-registry directory. |
+| `no_plan`        | bool   | `--no-plan`         | `false`            | Skip auto-registering the `plan` tool. |
+| `show_bash`      | bool   | `--show-bash` / `--no-show-bash` | `true` | Mirror bash subprocess output to the operator's terminal. |
+| `show_python`    | bool   | `--show-python` / `--no-show-python` | `true` | Same mirror for python3. |
+
+#### Reasoning / retry
+
+| Key | Type | CLI flag | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `show_reasoning`      | bool | `--no-reasoning` (off) | `true` | Print streaming reasoning_content to stderr. |
+| `max_reasoning`       | int  | `--max-reasoning`      | `0`    | 0 = unlimited. Hard cap on reasoning tokens before nudging. |
+| `retry_on_incomplete` | bool | `--no-retry-on-incomplete` (off) | `true` | Retry when the turn finishes with no tool_call and only an "announce" snippet. |
+
+#### Display / logging
+
+| Key | Type | CLI flag | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `verbose`     | bool | `-v` / `--verbose`  | `false` | Prints resolved INI path + raw HTTP bodies + tool dispatch traces. |
+| `quiet`       | bool | `-q` / `--quiet`    | `false` | Disable spinner + ctx-% gauge (batch / scripted use). |
+| `log_file`    | path | `--log-file`        | (empty) | Raw transaction log path. Empty = no log file. |
+| `auto_log`    | bool | (no CLI flag)       | `false` | Legacy `/tmp` auto-log; the `log_file` key is the recommended replacement. |
+| `unattended`  | bool | `--unattended`      | (auto)  | Tell the model no human is at the terminal. Auto-set when a prompt is passed on the command line. |
+
+#### Session
+
+| Key | Type | CLI flag | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `auto_continue`    | bool | `--continue` / `--no-continue` | `false` | Load `.easyai_session` from cwd before the first prompt. |
+| `auto_compress`    | bool | `--compress`                   | `false` | Run lossless recap on every load. Implies `auto_continue`. |
+| `session_file`     | path | `--session-file`               | `.easyai_session` (cwd) | Override the default filename. Implies `auto_continue`. |
+| `no_local_session` | bool | `--no-local-session`           | `false` | Read-only mode: load the session but never write back. |
+
+### Practical example
+
+A workstation talking to a sandboxed coding agent on the AI box, with
+persistent session and a custom log:
+
+```ini
+[cli]
+; ---- connection ----
+url           = http://ai.local:8080
+api_key       = 9f3c…hex…                     ; openssl rand -hex 32
+model         = EasyAi
+timeout       = 86400
+
+; ---- tools / sandbox ----
+tools_mode    = split
+sandbox       = /Users/gustavo/projects
+allow_bash    = true
+memory        = ~/.easyai/rag
+
+; ---- reasoning ----
+show_reasoning = true
+max_reasoning  = 0
+
+; ---- session ----
+auto_continue = true
+auto_compress = false
+log_file      = ~/.easyai/cli.log
+
+; ---- display ----
+verbose       = false
+quiet         = false
+```
+
+Then on the command line:
+
+```bash
+easyai-cli "refactor this module for SOLID"
+```
+
+…and every flag above is implicit. Override one-off with the matching
+`--flag` (e.g. `easyai-cli --no-continue "fresh chat"`).
+
+---
+
+## 6. Tool registration
 
 The CLI registers tools **client-side**: their handlers run in the
 binary's own process, not on the server. The server is told what tools
@@ -301,7 +495,7 @@ See [`AI_TOOLS.md`](AI_TOOLS.md) for the deep dive on what a tool is, and
 
 ---
 
-## 6. System prompt + injected blocks
+## 7. System prompt + injected blocks
 
 When the agent has any create/mutate affordance (fs_* / bash / plan),
 the CLI prepends two small in-binary blocks to the user's system prompt:
@@ -336,7 +530,7 @@ nothing else — neither block is injected.
 
 ---
 
-## 7. Sampling and penalty knobs
+## 8. Sampling and penalty knobs
 
 All knobs are server-side parameters; the CLI just forwards what you
 pass. Omitting any leaves the server's default in place.
@@ -387,7 +581,7 @@ modes, custom routing hints) work without recompiling.
 
 ---
 
-## 8. Reasoning streams
+## 9. Reasoning streams
 
 For models that emit `reasoning_content` (Qwen-thinking, GPT-o1-class,
 Claude 4.x extended thinking), the CLI prints the reasoning stream
@@ -410,7 +604,7 @@ raw incomplete signal for debugging.
 
 ---
 
-## 9. The raw transaction log
+## 10. The raw transaction log
 
 The raw transaction log is **opt-in** via `--log-file PATH`. Without
 that flag, no log file is created — neither the binary nor the
@@ -448,7 +642,7 @@ streams the same diagnostics to stderr.
 
 ---
 
-## 10. Session persistence
+## 11. Session persistence
 
 Every `easyai-cli` invocation writes a `.easyai_session` file in the
 current working directory after each chat turn (atomic tempfile +
@@ -531,33 +725,19 @@ post-command state.
 
 ### INI mapping
 
-Every session-related knob is also reachable via `[cli]` keys in
-`/etc/easyai/easyai-cli.ini` (override with `--config PATH`).
-Precedence: CLI flag > INI > hardcoded default.
+Every session-related knob is also reachable via `[cli]` keys in the
+INI file (`$HOME/.easyai/easyai-cli.ini` by default; full lookup order
+and the complete table are in
+[§5. Configuration file](#5-configuration-file-easyai-cliini)).
+Precedence: CLI flag > INI > hardcoded default. The session-relevant
+subset:
 
 | INI key (`[cli]`) | Default | CLI flag(s) | Effect |
 | --- | --- | --- | --- |
-| `auto_continue` | `false` | `--continue` / `--no-continue` | Load `.easyai_session` from cwd before the first prompt. |
-| `auto_compress` | `false` | `--compress` | Run the compress flow on every load (rare; usually you want `/compress` on demand). |
-| `log_file`      | `""`    | `--log-file PATH` | Raw transaction log path.  Empty = no log file. |
-| `auto_log`      | `false` | (no flag) | When `true`, removes the cli's default `EASYAI_NO_AUTO_LOG=1` so the library reopens its legacy `/tmp/easyai-client-{pid}-{epoch}.log` per Client.  Keep off unless you want that postmortem trail. |
-| `show_bash`     | `true`  | `--show-bash` / `--no-show-bash` | Print bash subprocess input/output to the operator's terminal in real time. |
-| `show_python`   | `true`  | `--show-python` / `--no-show-python` | Same for `python3`. |
-| `tools_mode`    | `split`   | `--tools-mode unified\|split\|both` | How `fs` / `web` / `memory` are exposed. Default `split` (since 2026-05-15): one focused tool per action (`fs_read`, `fs_edit`, …, `memory_save`, …) — flat schemas, name-as-anchor. `unified` registers the legacy single dispatcher per family with an `action=` argument. `both` registers both surfaces side-by-side. Same handlers under the hood. |
-
-Example `easyai-cli.ini` for an "always resume, never auto-log" workstation
-(flip `auto_continue` to `true` so every invocation resumes without
-needing `--continue` on the command line):
-
-```ini
-[cli]
-auto_continue = true
-auto_compress = false
-log_file      =
-auto_log      = false
-show_bash     = true
-show_python   = true
-```
+| `auto_continue`    | `false` | `--continue` / `--no-continue` | Load `.easyai_session` from cwd before the first prompt. |
+| `auto_compress`    | `false` | `--compress`                   | Run the compress flow on every load (rare; usually you want `/compress` on demand). |
+| `session_file`     | (empty) | `--session-file`               | Override the default filename. Implies `auto_continue`. |
+| `no_local_session` | `false` | `--no-local-session`           | Read-only mode: load the session but never write back. |
 
 Operators who don't want session files in cwd at all: leave
 `auto_continue = false` (the default) so existing files are
@@ -569,7 +749,7 @@ dirs have two independent sessions.
 
 ---
 
-## 11. memory — persistent memory
+## 12. memory — persistent memory
 
 `--memory <dir>` mounts a directory as the agent's long-term memory.
 It exposes ONE `memory` tool with seven sub-actions (`save`, `append`,
@@ -601,7 +781,7 @@ vocabulary injection".
 
 ---
 
-## 12. External tools
+## 13. External tools
 
 `--external-tools <dir>` loads every `EASYAI-<name>.tools` JSON manifest
 in `<dir>` as an operator-defined tool pack. Per-file fault isolation —
@@ -614,7 +794,7 @@ worked examples.
 
 ---
 
-## 13. Management subcommands
+## 14. Management subcommands
 
 Each one hits a known endpoint, prints the result, and exits. They're
 mutually exclusive with chat; if you pass any of them with `-p` or a
@@ -639,7 +819,7 @@ network call and works without `--url`.
 
 ---
 
-## 14. Worked examples
+## 15. Worked examples
 
 ### One-shot chat
 
@@ -752,7 +932,7 @@ through cleanly for models that emit them.
 
 ---
 
-## 15. Cross-references
+## 16. Cross-references
 
 - [`README.md`](README.md) — sales overview + quickstart for the whole
   project.

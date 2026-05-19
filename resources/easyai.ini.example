@@ -1,0 +1,321 @@
+; ============================================================
+; easyai.ini — operator config for easyai-server
+; ============================================================
+;
+; PRECEDENCE
+;   command-line flag   >   INI value   >   hardcoded default
+;
+; The server reads this file from `/etc/easyai/easyai.ini` by
+; default. Override with --config <path>. A missing file is NOT
+; an error — the server runs on defaults plus whatever flags were
+; passed on the command line.
+;
+; FORMAT
+;   ;   line comment (whole line)
+;   #   alternate line comment marker
+;   [section]
+;   key = value
+;
+;   Boolean values accept: true / false, on / off, yes / no, 1 / 0
+;   List values are comma-separated (only `override_kv` today).
+;
+; This file is a REFERENCE — every line is commented out. Uncomment
+; only what you actually want to change. The production INI shipped
+; by scripts/install_easyai_server.sh is a tuned subset of this.
+
+; ============================================================
+; [SERVER] — HTTP listener, identity, security gates, MCP
+; ============================================================
+[SERVER]
+
+; ---------- core paths / identity ----------
+
+; Path to the GGUF model file. Required. The installer puts
+; models under /var/lib/easyai/models/. Use either an absolute
+; path or one relative to the unit's WorkingDirectory.
+;model            = /var/lib/easyai/models/qwen3.gguf
+
+; HTTP bind address. 127.0.0.1 = loopback only (recommended when
+; the box also runs a reverse proxy). 0.0.0.0 = listen on every
+; interface — needs --api-key set.
+;host             = 127.0.0.1
+
+; TCP port. Default 8080. Match nginx upstream / firewall rules.
+;port             = 8080
+
+; Public model id reported by /v1/models. Lets clients hard-code
+; one name (e.g. "EasyAi") regardless of the actual GGUF file.
+;alias            = EasyAi
+
+; Sandbox root for the file-work tools (`fs`, `python3`, `bash`)
+; when allow_fs / allow_bash is on. Operations outside this dir
+; are rejected. Default empty = no file work allowed.
+;sandbox          = /var/lib/easyai/workspace
+
+; Path to a file containing the system prompt (persona). When
+; missing, the server uses its built-in "Deep" prompt. The
+; installer drops a `/etc/easyai/system.txt_template` reference;
+; `sudo cp` to system.txt to activate.
+;system_file      = /etc/easyai/system.txt
+
+; Inline system prompt — mutually exclusive with system_file
+; (system_file wins if both are set).
+;system_inline    = You are Deep — terse, honest. Lead with the answer.
+
+; Directory containing operator-defined EASYAI-<name>.tools
+; manifest files. Empty = no external tools registered.
+;external_tools   = /etc/easyai/external-tools
+
+; RAG / persistent registry directory. When set, the memory_*
+; tools (rag_save / search / load / list / delete / keywords)
+; auto-register. One Markdown file per entry. Legacy key `rag`
+; is still read for backwards compat; prefer `memory`.
+;memory           = /var/lib/easyai/rag
+
+; Bearer token required on every /v1/* route. Empty = open
+; (loopback only — never run open on 0.0.0.0). Generate:
+;   openssl rand -hex 32
+;api_key          = REPLACE-WITH-OPENSSL-RAND-HEX-32
+
+; Hard cap on the HTTP request body, in bytes. Above this the
+; server returns 413. Default 32 MiB.
+;max_body         = 33554432
+
+; ---------- toggles ----------
+
+; Expose Prometheus /metrics endpoint.
+;metrics          = true
+
+; Verbose stderr: raw request / response bodies, tool dispatch
+; traces, KV-cache fill gauge. Equivalent to -v.
+;verbose          = false
+
+; Allow the `fs` tool to register. Requires `sandbox` to also be
+; set (operations are scoped to that dir).
+;allow_fs         = false
+
+; Allow the `bash` tool to register. WARNING: NOT a hardened
+; sandbox — commands run as the easyai system user. Auto-implies
+; `fs` and `python3` registration.
+;allow_bash       = false
+
+; The python3 tool defaults ON; setting this to off in the INI
+; (or passing --no-python) opts out even when sandbox / allow_bash
+; would auto-register it.
+;allow_python     = true
+
+; Enable engine="google" in the unified `web` tool. Requires
+; GOOGLE_API_KEY + GOOGLE_CSE_ID env vars on the unit; without
+; them the tool silently falls back to DuckDuckGo.
+;use_google       = false
+
+; Disable the LOCAL built-in toolbelt. Remote tools fetched via
+; mcp = <url> are unaffected. Equivalent to --no-local-tools.
+;local_tools      = true
+
+; URL of an upstream MCP server. When set, the server pulls
+; that server's tools and exposes them to the model alongside
+; the local toolbelt. Empty = no MCP client.
+;mcp              =
+
+; Bearer token sent on every MCP outbound request (paired with
+; the `mcp = …` URL above).
+;mcp_token        =
+
+; HTTP retry budget on transient failures (connect refused, read
+; timeout, 5xx). 0 disables.
+;http_retries     = 5
+
+; HTTP read+write timeout per outbound request, in seconds.
+;http_timeout     = 60
+
+; Periodic METRICS log line every N seconds. ALWAYS ON regardless
+; of `verbose`. 0 disables. Default 300 (5 min).
+;metrics_interval = 300
+
+; Strip <think>…</think> blocks from streaming /v1/chat
+; responses (the assistant's reasoning_content is still emitted
+; as a separate field). Useful for clients that can't filter the
+; inline think blocks themselves.
+;no_think         = false
+
+; Prepend a small "Today is YYYY-MM-DD HH:MM TZ" preamble to the
+; system prompt on every turn — so the model can answer "what
+; date is today" without a tool call.
+;inject_datetime  = true
+
+; The model's training data cutoff, formatted as YYYY-MM. Sent
+; to the model as a hint inside the date/time preamble.
+;knowledge_cutoff = 2024-10
+
+; Enable the chat template's `enable_thinking` flag (Qwen3, R1
+; etc. surface a <think>…</think> block when this is on).
+; Default true; --no-think on the CLI flips this off.
+;reasoning        = true
+
+; MCP authentication gate. Accepts on / off / open / disabled
+; etc. (case-insensitive). When off, POST /mcp is open without
+; a Bearer token — useful for local dev / smoke tests, NEVER
+; for prod. The CLI override is --no-mcp-auth.
+;mcp_auth         = on
+
+; ---------- webui rebrand ----------
+
+; Display name shown in the webui chrome (browser tab + header).
+;webui_title       = Deep
+
+; Path to a custom favicon / logo (.ico / .png / .svg).
+;webui_icon        = /etc/easyai/logo.svg
+
+; Placeholder text in the input box.
+;webui_placeholder = Type a message…
+
+; webui mode: "modern" (full SvelteKit fork; embedded) | "minimal"
+; (inline single-file fallback). Default modern.
+;webui_mode        = modern
+
+; ============================================================
+; [ENGINE] — model loading + inference tunables
+; ============================================================
+[ENGINE]
+
+; ---------- core load knobs ----------
+
+; Context window size in tokens. Bigger ctx = more RAM/VRAM at
+; load time. Match the model's training context (Qwen3.5-4B
+; trained at 40k, Qwen3-30B at 32k, etc.).
+;context          = 32768
+
+; Number of layers to offload to GPU. -1 = auto-fit (default;
+; allocates as many as fit in VRAM). 0 = CPU only. 99 = force
+; ALL layers on GPU (will OOM if the model doesn't fit).
+;ngl              = -1
+
+; CPU threads for prompt processing.
+;threads          = 0
+
+; CPU threads for batched inference (prompt-eval batches). 0 =
+; follow `threads`.
+;threads_batch    = 0
+
+; Logical batch size (tokens per decode step). 0 = follow ctx.
+;batch            = 0
+
+; llama-server compatibility for parallel sequences. Set >1 and
+; the server warns; the easyai engine runs one sequence per
+; request, not N in parallel.
+;parallel         = 1
+
+; Sampling preset — picks the default (temperature, top_p,
+; top_k, min_p) bundle. Per-request overrides win. Five built-
+; ins ship: deterministic / precise / balanced / creative / wild.
+;preset           = precise
+
+; ---------- compute / memory ----------
+
+; Flash attention. Free perf on every backend that supports it.
+;flash_attn       = true
+
+; Pin the model weights in RAM. Needs `LimitMEMLOCK=infinity` on
+; the unit. Pair with no_mmap = true.
+;mlock            = false
+
+; Disable mmap and read the GGUF straight into RAM. Required
+; with mlock for portability. Slightly slower start-up, sometimes
+; needed on network filesystems.
+;no_mmap          = false
+
+; Keep KV cache on CPU even with GPU layers — useful when VRAM
+; is tiny.
+;no_kv_offload    = false
+
+; Use a single unified KV buffer across sequences (recent
+; llama.cpp feature; mostly for speculative + parallel).
+;kv_unified       = false
+
+; KV cache data type. f16 default; quantising V saves a LOT of
+; VRAM. Options: f32 / f16 / bf16 / q8_0 / q4_0 / q4_1 / q5_0 /
+; q5_1 / iq4_nl.
+;cache_type_k     = q8_0
+;cache_type_v     = q8_0
+
+; NUMA strategy. Empty = none. Options: distribute, isolate,
+; numactl, mirror.
+;numa             =
+
+; GGUF metadata overrides (comma-separated `key=type:value`).
+; Types: int | float | bool | str. Useful for fixing tokenizer
+; or rope parameters at load time without re-quantising.
+;override_kv      = tokenizer.ggml.eos_token_id=int:151645
+
+; ---------- speculative decoding ----------
+
+; Backend. `none` (off; default), `draft-mtp` (MTP-trained
+; models only — DeepSeek V3, MimoVL, Qwen3.5/3.6), `draft-simple`,
+; `draft-eagle3`, `ngram-simple` / `ngram-map-k` /
+; `ngram-map-k4v` / `ngram-mod` / `ngram-cache`. Typical decode
+; speedup with MTP: 1.5-2x tok/s. No second model loaded.
+;spec_type        = none
+
+; Max draft tokens per speculation step. Typical for MTP: 6.
+; Default 16. Ignored when spec_type = none.
+;spec_draft_n_max = 6
+
+; ---------- chat template / reasoning (llama-server compat) ----------
+
+; Override the GGUF's embedded chat template with a Jinja file
+; on disk. The file is read once at load. Mirrors llama-server
+; --chat-template-file. The installer drops a reference template
+; at /etc/easyai/qwen3-think.jinja_template; `sudo cp` to
+; /etc/easyai/qwen3-think.jinja to activate.
+;chat_template_file = /etc/easyai/qwen3-think.jinja
+
+; Reasoning-content extraction format:
+;   none            — leave <think>…</think> inline
+;   auto            — default; currently behaves like deepseek
+;   deepseek        — split <think>…</think> into reasoning_content,
+;                     including streaming deltas (Qwen3 / R1 default)
+;   deepseek-legacy — split for sync, leave inline for streaming
+;reasoning_format = deepseek
+
+; ---------- sampling (per-request overrides win) ----------
+
+;temperature      = 0.7
+;top_p            = 0.95
+;top_k            = 40
+;min_p            = 0.05
+
+; Anti-loop repetition penalty (multiplicative). Default 1.15
+; for thinking models. Set 1.0 to disable.
+;repeat_penalty   = 1.15
+
+; OpenAI presence penalty ([-2.0, 2.0]). Production AI box pairs
+; presence=1.5 with repeat_penalty=1.0 for long agentic flows.
+;presence_penalty = 0.0
+
+; Cap on assistant reply length. -1 = unlimited (until EOS or
+; ctx full).
+;max_tokens       = -1
+
+; How many "announce-only" retries the engine does before
+; bailing. 0 disables. Bump to 15-20 for weak 1-bit-quant models.
+;max_incomplete_retries = 10
+
+; Deterministic seed. 0 = random.
+;seed             = 0
+
+; ============================================================
+; [MCP_USER] — Bearer-token auth for POST /mcp
+; ============================================================
+;
+; Each line is `username = bearer_token`. The username appears
+; in the audit log; the token is what clients send as
+; `Authorization: Bearer <token>`. Generate:
+;   openssl rand -hex 32
+;
+; If the section is missing or empty AND [SERVER] mcp_auth=auto,
+; /mcp is OPEN. Useful for local dev. Production: define at
+; least one user.
+[MCP_USER]
+;gustavo  = REPLACE-WITH-OPENSSL-RAND-HEX-32
+;ai-agent = REPLACE-WITH-OPENSSL-RAND-HEX-32

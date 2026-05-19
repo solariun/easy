@@ -624,15 +624,55 @@ struct Options {
     // and stdin pipe); --unattended forces it on regardless.
     bool        unattended       = false;
 
-    // INI overlay (CLI > INI > hardcoded). Default path mirrors the
-    // server / mcp-server convention; missing file = use defaults.
-    std::string config_path = "/etc/easyai/easyai-cli.ini";
+    // INI overlay (CLI > INI > hardcoded). Default is resolved at load
+    // time via a layered lookup: $HOME/.easyai/easyai-cli.ini first
+    // (per-user, the common case — easyai-cli runs as your user, not a
+    // service), /etc/easyai/easyai-cli.ini as fallback (system-wide).
+    // --config <path> bypasses the layers and pins one file. An empty
+    // resolved path means "no INI found" and the CLI runs on defaults.
+    std::string config_path;            // populated by resolve_config_path()
+    bool        config_path_cli_set = false;  // true when --config was given
     // Whether show_bash / show_python were explicitly set by the user
     // on the command line — distinguishes "user wants the default"
     // from "user passed --no-show-*" so the INI can fill the gap when
     // CLI is silent.
     bool        show_bash_cli_set   = false;
     bool        show_python_cli_set = false;
+
+    // ---- CLI > INI > hardcoded tracking bits ------------------------
+    // Set true the moment the matching flag is seen on argv so the INI
+    // overlay knows not to clobber an explicit operator choice. Only
+    // flags whose default value isn't a sentinel (e.g. timeout=86400,
+    // model="EasyAi") need a tracking bit; sampling knobs use their
+    // sentinel (-1.0f / -2.0f / -1) instead.
+    bool        url_cli_set            = false;
+    bool        api_key_cli_set        = false;
+    bool        model_cli_set          = false;
+    bool        timeout_cli_set        = false;
+    bool        http_retries_cli_set   = false;
+    bool        max_tool_hops_cli_set  = false;
+    bool        system_prompt_cli_set  = false;
+    bool        system_file_cli_set    = false;
+    bool        sandbox_cli_set        = false;
+    bool        allow_bash_cli_set     = false;
+    bool        allow_python_cli_set   = false;
+    bool        use_google_cli_set     = false;
+    bool        external_tools_cli_set = false;
+    bool        rag_dir_cli_set        = false;
+    bool        max_reasoning_cli_set  = false;
+    bool        show_reasoning_cli_set = false;
+    bool        retry_on_incomplete_cli_set = false;
+    bool        no_plan_cli_set        = false;
+    bool        verbose_cli_set        = false;
+    bool        quiet_cli_set          = false;
+    bool        tls_insecure_cli_set   = false;
+    bool        tls_ca_path_cli_set    = false;
+    bool        session_file_cli_set   = false;
+    bool        no_local_session_cli_set = false;
+    bool        unattended_cli_set     = false;
+    bool        tools_enabled_cli_set  = false;  // --tools was passed
+    bool        stop_cli_set           = false;  // any --stop seen
+    bool        extra_body_cli_set     = false;
 };
 
 void usage(const char * argv0) {
@@ -875,24 +915,20 @@ void usage(const char * argv0) {
 "                                --session-file to seed a scheduled job\n"
 "                                with a pre-structured pre-session\n"
 "                                without mutating the source file.\n"
-"    --config PATH              INI overlay (CLI > INI > hardcoded). Default\n"
-"                                /etc/easyai/easyai-cli.ini; missing file is\n"
-"                                NOT an error (just keeps hardcoded\n"
-"                                defaults).  The [cli] section supports:\n"
-"                                  auto_continue = true|false  (default false)\n"
-"                                  auto_compress = true|false  (default false)\n"
-"                                  log_file      = PATH         (default \"\")\n"
-"                                  auto_log      = true|false  (default false;\n"
-"                                                  when true, restores the\n"
-"                                                  legacy library auto-log\n"
-"                                                  at /tmp/easyai-client-*.log)\n"
-"                                  show_bash     = true|false  (default true)\n"
-"                                  show_python   = true|false  (default true)\n"
-"                                  tools_mode    = unified|split|both\n"
-"                                                  (default split — focused\n"
-"                                                  one-verb-per-tool surfaces)\n"
-"                                CLI flags override INI; INI overrides hardcoded\n"
-"                                defaults.\n"
+"    --config PATH              INI overlay (CLI > INI > hardcoded). Without\n"
+"                                this flag the CLI looks in layers:\n"
+"                                  1. $HOME/.easyai/easyai-cli.ini  (per-user)\n"
+"                                  2. /etc/easyai/easyai-cli.ini    (fallback)\n"
+"                                  3. <none>                        (defaults)\n"
+"                                --config <path> pins one file; a missing\n"
+"                                explicit path prints a warning and falls\n"
+"                                through to defaults. The [cli] section\n"
+"                                accepts every flag below as a snake_case key\n"
+"                                (url, api_key, model, temperature, top_p,\n"
+"                                tools, sandbox, allow_bash, …). See\n"
+"                                easyai-cli.md §5 for the full table and\n"
+"                                resources/easyai-cli.ini.example for a\n"
+"                                pristine reference file to copy.\n"
 "    --unattended               inject an [unattended] block into the system\n"
 "                                prompt: tells the model there is no human at\n"
 "                                the terminal, so it cannot ask clarifying\n"
@@ -962,21 +998,22 @@ bool parse_args(int argc, char ** argv, Options & o) {
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
-        if      (a == "--url")            o.url     = need(i, "--url");
-        else if (a == "--api-key")        o.api_key = need(i, "--api-key");
-        else if (a == "--model")          o.model   = need(i, "--model");
-        else if (a == "--timeout")        o.timeout = std::stoi(need(i, "--timeout"));
-        else if (a == "--http-retries")   o.http_retries = std::stoi(need(i, "--http-retries"));
+        if      (a == "--url")            { o.url = need(i, "--url"); o.url_cli_set = true; }
+        else if (a == "--api-key")        { o.api_key = need(i, "--api-key"); o.api_key_cli_set = true; }
+        else if (a == "--model")          { o.model = need(i, "--model"); o.model_cli_set = true; }
+        else if (a == "--timeout")        { o.timeout = std::stoi(need(i, "--timeout")); o.timeout_cli_set = true; }
+        else if (a == "--http-retries")   { o.http_retries = std::stoi(need(i, "--http-retries")); o.http_retries_cli_set = true; }
         else if (a == "--max-tool-hops") {
             try { o.max_tool_hops = std::stoi(need(i, "--max-tool-hops")); } catch (...) {}
             // 0 / negative → effectively unlimited (same as default).
             if (o.max_tool_hops <= 0) o.max_tool_hops = 99999;
+            o.max_tool_hops_cli_set = true;
         }
-        else if (a == "--system")         o.system_prompt = need(i, "--system");
-        else if (a == "--system-file")    o.system_file   = need(i, "--system-file");
-        else if (a == "--sandbox")        o.sandbox       = need(i, "--sandbox");
-        else if (a == "--allow-bash")     o.allow_bash    = true;
-        else if (a == "--no-python")      o.allow_python  = false;
+        else if (a == "--system")         { o.system_prompt = need(i, "--system"); o.system_prompt_cli_set = true; }
+        else if (a == "--system-file")    { o.system_file = need(i, "--system-file"); o.system_file_cli_set = true; }
+        else if (a == "--sandbox")        { o.sandbox = need(i, "--sandbox"); o.sandbox_cli_set = true; }
+        else if (a == "--allow-bash")     { o.allow_bash = true; o.allow_bash_cli_set = true; }
+        else if (a == "--no-python")      { o.allow_python = false; o.allow_python_cli_set = true; }
         else if (a == "--no-show-bash") {
             o.show_bash         = false;
             o.show_bash_cli_set = true;
@@ -993,12 +1030,15 @@ bool parse_args(int argc, char ** argv, Options & o) {
             o.show_python         = true;
             o.show_python_cli_set = true;
         }
-        else if (a == "--config")         o.config_path   = need(i, "--config");
-        else if (a == "--unattended")     o.unattended    = true;
-        else if (a == "--use-google")     o.use_google    = true;
-        else if (a == "--external-tools") o.external_tools_dir = need(i, "--external-tools");
+        else if (a == "--config") {
+            o.config_path         = need(i, "--config");
+            o.config_path_cli_set = true;
+        }
+        else if (a == "--unattended")     { o.unattended = true; o.unattended_cli_set = true; }
+        else if (a == "--use-google")     { o.use_google = true; o.use_google_cli_set = true; }
+        else if (a == "--external-tools") { o.external_tools_dir = need(i, "--external-tools"); o.external_tools_cli_set = true; }
         else if (a == "--memory" ||
-                 a == "--RAG")            o.rag_dir            = need(i, a.c_str());
+                 a == "--RAG")            { o.rag_dir = need(i, a.c_str()); o.rag_dir_cli_set = true; }
         else if (a == "--temperature")    o.temperature       = std::stof(need(i, "--temperature"));
         else if (a == "--top-p")          o.top_p             = std::stof(need(i, "--top-p"));
         else if (a == "--top-k")          o.top_k             = std::stoi(need(i, "--top-k"));
@@ -1008,8 +1048,8 @@ bool parse_args(int argc, char ** argv, Options & o) {
         else if (a == "--presence-penalty")  o.presence_penalty  = std::stof(need(i, "--presence-penalty"));
         else if (a == "--seed")           o.seed              = std::stoll(need(i, "--seed"));
         else if (a == "--max-tokens")     o.max_tokens        = std::stoi(need(i, "--max-tokens"));
-        else if (a == "--stop")           o.stop_sequences.push_back(need(i, "--stop"));
-        else if (a == "--extra-json")     o.extra_body        = need(i, "--extra-json");
+        else if (a == "--stop")           { o.stop_sequences.push_back(need(i, "--stop")); o.stop_cli_set = true; }
+        else if (a == "--extra-json")     { o.extra_body = need(i, "--extra-json"); o.extra_body_cli_set = true; }
         else if (a == "--tools") {
             std::string list = need(i, "--tools");
             std::stringstream ss(list);
@@ -1017,6 +1057,7 @@ bool parse_args(int argc, char ** argv, Options & o) {
             while (std::getline(ss, tok, ',')) {
                 if (!tok.empty()) o.tools_enabled.insert(tok);
             }
+            o.tools_enabled_cli_set = true;
         }
         else if (a == "--tools-mode") {
             std::string m = need(i, "--tools-mode");
@@ -1031,15 +1072,15 @@ bool parse_args(int argc, char ** argv, Options & o) {
             o.tools_mode         = m;
             o.tools_mode_cli_set = true;
         }
-        else if (a == "--no-plan")        o.no_plan = true;
-        else if (a == "--show-reasoning") o.show_reasoning = true;   // no-op now (kept for compat)
+        else if (a == "--no-plan")        { o.no_plan = true; o.no_plan_cli_set = true; }
+        else if (a == "--show-reasoning") { o.show_reasoning = true; o.show_reasoning_cli_set = true; }
         else if (a == "--no-reasoning"
-              || a == "--hide-reasoning") o.show_reasoning = false;
-        else if (a == "--max-reasoning")     o.max_reasoning      = std::stoi(need(i, "--max-reasoning"));
-        else if (a == "--retry-on-incomplete")    o.retry_on_incomplete = true;   // legacy no-op (now default)
-        else if (a == "--no-retry-on-incomplete") o.retry_on_incomplete = false;
-        else if (a == "--verbose" || a == "-v") o.verbose = true;
-        else if (a == "--quiet"   || a == "-q") o.quiet   = true;
+              || a == "--hide-reasoning") { o.show_reasoning = false; o.show_reasoning_cli_set = true; }
+        else if (a == "--max-reasoning")  { o.max_reasoning = std::stoi(need(i, "--max-reasoning")); o.max_reasoning_cli_set = true; }
+        else if (a == "--retry-on-incomplete")    { o.retry_on_incomplete = true; o.retry_on_incomplete_cli_set = true; }
+        else if (a == "--no-retry-on-incomplete") { o.retry_on_incomplete = false; o.retry_on_incomplete_cli_set = true; }
+        else if (a == "--verbose" || a == "-v") { o.verbose = true; o.verbose_cli_set = true; }
+        else if (a == "--quiet"   || a == "-q") { o.quiet   = true; o.quiet_cli_set   = true; }
         else if (a == "--log-file") {
             o.log_file_path = need(i, "--log-file");
             o.log_file_path_cli_set = true;
@@ -1065,6 +1106,7 @@ bool parse_args(int argc, char ** argv, Options & o) {
         }
         else if (a == "--session-file") {
             o.session_file = need(i, "--session-file");
+            o.session_file_cli_set = true;
             // Auto-imply --continue: the operator passed an explicit
             // path so they obviously want it loaded. Don't make them
             // type both flags. They can still pass --no-continue
@@ -1079,10 +1121,11 @@ bool parse_args(int argc, char ** argv, Options & o) {
             // file still LOAD the file at startup, but no save_session()
             // call writes anything back. Designed for "feed a pre-baked
             // session into a scheduled job without mutating the file".
-            o.no_local_session = true;
+            o.no_local_session         = true;
+            o.no_local_session_cli_set = true;
         }
-        else if (a == "--insecure-tls")   o.tls_insecure = true;
-        else if (a == "--ca-cert")        o.tls_ca_path  = need(i, "--ca-cert");
+        else if (a == "--insecure-tls")   { o.tls_insecure = true; o.tls_insecure_cli_set = true; }
+        else if (a == "--ca-cert")        { o.tls_ca_path  = need(i, "--ca-cert"); o.tls_ca_path_cli_set = true; }
         else if (a == "-p" || a == "--prompt") o.prompt = need(i, "--prompt");
         else if (a == "--list-models")    o.list_models       = true;
         else if (a == "--list-tools")     o.list_tools        = true;
@@ -1126,11 +1169,49 @@ bool parse_args(int argc, char ** argv, Options & o) {
         o.system_prompt = ss.str();
     }
 
-    // INI overlay: precedence is CLI > INI > hardcoded. A missing INI
-    // file is NOT an error — load_ini_file returns an empty Ini and
-    // we simply keep the hardcoded defaults. Today only [cli]
-    // show_bash flows through here; future keys add a single
-    // `if (!o.<flag>_cli_set)` block each.
+    // INI overlay: precedence is CLI > INI > hardcoded.
+    //
+    // Path resolution (when --config wasn't given):
+    //   1. $HOME/.easyai/easyai-cli.ini   — per-user, primary location
+    //   2. /etc/easyai/easyai-cli.ini     — system-wide fallback
+    //   3. <none>                         — run on defaults
+    //
+    // --config <path> bypasses the layers and pins one file; if it's
+    // missing we still proceed on defaults but emit a warning (the
+    // operator explicitly asked for that path, so silence would be
+    // a foot-gun). A missing layered-default path is silent — it
+    // just means the operator hasn't created a config yet.
+    if (!o.config_path_cli_set) {
+        const char * home = std::getenv("HOME");
+        std::string user_path;
+        if (home && *home) {
+            user_path = std::string(home) + "/.easyai/easyai-cli.ini";
+        }
+        const std::string system_path = "/etc/easyai/easyai-cli.ini";
+        std::error_code ec;
+        if (!user_path.empty() && std::filesystem::exists(user_path, ec)) {
+            o.config_path = user_path;
+        } else if (std::filesystem::exists(system_path, ec)) {
+            o.config_path = system_path;
+        } else {
+            o.config_path.clear();
+        }
+    } else {
+        std::error_code ec;
+        if (!std::filesystem::exists(o.config_path, ec)) {
+            std::fprintf(stderr,
+                "easyai-cli: --config %s not found; continuing on defaults\n",
+                o.config_path.c_str());
+            o.config_path.clear();
+        }
+    }
+    if (o.verbose && !o.config_path.empty()) {
+        std::fprintf(stderr,
+            "easyai-cli: loading config from %s\n", o.config_path.c_str());
+    }
+
+    // A missing INI file is NOT an error — load_ini_file returns an
+    // empty Ini and we simply keep the hardcoded defaults.
     {
         std::string ini_err;
         easyai::config::Ini ini =
@@ -1140,6 +1221,12 @@ bool parse_args(int argc, char ** argv, Options & o) {
                 "easyai-cli: %s warnings:\n%s\n",
                 o.config_path.c_str(), ini_err.c_str());
         }
+        auto warn_bad = [&](const char * key, const std::string & v,
+                            const char * expected, const char * keeping) {
+            std::fprintf(stderr,
+                "easyai-cli: %s [cli] %s=%s — expected %s; keeping default %s\n",
+                o.config_path.c_str(), key, v.c_str(), expected, keeping);
+        };
         auto load_bool_flag = [&](const char * key, bool & target,
                                   bool cli_set) {
             if (cli_set) return;
@@ -1152,11 +1239,8 @@ bool parse_args(int argc, char ** argv, Options & o) {
             } else if (lc == "true" || lc == "yes" || lc == "on" || lc == "1") {
                 target = true;
             } else {
-                std::fprintf(stderr,
-                    "easyai-cli: %s [cli] %s=%s — "
-                    "expected true/false; keeping default %s\n",
-                    o.config_path.c_str(), key, v.c_str(),
-                    target ? "true" : "false");
+                warn_bad(key, v, "true/false",
+                         target ? "true" : "false");
             }
         };
         auto load_str_flag = [&](const char * key, std::string & target,
@@ -1166,15 +1250,160 @@ bool parse_args(int argc, char ** argv, Options & o) {
             if (v.empty()) return;
             target = v;
         };
-        load_bool_flag("show_bash",    o.show_bash,    o.show_bash_cli_set);
-        load_bool_flag("show_python",  o.show_python,  o.show_python_cli_set);
-        load_bool_flag("auto_continue", o.auto_continue, o.auto_continue_cli_set);
-        load_bool_flag("auto_compress", o.auto_compress, o.auto_compress_cli_set);
-        load_bool_flag("auto_log",      o.auto_log,      /*cli_set=*/false);
-        load_str_flag ("log_file",      o.log_file_path, o.log_file_path_cli_set);
-        // tools_mode also has a closed value set; validate the INI
-        // value the same way the CLI parser does instead of letting an
-        // unknown string slip through to registration time.
+        auto load_int_flag = [&](const char * key, int & target,
+                                 bool cli_set) {
+            if (cli_set) return;
+            const std::string v = ini.get("cli", key);
+            if (v.empty()) return;
+            try { target = std::stoi(v); }
+            catch (...) {
+                warn_bad(key, v, "integer", std::to_string(target).c_str());
+            }
+        };
+        auto load_long_flag = [&](const char * key, long long & target,
+                                  bool cli_set) {
+            if (cli_set) return;
+            const std::string v = ini.get("cli", key);
+            if (v.empty()) return;
+            try { target = std::stoll(v); }
+            catch (...) {
+                warn_bad(key, v, "integer", std::to_string(target).c_str());
+            }
+        };
+        auto load_float_flag = [&](const char * key, float & target,
+                                   bool cli_set) {
+            if (cli_set) return;
+            const std::string v = ini.get("cli", key);
+            if (v.empty()) return;
+            try { target = std::stof(v); }
+            catch (...) {
+                warn_bad(key, v, "float", std::to_string(target).c_str());
+            }
+        };
+        // Sentinel-driven loaders for sampling knobs where the "unset"
+        // value is a negative number (CLI default), not a tracking bit.
+        // Apply the INI only when no --flag was given AND the value is
+        // still the sentinel — the operator may have explicitly passed
+        // e.g. --temperature 0.0 which is a legit value but not the
+        // default.
+        auto load_float_sentinel = [&](const char * key, float & target,
+                                       float sentinel) {
+            if (target != sentinel) return;
+            const std::string v = ini.get("cli", key);
+            if (v.empty()) return;
+            try { target = std::stof(v); }
+            catch (...) {
+                warn_bad(key, v, "float", std::to_string(target).c_str());
+            }
+        };
+        auto load_int_sentinel = [&](const char * key, int & target,
+                                     int sentinel) {
+            if (target != sentinel) return;
+            const std::string v = ini.get("cli", key);
+            if (v.empty()) return;
+            try { target = std::stoi(v); }
+            catch (...) {
+                warn_bad(key, v, "integer", std::to_string(target).c_str());
+            }
+        };
+        // Comma-separated list (used for --tools and --stop).
+        auto load_csv_list = [&](const char * key,
+                                 std::vector<std::string> & target,
+                                 bool cli_set) {
+            if (cli_set) return;
+            const std::string v = ini.get("cli", key);
+            if (v.empty()) return;
+            target.clear();
+            std::stringstream ss(v);
+            std::string tok;
+            while (std::getline(ss, tok, ',')) {
+                // trim surrounding whitespace
+                auto issp = [](unsigned char c){ return std::isspace(c)!=0; };
+                while (!tok.empty() && issp(tok.front())) tok.erase(tok.begin());
+                while (!tok.empty() && issp(tok.back()))  tok.pop_back();
+                if (!tok.empty()) target.push_back(std::move(tok));
+            }
+        };
+        auto load_csv_set = [&](const char * key,
+                                std::set<std::string> & target,
+                                bool cli_set) {
+            std::vector<std::string> tmp;
+            load_csv_list(key, tmp, cli_set);
+            if (tmp.empty()) return;
+            target.clear();
+            for (auto & t : tmp) target.insert(std::move(t));
+        };
+
+        // ----- Connection ---------------------------------------------
+        load_str_flag  ("url",            o.url,            o.url_cli_set);
+        load_str_flag  ("api_key",        o.api_key,        o.api_key_cli_set);
+        load_str_flag  ("model",          o.model,          o.model_cli_set);
+        load_int_flag  ("timeout",        o.timeout,        o.timeout_cli_set);
+        load_int_flag  ("http_retries",   o.http_retries,   o.http_retries_cli_set);
+        load_int_flag  ("max_tool_hops",  o.max_tool_hops,  o.max_tool_hops_cli_set);
+        if (!o.max_tool_hops_cli_set && o.max_tool_hops <= 0) o.max_tool_hops = 99999;
+        load_bool_flag ("insecure_tls",   o.tls_insecure,   o.tls_insecure_cli_set);
+        load_str_flag  ("ca_cert",        o.tls_ca_path,    o.tls_ca_path_cli_set);
+
+        // ----- Conversation -------------------------------------------
+        load_str_flag  ("system",         o.system_prompt,  o.system_prompt_cli_set);
+        load_str_flag  ("system_file",    o.system_file,    o.system_file_cli_set);
+
+        // ----- Sampling / penalty (sentinel-driven) -------------------
+        load_float_sentinel("temperature",       o.temperature,       -1.0f);
+        load_float_sentinel("top_p",             o.top_p,             -1.0f);
+        load_int_sentinel  ("top_k",             o.top_k,             -1);
+        load_float_sentinel("min_p",             o.min_p,             -1.0f);
+        // repeat_penalty has a non-sentinel default (1.15); use a
+        // bool-tracked overlay so an INI value can override 1.15.
+        {
+            const std::string v = ini.get("cli", "repeat_penalty");
+            if (!v.empty()) {
+                try { o.repeat_penalty = std::stof(v); }
+                catch (...) {
+                    warn_bad("repeat_penalty", v, "float",
+                             std::to_string(o.repeat_penalty).c_str());
+                }
+            }
+        }
+        load_float_sentinel("frequency_penalty", o.frequency_penalty, -2.0f);
+        load_float_sentinel("presence_penalty",  o.presence_penalty,  -2.0f);
+        load_long_flag ("seed",           o.seed,           /*cli_set=*/o.seed != -1);
+        load_int_sentinel ("max_tokens",  o.max_tokens,     -1);
+        load_csv_list  ("stop",           o.stop_sequences, o.stop_cli_set);
+        load_str_flag  ("extra_json",     o.extra_body,     o.extra_body_cli_set);
+
+        // ----- Tools --------------------------------------------------
+        load_csv_set   ("tools",          o.tools_enabled,  o.tools_enabled_cli_set);
+        load_str_flag  ("sandbox",        o.sandbox,        o.sandbox_cli_set);
+        load_bool_flag ("allow_bash",     o.allow_bash,     o.allow_bash_cli_set);
+        load_bool_flag ("allow_python",   o.allow_python,   o.allow_python_cli_set);
+        load_bool_flag ("use_google",     o.use_google,     o.use_google_cli_set);
+        load_str_flag  ("external_tools", o.external_tools_dir, o.external_tools_cli_set);
+        load_str_flag  ("memory",         o.rag_dir,        o.rag_dir_cli_set);
+        load_bool_flag ("no_plan",        o.no_plan,        o.no_plan_cli_set);
+        load_bool_flag ("show_bash",      o.show_bash,      o.show_bash_cli_set);
+        load_bool_flag ("show_python",    o.show_python,    o.show_python_cli_set);
+
+        // ----- Reasoning / retry --------------------------------------
+        load_bool_flag ("show_reasoning",      o.show_reasoning,      o.show_reasoning_cli_set);
+        load_int_flag  ("max_reasoning",       o.max_reasoning,       o.max_reasoning_cli_set);
+        load_bool_flag ("retry_on_incomplete", o.retry_on_incomplete, o.retry_on_incomplete_cli_set);
+
+        // ----- Display / logging --------------------------------------
+        load_bool_flag ("verbose",        o.verbose,        o.verbose_cli_set);
+        load_bool_flag ("quiet",          o.quiet,          o.quiet_cli_set);
+        load_bool_flag ("auto_log",       o.auto_log,       /*cli_set=*/false);
+        load_str_flag  ("log_file",       o.log_file_path,  o.log_file_path_cli_set);
+        load_bool_flag ("unattended",     o.unattended,     o.unattended_cli_set);
+
+        // ----- Session ------------------------------------------------
+        load_bool_flag ("auto_continue",     o.auto_continue,     o.auto_continue_cli_set);
+        load_bool_flag ("auto_compress",     o.auto_compress,     o.auto_compress_cli_set);
+        load_str_flag  ("session_file",      o.session_file,      o.session_file_cli_set);
+        load_bool_flag ("no_local_session",  o.no_local_session,  o.no_local_session_cli_set);
+
+        // ----- Tools-mode (closed enum, validated separately) ---------
         if (!o.tools_mode_cli_set) {
             const std::string v = ini.get("cli", "tools_mode");
             if (!v.empty()) {

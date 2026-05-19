@@ -1,0 +1,283 @@
+; ============================================================
+; easyai-cli.ini — operator config for the easyai-cli client
+; ============================================================
+;
+; PRECEDENCE
+;   command-line flag   >   INI value   >   hardcoded default
+;
+; The client looks up this file in layers:
+;   1. $HOME/.easyai/easyai-cli.ini      (per-user; primary)
+;   2. /etc/easyai/easyai-cli.ini        (system-wide fallback)
+;   3. <none>                            (run on hardcoded defaults)
+;
+;   --config <path> on the command line overrides the lookup
+;   entirely and pins one file. A missing --config path prints
+;   a warning and falls through to defaults.
+;
+; FORMAT
+;   ;   line comment (whole line; in-line "#" inside a value is kept)
+;   #   alternate line comment marker
+;   [section]
+;   key = value
+;
+;   Boolean values accept: true / false, on / off, yes / no, 1 / 0
+;   List values are comma-separated:  tools = datetime, plan, web
+;
+; All keys live under [cli]. Unknown keys are ignored silently;
+; values that fail to parse fall back to the hardcoded default and
+; print a one-line warning at startup.
+;
+; This file is a REFERENCE — every line is commented out. Uncomment
+; only what you actually want to change.
+
+[cli]
+
+; ============================================================
+; Connection — where the client talks to
+; ============================================================
+
+; Endpoint of the OpenAI-compatible server. Required (CLI default
+; comes from the EASYAI_URL env var). Use the full URL incl. scheme.
+;url           = http://127.0.0.1:8080
+
+; Bearer token used in `Authorization: Bearer <key>` on every
+; request. Required when the server has [SERVER] api_key set.
+;api_key       = REPLACE-WITH-OPENSSL-RAND-HEX-32
+
+; Model id sent in the request body. The server matches this against
+; its loaded model (alias / GGUF basename); when the server is the
+; easyai-server reference deploy it accepts any of EasyAi / easyai /
+; the alias.
+;model         = EasyAi
+
+; Read + write timeout for a single HTTP turn, in seconds. The
+; timer ONLY fires on true silence — every SSE delta resets it.
+; Default 86400 (24h) so multi-hour agentic sessions don't get
+; killed by their own client. Set lower for short scripted turns.
+;timeout       = 86400
+
+; Extra attempts on transient HTTP failures (connect refused,
+; read timeout, 5xx) per request. 0 disables. Each retry logs to
+; stderr.
+;http_retries  = 5
+
+; Per-turn ceiling on tool calls before the agentic loop bails
+; with `max tool hops exceeded`. The default is effectively
+; unlimited (99999) because real agentic tasks routinely need
+; 10+ hops. Set a finite N to put a hard cap back; 0 / negative
+; resolve to unlimited.
+;max_tool_hops = 99999
+
+; Skip TLS peer cert verification (https:// only — DEV ONLY!).
+; Use --insecure-tls on the command line for ad-hoc tests; the
+; INI key exists for permanent dev rigs.
+;insecure_tls  = false
+
+; Path to a PEM CA bundle to trust on https:// requests. Useful
+; when the server presents a corporate CA that isn't in the
+; system trust store.
+;ca_cert       = /etc/ssl/certs/my-ca.pem
+
+; ============================================================
+; Conversation — system prompt
+; ============================================================
+
+; Inline system prompt. Mutually exclusive with system_file
+; (system_file wins if both are set on the CLI; on INI the last
+; one parsed wins). Leave empty to use the server-side default.
+;system        = You are a terse assistant. Reply in two sentences max.
+
+; Path to a file containing the system prompt. Lets you keep a
+; long persona out of the INI.
+;system_file   = ~/.easyai/persona.txt
+
+; ============================================================
+; Sampling — pass empty / unset to keep the server default
+; ============================================================
+;
+; The sampling keys below all behave identically: when unset OR
+; set to the sentinel default (-1.0 / -2.0 / -1) the client omits
+; the field from the request body, letting the SERVER's preset
+; (`[ENGINE] preset` on the server side) drive sampling. Set
+; explicitly to override per-client.
+
+;temperature       = 0.7
+;top_p             = 0.95
+;top_k             = 40
+;min_p             = 0.05
+
+; Anti-loop repetition penalty (multiplicative on logits of
+; recently-seen tokens). Default 1.15 — fights thinking-model
+; rephrasing loops. Set 1.0 to disable. Pairs naturally with
+; presence_penalty = 0.0; the server's production config flips
+; the pair (repeat=1.0 + presence=1.5) for long agentic flows.
+;repeat_penalty    = 1.15
+
+; OpenAI-standard frequency/presence penalties ([-2.0, 2.0]).
+; Unset = omit from request (server default applies).
+;frequency_penalty = 0.0
+;presence_penalty  = 0.0
+
+; Deterministic sampling seed (-1 = random / server picks).
+;seed              = -1
+
+; Cap on assistant reply length, in tokens. -1 = unlimited
+; (until EOS or context full).
+;max_tokens        = -1
+
+; Stop sequences (comma-separated; the model halts when any one
+; is produced). Leave empty to keep the server's defaults.
+;stop              = </s>, [END]
+
+; Free-form JSON object merged into the request body. Useful for
+; one-off knobs the CLI doesn't expose (e.g. logit_bias, custom
+; provider fields). Must be a single-line JSON OBJECT literal.
+;extra_json        = {"logit_bias": {}}
+
+; ============================================================
+; Tools — what the client registers locally before dispatching
+; ============================================================
+
+; Comma-separated list of tool names to register. Empty = use the
+; built-in default set (datetime + plan + web + system_meminfo +
+; system_loadavg + system_cpu_usage + system_swaps).
+;
+; Always-available names:
+;   datetime          — current date + time
+;   plan              — multi-step planning tool
+;   web               — unified search + fetch (DuckDuckGo by default)
+;   tool_lookup       — query the local tool registry
+;   system_meminfo, system_loadavg, system_cpu_usage, system_swaps
+;
+; Sandbox-gated (auto-on when sandbox / allow_bash is set):
+;   fs                — file work scoped to the sandbox
+;   python3           — stdlib-only Python 3 (disk gated to sandbox)
+;
+; Opt-in:
+;   bash              — shell command runner (allow_bash = true)
+;   memory            — RAG persistent registry (memory = DIR)
+;tools         = datetime, plan, web
+
+; Tool registration surface. Smaller / quantised models dispatch
+; much more reliably against the split shape; large models handle
+; either. "both" registers both surfaces for compatibility.
+;   unified — one dispatcher per family: fs(action="read"), …
+;   split   — one tool per action:       fs_read, fs_edit, …
+;   both    — register both
+;tools_mode    = split
+
+; Sandbox root for file work. When set, the `fs` and `python3`
+; tools auto-register and operations outside this dir are
+; rejected. Without sandbox AND without allow_bash, the model
+; has no file access.
+;sandbox       = /tmp/easyai-sandbox
+
+; Register the `bash` tool. WARNING: NOT a hardened sandbox —
+; the command runs with your user privileges. Auto-implies `fs`
+; and `python3` registration.
+;allow_bash    = false
+
+; Enable the `python3` tool. Defaults true; flip to false to opt
+; out even when sandbox / allow_bash would auto-register it.
+;allow_python  = true
+
+; Enable engine="google" inside the `web` tool. Requires
+; GOOGLE_API_KEY + GOOGLE_CSE_ID env vars at run time; without
+; them the tool silently falls back to DuckDuckGo.
+;use_google    = false
+
+; Directory of EASYAI-<name>.tools manifest files (operator-
+; defined external tools). Empty = no external tools registered.
+;external_tools = /etc/easyai/external-tools
+
+; RAG / persistent registry directory. When set, the `memory`
+; tool family (rag_save / search / load / list / delete /
+; keywords) is auto-registered. One Markdown file per entry.
+;memory        = ~/.easyai/rag
+
+; Skip auto-registering the `plan` tool. Default false (plan is
+; on for every agentic session); set true for raw chat / batch
+; classification flows where plan is pure overhead.
+;no_plan       = false
+
+; Mirror the bash subprocess's stdout+stderr to your terminal in
+; real time so a long build / test scroll is visible. Default
+; true; set false for batch / CI runs where the mirror would
+; pollute the log.
+;show_bash     = true
+
+; Same mirror for the python3 subprocess. Default true.
+;show_python   = true
+
+; ============================================================
+; Reasoning — Qwen3 / R1 / DeepSeek <think> handling
+; ============================================================
+
+; Print the model's reasoning_content (the <think>…</think>
+; block) to stderr in real time as it streams. Default true.
+;show_reasoning      = true
+
+; Hard ceiling on reasoning tokens before the loop aborts and
+; nudges the model to act. 0 = unlimited (the only stop is the
+; model itself emitting </think>). Set a finite N to backstop
+; runaway thinkers (Qwen3.5 occasionally loops on hard problems).
+;max_reasoning       = 0
+
+; Retry when the model finishes a turn with no tool_call and
+; only a short "announce" snippet ("Let me check…", "I'll
+; search…"). Default true.
+;retry_on_incomplete = true
+
+; ============================================================
+; Display / logging
+; ============================================================
+
+; Verbose stderr: prints the resolved INI path, raw HTTP request
+; / response bodies, tool dispatch traces. Equivalent to -v.
+;verbose       = false
+
+; Quiet mode: disable the spinner + context-percent gauge. Use
+; for piped / batch / CI invocations where the live UI would
+; corrupt the log.
+;quiet         = false
+
+; Open a raw transaction log at the given path (parent dir must
+; exist). Each turn appends a numbered block with HEADERS,
+; REQUEST, RESPONSE, RAW (incl. tool_call markup), tool DISPATCH
+; lines.
+;log_file      = ~/.easyai/cli.log
+
+; Automatic /tmp transaction log (legacy). Off by default; the
+; --log-file / log_file path is the recommended replacement.
+;auto_log      = false
+
+; Mark the session as unattended (no human at the terminal). The
+; model is told it cannot ask clarifying questions, request
+; approval, or present a numbered menu and wait. Auto-set when a
+; prompt is given on the command line; this key forces it on.
+;unattended    = false
+
+; ============================================================
+; Session persistence
+; ============================================================
+
+; Load `.easyai_session` (in cwd) before the first turn so a
+; previous conversation resumes. Default false — even if a
+; session file exists, we start fresh and overwrite it on the
+; first turn unless this is set.
+;auto_continue    = false
+
+; Run a lossless recap when loading the session (compresses
+; ancient history while keeping recent turns verbatim). Implies
+; auto_continue at use time.
+;auto_compress    = false
+
+; Override the default `.easyai_session` filename. Implies
+; auto_continue when set (the operator wants this loaded).
+;session_file     = ~/.easyai/last_session.json
+
+; Read-only session mode. session_file / auto_continue still
+; LOAD the file, but no save_session() call writes back. Designed
+; for feeding a pre-baked session into a scheduled job without
+; mutating the file.
+;no_local_session = false
