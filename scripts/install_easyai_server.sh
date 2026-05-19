@@ -962,6 +962,21 @@ EXT_EXAMPLE
         sudo chown root:"$service_group" "$example_disabled"
     fi
 
+    # ---- chat-template reference: refreshed every upgrade, never active --
+    # Mirrors the system.txt_template pattern: drops the upstream Qwen3
+    # template into /etc/easyai/qwen3-think.jinja_template so operators
+    # can `sudo cp` to /etc/easyai/qwen3-think.jinja and edit, then point
+    # easyai.ini [ENGINE] chat_template_file at it. The _template suffix
+    # is overwritten on every install/upgrade; the active .jinja next to
+    # it is preserved (never touched after the operator activates it).
+    qwen3_template_src="$easyai_dir/templates/qwen3-think.jinja"
+    qwen3_template_dst="$config_dir/qwen3-think.jinja_template"
+    if [[ -f "$qwen3_template_src" ]]; then
+        log "installing $qwen3_template_dst (reference; copy to qwen3-think.jinja to activate)"
+        sudo install -o root -g "$service_group" -m 640 \
+            "$qwen3_template_src" "$qwen3_template_dst"
+    fi
+
     # ---- RAG: agent's persistent registry / long-term memory ----------
     # Owned by the SERVICE user (not root) because the AGENT writes here
     # at runtime. mode 750 — the agent reads/writes; nobody else.
@@ -1199,9 +1214,12 @@ max_tokens       = $max_tokens
 # --- Chat template / reasoning extraction (llama-server compat) ---
 # Override the GGUF's embedded chat template with a Jinja file on
 # disk. Mirrors llama-server's --chat-template-file. Leave empty to
-# use the model's template. Example: ship a tuned Qwen3 thinking
-# template alongside easyai.ini so you can tweak it without re-
-# quantising the GGUF.
+# use the model's template.
+#
+# The installer drops a refresh-on-upgrade reference template at
+#   /etc/easyai/qwen3-think.jinja_template
+# Activate by copying once and pointing this key at the active copy:
+#   sudo cp /etc/easyai/qwen3-think.jinja_template /etc/easyai/qwen3-think.jinja
 #chat_template_file = /etc/easyai/qwen3-think.jinja
 #
 # Reasoning-content extraction format. Accepts:
